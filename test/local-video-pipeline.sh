@@ -272,27 +272,62 @@ watch_hls() {
   local url="$1"
   local last_marker=""
   local base="${url%/*}"
-  local tmp status seq uri marker
+  local tmp status seq probe uri range marker
   while true; do
     tmp="$(mktemp)"
     status="$(curl -k -sS -w '%{http_code}' -o "$tmp" "$url" || true)"
     if [[ "$status" == "200" || "$status" == "206" ]]; then
       seq="$(awk -F: '/#EXT-X-MEDIA-SEQUENCE/{print $2}' "$tmp" | tail -n 1)"
-      uri="$(awk -F'URI="' '/#EXT-X-PART/{split($2,a,"\""); u=a[1]} /^[^#].*\.mp4/{u=$0} END{print u}' "$tmp")"
-      marker="${seq:-?}:${uri:-?}"
+      probe="$(awk '
+        function byterange(line, fallback, parts, len, off) {
+          if (line == "") return fallback
+          split(line, parts, ":")
+          split(parts[2], parts, "@")
+          len = parts[1] + 0
+          off = (parts[2] == "" ? 0 : parts[2] + 0)
+          if (len <= 0) return fallback
+          return off "-" (off + len - 1)
+        }
+        /#EXT-X-BYTERANGE:/ { segment_range = byterange($0, "0-0") }
+        /#EXT-X-PART/ {
+          split($0, uri_parts, "URI=\"")
+          split(uri_parts[2], uri_value, "\"")
+          uri = uri_value[1]
+          range = "0-0"
+          if (index($0, "BYTERANGE=\"") > 0) {
+            split($0, range_parts, "BYTERANGE=\"")
+            split(range_parts[2], range_value, "\"")
+            range = byterange("#EXT-X-BYTERANGE:" range_value[1], range)
+          }
+        }
+        /^[^#].*\.mp4/ {
+          uri = $0
+          range = segment_range == "" ? "0-0" : segment_range
+          segment_range = ""
+        }
+        END {
+          if (uri != "") print uri " " range
+        }
+      ' "$tmp")"
+      uri="${probe%% *}"
+      range="${probe#* }"
+      if [[ "$range" == "$probe" ]]; then
+        range="0-0"
+      fi
+      marker="${seq:-?}:${uri:-?}:${range:-?}"
       if [[ "$marker" != "$last_marker" ]]; then
-        printf '[hls] playlist ok media_sequence=%s latest=%s\n' "${seq:-?}" "${uri:-?}"
+        printf '[hls] playlist ok media_sequence=%s latest=%s range=%s\n' "${seq:-?}" "${uri:-?}" "${range:-?}"
         last_marker="$marker"
       else
-        printf '[hls] playlist unchanged media_sequence=%s latest=%s\n' "${seq:-?}" "${uri:-?}"
+        printf '[hls] playlist unchanged media_sequence=%s latest=%s range=%s\n' "${seq:-?}" "${uri:-?}" "${range:-?}"
       fi
       if [[ -n "$uri" ]]; then
-        if curl -kfsS -r 0-0 -o /dev/null "$base/$uri"; then
+        if curl -kfsS -r "$range" -o /dev/null "$base/$uri"; then
           if [[ -n "$HLS_OK_FILE" ]]; then
             printf 'ok\n' >"$HLS_OK_FILE"
           fi
         else
-          printf '[hls] latest media range probe failed uri=%s\n' "$uri"
+          printf '[hls] latest media range probe failed uri=%s range=%s\n' "$uri" "$range"
         fi
       fi
     else
