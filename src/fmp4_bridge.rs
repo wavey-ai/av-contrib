@@ -28,6 +28,9 @@ pub const DEFAULT_MIN_PART_MS: u32 = 50;
 const MAX_PART_MS_WITHOUT_KEY: u32 = 2_000;
 const MAX_PENDING_AUS_WITHOUT_CONFIG: usize = 180;
 const MAX_PES_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MIN_H264_WIDTH: u16 = 160;
+const MIN_H264_HEIGHT: u16 = 90;
+const MAX_H264_DIMENSION: u16 = 8_192;
 
 #[derive(Debug, Clone)]
 pub struct PublishedFmp4Part {
@@ -342,31 +345,54 @@ impl Fmp4Segmenter {
         self.timestamp_base_input = None;
     }
 
-    async fn push_video(&mut self, access_unit: AccessUnit) {
+    async fn push_video(&mut self, mut access_unit: AccessUnit) {
         let had_config = self.config.avcc.is_some();
-        let mut config_changed = false;
+        let mut accepted_config_changed = false;
         if let Some((config, signature)) = self.parse_h264_config(&access_unit) {
-            config_changed = self.config_signature.as_ref() != Some(&signature);
+            let config_changed = self.config_signature.as_ref() != Some(&signature);
             if config_changed {
                 if had_config {
-                    self.flush_with_next_dts(access_unit.dts).await;
+                    if self.config.width == config.width && self.config.height == config.height {
+                        debug!(
+                            output_stream_id = self.output_stream_id,
+                            width = self.config.width,
+                            height = self.config.height,
+                            "ignoring same-resolution mid-stream H.264 config update"
+                        );
+                    } else {
+                        warn!(
+                            output_stream_id = self.output_stream_id,
+                            current_width = self.config.width,
+                            current_height = self.config.height,
+                            new_width = config.width,
+                            new_height = config.height,
+                            "ignoring mid-stream H.264 resolution change"
+                        );
+                    }
                 } else {
                     self.clear_pending_media();
+
+                    self.sps = Some(signature.sps.clone());
+                    self.pps = Some(signature.pps.clone());
+                    self.config = config;
+                    self.config_signature = Some(signature);
+                    self.force_next_init = true;
+                    self.started_video = false;
+                    self.warned_no_config = false;
+                    accepted_config_changed = true;
+
+                    info!(
+                        output_stream_id = self.output_stream_id,
+                        width = self.config.width,
+                        height = self.config.height,
+                        "configured H.264 fMP4 track"
+                    );
                 }
-
-                self.config = config;
-                self.config_signature = Some(signature);
-                self.force_next_init = true;
-                self.started_video = false;
-                self.warned_no_config = false;
-
-                info!(
-                    output_stream_id = self.output_stream_id,
-                    width = self.config.width,
-                    height = self.config.height,
-                    "configured H.264 fMP4 track"
-                );
             }
+        }
+
+        if !strip_h264_parameter_sets(&mut access_unit) {
+            return;
         }
 
         if self.config.avcc.is_none() {
@@ -383,12 +409,12 @@ impl Fmp4Segmenter {
             return;
         }
 
-        if (!had_config || config_changed) && !access_unit.key {
+        if (!had_config || accepted_config_changed) && !access_unit.key {
             debug!(
                 output_stream_id = self.output_stream_id,
                 output_stream_idx = self.output_stream_idx,
                 key = access_unit.key,
-                config_changed,
+                config_changed = accepted_config_changed,
                 "dropping non-key video access unit until first keyframe after H.264 config"
             );
             return;
@@ -683,6 +709,8 @@ impl Fmp4Segmenter {
         access_unit: &AccessUnit,
     ) -> Option<(Config, H264ConfigSignature)> {
         let mut found_config_nalu = false;
+        let mut candidate_sps = self.sps.clone();
+        let mut candidate_pps = self.pps.clone();
         let mut data = access_unit.data.as_ref();
         while data.len() >= 4 {
             let nalu_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
@@ -699,11 +727,11 @@ impl Fmp4Segmenter {
 
             match nalu[0] & NAL_UNIT_TYPE_MASK {
                 NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET => {
-                    self.sps = Some(Bytes::copy_from_slice(nalu));
+                    candidate_sps = Some(Bytes::copy_from_slice(nalu));
                     found_config_nalu = true;
                 }
                 NAL_UNIT_TYPE_PICTURE_PARAMETER_SET => {
-                    self.pps = Some(Bytes::copy_from_slice(nalu));
+                    candidate_pps = Some(Bytes::copy_from_slice(nalu));
                     found_config_nalu = true;
                 }
                 _ => {}
@@ -714,7 +742,7 @@ impl Fmp4Segmenter {
             return None;
         }
 
-        let (Some(sps), Some(pps)) = (&self.sps, &self.pps) else {
+        let (Some(sps), Some(pps)) = (&candidate_sps, &candidate_pps) else {
             return None;
         };
         let bitstream = Bitstream::new(sps.iter().copied());
@@ -758,6 +786,21 @@ impl Fmp4Segmenter {
             );
             return None;
         };
+        if width < MIN_H264_WIDTH
+            || height < MIN_H264_HEIGHT
+            || width > MAX_H264_DIMENSION
+            || height > MAX_H264_DIMENSION
+        {
+            warn!(
+                width,
+                height,
+                min_width = MIN_H264_WIDTH,
+                min_height = MIN_H264_HEIGHT,
+                max_dimension = MAX_H264_DIMENSION,
+                "rejecting implausible H.264 SPS dimensions"
+            );
+            return None;
+        }
         Some((
             Config {
                 width,
@@ -847,6 +890,39 @@ fn looks_like_annex_b(data: &[u8]) -> bool {
     data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
 }
 
+fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> bool {
+    let mut data = access_unit.data.as_ref();
+    let mut sample = BytesMut::with_capacity(access_unit.data.len());
+    while data.len() >= 4 {
+        let nalu_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        data = &data[4..];
+        if data.len() < nalu_len {
+            return false;
+        }
+
+        let nalu = &data[..nalu_len];
+        data = &data[nalu_len..];
+        if nalu.is_empty() {
+            continue;
+        }
+
+        match nalu[0] & NAL_UNIT_TYPE_MASK {
+            NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET | NAL_UNIT_TYPE_PICTURE_PARAMETER_SET => {}
+            _ => {
+                sample.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+                sample.extend_from_slice(nalu);
+            }
+        }
+    }
+
+    if !data.is_empty() || sample.is_empty() {
+        return false;
+    }
+
+    access_unit.data = sample.freeze();
+    true
+}
+
 fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSignature> {
     for unit in audio_units {
         let Some(header) = AdtsHeader::read_from(&unit.data) else {
@@ -889,6 +965,11 @@ mod tests {
         }
     }
 
+    fn push_len_prefixed_nalu(out: &mut BytesMut, nalu: &[u8]) {
+        out.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+        out.extend_from_slice(nalu);
+    }
+
     #[test]
     fn fmp4_segmenter_rebases_large_mpeg_ts_timestamps() {
         let (playlists, _, _) = Playlists::new(Options::default());
@@ -925,6 +1006,21 @@ mod tests {
 
         assert!(!segmenter.timestamp_went_backwards(&audio_access_unit(126_000, 126_000)));
         assert!(segmenter.timestamp_went_backwards(&h264_access_unit(126_000, 126_000)));
+    }
+
+    #[test]
+    fn strips_h264_parameter_sets_from_media_sample() {
+        let mut data = BytesMut::new();
+        push_len_prefixed_nalu(&mut data, &[0x67, 0x01, 0x02]);
+        push_len_prefixed_nalu(&mut data, &[0x68, 0x03, 0x04]);
+        push_len_prefixed_nalu(&mut data, &[0x65, 0x05, 0x06]);
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.data = data.freeze();
+
+        assert!(strip_h264_parameter_sets(&mut access_unit));
+
+        let nalus: Vec<&[u8]> = h264::iterate_avcc(&access_unit.data, 4).collect();
+        assert_eq!(nalus, vec![&[0x65, 0x05, 0x06][..]]);
     }
 }
 

@@ -1080,7 +1080,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hls"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#70222d0e9a7043d7c75612d536ba200116ca0155"
+source = "git+https://github.com/wavey-ai/web-services.git#419813771698f8fb57f8a9b66b82b4c5033a2a7d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1245,7 +1245,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -1932,7 +1932,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1969,7 +1969,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3275,7 +3275,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#70222d0e9a7043d7c75612d536ba200116ca0155"
+source = "git+https://github.com/wavey-ai/web-services.git#419813771698f8fb57f8a9b66b82b4c5033a2a7d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3439,7 +3439,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#70222d0e9a7043d7c75612d536ba200116ca0155"
+source = "git+https://github.com/wavey-ai/web-services.git#419813771698f8fb57f8a9b66b82b4c5033a2a7d"
 dependencies = [
  "anyhow",
  "async-trait",
