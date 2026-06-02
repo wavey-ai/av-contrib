@@ -1,0 +1,159 @@
+use anyhow::{Context, Result};
+use clap::{Parser, ValueEnum};
+use rist_core_pure::time::ntp_now;
+use rist_mio_pure::{MainMioSender, SimpleMioSender};
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Instant;
+use tokio::io::{self as tokio_io, AsyncReadExt};
+
+const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RistProfile {
+    Simple,
+    Main,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "rist-send",
+    about = "Send stdin to an av-mesh RIST ingest socket"
+)]
+struct Args {
+    target: SocketAddr,
+
+    #[arg(long, value_enum, default_value = "main")]
+    profile: RistProfile,
+
+    #[arg(long, value_parser = parse_u32_auto, default_value_t = DEFAULT_FLOW_ID)]
+    flow_id: u32,
+
+    #[arg(long, default_value_t = 1316)]
+    chunk_bytes: usize,
+
+    #[arg(long, default_value_t = 8192)]
+    history_packets: usize,
+}
+
+enum Sender {
+    Simple(SimpleMioSender),
+    Main(MainMioSender),
+}
+
+impl Sender {
+    fn connect(args: &Args) -> io::Result<Self> {
+        let local = local_sender_addr(args.target);
+        match args.profile {
+            RistProfile::Simple => {
+                SimpleMioSender::connect(local, args.target, args.flow_id, args.history_packets)
+                    .map(Self::Simple)
+            }
+            RistProfile::Main => {
+                MainMioSender::connect(local, args.target, args.flow_id, args.history_packets)
+                    .map(Self::Main)
+            }
+        }
+    }
+
+    fn send_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Simple(sender) => sender
+                .send_payload(payload, ntp_now(), Instant::now())
+                .map(|_| ()),
+            Self::Main(sender) => sender
+                .send_payload(payload, ntp_now(), Instant::now())
+                .map(|_| ()),
+        }
+    }
+
+    fn drain_feedback(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        for _ in 0..32 {
+            match self {
+                Self::Simple(sender) => match sender.try_recv_feedback_and_retransmit(buf) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                },
+                Self::Main(sender) => match sender.try_recv_feedback_and_retransmit(buf) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let mut input = Vec::new();
+    tokio_io::stdin()
+        .read_to_end(&mut input)
+        .await
+        .context("failed to read stdin")?;
+
+    let mut sender = Sender::connect(&args)
+        .with_context(|| format!("failed to create RIST sender for {}", args.target))?;
+    let mut feedback_buf = vec![0u8; 65_536];
+    let chunk_bytes = args.chunk_bytes.max(1);
+
+    for chunk in input.chunks(chunk_bytes) {
+        loop {
+            match sender.send_payload(chunk) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    sender.drain_feedback(&mut feedback_buf)?;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error).context("failed to send RIST payload"),
+            }
+        }
+        sender.drain_feedback(&mut feedback_buf)?;
+    }
+
+    println!(
+        "sent {} bytes to {} using RIST chunks of {} bytes",
+        input.len(),
+        args.target,
+        chunk_bytes
+    );
+    Ok(())
+}
+
+fn local_sender_addr(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V4(addr) => {
+            let ip = if addr.ip().is_loopback() {
+                Ipv4Addr::LOCALHOST
+            } else {
+                Ipv4Addr::UNSPECIFIED
+            };
+            SocketAddr::new(ip.into(), 0)
+        }
+        SocketAddr::V6(addr) => {
+            let ip = if addr.ip().is_loopback() {
+                Ipv6Addr::LOCALHOST
+            } else {
+                Ipv6Addr::UNSPECIFIED
+            };
+            SocketAddr::new(ip.into(), 0)
+        }
+    }
+}
+
+fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|err| err.to_string())
+    } else {
+        trimmed.parse::<u32>().map_err(|err| err.to_string())
+    }
+}
