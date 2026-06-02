@@ -52,6 +52,8 @@ fixtures and logs are written under ignored `test/work/`:
 ```sh
 test/local-video-pipeline.sh prepare all
 test/local-video-pipeline.sh run srt 720p
-test/local-video-pipeline.sh run rist-pure 720p
-test/local-video-pipeline.sh run rist-librist 720p
+test/local-video-pipeline.sh run rist-ffmpeg-pure 720p
+test/local-video-pipeline.sh run rist-ffmpeg-librist 720p
+test/local-video-pipeline.sh run rist-rust-pure 720p
+test/local-video-pipeline.sh run rist-rust-librist 720p
 ```

@@ -2,16 +2,25 @@
 
 ## Local OBS-like ingest harness
 
-- Continue from the 360p fixture at `test/work/media/lori-360p.ts`.
-- Keep test artifacts under ignored `test/work/`.
-- Current good path: SRT 360p ran for 80 seconds, crossed the segment ring boundary, and served LL-HLS media byte ranges cleanly.
-- Current RIST status:
-  - `rist-ffmpeg-pure` served LL-HLS cleanly through the retained window.
-  - `rist-ffmpeg-librist` served LL-HLS cleanly through the retained window.
-  - `rist-rust-pure` served LL-HLS cleanly through the retained window and the native sender exited cleanly.
-  - `rist-rust-librist` sent the full 360p byte count, but librist ingest never produced an upload-response stream or LL-HLS playlist.
-  - FFmpeg/librist sender exits with status `187` at close after HLS is already readable: `Error closing file: Generic error in an external library`.
-  - Treat that as unresolved until isolated; do not hide it as a pass.
+- Keep generated fixtures and logs under ignored `test/work/`.
+- Current prepared fixtures:
+  - `test/work/media/lori-360p.ts`
+  - `test/work/media/lori-720p.ts`
+  - `test/work/media/lori-1080p.ts`
+- Current good 360p and 720p full-video paths:
+  - `srt`
+  - `rist-rust-pure`
+  - `rist-rust-librist`
+- Current partially good 360p and 720p paths:
+  - `rist-ffmpeg-pure` serves LL-HLS but FFmpeg/librist exits `187` at close
+    with `Error closing file`.
+  - `rist-ffmpeg-librist` serves LL-HLS but FFmpeg/librist exits `187` at
+    close with `Error closing file`.
+- Treat the FFmpeg/librist close status as unresolved until isolated; do not
+  hide it as a pass.
+- The fMP4 bridge still logs guarded implausible SPS and ignored mid-stream
+  resolution changes during otherwise readable HLS output. Audit H.264
+  parsing/packetization before calling this clean.
 
 ## Next Protocol Checks
 
@@ -41,7 +50,7 @@ rg 'ERROR|WARN|reorder|continuity|panic|RIST|rist' test/work/logs
 
 ## Fixture Preparation
 
-Prepare larger fixtures once the 360p protocol matrix is understood:
+Prepare or refresh fixtures:
 
 ```sh
 AV_CONTRIB_TEST_X264_PRESET=ultrafast test/local-video-pipeline.sh prepare 720p
@@ -50,6 +59,18 @@ AV_CONTRIB_TEST_X264_PRESET=ultrafast test/local-video-pipeline.sh prepare 2160p
 ```
 
 Use 720p first for resource isolation before spending time on 1080p/2160p.
+
+## Full-Video Matrix
+
+```sh
+unset AV_CONTRIB_TEST_LIMIT_SECONDS
+AV_CONTRIB_TEST_POST_SEND_WATCH_SECONDS=2 \
+AV_CONTRIB_TEST_FFMPEG_LOGLEVEL=warning \
+AV_CONTRIB_TEST_RUST_LOG=av_contrib=info,upload_response=info,playlists=debug,web_service=info,hls=debug,info \
+test/local-video-pipeline.sh matrix 720p
+```
+
+Then repeat for `1080p`.
 
 ## Already Fixed And Pushed
 
