@@ -142,15 +142,10 @@ prepare_variant() {
     return
   fi
 
-  local limit_args=()
-  if [[ -n "${AV_CONTRIB_TEST_LIMIT_SECONDS:-}" ]]; then
-    limit_args=(-t "$AV_CONTRIB_TEST_LIMIT_SECONDS")
-  fi
-
   log "preparing $variant full-video MPEG-TS fixture"
   ffmpeg -hide_banner -y \
     -i "$SOURCE" \
-    "${limit_args[@]}" \
+    $(ffmpeg_limit_args) \
     -map 0:v:0 -map 0:a:0 -sn -dn \
     -vf "scale=-2:${height}:flags=bicubic" \
     -c:v libx264 -preset "$X264_PRESET" -tune zerolatency \
