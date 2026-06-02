@@ -7,11 +7,11 @@
   - `test/work/media/lori-360p.ts`
   - `test/work/media/lori-720p.ts`
   - `test/work/media/lori-1080p.ts`
-- Current good 360p and 720p full-video paths:
+- Current good 360p, 720p, and 1080p full-video paths:
   - `srt`
   - `rist-rust-pure`
   - `rist-rust-librist`
-- Current partially good 360p and 720p paths:
+- Current partially good 360p, 720p, and 1080p paths:
   - `rist-ffmpeg-pure` serves LL-HLS but FFmpeg/librist exits `187` at close
     with `Error closing file`.
   - `rist-ffmpeg-librist` serves LL-HLS but FFmpeg/librist exits `187` at
@@ -70,7 +70,8 @@ AV_CONTRIB_TEST_RUST_LOG=av_contrib=info,upload_response=info,playlists=debug,we
 test/local-video-pipeline.sh matrix 720p
 ```
 
-Then repeat for `1080p`.
+Prepared 360p, 720p, and 1080p matrices have been run. Prepare and run 2160p
+only if we need a local resource-pressure check.
 
 ## Already Fixed And Pushed
 

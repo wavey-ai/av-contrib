@@ -18,25 +18,28 @@ Latest current-code evidence, run on 2026-06-02:
 - Full 720p matrix log:
   `test/work/logs/matrix-720p-full-20260602-230233.log` (ignored, not
   committed).
+- Full 1080p matrix log:
+  `test/work/logs/matrix-1080p-full-20260602-232129.log` (ignored, not
+  committed).
 
 | Mode | Result | Notes |
 | --- | --- | --- |
-| `srt` | Full 360p and 720p status 0, HLS readable | Playlist currently drops after ingest stream end |
-| `rist-ffmpeg-pure` | Full 360p and 720p HLS readable, sender status 187 | FFmpeg/librist exits `187` with `Error closing file` after HLS became readable |
-| `rist-ffmpeg-librist` | Full 360p and 720p HLS readable, sender status 187 | FFmpeg/librist exits `187` with `Error closing file` after HLS became readable |
-| `rist-rust-pure` | Full 360p and 720p status 0, HLS readable | Native sender sent 30,170,992 bytes for 360p and 74,551,588 bytes for 720p |
-| `rist-rust-librist` | Full 360p and 720p status 0, HLS readable | Native Rust sender fed librist receiver using `0x11223344` flow id and sent the full prepared fixtures |
+| `srt` | Full 360p, 720p, and 1080p status 0, HLS readable | Playlist currently drops after ingest stream end |
+| `rist-ffmpeg-pure` | Full 360p, 720p, and 1080p HLS readable, sender status 187 | FFmpeg/librist exits `187` with `Error closing file` after HLS became readable |
+| `rist-ffmpeg-librist` | Full 360p, 720p, and 1080p HLS readable, sender status 187 | FFmpeg/librist exits `187` with `Error closing file` after HLS became readable |
+| `rist-rust-pure` | Full 360p, 720p, and 1080p status 0, HLS readable | Native sender sent 30,170,992 bytes for 360p, 74,551,588 bytes for 720p, and 158,918,092 bytes for 1080p |
+| `rist-rust-librist` | Full 360p, 720p, and 1080p status 0, HLS readable | Native Rust sender fed librist receiver using `0x11223344` flow id and sent the full prepared fixtures |
 
 Known remaining issues:
 
 - FFmpeg/librist sender close returns status `187` after HLS is already
-  readable. This repeats on 360p and 720p against both pure Rust and librist
-  receivers, so it appears isolated to FFmpeg/librist sender shutdown rather
-  than an ingest or HLS stall.
+  readable. This repeats on 360p, 720p, and 1080p against both pure Rust and
+  librist receivers, so it appears isolated to FFmpeg/librist sender shutdown
+  rather than an ingest or HLS stall.
 - The live playlist goes 404 after SRT ingest ends. That may be acceptable for a
   live-only endpoint, but it is still a behavior decision.
 - The fMP4 bridge logs implausible H.264 SPS guards and ignored mid-stream
   resolution changes for some payloads while still continuing playback; this
   needs a real parser/packetization audit before calling it clean.
-- Full-video matrix run is still needed for 1080p before calling the LORI
-  no-OBS pipeline fully proven across prepared variants.
+- 2160p is not prepared or run yet; use it only if we need a local
+  resource-pressure check beyond 1080p.
