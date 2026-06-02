@@ -960,6 +960,12 @@ impl pes::ElementaryStreamConsumer<TsDemuxContext> for ElementaryStreamConsumer 
     }
 
     fn continuity_error(&mut self, _ctx: &mut TsDemuxContext) {
-        warn!(stream_type = ?self.stream_type, "MPEG-TS continuity error");
+        let dropped_payload_bytes = self.accumulated_payload.len();
+        self.accumulated_payload.clear();
+        warn!(
+            stream_type = ?self.stream_type,
+            dropped_payload_bytes,
+            "MPEG-TS continuity error; dropping partial elementary stream payload"
+        );
     }
 }

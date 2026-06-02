@@ -16,7 +16,7 @@ use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use upload_response::{
     SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
 };
@@ -42,6 +42,8 @@ const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
 const MAX_RIST_DRAIN_PER_TICK: usize = 128;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
 const RIST_POLL_MS: u64 = 1;
+const RIST_REORDER_WAIT_MS: u64 = 80;
+const RIST_REORDER_MAX_PENDING: usize = 512;
 const RTCP_INTERVAL_MS: u64 = 20;
 const SRT_HLS_WORKER_ID: &str = "av-contrib-srt-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
@@ -286,6 +288,95 @@ impl Fmp4PartPublisher for MeshForwarder {
     }
 }
 
+struct RistPayloadReorderer {
+    next_sequence: Option<u32>,
+    pending: BTreeMap<u32, (SocketAddr, ReceivedPayload)>,
+    gap_started_at: Option<Instant>,
+}
+
+impl RistPayloadReorderer {
+    fn new() -> Self {
+        Self {
+            next_sequence: None,
+            pending: BTreeMap::new(),
+            gap_started_at: None,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        peer: SocketAddr,
+        payload: ReceivedPayload,
+        now: Instant,
+    ) -> Vec<(SocketAddr, ReceivedPayload)> {
+        if payload.duplicate {
+            return Vec::new();
+        }
+
+        let sequence = payload.sequence;
+        if self.next_sequence.is_some_and(|next| sequence < next) {
+            trace!(
+                peer = %peer,
+                sequence,
+                "dropping late RIST payload behind reorder window"
+            );
+            return Vec::new();
+        }
+
+        self.next_sequence.get_or_insert(sequence);
+        self.pending.entry(sequence).or_insert((peer, payload));
+        self.drain_ready(now)
+    }
+
+    fn drain_due(&mut self, now: Instant) -> Vec<(SocketAddr, ReceivedPayload)> {
+        if self.pending.is_empty() {
+            self.gap_started_at = None;
+            return Vec::new();
+        }
+
+        let gap_elapsed = self
+            .gap_started_at
+            .map(|started| now.saturating_duration_since(started))
+            .unwrap_or_default();
+        if gap_elapsed >= Duration::from_millis(RIST_REORDER_WAIT_MS)
+            || self.pending.len() >= RIST_REORDER_MAX_PENDING
+        {
+            let first_pending = *self.pending.keys().next().unwrap();
+            if let Some(next) = self.next_sequence {
+                warn!(
+                    next_sequence = next,
+                    first_pending_sequence = first_pending,
+                    pending_payloads = self.pending.len(),
+                    waited_ms = gap_elapsed.as_millis(),
+                    "RIST reorder gap timed out; releasing recovered stream with missing payloads"
+                );
+            }
+            self.next_sequence = Some(first_pending);
+            self.gap_started_at = None;
+        }
+
+        self.drain_ready(now)
+    }
+
+    fn drain_ready(&mut self, now: Instant) -> Vec<(SocketAddr, ReceivedPayload)> {
+        let mut ready = Vec::new();
+        while let Some(next) = self.next_sequence {
+            let Some((peer, payload)) = self.pending.remove(&next) else {
+                if self.pending.is_empty() {
+                    self.gap_started_at = None;
+                } else {
+                    self.gap_started_at.get_or_insert(now);
+                }
+                break;
+            };
+            ready.push((peer, payload));
+            self.next_sequence = Some(next.wrapping_add(1));
+            self.gap_started_at = None;
+        }
+        ready
+    }
+}
+
 async fn run_rist_ingest(
     mut receiver: RistReceiver,
     config: RistIngestConfig,
@@ -304,6 +395,7 @@ async fn run_rist_ingest(
     let mut poll = interval(Duration::from_millis(RIST_POLL_MS));
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_rtcp = Instant::now();
+    let mut reorderer = RistPayloadReorderer::new();
 
     loop {
         tokio::select! {
@@ -313,16 +405,14 @@ async fn run_rist_ingest(
                 return Ok(());
             }
             _ = poll.tick() => {
+                let now = Instant::now();
                 for _ in 0..MAX_RIST_DRAIN_PER_TICK {
                     match receiver.try_recv_payload(&mut buf) {
                         Ok(Some((peer, payload))) => {
-                            if payload.duplicate {
-                                continue;
+                            let ready = reorderer.insert(peer, payload, now);
+                            for (peer, payload) in ready {
+                                push_rist_payload(&mut bridge, peer, payload).await;
                             }
-                            if payload.recovered {
-                                debug!(peer = %peer, "RIST payload recovered by protocol repair");
-                            }
-                            bridge.push_ts(Bytes::copy_from_slice(&payload.payload)).await;
                         }
                         Ok(None) => break,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -334,6 +424,10 @@ async fn run_rist_ingest(
                 }
 
                 let now = Instant::now();
+                for (peer, payload) in reorderer.drain_due(now) {
+                    push_rist_payload(&mut bridge, peer, payload).await;
+                }
+
                 if now.duration_since(last_rtcp) >= Duration::from_millis(RTCP_INTERVAL_MS) {
                     if let Err(error) = receiver.poll_rtcp_and_send(now, ntp_now()) {
                         if error.kind() != io::ErrorKind::WouldBlock {
@@ -345,6 +439,17 @@ async fn run_rist_ingest(
             }
         }
     }
+}
+
+async fn push_rist_payload(bridge: &mut TsFmp4Bridge, peer: SocketAddr, payload: ReceivedPayload) {
+    if payload.recovered {
+        trace!(
+            peer = %peer,
+            sequence = payload.sequence,
+            "RIST payload recovered by protocol repair"
+        );
+    }
+    bridge.push_ts(Bytes::from(payload.payload)).await;
 }
 
 struct UploadTsBridgeState {
@@ -1107,6 +1212,50 @@ mod tests {
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
     }
 
+    #[test]
+    fn rist_reorderer_holds_out_of_order_payloads_until_gap_recovers() {
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 5000));
+        let now = Instant::now();
+        let mut reorderer = RistPayloadReorderer::new();
+
+        let ready = reorderer.insert(peer, rist_payload(10, false, b"ten"), now);
+        assert_eq!(payload_sequences(&ready), vec![10]);
+
+        let ready = reorderer.insert(peer, rist_payload(12, false, b"twelve"), now);
+        assert!(ready.is_empty());
+
+        let ready = reorderer.insert(
+            peer,
+            rist_payload(11, true, b"eleven"),
+            now + Duration::from_millis(5),
+        );
+        assert_eq!(payload_sequences(&ready), vec![11, 12]);
+        assert_eq!(ready[0].1.payload, b"eleven");
+        assert_eq!(ready[1].1.payload, b"twelve");
+    }
+
+    #[test]
+    fn rist_reorderer_releases_gap_after_timeout() {
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 5000));
+        let now = Instant::now();
+        let mut reorderer = RistPayloadReorderer::new();
+
+        assert_eq!(
+            payload_sequences(&reorderer.insert(peer, rist_payload(20, false, b"twenty"), now)),
+            vec![20]
+        );
+        assert!(reorderer
+            .insert(peer, rist_payload(22, false, b"twenty-two"), now)
+            .is_empty());
+        assert!(reorderer
+            .drain_due(now + Duration::from_millis(RIST_REORDER_WAIT_MS - 1))
+            .is_empty());
+
+        let ready = reorderer.drain_due(now + Duration::from_millis(RIST_REORDER_WAIT_MS + 1));
+        assert_eq!(payload_sequences(&ready), vec![22]);
+        assert_eq!(ready[0].1.payload, b"twenty-two");
+    }
+
     #[tokio::test]
     async fn stream_slot_forwarder_uses_stream_prefixed_fec() {
         let mesh_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1153,5 +1302,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(payload, b"non-obs-stream-bytes");
+    }
+
+    fn rist_payload(sequence: u32, recovered: bool, payload: &[u8]) -> ReceivedPayload {
+        ReceivedPayload {
+            sequence,
+            recovered,
+            duplicate: false,
+            newly_missing: Vec::new(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn payload_sequences(ready: &[(SocketAddr, ReceivedPayload)]) -> Vec<u32> {
+        ready
+            .iter()
+            .map(|(_peer, payload)| payload.sequence)
+            .collect()
     }
 }
