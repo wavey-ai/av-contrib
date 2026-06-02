@@ -754,6 +754,15 @@ impl ContribRouter {
             hls_router,
         }
     }
+
+    async fn route_hls(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        let query = req.uri().query().map(ToOwned::to_owned);
+        let response = self.hls_router.route(req).await?;
+        log_hls_response(&method, &path, query.as_deref(), response.status);
+        Ok(response)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -814,7 +823,7 @@ impl Router for ContribRouter {
                 )),
                 Some("text/plain"),
             )),
-            _ => self.hls_router.route(req).await,
+            _ => self.route_hls(req).await,
         }
     }
 
@@ -919,7 +928,7 @@ impl Router for ContribRouter {
             ));
         }
 
-        self.hls_router.route(req).await
+        self.route_hls(req).await
     }
 
     fn has_body_handler(&self, path: &str) -> bool {
@@ -1121,6 +1130,26 @@ fn response(
         body,
         content_type: content_type.map(ToOwned::to_owned),
         ..Default::default()
+    }
+}
+
+fn log_hls_response(method: &Method, path: &str, query: Option<&str>, status: StatusCode) {
+    if status == StatusCode::NOT_FOUND {
+        debug!(
+            %method,
+            %path,
+            query = query.unwrap_or(""),
+            status = status.as_u16(),
+            "HLS request not found"
+        );
+    } else if status.is_success() {
+        trace!(
+            %method,
+            %path,
+            query = query.unwrap_or(""),
+            status = status.as_u16(),
+            "HLS request completed"
+        );
     }
 }
 
