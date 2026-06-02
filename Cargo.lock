@@ -1080,7 +1080,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hls"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#39da362892a65a738d6ce52e94056a7cdc74ef95"
+source = "git+https://github.com/wavey-ai/web-services.git#5d777d6655b5d37f690fef01b7cba91c6f7c1e58"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1245,7 +1245,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -1932,7 +1932,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1969,7 +1969,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -2220,7 +2220,7 @@ dependencies = [
 [[package]]
 name = "rist"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git#4b04fee24f961827d5676425a2020fdcc59202d9"
+source = "git+https://github.com/wavey-ai/rist-rs.git#dc387f4bff0ef5a8f69a4105095d67eaf1c20f5d"
 dependencies = [
  "libc",
  "rist-sys",
@@ -2231,7 +2231,7 @@ dependencies = [
 [[package]]
 name = "rist-core"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?branch=pure-rust#c715de9e0c54dd67fbb2dc1ff32a8bf6ec6f7b98"
+source = "git+https://github.com/wavey-ai/rist-rs.git#dc387f4bff0ef5a8f69a4105095d67eaf1c20f5d"
 dependencies = [
  "aes",
  "ctr",
@@ -2246,7 +2246,7 @@ dependencies = [
 [[package]]
 name = "rist-mio"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?branch=pure-rust#c715de9e0c54dd67fbb2dc1ff32a8bf6ec6f7b98"
+source = "git+https://github.com/wavey-ai/rist-rs.git#dc387f4bff0ef5a8f69a4105095d67eaf1c20f5d"
 dependencies = [
  "mio",
  "rist-core",
@@ -2256,7 +2256,7 @@ dependencies = [
 [[package]]
 name = "rist-sys"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git#4b04fee24f961827d5676425a2020fdcc59202d9"
+source = "git+https://github.com/wavey-ai/rist-rs.git#dc387f4bff0ef5a8f69a4105095d67eaf1c20f5d"
 dependencies = [
  "bindgen 0.70.1",
  "pkg-config",
@@ -3275,7 +3275,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#39da362892a65a738d6ce52e94056a7cdc74ef95"
+source = "git+https://github.com/wavey-ai/web-services.git#5d777d6655b5d37f690fef01b7cba91c6f7c1e58"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3439,7 +3439,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#39da362892a65a738d6ce52e94056a7cdc74ef95"
+source = "git+https://github.com/wavey-ai/web-services.git#5d777d6655b5d37f690fef01b7cba91c6f7c1e58"
 dependencies = [
  "anyhow",
  "async-trait",

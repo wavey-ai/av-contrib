@@ -13,16 +13,14 @@ Run the full prepared video through the OBS-style ingest path:
 
 ```sh
 test/local-video-pipeline.sh run srt 720p
-test/local-video-pipeline.sh run rist-pure 720p
-test/local-video-pipeline.sh run rist-librist 720p
+test/local-video-pipeline.sh run rist-ffmpeg-pure 720p
+test/local-video-pipeline.sh run rist-ffmpeg-librist 720p
+test/local-video-pipeline.sh run rist-rust-pure 720p
+test/local-video-pipeline.sh run rist-rust-librist 720p
 ```
 
-By default RIST sends with FFmpeg/librist so `rist-pure` and `rist-librist`
-compare receiver backends. To test the native Rust sender as well:
-
-```sh
-AV_CONTRIB_TEST_RIST_SENDER=rust test/local-video-pipeline.sh run rist-pure 720p
-```
+RIST modes name the sender first and the av-contrib receiver backend second.
+`matrix` runs SRT plus every RIST sender/backend combination for each variant.
 
 Unset `AV_CONTRIB_TEST_LIMIT_SECONDS` for full-video runs. Set it only for quick
 smoke tests.

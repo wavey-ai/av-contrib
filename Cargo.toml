@@ -23,8 +23,8 @@ mpeg2ts-reader = { git = "https://github.com/wavey-ai/mpeg2ts-reader.git" }
 playlists = { git = "https://github.com/wavey-ai/playlists.git" }
 raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git" }
 raptorq-fec-transport = { git = "https://github.com/wavey-ai/raptor-fec.git" }
-rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
-rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
+rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git" }
+rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git" }
 rtmp-ingress = { git = "https://github.com/wavey-ai/rtmp-ingress.git" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

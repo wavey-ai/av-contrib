@@ -6,31 +6,31 @@
 - Keep test artifacts under ignored `test/work/`.
 - Current good path: SRT 360p ran for 80 seconds, crossed the segment ring boundary, and served LL-HLS media byte ranges cleanly.
 - Current RIST status:
-  - `rist-pure` receiver with FFmpeg/librist sender served LL-HLS cleanly through the retained window.
-  - `rist-librist` receiver with FFmpeg/librist sender served LL-HLS cleanly through the retained window.
+  - `rist-ffmpeg-pure` served LL-HLS cleanly through the retained window.
+  - `rist-ffmpeg-librist` served LL-HLS cleanly through the retained window.
+  - `rist-rust-pure` served LL-HLS cleanly through the retained window and the native sender exited cleanly.
+  - `rist-rust-librist` sent the full 360p byte count, but librist ingest never produced an upload-response stream or LL-HLS playlist.
   - FFmpeg/librist sender exits with status `187` at close after HLS is already readable: `Error closing file: Generic error in an external library`.
   - Treat that as unresolved until isolated; do not hide it as a pass.
 
 ## Next Protocol Checks
 
-Run the native Rust sender variants to separate sender-close behavior from receiver behavior:
+Re-run these exact modes after touching RIST:
 
 ```sh
 AV_CONTRIB_TEST_LIMIT_SECONDS=80 \
 AV_CONTRIB_TEST_POST_SEND_WATCH_SECONDS=2 \
-AV_CONTRIB_TEST_RIST_SENDER=rust \
 AV_CONTRIB_TEST_FFMPEG_LOGLEVEL=warning \
 AV_CONTRIB_TEST_RUST_LOG=av_contrib=info,upload_response=info,playlists=debug,web_service=info,hls=debug,info \
-test/local-video-pipeline.sh run rist-pure 360p
+test/local-video-pipeline.sh run rist-rust-pure 360p
 ```
 
 ```sh
 AV_CONTRIB_TEST_LIMIT_SECONDS=80 \
 AV_CONTRIB_TEST_POST_SEND_WATCH_SECONDS=2 \
-AV_CONTRIB_TEST_RIST_SENDER=rust \
 AV_CONTRIB_TEST_FFMPEG_LOGLEVEL=warning \
 AV_CONTRIB_TEST_RUST_LOG=av_contrib=info,upload_response=info,playlists=debug,web_service=info,hls=debug,info \
-test/local-video-pipeline.sh run rist-librist 360p
+test/local-video-pipeline.sh run rist-rust-librist 360p
 ```
 
 If either run fails, inspect the matching log under `test/work/logs/` and search for:

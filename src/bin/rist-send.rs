@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use rist_core_pure::packet::gre::{BufferNegotiation, GreKeepalive};
 use rist_core_pure::time::ntp_now;
 use rist_mio_pure::{MainMioSender, SimpleMioSender};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{self as tokio_io, AsyncReadExt};
 
 const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
@@ -44,7 +45,7 @@ enum Sender {
 impl Sender {
     fn connect(args: &Args) -> io::Result<Self> {
         let local = local_sender_addr(args.target);
-        match args.profile {
+        let mut sender = match args.profile {
             RistProfile::Simple => {
                 SimpleMioSender::connect(local, args.target, args.flow_id, args.history_packets)
                     .map(Self::Simple)
@@ -53,7 +54,23 @@ impl Sender {
                 MainMioSender::connect(local, args.target, args.flow_id, args.history_packets)
                     .map(Self::Main)
             }
-        }
+        }?;
+        sender.prime_session()?;
+        Ok(sender)
+    }
+
+    fn prime_session(&mut self) -> io::Result<()> {
+        let Self::Main(sender) = self else {
+            return Ok(());
+        };
+
+        sender.send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))?;
+        sender.send_buffer_negotiation(BufferNegotiation::session(1000, 250))?;
+        let now = Instant::now();
+        sender.poll_rtcp_and_send(now, ntp_now())?;
+        sender.poll_rtcp_and_send(now + Duration::from_secs(1), ntp_now())?;
+        std::thread::sleep(Duration::from_millis(20));
+        Ok(())
     }
 
     fn send_payload(&mut self, payload: &[u8]) -> io::Result<()> {

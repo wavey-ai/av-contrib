@@ -23,7 +23,6 @@ PLAYLIST_BUFFER_KB="${AV_CONTRIB_TEST_PLAYLIST_BUFFER_KB:-2048}"
 RIST_PROFILE="${AV_CONTRIB_TEST_RIST_PROFILE:-main}"
 RIST_FLOW_ID="${AV_CONTRIB_TEST_RIST_FLOW_ID:-0x72737401}"
 RIST_BUFFER_MS="${AV_CONTRIB_TEST_RIST_BUFFER_MS:-120}"
-RIST_SENDER="${AV_CONTRIB_TEST_RIST_SENDER:-ffmpeg}"
 
 FFMPEG_LOGLEVEL="${AV_CONTRIB_TEST_FFMPEG_LOGLEVEL:-info}"
 X264_PRESET="${AV_CONTRIB_TEST_X264_PRESET:-veryfast}"
@@ -41,8 +40,15 @@ usage() {
   cat <<USAGE
 Usage:
   test/local-video-pipeline.sh prepare [360p|720p|1080p|2160p|all...]
-  test/local-video-pipeline.sh run <srt|rist-pure|rist-librist> [360p|720p|1080p|2160p]
+  test/local-video-pipeline.sh run <mode> [360p|720p|1080p|2160p]
   test/local-video-pipeline.sh matrix [360p|720p|1080p|2160p...]
+
+Modes:
+  srt
+  rist-ffmpeg-pure
+  rist-ffmpeg-librist
+  rist-rust-pure
+  rist-rust-librist
 
 Defaults:
   source:     $SOURCE
@@ -52,7 +58,6 @@ Defaults:
 Useful environment:
   LORI_SOURCE=/path/to/LORI.m4v
   AV_CONTRIB_TEST_LIMIT_SECONDS=30       # optional smoke limit; unset means full video
-  AV_CONTRIB_TEST_RIST_SENDER=ffmpeg     # ffmpeg or rust
   AV_LL_HLS_PART_MS=50
 
 The run modes start av-contrib locally, send a prepared MPEG-TS fixture in
@@ -393,18 +398,28 @@ send_rist_rust() {
 
 send_rist() {
   local fixture="$1"
-  case "$RIST_SENDER" in
+  local sender="$2"
+  case "$sender" in
     ffmpeg) send_rist_ffmpeg "$fixture" ;;
     rust) send_rist_rust "$fixture" ;;
-    *) die "unknown AV_CONTRIB_TEST_RIST_SENDER: $RIST_SENDER" ;;
+    *) die "unknown RIST sender: $sender" ;;
   esac
 }
 
 mode_backend() {
   case "$1" in
     srt) printf '\n' ;;
-    rist-pure) printf 'pure\n' ;;
-    rist-librist) printf 'librist\n' ;;
+    rist-ffmpeg-pure|rist-rust-pure) printf 'pure\n' ;;
+    rist-ffmpeg-librist|rist-rust-librist) printf 'librist\n' ;;
+    *) die "unknown run mode: $1" ;;
+  esac
+}
+
+mode_sender() {
+  case "$1" in
+    srt) printf '\n' ;;
+    rist-ffmpeg-pure|rist-ffmpeg-librist) printf 'ffmpeg\n' ;;
+    rist-rust-pure|rist-rust-librist) printf 'rust\n' ;;
     *) die "unknown run mode: $1" ;;
   esac
 }
@@ -412,8 +427,9 @@ mode_backend() {
 run_once() {
   local mode="$1"
   local variant="${2:-720p}"
-  local backend fixture
+  local backend sender fixture
   backend="$(mode_backend "$mode")"
+  sender="$(mode_sender "$mode")"
   fixture="$(variant_file "$variant")"
   [[ -s "$fixture" ]] || prepare_variant "$variant"
 
@@ -427,7 +443,7 @@ run_once() {
   if [[ "$mode" == "srt" ]]; then
     send_srt "$fixture"
   else
-    send_rist "$fixture"
+    send_rist "$fixture" "$sender"
   fi
   sender_status=$?
   set -e
@@ -450,8 +466,10 @@ matrix() {
   local variant
   while IFS= read -r variant; do
     run_once srt "$variant"
-    run_once rist-pure "$variant"
-    run_once rist-librist "$variant"
+    run_once rist-ffmpeg-pure "$variant"
+    run_once rist-ffmpeg-librist "$variant"
+    run_once rist-rust-pure "$variant"
+    run_once rist-rust-librist "$variant"
   done < <(expand_variants "$@")
 }
 
