@@ -24,3 +24,6 @@ RIST modes name the sender first and the av-contrib receiver backend second.
 
 Unset `AV_CONTRIB_TEST_LIMIT_SECONDS` for full-video runs. Set it only for quick
 smoke tests.
+
+See `test/STATUS.md` for the latest local matrix results and known remaining
+protocol gaps.

@@ -463,14 +463,22 @@ run_once() {
 }
 
 matrix() {
-  local variant
+  local variant mode rc overall
+  local modes=(srt rist-ffmpeg-pure rist-ffmpeg-librist rist-rust-pure rist-rust-librist)
+  overall=0
   while IFS= read -r variant; do
-    run_once srt "$variant"
-    run_once rist-ffmpeg-pure "$variant"
-    run_once rist-ffmpeg-librist "$variant"
-    run_once rist-rust-pure "$variant"
-    run_once rist-rust-librist "$variant"
+    for mode in "${modes[@]}"; do
+      log "matrix starting mode=$mode variant=$variant"
+      if run_once "$mode" "$variant"; then
+        rc=0
+      else
+        rc=$?
+        overall=1
+      fi
+      log "matrix finished mode=$mode variant=$variant status=$rc"
+    done
   done < <(expand_variants "$@")
+  return "$overall"
 }
 
 main() {
