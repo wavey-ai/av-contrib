@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 const TICKS_PER_SECOND: u64 = 90_000;
-pub const DEFAULT_MIN_PART_MS: u32 = 900;
+pub const DEFAULT_MIN_PART_MS: u32 = 50;
 const MAX_PART_MS_WITHOUT_KEY: u32 = 2_000;
 const MAX_PENDING_AUS_WITHOUT_CONFIG: usize = 180;
 const MAX_PES_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -125,9 +125,26 @@ impl TsFmp4Bridge {
     }
 
     pub async fn push_ts(&mut self, bytes: Bytes) {
+        let input_bytes = bytes.len();
         self.demux.push(&mut self.context, &bytes);
         self.context
             .drain_access_units_into(&mut self.drained_access_units);
+        if !self.drained_access_units.is_empty() {
+            debug!(
+                output_stream_id = self.segmenter.output_stream_id,
+                output_stream_idx = self.segmenter.output_stream_idx,
+                input_bytes,
+                access_units = self.drained_access_units.len(),
+                "MPEG-TS chunk demuxed into access units"
+            );
+        } else {
+            debug!(
+                output_stream_id = self.segmenter.output_stream_id,
+                output_stream_idx = self.segmenter.output_stream_idx,
+                input_bytes,
+                "MPEG-TS chunk buffered without complete access unit"
+            );
+        }
         for access_unit in self.drained_access_units.drain(..) {
             self.segmenter.push_access_unit(access_unit).await;
         }
@@ -249,6 +266,17 @@ impl Fmp4Segmenter {
     }
 
     pub async fn push_access_unit(&mut self, mut access_unit: AccessUnit) {
+        debug!(
+            output_stream_id = self.output_stream_id,
+            output_stream_idx = self.output_stream_idx,
+            stream_type = ?access_unit.stream_type,
+            key = access_unit.key,
+            pts = access_unit.pts,
+            dts = access_unit.dts,
+            bytes = access_unit.data.len(),
+            "fMP4 segmenter received access unit"
+        );
+
         if is_h264(access_unit.stream_type) {
             self.seen_video = true;
             if !ensure_h264_length_prefixed(&mut access_unit) {
@@ -283,6 +311,14 @@ impl Fmp4Segmenter {
     }
 
     pub fn reset(&mut self) {
+        debug!(
+            output_stream_id = self.output_stream_id,
+            output_stream_idx = self.output_stream_idx,
+            buffered_video = self.video_buf.len(),
+            buffered_audio = self.audio_buf.len(),
+            published_parts = self.published_parts,
+            "resetting fMP4 segmenter state"
+        );
         self.video_buf.clear();
         self.video_timestamps.clear();
         self.audio_buf.clear();
@@ -335,15 +371,48 @@ impl Fmp4Segmenter {
         if self.config.avcc.is_none() {
             self.video_timestamps.push(access_unit.dts);
             self.video_buf.push(access_unit);
+            debug!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                buffered_video = self.video_buf.len(),
+                buffered_audio = self.audio_buf.len(),
+                "buffering video while waiting for H.264 SPS/PPS"
+            );
             self.drop_pending_without_config_if_needed();
             return;
         }
 
         if (!had_config || config_changed) && !access_unit.key {
+            debug!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                key = access_unit.key,
+                config_changed,
+                "dropping non-key video access unit until first keyframe after H.264 config"
+            );
             return;
         }
 
-        if self.should_flush_before(&access_unit) {
+        if let Some(reason) = self.flush_reason_before(&access_unit) {
+            let first_dts = self
+                .video_timestamps
+                .first()
+                .copied()
+                .unwrap_or(access_unit.dts);
+            let elapsed = access_unit.dts.saturating_sub(first_dts);
+            debug!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                reason,
+                key = access_unit.key,
+                buffered_video = self.video_buf.len(),
+                buffered_audio = self.audio_buf.len(),
+                elapsed_ms = ticks_to_ms(elapsed),
+                target_ms = ticks_to_ms(self.min_part_ticks),
+                max_without_key_ms = ticks_to_ms(self.max_part_ticks_without_key),
+                next_dts = access_unit.dts,
+                "flushing fMP4 part before next video access unit"
+            );
             self.flush_with_next_dts(access_unit.dts).await;
         }
 
@@ -356,11 +425,31 @@ impl Fmp4Segmenter {
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
             self.audio_timestamps.push(access_unit.pts);
             self.audio_buf.push(access_unit);
+            debug!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                buffered_video = self.video_buf.len(),
+                buffered_audio = self.audio_buf.len(),
+                "buffering audio until video track is configured and started"
+            );
             self.drop_pending_without_config_if_needed();
             return;
         }
 
         if self.video_buf.is_empty() && self.should_flush_audio_only_before(&access_unit) {
+            let first_pts = self
+                .audio_timestamps
+                .first()
+                .copied()
+                .unwrap_or(access_unit.pts);
+            debug!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                buffered_audio = self.audio_buf.len(),
+                elapsed_ms = access_unit.pts.saturating_sub(first_pts),
+                target_ms = ticks_to_ms(self.min_part_ticks),
+                "flushing audio-only fMP4 part before next access unit"
+            );
             self.flush_with_next_dts(0).await;
         }
 
@@ -401,13 +490,22 @@ impl Fmp4Segmenter {
         };
     }
 
-    fn should_flush_before(&self, access_unit: &AccessUnit) -> bool {
+    fn flush_reason_before(&self, access_unit: &AccessUnit) -> Option<&'static str> {
         let Some(first_dts) = self.video_timestamps.first().copied() else {
-            return false;
+            return None;
         };
         let elapsed = access_unit.dts.saturating_sub(first_dts);
-        (access_unit.key && elapsed >= self.min_part_ticks)
-            || elapsed >= self.max_part_ticks_without_key
+        if elapsed >= self.min_part_ticks {
+            Some(if access_unit.key {
+                "target-keyframe"
+            } else {
+                "target-duration"
+            })
+        } else if elapsed >= self.max_part_ticks_without_key {
+            Some("max-duration-without-key")
+        } else {
+            None
+        }
     }
 
     fn should_flush_audio_only_before(&self, access_unit: &AccessUnit) -> bool {
@@ -437,6 +535,8 @@ impl Fmp4Segmenter {
         let init_signature = self.current_init_signature();
         let include_init =
             self.force_next_init || self.last_init_signature.as_ref() != Some(&init_signature);
+        let video_units = self.video_buf.len();
+        let audio_units = self.audio_buf.len();
 
         let fmp4 = box_fmp4_with_init(
             self.seg_seq,
@@ -501,6 +601,14 @@ impl Fmp4Segmenter {
                     error = %error,
                     "failed to publish fMP4 part into mesh"
                 );
+            } else {
+                debug!(
+                    output_stream_id = self.output_stream_id,
+                    output_stream_idx = self.output_stream_idx,
+                    sequence = self.published_parts,
+                    bytes,
+                    "published fMP4 part into mesh"
+                );
             }
         }
 
@@ -510,6 +618,19 @@ impl Fmp4Segmenter {
         }
 
         self.published_parts += 1;
+        debug!(
+            output_stream_id = self.output_stream_id,
+            output_stream_idx = self.output_stream_idx,
+            seq = self.seg_seq,
+            duration_ms = duration,
+            key,
+            bytes,
+            video_units,
+            audio_units,
+            include_init = init_published,
+            published_parts = self.published_parts,
+            "published fMP4 HLS part details"
+        );
         if self.published_parts <= 3 || self.published_parts % 25 == 0 {
             info!(
                 output_stream_id = self.output_stream_id,

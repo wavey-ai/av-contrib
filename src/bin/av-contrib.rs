@@ -102,7 +102,7 @@ struct Args {
     #[arg(long)]
     rtmp_bind: Option<SocketAddr>,
 
-    #[arg(long, default_value_t = DEFAULT_MIN_PART_MS)]
+    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = DEFAULT_MIN_PART_MS)]
     fmp4_part_ms: u32,
 
     #[arg(long, default_value_t = 65)]
@@ -310,6 +310,11 @@ impl RistPayloadReorderer {
         now: Instant,
     ) -> Vec<(SocketAddr, ReceivedPayload)> {
         if payload.duplicate {
+            debug!(
+                peer = %peer,
+                sequence = payload.sequence,
+                "dropping duplicate RIST payload"
+            );
             return Vec::new();
         }
 
@@ -326,6 +331,14 @@ impl RistPayloadReorderer {
         self.next_sequence.get_or_insert(sequence);
         self.pending.entry(sequence).or_insert((peer, payload));
         let ready = self.drain_ready(now);
+        if !ready.is_empty() {
+            debug!(
+                ready_payloads = ready.len(),
+                pending_payloads = self.pending.len(),
+                next_sequence = self.next_sequence.unwrap_or(sequence),
+                "RIST reorder released contiguous payloads"
+            );
+        }
         if ready.is_empty() && self.pending.len() >= RIST_REORDER_MAX_PENDING {
             return self.release_gap(now, "pending-cap");
         }
@@ -470,14 +483,24 @@ async fn push_rist_payload(bridge: &mut TsFmp4Bridge, peer: SocketAddr, payload:
             "RIST payload recovered by protocol repair"
         );
     }
+    debug!(
+        peer = %peer,
+        sequence = payload.sequence,
+        recovered = payload.recovered,
+        bytes = payload.payload.len(),
+        "forwarding RIST payload into MPEG-TS fMP4 bridge"
+    );
     bridge.push_ts(Bytes::from(payload.payload)).await;
 }
 
 struct UploadTsBridgeState {
-    output_stream_id: u64,
+    output_stream_id: Option<u64>,
+    output_stream_idx: Option<usize>,
     last_seen: usize,
     reader_registered: bool,
-    bridge: TsFmp4Bridge,
+    body_slots: u64,
+    ended: bool,
+    bridge: Option<TsFmp4Bridge>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -534,7 +557,9 @@ async fn run_upload_response_ts_bridge(
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 for (_, mut state) in bridges.drain() {
-                    state.bridge.finish().await;
+                    if let Some(bridge) = state.bridge.as_mut() {
+                        bridge.finish().await;
+                    }
                 }
                 return;
             }
@@ -548,50 +573,48 @@ async fn run_upload_response_ts_bridge(
                     .collect();
                 for stream_id in stale {
                     if let Some(mut state) = bridges.remove(&stream_id) {
-                        state.bridge.finish().await;
-                        playlists.fin(state.output_stream_id);
+                        if let Some(bridge) = state.bridge.as_mut() {
+                            bridge.finish().await;
+                        }
+                        if let Some(output_stream_id) = state.output_stream_id {
+                            playlists.fin(output_stream_id);
+                        }
                     }
                 }
 
                 for stream in streams {
                     let stream_id = stream.stream_id;
                     if !bridges.contains_key(&stream_id) {
-                        let public_stream_id = if bridges.is_empty() {
-                            output_stream_id
-                        } else {
-                            stream_id
-                        };
-                        let public_stream_idx = if public_stream_id == output_stream_id {
-                            output_stream_idx
-                        } else {
-                            resolve_output_stream_idx(&playlists, public_stream_id).await
-                        };
                         bridges.insert(
                             stream_id,
                             UploadTsBridgeState {
-                                output_stream_id: public_stream_id,
+                                output_stream_id: None,
+                                output_stream_idx: None,
                                 last_seen: 0,
                                 reader_registered: false,
-                                bridge: TsFmp4Bridge::new_with_publisher(
-                                    public_stream_id,
-                                    public_stream_idx,
-                                    playlists.clone(),
-                                    min_part_ms,
-                                    Some(publisher.clone()),
-                                ),
+                                body_slots: 0,
+                                ended: false,
+                                bridge: None,
                             },
                         );
+                        trace!(stream_id, "tracking SRT upload-response stream");
                     }
+                    let has_active_bridge = bridges
+                        .iter()
+                        .any(|(&id, state)| id != stream_id && state.bridge.is_some() && !state.ended);
                     let state = bridges.get_mut(&stream_id).expect("bridge state");
 
-                    if !state.reader_registered {
-                        service
-                            .register_request_reader(stream_id, SRT_HLS_WORKER_ID)
-                            .await;
-                        state.reader_registered = true;
+                    if state.ended {
+                        continue;
                     }
 
                     if stream.request_last <= state.last_seen {
+                        trace!(
+                            stream_id,
+                            last_seen = state.last_seen,
+                            request_last = stream.request_last,
+                            "SRT fMP4 bridge has no new request slots"
+                        );
                         continue;
                     }
 
@@ -599,21 +622,99 @@ async fn run_upload_response_ts_bridge(
                     for slot in (state.last_seen + 1)..=stream.request_last {
                         match service.tail_request(stream_id, slot).await {
                             Some(TailSlot::Headers(headers)) => {
-                                debug!(
+                                trace!(
                                     stream_id,
                                     path = %String::from_utf8_lossy(&headers.path),
                                     "SRT stream headers"
                                 );
                             }
                             Some(TailSlot::Body(data)) => {
-                                state.bridge.push_ts(data).await;
+                                if state.bridge.is_none() {
+                                    let public_stream_id = if has_active_bridge {
+                                        stream_id
+                                    } else {
+                                        output_stream_id
+                                    };
+                                    let public_stream_idx = if public_stream_id == output_stream_id {
+                                        output_stream_idx
+                                    } else {
+                                        resolve_output_stream_idx(&playlists, public_stream_id).await
+                                    };
+                                    state.output_stream_id = Some(public_stream_id);
+                                    state.output_stream_idx = Some(public_stream_idx);
+                                    state.bridge = Some(TsFmp4Bridge::new_with_publisher(
+                                        public_stream_id,
+                                        public_stream_idx,
+                                        playlists.clone(),
+                                        min_part_ms,
+                                        Some(publisher.clone()),
+                                    ));
+                                    debug!(
+                                        stream_id,
+                                        output_stream_id = public_stream_id,
+                                        output_stream_idx = public_stream_idx,
+                                        "created upload-response MPEG-TS fMP4 bridge after first body slot"
+                                    );
+                                }
+                                if !state.reader_registered {
+                                    service
+                                        .register_request_reader(stream_id, SRT_HLS_WORKER_ID)
+                                        .await;
+                                    state.reader_registered = true;
+                                    debug!(
+                                        stream_id,
+                                        worker_id = SRT_HLS_WORKER_ID,
+                                        "registered SRT fMP4 bridge reader"
+                                    );
+                                }
+                                state.body_slots = state.body_slots.saturating_add(1);
+                                debug!(
+                                    stream_id,
+                                    slot,
+                                    bytes = data.len(),
+                                    "SRT fMP4 bridge consuming MPEG-TS body slot"
+                                );
+                                if let Some(bridge) = state.bridge.as_mut() {
+                                    bridge.push_ts(data).await;
+                                }
                             }
                             Some(TailSlot::End) => {
-                                state.bridge.finish().await;
-                                playlists.fin(state.output_stream_id);
+                                if let Some(bridge) = state.bridge.as_mut() {
+                                    debug!(
+                                        stream_id,
+                                        output_stream_id = state.output_stream_id.unwrap_or_default(),
+                                        output_stream_idx = state.output_stream_idx.unwrap_or_default(),
+                                        slot,
+                                        body_slots = state.body_slots,
+                                        "SRT fMP4 bridge reached stream end"
+                                    );
+                                    bridge.finish().await;
+                                    if let Some(output_stream_id) = state.output_stream_id {
+                                        playlists.fin(output_stream_id);
+                                    }
+                                } else {
+                                    trace!(
+                                        stream_id,
+                                        slot,
+                                        "SRT upload-response stream ended without media body slots"
+                                    );
+                                }
                                 stream_ended = true;
                             }
-                            Some(TailSlot::Control(_)) | None => {}
+                            Some(TailSlot::Control(_)) => {
+                                trace!(
+                                    stream_id,
+                                    slot,
+                                    "SRT fMP4 bridge ignoring request control slot"
+                                );
+                            }
+                            None => {
+                                trace!(
+                                    stream_id,
+                                    slot,
+                                    "SRT fMP4 bridge request slot missing"
+                                );
+                            }
                         }
                         service
                             .mark_request_reader_position(stream_id, SRT_HLS_WORKER_ID, slot)
@@ -622,7 +723,7 @@ async fn run_upload_response_ts_bridge(
 
                     state.last_seen = stream.request_last;
                     if stream_ended {
-                        bridges.remove(&stream_id);
+                        state.ended = true;
                     }
                 }
             }
@@ -650,6 +751,11 @@ async fn run_rtmp_hls_bridge(
                 stream,
                 access_unit,
             } => {
+                let stream_type = access_unit.stream_type;
+                let key = access_unit.key;
+                let pts = access_unit.pts;
+                let dts = access_unit.dts;
+                let bytes = access_unit.data.len();
                 if !segmenters.contains_key(&stream.id) {
                     let output_stream_id = rtmp_output_stream_id(
                         &stream,
@@ -682,6 +788,17 @@ async fn run_rtmp_hls_bridge(
                 }
 
                 if let Some(state) = segmenters.get_mut(&stream.id) {
+                    tracing::debug!(
+                        key = %stream.key,
+                        rtmp_stream_id = stream.id,
+                        output_stream_id = state.output_stream_id,
+                        stream_type = ?stream_type,
+                        keyframe = key,
+                        pts,
+                        dts,
+                        bytes,
+                        "RTMP access unit forwarded to fMP4 segmenter"
+                    );
                     state.segmenter.push_access_unit(access_unit).await;
                 }
             }
@@ -1143,12 +1260,20 @@ fn log_hls_response(method: &Method, path: &str, query: Option<&str>, status: St
             "HLS request not found"
         );
     } else if status.is_success() {
-        trace!(
+        debug!(
             %method,
             %path,
             query = query.unwrap_or(""),
             status = status.as_u16(),
             "HLS request completed"
+        );
+    } else {
+        debug!(
+            %method,
+            %path,
+            query = query.unwrap_or(""),
+            status = status.as_u16(),
+            "HLS request completed with non-success status"
         );
     }
 }
