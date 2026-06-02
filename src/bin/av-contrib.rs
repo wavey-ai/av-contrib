@@ -45,6 +45,28 @@ const RIST_POLL_MS: u64 = 1;
 const RIST_REORDER_WAIT_MS: u64 = 80;
 const RIST_REORDER_MAX_PENDING: usize = 512;
 const RTCP_INTERVAL_MS: u64 = 20;
+const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
+const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
+
+fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
+    let init_len = init.map_or(0, Bytes::len);
+    if init_len > u32::MAX as usize {
+        bail!("fMP4 init segment too large for mesh slot envelope");
+    }
+    if media.len() > u32::MAX as usize {
+        bail!("fMP4 media fragment too large for mesh slot envelope");
+    }
+
+    let mut out = Vec::with_capacity(MESH_FMP4_SLOT_HEADER_LEN + init_len + media.len());
+    out.extend_from_slice(MESH_FMP4_SLOT_MAGIC);
+    out.extend_from_slice(&(init_len as u32).to_be_bytes());
+    out.extend_from_slice(&(media.len() as u32).to_be_bytes());
+    if let Some(init) = init {
+        out.extend_from_slice(init);
+    }
+    out.extend_from_slice(media);
+    Ok(Bytes::from(out))
+}
 const SRT_HLS_WORKER_ID: &str = "av-contrib-srt-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
@@ -289,7 +311,9 @@ impl MeshForwarder {
 #[async_trait::async_trait]
 impl Fmp4PartPublisher for MeshForwarder {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
-        self.forward_stream_slot(part.stream_id, &part.bytes)
+        let payload = encode_mesh_fmp4_slot(part.init.as_ref(), &part.bytes)
+            .map_err(|error| error.to_string())?;
+        self.forward_stream_slot(part.stream_id, &payload)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -1310,6 +1334,7 @@ fn playlist_options(args: &Args) -> playlists::Options {
         max_parted_segments: 32,
         segment_min_ms: args.fmp4_segment_ms.max(args.fmp4_part_ms).max(1),
         target_duration_ms: args.hls_target_duration_ms.max(1_000),
+        part_target_ms: args.fmp4_part_ms.max(1),
         buffer_size_kb: args.playlist_buffer_kb.max(1),
         init_size_kb: 5,
     }

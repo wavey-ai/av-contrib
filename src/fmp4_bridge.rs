@@ -34,6 +34,7 @@ pub struct PublishedFmp4Part {
     pub stream_id: u64,
     pub stream_idx: usize,
     pub sequence: u64,
+    pub init: Option<Bytes>,
     pub bytes: Bytes,
 }
 
@@ -559,7 +560,8 @@ impl Fmp4Segmenter {
             return;
         }
 
-        let init_published = fmp4.init.is_some();
+        let init_for_mesh = fmp4.init.clone();
+        let init_published = init_for_mesh.is_some();
         let duration = fmp4.duration;
         let key = fmp4.key;
         let part_bytes = fmp4.data.clone();
@@ -592,6 +594,7 @@ impl Fmp4Segmenter {
                 stream_id: self.output_stream_id,
                 stream_idx: self.output_stream_idx,
                 sequence: self.published_parts,
+                init: init_for_mesh,
                 bytes: part_bytes,
             };
             if let Err(error) = publisher.publish_fmp4_part(part).await {
