@@ -45,3 +45,13 @@ cargo run --bin udp-fec-send -- 127.0.0.1:12001
 cargo run --bin rist-send -- 127.0.0.1:7000
 cargo run --bin media-fec-send -- --stream-id 55 --codec auto 127.0.0.1:12101
 ```
+
+Full-video local SRT/RIST pipeline tests live in `test/`. The generated MPEG-TS
+fixtures and logs are written under ignored `test/work/`:
+
+```sh
+test/local-video-pipeline.sh prepare all
+test/local-video-pipeline.sh run srt 720p
+test/local-video-pipeline.sh run rist-pure 720p
+test/local-video-pipeline.sh run rist-librist 720p
+```

@@ -1050,9 +1050,18 @@ async fn main() -> Result<()> {
         "av-contrib ready"
     );
     println!("contrib: https://127.0.0.1:{}", args.http_port);
+    let advertised_hls_stream_id = if args.rist_bind.is_some() {
+        args.rist_stream_id
+    } else if args.srt_bind.is_some() {
+        args.srt_stream_id
+    } else if args.rtmp_bind.is_some() {
+        args.rtmp_stream_id
+    } else {
+        args.stream_id
+    };
     println!(
         "ll-hls:  https://127.0.0.1:{}/{}/stream.m3u8",
-        args.http_port, args.rist_stream_id
+        args.http_port, advertised_hls_stream_id
     );
     println!("bytes:   udp+stream-fec://{}", args.mesh_fec_target);
     println!("media:   udp+media-fec://{}", args.mesh_media_fec_target);

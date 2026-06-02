@@ -459,6 +459,9 @@ impl Fmp4Segmenter {
     }
 
     fn timestamp_went_backwards(&self, access_unit: &AccessUnit) -> bool {
+        if !is_h264(access_unit.stream_type) {
+            return false;
+        }
         self.timestamp_base_input
             .is_some_and(|base| access_unit.dts < base)
     }
@@ -875,6 +878,17 @@ mod tests {
         }
     }
 
+    fn audio_access_unit(pts: u64, dts: u64) -> AccessUnit {
+        AccessUnit {
+            key: false,
+            pts,
+            dts,
+            data: Bytes::new(),
+            stream_type: PSI_STREAM_AAC,
+            id: 0,
+        }
+    }
+
     #[test]
     fn fmp4_segmenter_rebases_large_mpeg_ts_timestamps() {
         let (playlists, _, _) = Playlists::new(Options::default());
@@ -895,6 +909,22 @@ mod tests {
         assert_eq!(first.pts, 3_000);
         assert_eq!(second.dts, 3_000);
         assert_eq!(second.pts, 6_000);
+    }
+
+    #[test]
+    fn fmp4_segmenter_allows_audio_to_start_before_first_video_dts() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let mut segmenter = Fmp4Segmenter::new(
+            0,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+        );
+        segmenter.timestamp_base_input = Some(127_920);
+
+        assert!(!segmenter.timestamp_went_backwards(&audio_access_unit(126_000, 126_000)));
+        assert!(segmenter.timestamp_went_backwards(&h264_access_unit(126_000, 126_000)));
     }
 }
 

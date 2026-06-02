@@ -91,20 +91,23 @@ impl Sender {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut input = Vec::new();
-    tokio_io::stdin()
-        .read_to_end(&mut input)
-        .await
-        .context("failed to read stdin")?;
+    let mut input = tokio_io::stdin();
 
     let mut sender = Sender::connect(&args)
         .with_context(|| format!("failed to create RIST sender for {}", args.target))?;
     let mut feedback_buf = vec![0u8; 65_536];
     let chunk_bytes = args.chunk_bytes.max(1);
+    let mut chunk = vec![0u8; chunk_bytes];
+    let mut sent_bytes = 0usize;
 
-    for chunk in input.chunks(chunk_bytes) {
+    loop {
+        let read = read_chunk(&mut input, &mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let payload = &chunk[..read];
         loop {
-            match sender.send_payload(chunk) {
+            match sender.send_payload(payload) {
                 Ok(()) => break,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     sender.drain_feedback(&mut feedback_buf)?;
@@ -114,15 +117,32 @@ async fn main() -> Result<()> {
             }
         }
         sender.drain_feedback(&mut feedback_buf)?;
+        sent_bytes += read;
     }
 
     println!(
         "sent {} bytes to {} using RIST chunks of {} bytes",
-        input.len(),
-        args.target,
-        chunk_bytes
+        sent_bytes, args.target, chunk_bytes
     );
     Ok(())
+}
+
+async fn read_chunk<R>(input: &mut R, chunk: &mut [u8]) -> Result<usize>
+where
+    R: tokio_io::AsyncRead + Unpin,
+{
+    let mut filled = 0usize;
+    while filled < chunk.len() {
+        let read = input
+            .read(&mut chunk[filled..])
+            .await
+            .context("failed to read stdin")?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 fn local_sender_addr(peer: SocketAddr) -> SocketAddr {
