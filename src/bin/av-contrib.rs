@@ -325,7 +325,11 @@ impl RistPayloadReorderer {
 
         self.next_sequence.get_or_insert(sequence);
         self.pending.entry(sequence).or_insert((peer, payload));
-        self.drain_ready(now)
+        let ready = self.drain_ready(now);
+        if ready.is_empty() && self.pending.len() >= RIST_REORDER_MAX_PENDING {
+            return self.release_gap(now, "pending-cap");
+        }
+        ready
     }
 
     fn drain_due(&mut self, now: Instant) -> Vec<(SocketAddr, ReceivedPayload)> {
@@ -338,23 +342,40 @@ impl RistPayloadReorderer {
             .gap_started_at
             .map(|started| now.saturating_duration_since(started))
             .unwrap_or_default();
-        if gap_elapsed >= Duration::from_millis(RIST_REORDER_WAIT_MS)
-            || self.pending.len() >= RIST_REORDER_MAX_PENDING
-        {
-            let first_pending = *self.pending.keys().next().unwrap();
-            if let Some(next) = self.next_sequence {
-                warn!(
-                    next_sequence = next,
-                    first_pending_sequence = first_pending,
-                    pending_payloads = self.pending.len(),
-                    waited_ms = gap_elapsed.as_millis(),
-                    "RIST reorder gap timed out; releasing recovered stream with missing payloads"
-                );
-            }
-            self.next_sequence = Some(first_pending);
-            self.gap_started_at = None;
+        if gap_elapsed >= Duration::from_millis(RIST_REORDER_WAIT_MS) {
+            return self.release_gap(now, "timeout");
         }
 
+        self.drain_ready(now)
+    }
+
+    fn release_gap(
+        &mut self,
+        now: Instant,
+        release_reason: &'static str,
+    ) -> Vec<(SocketAddr, ReceivedPayload)> {
+        if self.pending.is_empty() {
+            self.gap_started_at = None;
+            return Vec::new();
+        }
+
+        let first_pending = *self.pending.keys().next().unwrap();
+        let waited_ms = self
+            .gap_started_at
+            .map(|started| now.saturating_duration_since(started).as_millis())
+            .unwrap_or_default();
+        if let Some(next) = self.next_sequence {
+            warn!(
+                next_sequence = next,
+                first_pending_sequence = first_pending,
+                pending_payloads = self.pending.len(),
+                waited_ms,
+                release_reason,
+                "RIST reorder gap released; continuing with missing payloads"
+            );
+        }
+        self.next_sequence = Some(first_pending);
+        self.gap_started_at = None;
         self.drain_ready(now)
     }
 
@@ -1254,6 +1275,37 @@ mod tests {
         let ready = reorderer.drain_due(now + Duration::from_millis(RIST_REORDER_WAIT_MS + 1));
         assert_eq!(payload_sequences(&ready), vec![22]);
         assert_eq!(ready[0].1.payload, b"twenty-two");
+    }
+
+    #[test]
+    fn rist_reorderer_releases_gap_at_pending_cap() {
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 5000));
+        let now = Instant::now();
+        let mut reorderer = RistPayloadReorderer::new();
+
+        assert_eq!(
+            payload_sequences(&reorderer.insert(peer, rist_payload(30, false, b"thirty"), now)),
+            vec![30]
+        );
+
+        let mut ready = Vec::new();
+        for offset in 0..RIST_REORDER_MAX_PENDING {
+            ready = reorderer.insert(
+                peer,
+                rist_payload(32 + offset as u32, false, b"pending"),
+                now + Duration::from_millis(1),
+            );
+        }
+
+        assert_eq!(ready.len(), RIST_REORDER_MAX_PENDING);
+        assert_eq!(
+            ready.first().map(|(_peer, payload)| payload.sequence),
+            Some(32)
+        );
+        assert_eq!(
+            ready.last().map(|(_peer, payload)| payload.sequence),
+            Some(32 + RIST_REORDER_MAX_PENDING as u32 - 1)
+        );
     }
 
     #[tokio::test]

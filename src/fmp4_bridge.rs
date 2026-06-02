@@ -599,12 +599,38 @@ impl Fmp4Segmenter {
             return None;
         };
 
-        let width = (decoded_sps.pic_width_in_samples()
-            - (decoded_sps.frame_crop_right_offset.0 * 2)
-            - (decoded_sps.frame_crop_left_offset.0 * 2)) as u16;
-        let height = ((decoded_sps.frame_height_in_mbs() * 16)
-            - (decoded_sps.frame_crop_bottom_offset.0 * 2)
-            - (decoded_sps.frame_crop_top_offset.0 * 2)) as u16;
+        let width_samples = decoded_sps.pic_width_in_samples();
+        let width_crop = decoded_sps
+            .frame_crop_right_offset
+            .0
+            .checked_add(decoded_sps.frame_crop_left_offset.0)?
+            .checked_mul(2)?;
+        let height_samples = decoded_sps.frame_height_in_mbs().checked_mul(16)?;
+        let height_crop = decoded_sps
+            .frame_crop_bottom_offset
+            .0
+            .checked_add(decoded_sps.frame_crop_top_offset.0)?
+            .checked_mul(2)?;
+        let Some(width) = width_samples
+            .checked_sub(width_crop)
+            .and_then(|value| u16::try_from(value).ok())
+        else {
+            warn!(
+                width_samples,
+                width_crop, "rejecting invalid H.264 SPS width"
+            );
+            return None;
+        };
+        let Some(height) = height_samples
+            .checked_sub(height_crop)
+            .and_then(|value| u16::try_from(value).ok())
+        else {
+            warn!(
+                height_samples,
+                height_crop, "rejecting invalid H.264 SPS height"
+            );
+            return None;
+        };
         Some((
             Config {
                 width,
