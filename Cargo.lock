@@ -1060,7 +1060,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hls"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#aaa093c6eda987caefe862fd57efacd32f955ec6"
+source = "git+https://github.com/wavey-ai/web-services.git#4678ba4a9629409c0b73818605c06d43e1a543f8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1797,7 +1797,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#d0d911f33ab50384d1e5a1e6f9cdd5194b444289"
+source = "git+https://github.com/wavey-ai/playlists.git#9b767953e171a9df33c79785aebe48182ba1ef9b"
 dependencies = [
  "access-unit",
  "bytes",
@@ -3229,7 +3229,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#aaa093c6eda987caefe862fd57efacd32f955ec6"
+source = "git+https://github.com/wavey-ai/web-services.git#4678ba4a9629409c0b73818605c06d43e1a543f8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3390,7 +3390,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#aaa093c6eda987caefe862fd57efacd32f955ec6"
+source = "git+https://github.com/wavey-ai/web-services.git#4678ba4a9629409c0b73818605c06d43e1a543f8"
 dependencies = [
  "anyhow",
  "async-trait",

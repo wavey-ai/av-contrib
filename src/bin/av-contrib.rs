@@ -47,6 +47,8 @@ const RIST_REORDER_MAX_PENDING: usize = 512;
 const RTCP_INTERVAL_MS: u64 = 20;
 const SRT_HLS_WORKER_ID: &str = "av-contrib-srt-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
+const DEFAULT_SEGMENT_MS: u32 = 1_000;
+const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -104,6 +106,12 @@ struct Args {
 
     #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = DEFAULT_MIN_PART_MS)]
     fmp4_part_ms: u32,
+
+    #[arg(long, env = "AV_LL_HLS_SEGMENT_MS", default_value_t = DEFAULT_SEGMENT_MS)]
+    fmp4_segment_ms: u32,
+
+    #[arg(long, env = "AV_LL_HLS_TARGET_DURATION_MS", default_value_t = DEFAULT_TARGET_DURATION_MS)]
+    hls_target_duration_ms: u32,
 
     #[arg(long, default_value_t = 65)]
     playlist_count: usize,
@@ -1300,7 +1308,8 @@ fn playlist_options(args: &Args) -> playlists::Options {
         num_playlists: args.playlist_count.max(1),
         max_parts_per_segment: 128,
         max_parted_segments: 32,
-        segment_min_ms: args.fmp4_part_ms.max(1),
+        segment_min_ms: args.fmp4_segment_ms.max(args.fmp4_part_ms).max(1),
+        target_duration_ms: args.hls_target_duration_ms.max(1_000),
         buffer_size_kb: args.playlist_buffer_kb.max(1),
         init_size_kb: 5,
     }
@@ -1484,6 +1493,8 @@ mod tests {
             srt_bind: None,
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
+            fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
         };
