@@ -8,23 +8,28 @@ repository = "https://github.com/wavey-ai/av-contrib"
 readme = "README.md"
 
 [dependencies]
-access-unit = { path = "../access-unit" }
+access-unit = { git = "https://github.com/wavey-ai/access-unit.git" }
 anyhow = "1.0"
 async-trait = "0.1"
+boxer = { git = "https://github.com/wavey-ai/boxer.git" }
 bytes = "1.9"
 clap = { version = "4.5", features = ["derive"] }
 form_urlencoded = "1.2"
 futures-util = "0.3"
+h264 = { git = "https://github.com/wavey-ai/av-rs.git" }
+hls = { git = "https://github.com/wavey-ai/web-services.git", branch = "codex/web-studio-audio-llhls-switch" }
 http = "1"
-raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+mpeg2ts-reader = { git = "https://github.com/wavey-ai/mpeg2ts-reader.git" }
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }
+raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git" }
+raptorq-fec-transport = { git = "https://github.com/wavey-ai/raptor-fec.git" }
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
 rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
+rtmp-ingress = { git = "https://github.com/wavey-ai/rtmp-ingress.git" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { path = "../web-services/web-service" }
-
-[patch."https://github.com/wavey-ai/playlists.git"]
-playlists = { path = "../playlists" }
+upload-response = { git = "https://github.com/wavey-ai/web-services.git", branch = "codex/web-studio-audio-llhls-switch", default-features = false, features = ["srt"] }
+web-service = { git = "https://github.com/wavey-ai/web-services.git", branch = "codex/web-studio-audio-llhls-switch" }

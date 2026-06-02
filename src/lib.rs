@@ -1,3 +1,5 @@
+pub mod fmp4_bridge;
+
 use access_unit::{detect_audio, h264, AudioType};
 #[cfg(test)]
 use bytes::Bytes;
