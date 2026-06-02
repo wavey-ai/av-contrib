@@ -37,7 +37,7 @@ use web_service::{
     WebTransportHandler,
 };
 
-const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
+const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
@@ -1251,8 +1251,8 @@ mod tests {
 
     #[test]
     fn parses_decimal_and_hex_rist_flow_ids() {
-        assert_eq!(parse_u32_auto("0x72737401").unwrap(), DEFAULT_FLOW_ID);
-        assert_eq!(parse_u32_auto("1920168961").unwrap(), DEFAULT_FLOW_ID);
+        assert_eq!(parse_u32_auto("0x11223344").unwrap(), DEFAULT_FLOW_ID);
+        assert_eq!(parse_u32_auto("287454020").unwrap(), DEFAULT_FLOW_ID);
     }
 
     #[test]

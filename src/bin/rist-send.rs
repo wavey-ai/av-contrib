@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::{self as tokio_io, AsyncReadExt};
 
-const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
+const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RistProfile {
