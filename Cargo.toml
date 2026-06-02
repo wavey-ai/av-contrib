@@ -31,5 +31,5 @@ serde_json = "1.0"
 tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-upload-response = { git = "https://github.com/wavey-ai/web-services.git", default-features = false, features = ["srt"] }
+upload-response = { git = "https://github.com/wavey-ai/web-services.git", default-features = false, features = ["srt", "rist", "rist-pure"] }
 web-service = { git = "https://github.com/wavey-ai/web-services.git" }

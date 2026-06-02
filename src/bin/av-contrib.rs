@@ -11,26 +11,25 @@ use hls::{HlsHandler, HlsRouter};
 use http::{Method, Request, StatusCode};
 use raptorq_datagram_fec::{MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SYMBOL_SIZE};
 use raptorq_fec_transport::FecDatagramEncoder;
-use rist_core_pure::{packet::rtcp::NackMode, time::ntp_now, ReceivedPayload};
-use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 use upload_response::{
-    SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
+    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
+    RistIngest as UploadRistIngest, RistProfile as UploadRistProfile, SrtIngest as UploadSrtIngest,
+    TailSlot, UploadResponseConfig, UploadResponseService,
 };
 use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
@@ -39,12 +38,7 @@ use web_service::{
 };
 
 const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
-const MAX_RIST_DRAIN_PER_TICK: usize = 128;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
-const RIST_POLL_MS: u64 = 1;
-const RIST_REORDER_WAIT_MS: u64 = 80;
-const RIST_REORDER_MAX_PENDING: usize = 512;
-const RTCP_INTERVAL_MS: u64 = 20;
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 
@@ -67,7 +61,7 @@ fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
     out.extend_from_slice(media);
     Ok(Bytes::from(out))
 }
-const SRT_HLS_WORKER_ID: &str = "av-contrib-srt-fmp4-bridge";
+const UPLOAD_RESPONSE_HLS_WORKER_ID: &str = "av-contrib-upload-response-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
@@ -117,6 +111,9 @@ struct Args {
     #[arg(long, value_enum, default_value = "main")]
     rist_profile: RistProfile,
 
+    #[arg(long, value_enum, default_value = "pure")]
+    rist_backend: RistBackend,
+
     #[arg(long, value_parser = parse_u32_auto, default_value_t = DEFAULT_FLOW_ID)]
     rist_flow_id: u32,
 
@@ -157,50 +154,48 @@ impl RistProfile {
     }
 }
 
+impl From<RistProfile> for UploadPureRistProfile {
+    fn from(profile: RistProfile) -> Self {
+        match profile {
+            RistProfile::Simple => Self::Simple,
+            RistProfile::Main => Self::Main,
+        }
+    }
+}
+
+impl From<RistProfile> for UploadRistProfile {
+    fn from(profile: RistProfile) -> Self {
+        match profile {
+            RistProfile::Simple => Self::Simple,
+            RistProfile::Main => Self::Main,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RistBackend {
+    Pure,
+    Librist,
+}
+
+impl RistBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pure => "pure",
+            Self::Librist => "librist",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RistIngestConfig {
     bind: SocketAddr,
     profile: RistProfile,
+    backend: RistBackend,
     flow_id: u32,
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
-}
-
-enum RistReceiver {
-    Simple(SimpleMioReceiver),
-    Main(MainMioReceiver),
-}
-
-impl RistReceiver {
-    fn bind(profile: RistProfile, addr: SocketAddr, flow_id: u32) -> io::Result<Self> {
-        match profile {
-            RistProfile::Simple => {
-                SimpleMioReceiver::bind(addr, flow_id, "av-contrib", NackMode::Range)
-                    .map(Self::Simple)
-            }
-            RistProfile::Main => {
-                MainMioReceiver::bind(addr, flow_id, "av-contrib", NackMode::Range).map(Self::Main)
-            }
-        }
-    }
-
-    fn try_recv_payload(
-        &mut self,
-        buf: &mut [u8],
-    ) -> io::Result<Option<(SocketAddr, ReceivedPayload)>> {
-        match self {
-            Self::Simple(receiver) => receiver.try_recv_payload(buf),
-            Self::Main(receiver) => receiver.try_recv_payload(buf),
-        }
-    }
-
-    fn poll_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<()> {
-        match self {
-            Self::Simple(receiver) => receiver.poll_rtcp_and_send(now, now_ntp).map(|_| ()),
-            Self::Main(receiver) => receiver.poll_rtcp_and_send(now, now_ntp).map(|_| ()),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -320,209 +315,49 @@ impl Fmp4PartPublisher for MeshForwarder {
     }
 }
 
-struct RistPayloadReorderer {
-    next_sequence: Option<u32>,
-    pending: BTreeMap<u32, (SocketAddr, ReceivedPayload)>,
-    gap_started_at: Option<Instant>,
-}
-
-impl RistPayloadReorderer {
-    fn new() -> Self {
-        Self {
-            next_sequence: None,
-            pending: BTreeMap::new(),
-            gap_started_at: None,
-        }
-    }
-
-    fn insert(
-        &mut self,
-        peer: SocketAddr,
-        payload: ReceivedPayload,
-        now: Instant,
-    ) -> Vec<(SocketAddr, ReceivedPayload)> {
-        if payload.duplicate {
-            debug!(
-                peer = %peer,
-                sequence = payload.sequence,
-                "dropping duplicate RIST payload"
-            );
-            return Vec::new();
-        }
-
-        let sequence = payload.sequence;
-        if self.next_sequence.is_some_and(|next| sequence < next) {
-            trace!(
-                peer = %peer,
-                sequence,
-                "dropping late RIST payload behind reorder window"
-            );
-            return Vec::new();
-        }
-
-        self.next_sequence.get_or_insert(sequence);
-        self.pending.entry(sequence).or_insert((peer, payload));
-        let ready = self.drain_ready(now);
-        if !ready.is_empty() {
-            debug!(
-                ready_payloads = ready.len(),
-                pending_payloads = self.pending.len(),
-                next_sequence = self.next_sequence.unwrap_or(sequence),
-                "RIST reorder released contiguous payloads"
-            );
-        }
-        if ready.is_empty() && self.pending.len() >= RIST_REORDER_MAX_PENDING {
-            return self.release_gap(now, "pending-cap");
-        }
-        ready
-    }
-
-    fn drain_due(&mut self, now: Instant) -> Vec<(SocketAddr, ReceivedPayload)> {
-        if self.pending.is_empty() {
-            self.gap_started_at = None;
-            return Vec::new();
-        }
-
-        let gap_elapsed = self
-            .gap_started_at
-            .map(|started| now.saturating_duration_since(started))
-            .unwrap_or_default();
-        if gap_elapsed >= Duration::from_millis(RIST_REORDER_WAIT_MS) {
-            return self.release_gap(now, "timeout");
-        }
-
-        self.drain_ready(now)
-    }
-
-    fn release_gap(
-        &mut self,
-        now: Instant,
-        release_reason: &'static str,
-    ) -> Vec<(SocketAddr, ReceivedPayload)> {
-        if self.pending.is_empty() {
-            self.gap_started_at = None;
-            return Vec::new();
-        }
-
-        let first_pending = *self.pending.keys().next().unwrap();
-        let waited_ms = self
-            .gap_started_at
-            .map(|started| now.saturating_duration_since(started).as_millis())
-            .unwrap_or_default();
-        if let Some(next) = self.next_sequence {
-            warn!(
-                next_sequence = next,
-                first_pending_sequence = first_pending,
-                pending_payloads = self.pending.len(),
-                waited_ms,
-                release_reason,
-                "RIST reorder gap released; continuing with missing payloads"
-            );
-        }
-        self.next_sequence = Some(first_pending);
-        self.gap_started_at = None;
-        self.drain_ready(now)
-    }
-
-    fn drain_ready(&mut self, now: Instant) -> Vec<(SocketAddr, ReceivedPayload)> {
-        let mut ready = Vec::new();
-        while let Some(next) = self.next_sequence {
-            let Some((peer, payload)) = self.pending.remove(&next) else {
-                if self.pending.is_empty() {
-                    self.gap_started_at = None;
-                } else {
-                    self.gap_started_at.get_or_insert(now);
-                }
-                break;
-            };
-            ready.push((peer, payload));
-            self.next_sequence = Some(next.wrapping_add(1));
-            self.gap_started_at = None;
-        }
-        ready
-    }
-}
-
-async fn run_rist_ingest(
-    mut receiver: RistReceiver,
+async fn start_rist_ingest(
     config: RistIngestConfig,
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
-    mut shutdown_rx: watch::Receiver<()>,
-) -> Result<()> {
-    let mut bridge = TsFmp4Bridge::new_with_publisher(
+    shutdown_rx: watch::Receiver<()>,
+) -> Result<watch::Sender<()>> {
+    let service = Arc::new(UploadResponseService::new(upload_response_config()));
+    let rist_shutdown = match config.backend {
+        RistBackend::Pure => UploadPureRistIngest::new(service.clone())
+            .with_profile(config.profile.into())
+            .with_flow_id(config.flow_id)
+            .start(config.bind)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to bind pure Rust RIST contributor frontend: {error}")
+            })?,
+        RistBackend::Librist => UploadRistIngest::new(service.clone())
+            .with_profile(config.profile.into())
+            .start(config.bind)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to bind librist contributor frontend: {error}")
+            })?,
+    };
+    tokio::spawn(run_upload_response_ts_bridge(
+        service,
+        playlists,
+        publisher,
         config.output_stream_id,
         config.output_stream_idx,
-        playlists,
         config.min_part_ms,
-        Some(publisher),
+        shutdown_rx,
+    ));
+    info!(
+        bind = %config.bind,
+        profile = config.profile.as_str(),
+        backend = config.backend.as_str(),
+        flow_id = format_args!("0x{:08x}", config.flow_id),
+        output_stream_id = config.output_stream_id,
+        output_stream_idx = config.output_stream_idx,
+        "RIST contributor frontend listening via upload-response"
     );
-    let mut buf = vec![0u8; 65_536];
-    let mut poll = interval(Duration::from_millis(RIST_POLL_MS));
-    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_rtcp = Instant::now();
-    let mut reorderer = RistPayloadReorderer::new();
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                bridge.finish().await;
-                info!("RIST contributor frontend shutting down");
-                return Ok(());
-            }
-            _ = poll.tick() => {
-                let now = Instant::now();
-                for _ in 0..MAX_RIST_DRAIN_PER_TICK {
-                    match receiver.try_recv_payload(&mut buf) {
-                        Ok(Some((peer, payload))) => {
-                            let ready = reorderer.insert(peer, payload, now);
-                            for (peer, payload) in ready {
-                                push_rist_payload(&mut bridge, peer, payload).await;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => {
-                            warn!(bind = %config.bind, error = %error, "RIST receive failed");
-                            break;
-                        }
-                    }
-                }
-
-                let now = Instant::now();
-                for (peer, payload) in reorderer.drain_due(now) {
-                    push_rist_payload(&mut bridge, peer, payload).await;
-                }
-
-                if now.duration_since(last_rtcp) >= Duration::from_millis(RTCP_INTERVAL_MS) {
-                    if let Err(error) = receiver.poll_rtcp_and_send(now, ntp_now()) {
-                        if error.kind() != io::ErrorKind::WouldBlock {
-                            debug!(error = %error, "RIST RTCP poll failed");
-                        }
-                    }
-                    last_rtcp = now;
-                }
-            }
-        }
-    }
-}
-
-async fn push_rist_payload(bridge: &mut TsFmp4Bridge, peer: SocketAddr, payload: ReceivedPayload) {
-    if payload.recovered {
-        trace!(
-            peer = %peer,
-            sequence = payload.sequence,
-            "RIST payload recovered by protocol repair"
-        );
-    }
-    debug!(
-        peer = %peer,
-        sequence = payload.sequence,
-        recovered = payload.recovered,
-        bytes = payload.payload.len(),
-        "forwarding RIST payload into MPEG-TS fMP4 bridge"
-    );
-    bridge.push_ts(Bytes::from(payload.payload)).await;
+    Ok(rist_shutdown)
 }
 
 struct UploadTsBridgeState {
@@ -629,7 +464,7 @@ async fn run_upload_response_ts_bridge(
                                 bridge: None,
                             },
                         );
-                        trace!(stream_id, "tracking SRT upload-response stream");
+                        trace!(stream_id, "tracking upload-response stream");
                     }
                     let has_active_bridge = bridges
                         .iter()
@@ -645,7 +480,7 @@ async fn run_upload_response_ts_bridge(
                             stream_id,
                             last_seen = state.last_seen,
                             request_last = stream.request_last,
-                            "SRT fMP4 bridge has no new request slots"
+                            "upload-response fMP4 bridge has no new request slots"
                         );
                         continue;
                     }
@@ -657,7 +492,7 @@ async fn run_upload_response_ts_bridge(
                                 trace!(
                                     stream_id,
                                     path = %String::from_utf8_lossy(&headers.path),
-                                    "SRT stream headers"
+                                    "upload-response stream headers"
                                 );
                             }
                             Some(TailSlot::Body(data)) => {
@@ -690,13 +525,16 @@ async fn run_upload_response_ts_bridge(
                                 }
                                 if !state.reader_registered {
                                     service
-                                        .register_request_reader(stream_id, SRT_HLS_WORKER_ID)
+                                        .register_request_reader(
+                                            stream_id,
+                                            UPLOAD_RESPONSE_HLS_WORKER_ID,
+                                        )
                                         .await;
                                     state.reader_registered = true;
                                     debug!(
                                         stream_id,
-                                        worker_id = SRT_HLS_WORKER_ID,
-                                        "registered SRT fMP4 bridge reader"
+                                        worker_id = UPLOAD_RESPONSE_HLS_WORKER_ID,
+                                        "registered upload-response fMP4 bridge reader"
                                     );
                                 }
                                 state.body_slots = state.body_slots.saturating_add(1);
@@ -704,7 +542,7 @@ async fn run_upload_response_ts_bridge(
                                     stream_id,
                                     slot,
                                     bytes = data.len(),
-                                    "SRT fMP4 bridge consuming MPEG-TS body slot"
+                                    "upload-response fMP4 bridge consuming MPEG-TS body slot"
                                 );
                                 if let Some(bridge) = state.bridge.as_mut() {
                                     bridge.push_ts(data).await;
@@ -718,7 +556,7 @@ async fn run_upload_response_ts_bridge(
                                         output_stream_idx = state.output_stream_idx.unwrap_or_default(),
                                         slot,
                                         body_slots = state.body_slots,
-                                        "SRT fMP4 bridge reached stream end"
+                                        "upload-response fMP4 bridge reached stream end"
                                     );
                                     bridge.finish().await;
                                     if let Some(output_stream_id) = state.output_stream_id {
@@ -728,7 +566,7 @@ async fn run_upload_response_ts_bridge(
                                     trace!(
                                         stream_id,
                                         slot,
-                                        "SRT upload-response stream ended without media body slots"
+                                        "upload-response stream ended without media body slots"
                                     );
                                 }
                                 stream_ended = true;
@@ -737,19 +575,23 @@ async fn run_upload_response_ts_bridge(
                                 trace!(
                                     stream_id,
                                     slot,
-                                    "SRT fMP4 bridge ignoring request control slot"
+                                    "upload-response fMP4 bridge ignoring request control slot"
                                 );
                             }
                             None => {
                                 trace!(
                                     stream_id,
                                     slot,
-                                    "SRT fMP4 bridge request slot missing"
+                                    "upload-response fMP4 bridge request slot missing"
                                 );
                             }
                         }
                         service
-                            .mark_request_reader_position(stream_id, SRT_HLS_WORKER_ID, slot)
+                            .mark_request_reader_position(
+                                stream_id,
+                                UPLOAD_RESPONSE_HLS_WORKER_ID,
+                                slot,
+                            )
                             .await;
                     }
 
@@ -1122,33 +964,25 @@ async fn main() -> Result<()> {
     let hls_router =
         Arc::new(HlsRouter::new().add_handler(Box::new(HlsHandler::new(chunk_cache, m3u8_cache))));
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let rist_task = if let Some(bind) = args.rist_bind {
+    let rist_shutdown = if let Some(bind) = args.rist_bind {
         let output_stream_idx = resolve_output_stream_idx(&playlists, args.rist_stream_id).await;
-        let config = RistIngestConfig {
-            bind,
-            profile: args.rist_profile,
-            flow_id: args.rist_flow_id,
-            output_stream_id: args.rist_stream_id,
-            output_stream_idx,
-            min_part_ms: args.fmp4_part_ms,
-        };
-        let receiver = RistReceiver::bind(config.profile, config.bind, config.flow_id)
-            .with_context(|| format!("failed to bind RIST contributor frontend on {bind}"))?;
-        info!(
-            bind = %config.bind,
-            profile = config.profile.as_str(),
-            flow_id = format_args!("0x{:08x}", config.flow_id),
-            output_stream_id = config.output_stream_id,
-            output_stream_idx,
-            "RIST contributor frontend listening"
-        );
-        Some(tokio::spawn(run_rist_ingest(
-            receiver,
-            config,
-            playlists.clone(),
-            publisher.clone(),
-            shutdown_rx.clone(),
-        )))
+        Some(
+            start_rist_ingest(
+                RistIngestConfig {
+                    bind,
+                    profile: args.rist_profile,
+                    backend: args.rist_backend,
+                    flow_id: args.rist_flow_id,
+                    output_stream_id: args.rist_stream_id,
+                    output_stream_idx,
+                    min_part_ms: args.fmp4_part_ms,
+                },
+                playlists.clone(),
+                publisher.clone(),
+                shutdown_rx.clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -1224,8 +1058,9 @@ async fn main() -> Result<()> {
     println!("media:   udp+media-fec://{}", args.mesh_media_fec_target);
     if let Some(bind) = args.rist_bind {
         println!(
-            "rist:    rist://127.0.0.1:{} profile={} flow_id=0x{:08x} stream_id={}",
+            "rist:    rist://127.0.0.1:{} backend={} profile={} flow_id=0x{:08x} stream_id={}",
             bind.port(),
+            args.rist_backend.as_str(),
             args.rist_profile.as_str(),
             args.rist_flow_id,
             args.rist_stream_id
@@ -1250,6 +1085,9 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     let _ = handle.shutdown_tx.send(());
     let _ = shutdown_tx.send(());
+    if let Some(shutdown) = rist_shutdown {
+        let _ = shutdown.send(());
+    }
     if let Some(shutdown) = srt_shutdown {
         let _ = shutdown.send(());
     }
@@ -1257,9 +1095,6 @@ async fn main() -> Result<()> {
         let _ = shutdown.send(());
     }
     let _ = handle.finished_rx.await;
-    if let Some(task) = rist_task {
-        let _ = task.await;
-    }
     if let Some(finished) = rtmp_finished {
         let _ = finished.await;
     }
@@ -1421,81 +1256,6 @@ mod tests {
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
     }
 
-    #[test]
-    fn rist_reorderer_holds_out_of_order_payloads_until_gap_recovers() {
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 5000));
-        let now = Instant::now();
-        let mut reorderer = RistPayloadReorderer::new();
-
-        let ready = reorderer.insert(peer, rist_payload(10, false, b"ten"), now);
-        assert_eq!(payload_sequences(&ready), vec![10]);
-
-        let ready = reorderer.insert(peer, rist_payload(12, false, b"twelve"), now);
-        assert!(ready.is_empty());
-
-        let ready = reorderer.insert(
-            peer,
-            rist_payload(11, true, b"eleven"),
-            now + Duration::from_millis(5),
-        );
-        assert_eq!(payload_sequences(&ready), vec![11, 12]);
-        assert_eq!(ready[0].1.payload, b"eleven");
-        assert_eq!(ready[1].1.payload, b"twelve");
-    }
-
-    #[test]
-    fn rist_reorderer_releases_gap_after_timeout() {
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 5000));
-        let now = Instant::now();
-        let mut reorderer = RistPayloadReorderer::new();
-
-        assert_eq!(
-            payload_sequences(&reorderer.insert(peer, rist_payload(20, false, b"twenty"), now)),
-            vec![20]
-        );
-        assert!(reorderer
-            .insert(peer, rist_payload(22, false, b"twenty-two"), now)
-            .is_empty());
-        assert!(reorderer
-            .drain_due(now + Duration::from_millis(RIST_REORDER_WAIT_MS - 1))
-            .is_empty());
-
-        let ready = reorderer.drain_due(now + Duration::from_millis(RIST_REORDER_WAIT_MS + 1));
-        assert_eq!(payload_sequences(&ready), vec![22]);
-        assert_eq!(ready[0].1.payload, b"twenty-two");
-    }
-
-    #[test]
-    fn rist_reorderer_releases_gap_at_pending_cap() {
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 5000));
-        let now = Instant::now();
-        let mut reorderer = RistPayloadReorderer::new();
-
-        assert_eq!(
-            payload_sequences(&reorderer.insert(peer, rist_payload(30, false, b"thirty"), now)),
-            vec![30]
-        );
-
-        let mut ready = Vec::new();
-        for offset in 0..RIST_REORDER_MAX_PENDING {
-            ready = reorderer.insert(
-                peer,
-                rist_payload(32 + offset as u32, false, b"pending"),
-                now + Duration::from_millis(1),
-            );
-        }
-
-        assert_eq!(ready.len(), RIST_REORDER_MAX_PENDING);
-        assert_eq!(
-            ready.first().map(|(_peer, payload)| payload.sequence),
-            Some(32)
-        );
-        assert_eq!(
-            ready.last().map(|(_peer, payload)| payload.sequence),
-            Some(32 + RIST_REORDER_MAX_PENDING as u32 - 1)
-        );
-    }
-
     #[tokio::test]
     async fn stream_slot_forwarder_uses_stream_prefixed_fec() {
         let mesh_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1514,6 +1274,7 @@ mod tests {
             symbol_size: DEFAULT_SYMBOL_SIZE,
             rist_bind: None,
             rist_profile: RistProfile::Main,
+            rist_backend: RistBackend::Pure,
             rist_flow_id: DEFAULT_FLOW_ID,
             srt_bind: None,
             rtmp_bind: None,
@@ -1544,22 +1305,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(payload, b"non-obs-stream-bytes");
-    }
-
-    fn rist_payload(sequence: u32, recovered: bool, payload: &[u8]) -> ReceivedPayload {
-        ReceivedPayload {
-            sequence,
-            recovered,
-            duplicate: false,
-            newly_missing: Vec::new(),
-            payload: payload.to_vec(),
-        }
-    }
-
-    fn payload_sequences(ready: &[(SocketAddr, ReceivedPayload)]) -> Vec<u32> {
-        ready
-            .iter()
-            .map(|(_peer, payload)| payload.sequence)
-            .collect()
     }
 }

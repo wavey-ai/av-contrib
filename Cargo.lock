@@ -241,6 +241,26 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex 1.3.0",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
@@ -254,7 +274,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "shlex 1.3.0",
  "syn 2.0.117",
 ]
@@ -1060,7 +1080,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hls"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#b17fc963ec9cea8ca324c63a743ae43592bcb2c8"
+source = "git+https://github.com/wavey-ai/web-services.git#70222d0e9a7043d7c75612d536ba200116ca0155"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1797,7 +1817,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#5701b9b2fdf5b61fa427a96c8d8ca1424f6d8e9a"
+source = "git+https://github.com/wavey-ai/playlists.git#fea8f07b08d355bffeb7d8f5576381882750bc5e"
 dependencies = [
  "access-unit",
  "bytes",
@@ -1910,7 +1930,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls 0.23.40",
  "socket2 0.6.4",
  "thiserror 2.0.18",
@@ -1930,7 +1950,7 @@ dependencies = [
  "lru-slab",
  "rand 0.9.4",
  "ring",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls 0.23.40",
  "rustls-pki-types",
  "slab",
@@ -2198,6 +2218,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rist"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git#4b04fee24f961827d5676425a2020fdcc59202d9"
+dependencies = [
+ "libc",
+ "rist-sys",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rist-core"
 version = "0.1.0"
 source = "git+https://github.com/wavey-ai/rist-rs.git?branch=pure-rust#c715de9e0c54dd67fbb2dc1ff32a8bf6ec6f7b98"
@@ -2220,6 +2251,15 @@ dependencies = [
  "mio",
  "rist-core",
  "socket2 0.6.4",
+]
+
+[[package]]
+name = "rist-sys"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git#4b04fee24f961827d5676425a2020fdcc59202d9"
+dependencies = [
+ "bindgen 0.70.1",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2270,6 +2310,12 @@ name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -2647,7 +2693,7 @@ name = "srt-sys"
 version = "0.1.0"
 source = "git+https://github.com/wavey-ai/av-rs.git#104f0645e70b97f7a14ac0e5dbc2afa0db16596d"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cmake",
  "libc",
 ]
@@ -3229,7 +3275,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#b17fc963ec9cea8ca324c63a743ae43592bcb2c8"
+source = "git+https://github.com/wavey-ai/web-services.git#70222d0e9a7043d7c75612d536ba200116ca0155"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3241,6 +3287,9 @@ dependencies = [
  "hyper-util",
  "playlists",
  "reqwest",
+ "rist",
+ "rist-core",
+ "rist-mio",
  "rustls 0.23.40",
  "rustls-pemfile",
  "serde",
@@ -3390,7 +3439,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#b17fc963ec9cea8ca324c63a743ae43592bcb2c8"
+source = "git+https://github.com/wavey-ai/web-services.git#70222d0e9a7043d7c75612d536ba200116ca0155"
 dependencies = [
  "anyhow",
  "async-trait",
