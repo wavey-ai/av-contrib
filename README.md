@@ -34,6 +34,8 @@ Useful endpoints:
   targets, LL-HLS timing, FEC settings, contributor listeners, browser-safe
   stream id strings, runtime raw/media/MPEG-TS/RTMP/fMP4 counters, publish
   errors, and current alerts.
+- `GET /api/status/events`: streams the same status snapshot once per second as
+  Server-Sent Events using the named event `contrib`.
 - `rist://<rist-bind>`: accepts OBS-style RIST MPEG-TS, demuxes H.264/AAC,
   boxes fMP4/CMAF parts, serves LL-HLS locally, and publishes fMP4 part bytes to
   mesh under `--rist-stream-id` (default `0`).
@@ -75,8 +77,9 @@ nodes plus one `av-contrib` ingress, and prefixes every child process
 stdout/stderr line into the supervisor stdout. By default it uses stream id `1`,
 UK egress `https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
 `https://local.bitneedle.com:19445/live/1/stream.m3u8`, and mesh dashboards at
-`/mesh` on both ports. The contributor status feed is available at
-`https://local.bitneedle.com:19443/api/status`.
+`/mesh` on both ports. The contributor status endpoints are available at
+`https://local.bitneedle.com:19443/api/status` and
+`https://local.bitneedle.com:19443/api/status/events`.
 
 OBS can publish RTMP to `rtmp://local.bitneedle.com:19350/live` with stream key
 `obs-local`, or SRT to `srt://local.bitneedle.com:27001?mode=caller`. RIST is

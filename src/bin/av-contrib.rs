@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use hls::{HlsHandler, HlsRouter};
-use http::{Method, Request, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use raptorq_datagram_fec::{MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SYMBOL_SIZE};
 use raptorq_fec_transport::FecDatagramEncoder;
 use rtmp_ingress::ingress::start_rtmp_listener;
@@ -40,6 +40,7 @@ use web_service::{
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
 const CONTRIB_STATUS_PATH: &str = "/api/status";
+const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 
@@ -1058,6 +1059,17 @@ impl ContribStatusConfig {
             alerts,
         }
     }
+
+    fn sse_event(&self) -> HandlerResult<Bytes> {
+        let json = serde_json::to_vec(&self.snapshot())
+            .map_err(|err| ServerError::Handler(Box::new(err)))?;
+        let mut event = BytesMut::new();
+        event.extend_from_slice(b"event: contrib\n");
+        event.extend_from_slice(b"data: ");
+        event.extend_from_slice(&json);
+        event.extend_from_slice(b"\n\n");
+        Ok(event.freeze())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1282,7 +1294,7 @@ impl Router for ContribRouter {
             "/" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(
-                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /api/status returns service status for dashboards\nGET /up checks health\n",
+                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /api/status returns service status for dashboards\nGET /api/status/events streams service status as SSE\nGET /up checks health\n",
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
@@ -1433,14 +1445,31 @@ impl Router for ContribRouter {
     }
 
     fn is_streaming(&self, path: &str) -> bool {
-        self.hls_router.is_streaming(path)
+        path == CONTRIB_STATUS_EVENTS_PATH || self.hls_router.is_streaming(path)
     }
 
     async fn route_stream(
         &self,
         req: Request<()>,
-        stream_writer: Box<dyn StreamWriter>,
+        mut stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
+        if req.uri().path() == CONTRIB_STATUS_EVENTS_PATH {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-store, max-age=0")
+                .body(())
+                .map_err(ServerError::Http)?;
+            stream_writer.send_response(response).await?;
+
+            let mut ticker = interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                stream_writer.send_data(self.status.sse_event()?).await?;
+                ticker.tick().await;
+            }
+        }
+
         self.hls_router.route_stream(req, stream_writer).await
     }
 
@@ -1598,6 +1627,10 @@ async fn main() -> Result<()> {
         );
     }
     println!("status:  https://127.0.0.1:{}/api/status", args.http_port);
+    println!(
+        "events:  https://127.0.0.1:{}/api/status/events",
+        args.http_port
+    );
     println!("health:  https://127.0.0.1:{}/up", args.http_port);
 
     tokio::signal::ctrl_c().await?;
@@ -1807,7 +1840,12 @@ mod tests {
         telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
         telemetry.record_rtmp_access_unit(args.rtmp_stream_id, 1024);
         telemetry.record_fmp4_part(args.rist_stream_id, 1, 9, 8192, 512);
-        let snapshot = ContribStatusConfig::from_args(&args, telemetry).snapshot();
+        let status_config = ContribStatusConfig::from_args(&args, telemetry);
+        let event = status_config.sse_event().unwrap();
+        assert!(event.starts_with(b"event: contrib\ndata: {"));
+        assert!(event.ends_with(b"\n\n"));
+
+        let snapshot = status_config.snapshot();
 
         assert_eq!(snapshot.default_stream_id, "9007199254741993");
         assert_eq!(snapshot.advertised_hls_stream_id, "9007199254741994");

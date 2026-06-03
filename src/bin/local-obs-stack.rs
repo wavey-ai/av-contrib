@@ -584,6 +584,10 @@ fn print_ready(args: &Args) {
         args.host, args.contrib_http_port
     );
     println!(
+        "[orchestrator] contrib events: https://{}:{}/api/status/events",
+        args.host, args.contrib_http_port
+    );
+    println!(
         "[orchestrator] LL-HLS part target: {}ms (override with AV_LL_HLS_PART_MS or --part-ms)",
         args.part_ms
     );
