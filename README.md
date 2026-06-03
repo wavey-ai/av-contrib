@@ -10,6 +10,13 @@ fMP4/CMAF LL-HLS artifacts with `playlists`, and publishes only stream-addressed
 artifact bytes into mesh RaptorQ/FEC ingest sockets. Raw RIST, SRT, RTMP, and
 MPEG-TS payloads do not cross the mesh boundary.
 
+Reliability boundary: RIST and SRT belong here at the contributor edge because
+they are mature WAN ingest protocols with retransmission history. The mesh hot
+path is still RaptorQ-FEC over stream-addressed artifacts because it gives fixed
+low-latency recovery for bounded loss. FEC is not magic reliability; if repair
+budget is exceeded, the mesh needs a separate slot repair/backfill path rather
+than pushing raw RIST/SRT semantics through every mesh node.
+
 ```sh
 cargo run --bin av-contrib -- \
   --http-port 9443 \
