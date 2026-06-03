@@ -14,12 +14,12 @@ use raptorq_fec_transport::FecDatagramEncoder;
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -316,10 +316,39 @@ impl Fmp4PartPublisher for MeshForwarder {
     }
 }
 
+struct TelemetryFmp4Publisher {
+    inner: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
+}
+
+#[async_trait::async_trait]
+impl Fmp4PartPublisher for TelemetryFmp4Publisher {
+    async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
+        let stream_id = part.stream_id;
+        let stream_idx = part.stream_idx;
+        let sequence = part.sequence;
+        let bytes = part.bytes.len() as u64;
+        let init_bytes = part.init.as_ref().map_or(0, |init| init.len() as u64);
+        match self.inner.publish_fmp4_part(part).await {
+            Ok(()) => {
+                self.telemetry
+                    .record_fmp4_part(stream_id, stream_idx, sequence, bytes, init_bytes);
+                Ok(())
+            }
+            Err(error) => {
+                self.telemetry
+                    .record_fmp4_publish_error(stream_id, stream_idx, sequence, &error);
+                Err(error)
+            }
+        }
+    }
+}
+
 async fn start_rist_ingest(
     config: RistIngestConfig,
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
     let service = Arc::new(UploadResponseService::new(upload_response_config()));
@@ -344,6 +373,8 @@ async fn start_rist_ingest(
         service,
         playlists,
         publisher,
+        telemetry,
+        "rist",
         config.output_stream_id,
         config.output_stream_idx,
         config.min_part_ms,
@@ -382,6 +413,7 @@ async fn start_srt_ingest(
     config: SrtIngestConfig,
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
     let service = Arc::new(UploadResponseService::new(upload_response_config()));
@@ -394,6 +426,8 @@ async fn start_srt_ingest(
         service,
         playlists,
         publisher,
+        telemetry,
+        "srt",
         config.output_stream_id,
         output_stream_idx,
         config.min_part_ms,
@@ -412,6 +446,8 @@ async fn run_upload_response_ts_bridge(
     service: Arc<UploadResponseService>,
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
+    protocol: &'static str,
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
@@ -539,6 +575,7 @@ async fn run_upload_response_ts_bridge(
                                     );
                                 }
                                 state.body_slots = state.body_slots.saturating_add(1);
+                                telemetry.record_mpeg_ts_slot(protocol, stream_id, data.len());
                                 debug!(
                                     stream_id,
                                     slot,
@@ -615,6 +652,7 @@ async fn run_rtmp_hls_bridge(
     mut rx: tokio::sync::mpsc::Receiver<RtmpIngestEvent>,
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
     fallback_output_stream_id: u64,
     min_part_ms: u32,
 ) {
@@ -631,6 +669,7 @@ async fn run_rtmp_hls_bridge(
                 let pts = access_unit.pts;
                 let dts = access_unit.dts;
                 let bytes = access_unit.data.len();
+                telemetry.record_rtmp_access_unit(stream.id, bytes);
                 if !segmenters.contains_key(&stream.id) {
                     let output_stream_id = rtmp_output_stream_id(
                         &stream,
@@ -740,6 +779,204 @@ fn advertised_hls_stream_id(args: &Args) -> u64 {
     }
 }
 
+#[derive(Debug, Default)]
+struct IngestTelemetry {
+    raw_http_requests: AtomicU64,
+    raw_http_chunks: AtomicU64,
+    raw_http_bytes: AtomicU64,
+    raw_http_datagrams: AtomicU64,
+    raw_http_last_unix_ms: AtomicU64,
+    media_requests: AtomicU64,
+    media_payload_bytes: AtomicU64,
+    media_datagrams: AtomicU64,
+    media_last_unix_ms: AtomicU64,
+    mpeg_ts_slots: AtomicU64,
+    mpeg_ts_bytes: AtomicU64,
+    mpeg_ts_last_unix_ms: AtomicU64,
+    rtmp_access_units: AtomicU64,
+    rtmp_bytes: AtomicU64,
+    rtmp_last_unix_ms: AtomicU64,
+    fmp4_parts: AtomicU64,
+    fmp4_bytes: AtomicU64,
+    fmp4_init_bytes: AtomicU64,
+    fmp4_publish_errors: AtomicU64,
+    fmp4_last_publish_unix_ms: AtomicU64,
+    recent_alerts: StdMutex<VecDeque<ContribAlert>>,
+}
+
+impl IngestTelemetry {
+    fn record_raw_http(&self, stream_id: u64, chunks: u64, bytes: u64, datagrams: u64) {
+        self.raw_http_requests.fetch_add(1, Ordering::Relaxed);
+        self.raw_http_chunks.fetch_add(chunks, Ordering::Relaxed);
+        self.raw_http_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.raw_http_datagrams
+            .fetch_add(datagrams, Ordering::Relaxed);
+        self.raw_http_last_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+        trace!(
+            stream_id,
+            chunks,
+            bytes,
+            datagrams,
+            "recorded raw HTTP byte ingest"
+        );
+    }
+
+    fn record_media_access_unit(&self, stream_id: u64, payload_bytes: u64, datagrams: u64) {
+        self.media_requests.fetch_add(1, Ordering::Relaxed);
+        self.media_payload_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
+        self.media_datagrams.fetch_add(datagrams, Ordering::Relaxed);
+        self.media_last_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+        trace!(
+            stream_id,
+            payload_bytes,
+            datagrams,
+            "recorded media access-unit ingest"
+        );
+    }
+
+    fn record_mpeg_ts_slot(&self, protocol: &'static str, stream_id: u64, bytes: usize) {
+        self.mpeg_ts_slots.fetch_add(1, Ordering::Relaxed);
+        self.mpeg_ts_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.mpeg_ts_last_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+        trace!(protocol, stream_id, bytes, "recorded MPEG-TS ingest slot");
+    }
+
+    fn record_rtmp_access_unit(&self, stream_id: u64, bytes: usize) {
+        self.rtmp_access_units.fetch_add(1, Ordering::Relaxed);
+        self.rtmp_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.rtmp_last_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+        trace!(stream_id, bytes, "recorded RTMP access unit");
+    }
+
+    fn record_fmp4_part(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        sequence: u64,
+        bytes: u64,
+        init_bytes: u64,
+    ) {
+        self.fmp4_parts.fetch_add(1, Ordering::Relaxed);
+        self.fmp4_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.fmp4_init_bytes
+            .fetch_add(init_bytes, Ordering::Relaxed);
+        self.fmp4_last_publish_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+        trace!(
+            stream_id,
+            stream_idx,
+            sequence,
+            bytes,
+            init_bytes,
+            "recorded fMP4 mesh publish"
+        );
+    }
+
+    fn record_fmp4_publish_error(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        sequence: u64,
+        error: &str,
+    ) {
+        self.fmp4_publish_errors.fetch_add(1, Ordering::Relaxed);
+        self.push_alert(ContribAlert {
+            level: "warn",
+            code: "fmp4_publish_error",
+            message: format!(
+                "Failed to publish fMP4 part {sequence} for stream {stream_id} idx {stream_idx}: {error}"
+            ),
+            count: 1,
+            last_seen_unix_ms: Some(now_unix_ms()),
+        });
+    }
+
+    fn snapshot(&self) -> IngestRuntimeSnapshot {
+        let now_ms = now_unix_ms();
+        IngestRuntimeSnapshot {
+            raw_http: RawHttpRuntimeSnapshot {
+                requests: self.raw_http_requests.load(Ordering::Relaxed),
+                chunks: self.raw_http_chunks.load(Ordering::Relaxed),
+                bytes: self.raw_http_bytes.load(Ordering::Relaxed),
+                datagrams: self.raw_http_datagrams.load(Ordering::Relaxed),
+                last_seen_unix_ms: nonzero_unix_ms(
+                    self.raw_http_last_unix_ms.load(Ordering::Relaxed),
+                ),
+                last_seen_age_ms: age_from_atomic_ms(now_ms, &self.raw_http_last_unix_ms),
+            },
+            media_access_units: MediaRuntimeSnapshot {
+                requests: self.media_requests.load(Ordering::Relaxed),
+                payload_bytes: self.media_payload_bytes.load(Ordering::Relaxed),
+                datagrams: self.media_datagrams.load(Ordering::Relaxed),
+                last_seen_unix_ms: nonzero_unix_ms(self.media_last_unix_ms.load(Ordering::Relaxed)),
+                last_seen_age_ms: age_from_atomic_ms(now_ms, &self.media_last_unix_ms),
+            },
+            mpeg_ts: MpegTsRuntimeSnapshot {
+                slots: self.mpeg_ts_slots.load(Ordering::Relaxed),
+                bytes: self.mpeg_ts_bytes.load(Ordering::Relaxed),
+                last_seen_unix_ms: nonzero_unix_ms(
+                    self.mpeg_ts_last_unix_ms.load(Ordering::Relaxed),
+                ),
+                last_seen_age_ms: age_from_atomic_ms(now_ms, &self.mpeg_ts_last_unix_ms),
+            },
+            rtmp: RtmpRuntimeSnapshot {
+                access_units: self.rtmp_access_units.load(Ordering::Relaxed),
+                bytes: self.rtmp_bytes.load(Ordering::Relaxed),
+                last_seen_unix_ms: nonzero_unix_ms(self.rtmp_last_unix_ms.load(Ordering::Relaxed)),
+                last_seen_age_ms: age_from_atomic_ms(now_ms, &self.rtmp_last_unix_ms),
+            },
+            fmp4: Fmp4RuntimeSnapshot {
+                parts: self.fmp4_parts.load(Ordering::Relaxed),
+                bytes: self.fmp4_bytes.load(Ordering::Relaxed),
+                init_bytes: self.fmp4_init_bytes.load(Ordering::Relaxed),
+                publish_errors: self.fmp4_publish_errors.load(Ordering::Relaxed),
+                last_publish_unix_ms: nonzero_unix_ms(
+                    self.fmp4_last_publish_unix_ms.load(Ordering::Relaxed),
+                ),
+                last_publish_age_ms: age_from_atomic_ms(now_ms, &self.fmp4_last_publish_unix_ms),
+            },
+        }
+    }
+
+    fn recent_alerts(&self) -> Vec<ContribAlert> {
+        self.recent_alerts
+            .lock()
+            .map(|alerts| alerts.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn push_alert(&self, alert: ContribAlert) {
+        if let Ok(mut alerts) = self.recent_alerts.lock() {
+            if let Some(existing) = alerts
+                .iter_mut()
+                .find(|existing| existing.code == alert.code && existing.message == alert.message)
+            {
+                existing.count = existing.count.saturating_add(1);
+                existing.last_seen_unix_ms = alert.last_seen_unix_ms;
+                return;
+            }
+            alerts.push_front(alert);
+            while alerts.len() > 32 {
+                alerts.pop_back();
+            }
+        }
+    }
+}
+
+fn nonzero_unix_ms(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn age_from_atomic_ms(now_ms: u64, value: &AtomicU64) -> Option<u64> {
+    nonzero_unix_ms(value.load(Ordering::Relaxed)).map(|then| now_ms.saturating_sub(then))
+}
+
 #[derive(Debug, Clone)]
 struct ContribStatusConfig {
     default_stream_id: String,
@@ -750,10 +987,11 @@ struct ContribStatusConfig {
     fec: FecStatus,
     listeners: Vec<ListenerStatus>,
     alerts: Vec<ContribAlert>,
+    telemetry: Arc<IngestTelemetry>,
 }
 
 impl ContribStatusConfig {
-    fn from_args(args: &Args) -> Self {
+    fn from_args(args: &Args, telemetry: Arc<IngestTelemetry>) -> Self {
         let advertised_hls_stream_id = advertised_hls_stream_id(args);
         let mut listeners = Vec::with_capacity(3);
         listeners.push(ListenerStatus::rist(args));
@@ -766,6 +1004,8 @@ impl ContribStatusConfig {
                 level: "info",
                 code: "raw_ingest_only",
                 message: "No RIST, SRT, or RTMP listener is enabled; raw HTTP byte ingest remains available.".to_owned(),
+                count: 1,
+                last_seen_unix_ms: None,
             });
         }
 
@@ -790,13 +1030,22 @@ impl ContribStatusConfig {
             },
             listeners,
             alerts,
+            telemetry,
         }
     }
 
     fn snapshot(&self) -> ContribStatusSnapshot {
+        let runtime = self.telemetry.snapshot();
+        let mut alerts = self.alerts.clone();
+        alerts.extend(self.telemetry.recent_alerts());
+        let status = if runtime.fmp4.publish_errors > 0 {
+            "degraded"
+        } else {
+            "ok"
+        };
         ContribStatusSnapshot {
             service: "av-contrib",
-            status: "ok",
+            status,
             updated_unix_ms: now_unix_ms(),
             default_stream_id: self.default_stream_id.clone(),
             advertised_hls_stream_id: self.advertised_hls_stream_id.clone(),
@@ -805,7 +1054,8 @@ impl ContribStatusConfig {
             hls: self.hls.clone(),
             fec: self.fec.clone(),
             listeners: self.listeners.clone(),
-            alerts: self.alerts.clone(),
+            runtime,
+            alerts,
         }
     }
 }
@@ -822,7 +1072,62 @@ struct ContribStatusSnapshot {
     hls: HlsStatus,
     fec: FecStatus,
     listeners: Vec<ListenerStatus>,
+    runtime: IngestRuntimeSnapshot,
     alerts: Vec<ContribAlert>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IngestRuntimeSnapshot {
+    raw_http: RawHttpRuntimeSnapshot,
+    media_access_units: MediaRuntimeSnapshot,
+    mpeg_ts: MpegTsRuntimeSnapshot,
+    rtmp: RtmpRuntimeSnapshot,
+    fmp4: Fmp4RuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RawHttpRuntimeSnapshot {
+    requests: u64,
+    chunks: u64,
+    bytes: u64,
+    datagrams: u64,
+    last_seen_unix_ms: Option<u64>,
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MediaRuntimeSnapshot {
+    requests: u64,
+    payload_bytes: u64,
+    datagrams: u64,
+    last_seen_unix_ms: Option<u64>,
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MpegTsRuntimeSnapshot {
+    slots: u64,
+    bytes: u64,
+    last_seen_unix_ms: Option<u64>,
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RtmpRuntimeSnapshot {
+    access_units: u64,
+    bytes: u64,
+    last_seen_unix_ms: Option<u64>,
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Fmp4RuntimeSnapshot {
+    parts: u64,
+    bytes: u64,
+    init_bytes: u64,
+    publish_errors: u64,
+    last_publish_unix_ms: Option<u64>,
+    last_publish_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -904,6 +1209,8 @@ struct ContribAlert {
     level: &'static str,
     code: &'static str,
     message: String,
+    count: u64,
+    last_seen_unix_ms: Option<u64>,
 }
 
 struct ContribRouter {
@@ -1051,6 +1358,9 @@ impl Router for ContribRouter {
                 bytes,
                 datagrams,
             };
+            self.status
+                .telemetry
+                .record_raw_http(stream_id, chunks, bytes, datagrams);
             let json =
                 serde_json::to_vec(&ack).map_err(|err| ServerError::Handler(Box::new(err)))?;
             return Ok(response(
@@ -1101,6 +1411,11 @@ impl Router for ContribRouter {
                 payload_bytes: payload.len(),
                 datagrams,
             };
+            self.status.telemetry.record_media_access_unit(
+                metadata.stream_id,
+                payload.len() as u64,
+                datagrams as u64,
+            );
             let json =
                 serde_json::to_vec(&ack).map_err(|err| ServerError::Handler(Box::new(err)))?;
             return Ok(response(
@@ -1150,11 +1465,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let (cert, key) = load_tls(&args)?;
     let forwarder = Arc::new(MeshForwarder::new(&args).await?);
-    let publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
+    let telemetry = Arc::new(IngestTelemetry::default());
+    let mesh_publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
+    let publisher: Arc<dyn Fmp4PartPublisher> = Arc::new(TelemetryFmp4Publisher {
+        inner: mesh_publisher,
+        telemetry: telemetry.clone(),
+    });
     let (playlists, chunk_cache, m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
     let hls_router =
         Arc::new(HlsRouter::new().add_handler(Box::new(HlsHandler::new(chunk_cache, m3u8_cache))));
-    let status = Arc::new(ContribStatusConfig::from_args(&args));
+    let status = Arc::new(ContribStatusConfig::from_args(&args, telemetry.clone()));
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let rist_shutdown = if let Some(bind) = args.rist_bind {
         let output_stream_idx = resolve_output_stream_idx(&playlists, args.rist_stream_id).await;
@@ -1171,6 +1491,7 @@ async fn main() -> Result<()> {
                 },
                 playlists.clone(),
                 publisher.clone(),
+                telemetry.clone(),
                 shutdown_rx.clone(),
             )
             .await?,
@@ -1188,6 +1509,7 @@ async fn main() -> Result<()> {
                 },
                 playlists.clone(),
                 publisher.clone(),
+                telemetry.clone(),
                 shutdown_rx.clone(),
             )
             .await?,
@@ -1212,6 +1534,7 @@ async fn main() -> Result<()> {
             rx,
             playlists.clone(),
             publisher.clone(),
+            telemetry.clone(),
             args.rtmp_stream_id,
             args.fmp4_part_ms,
         ));
@@ -1478,7 +1801,13 @@ mod tests {
             playlist_buffer_kb: 800,
         };
 
-        let snapshot = ContribStatusConfig::from_args(&args).snapshot();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        telemetry.record_raw_http(args.stream_id, 2, 4096, 6);
+        telemetry.record_media_access_unit(args.stream_id, 2048, 3);
+        telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
+        telemetry.record_rtmp_access_unit(args.rtmp_stream_id, 1024);
+        telemetry.record_fmp4_part(args.rist_stream_id, 1, 9, 8192, 512);
+        let snapshot = ContribStatusConfig::from_args(&args, telemetry).snapshot();
 
         assert_eq!(snapshot.default_stream_id, "9007199254741993");
         assert_eq!(snapshot.advertised_hls_stream_id, "9007199254741994");
@@ -1489,6 +1818,13 @@ mod tests {
         assert_eq!(snapshot.mesh.byte_fec_target, "127.0.0.1:22001");
         assert_eq!(snapshot.hls.part_target_ms, 50);
         assert_eq!(snapshot.fec.repair_symbols, 3);
+        assert_eq!(snapshot.runtime.raw_http.requests, 1);
+        assert_eq!(snapshot.runtime.raw_http.bytes, 4096);
+        assert_eq!(snapshot.runtime.media_access_units.requests, 1);
+        assert_eq!(snapshot.runtime.mpeg_ts.slots, 1);
+        assert_eq!(snapshot.runtime.rtmp.access_units, 1);
+        assert_eq!(snapshot.runtime.fmp4.parts, 1);
+        assert_eq!(snapshot.runtime.fmp4.init_bytes, 512);
 
         let rist = snapshot
             .listeners
