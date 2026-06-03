@@ -965,6 +965,7 @@ struct IngestTelemetry {
     recent_hls_responses: StdMutex<VecDeque<ContribHlsResponse>>,
     ingest_sessions_started: AtomicU64,
     ingest_sessions_ended: AtomicU64,
+    protocol_runtime: StdMutex<HashMap<&'static str, ProtocolRuntimeRecord>>,
     ingest_sessions: StdMutex<HashMap<String, IngestSessionRecord>>,
     recent_alerts: StdMutex<VecDeque<ContribAlert>>,
     recent_activity: StdMutex<VecDeque<ContribActivity>>,
@@ -1125,6 +1126,7 @@ impl IngestTelemetry {
             .fetch_add(bytes as u64, Ordering::Relaxed);
         self.mpeg_ts_last_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        self.record_protocol_unit(protocol, bytes as u64);
         if should_sample_activity(slots, 25) {
             self.push_activity(ContribActivity {
                 level: "info",
@@ -1198,6 +1200,7 @@ impl IngestTelemetry {
         self.rtmp_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         self.rtmp_last_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        self.record_protocol_unit("rtmp", bytes as u64);
         if should_sample_activity(access_units, 100) {
             self.push_activity(ContribActivity {
                 level: "info",
@@ -1213,6 +1216,20 @@ impl IngestTelemetry {
             });
         }
         trace!(stream_id, bytes, "recorded RTMP access unit");
+    }
+
+    fn record_protocol_unit(&self, protocol: &'static str, bytes: u64) {
+        let now = now_unix_ms();
+        if let Ok(mut records) = self.protocol_runtime.lock() {
+            let record = records
+                .entry(protocol)
+                .or_insert_with(|| ProtocolRuntimeRecord {
+                    ..ProtocolRuntimeRecord::default()
+                });
+            record.units = record.units.saturating_add(1);
+            record.bytes = record.bytes.saturating_add(bytes);
+            record.last_seen_unix_ms = Some(now);
+        }
     }
 
     fn record_fmp4_part(
@@ -1514,6 +1531,7 @@ impl IngestTelemetry {
             .iter()
             .filter(|session| session.state == "active")
             .count();
+        let protocols = self.protocol_snapshots(&ingest_session_records, now_ms);
         let mut recent_ingest_sessions = ingest_session_records
             .into_iter()
             .map(|session| IngestSessionSnapshot::from_record(session, now_ms))
@@ -1627,7 +1645,67 @@ impl IngestTelemetry {
                 ended: self.ingest_sessions_ended.load(Ordering::Relaxed),
                 recent: recent_ingest_sessions,
             },
+            protocols,
         }
+    }
+
+    fn protocol_snapshots(
+        &self,
+        sessions: &[IngestSessionRecord],
+        now_ms: u64,
+    ) -> Vec<ProtocolRuntimeSnapshot> {
+        let mut records = self
+            .protocol_runtime
+            .lock()
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|(protocol, record)| (*protocol, record.clone()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        for protocol in ["rist", "srt", "rtmp"] {
+            records
+                .entry(protocol)
+                .or_insert_with(|| ProtocolRuntimeRecord {
+                    ..ProtocolRuntimeRecord::default()
+                });
+        }
+
+        let mut snapshots = records
+            .into_iter()
+            .map(|(protocol, record)| {
+                let active_sessions = sessions
+                    .iter()
+                    .filter(|session| session.protocol == protocol && session.state == "active")
+                    .count();
+                let ended_sessions = sessions
+                    .iter()
+                    .filter(|session| session.protocol == protocol && session.state == "ended")
+                    .count();
+                let latest_session_seen = sessions
+                    .iter()
+                    .filter(|session| session.protocol == protocol)
+                    .map(|session| session.last_seen_unix_ms)
+                    .max();
+                let last_seen_unix_ms = [record.last_seen_unix_ms, latest_session_seen]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                ProtocolRuntimeSnapshot {
+                    protocol,
+                    units: record.units,
+                    bytes: record.bytes,
+                    active_sessions,
+                    ended_sessions,
+                    last_seen_unix_ms,
+                    last_seen_age_ms: last_seen_unix_ms.map(|seen| now_ms.saturating_sub(seen)),
+                }
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.protocol.cmp(right.protocol));
+        snapshots
     }
 
     fn recent_alerts(&self) -> Vec<ContribAlert> {
@@ -1673,6 +1751,13 @@ impl IngestTelemetry {
 
 fn should_sample_activity(count: u64, interval: u64) -> bool {
     count <= 3 || count % interval == 0
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtocolRuntimeRecord {
+    units: u64,
+    bytes: u64,
+    last_seen_unix_ms: Option<u64>,
 }
 
 fn nonzero_unix_ms(value: u64) -> Option<u64> {
@@ -2016,6 +2101,7 @@ struct IngestRuntimeSnapshot {
     fmp4: Fmp4RuntimeSnapshot,
     hls: HlsRuntimeSnapshot,
     ingest_sessions: IngestSessionsRuntimeSnapshot,
+    protocols: Vec<ProtocolRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2143,6 +2229,17 @@ struct IngestSessionsRuntimeSnapshot {
     started: u64,
     ended: u64,
     recent: Vec<IngestSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProtocolRuntimeSnapshot {
+    protocol: &'static str,
+    units: u64,
+    bytes: u64,
+    active_sessions: usize,
+    ended_sessions: usize,
+    last_seen_unix_ms: Option<u64>,
+    last_seen_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2993,11 +3090,28 @@ mod tests {
         assert_eq!(snapshot.runtime.mpeg_ts.continuity_dropped_bytes, 2048);
         assert_eq!(snapshot.runtime.mpeg_ts.payload_drops, 1);
         assert_eq!(snapshot.runtime.mpeg_ts.payload_drop_bytes, 8192);
+        let srt_protocol = snapshot
+            .runtime
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol == "srt")
+            .expect("missing SRT protocol runtime");
+        assert_eq!(srt_protocol.units, 1);
+        assert_eq!(srt_protocol.bytes, 1316);
+        assert!(srt_protocol.last_seen_age_ms.is_some());
         assert!(snapshot
             .alerts
             .iter()
             .any(|alert| alert.code == "mpeg_ts_input_damage"));
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
+        let rtmp_protocol = snapshot
+            .runtime
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol == "rtmp")
+            .expect("missing RTMP protocol runtime");
+        assert_eq!(rtmp_protocol.units, 1);
+        assert_eq!(rtmp_protocol.bytes, 1024);
         assert_eq!(snapshot.runtime.fmp4.parts, 1);
         assert_eq!(snapshot.runtime.fmp4.init_bytes, 512);
         assert_eq!(snapshot.runtime.fmp4.video_codec, Some("h264"));
@@ -3152,11 +3266,22 @@ mod tests {
             Some("/srt/42".into()),
         );
         telemetry.record_ingest_session_body("srt", 42, 1316);
+        telemetry.record_mpeg_ts_slot("srt", 42, 1316);
         let active = status_config.snapshot();
 
         assert_eq!(active.runtime.ingest_sessions.active, 1);
         assert_eq!(active.runtime.ingest_sessions.started, 1);
         assert_eq!(active.runtime.ingest_sessions.ended, 0);
+        let protocol = active
+            .runtime
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol == "srt")
+            .expect("missing SRT protocol runtime");
+        assert_eq!(protocol.units, 1);
+        assert_eq!(protocol.bytes, 1316);
+        assert_eq!(protocol.active_sessions, 1);
+        assert_eq!(protocol.ended_sessions, 0);
         let session = &active.runtime.ingest_sessions.recent[0];
         assert_eq!(session.session_id, 1);
         assert_eq!(session.protocol, "srt");
@@ -3177,6 +3302,14 @@ mod tests {
         assert_eq!(ended.runtime.ingest_sessions.active, 0);
         assert_eq!(ended.runtime.ingest_sessions.started, 1);
         assert_eq!(ended.runtime.ingest_sessions.ended, 1);
+        let protocol = ended
+            .runtime
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol == "srt")
+            .expect("missing SRT protocol runtime");
+        assert_eq!(protocol.active_sessions, 0);
+        assert_eq!(protocol.ended_sessions, 1);
         assert_eq!(ended.runtime.ingest_sessions.recent[0].state, "ended");
         assert_eq!(
             ended.runtime.ingest_sessions.recent[0].end_reason,

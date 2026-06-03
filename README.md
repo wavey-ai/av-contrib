@@ -32,8 +32,9 @@ Useful endpoints:
   RIST/SRT/RTMP ingest.
 - `GET /api/status`: returns dashboard-ready JSON describing configured mesh
   targets, LL-HLS timing, FEC settings, contributor listeners, browser-safe
-  stream id strings, runtime raw/media/MPEG-TS/RTMP/fMP4 counters, publish
-  errors, and current alerts.
+  stream id strings, runtime raw/media/MPEG-TS/RTMP/fMP4 counters,
+  per-protocol ingest counters and sessions, publish errors, and current
+  alerts.
 - `GET /api/status/events`: streams the same status snapshot once per second as
   Server-Sent Events using the named event `contrib`.
 - `rist://<rist-bind>`: accepts OBS-style RIST MPEG-TS, demuxes H.264/AAC,
