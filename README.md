@@ -69,7 +69,7 @@ For local OBS testing with both mesh nodes and the contributor ingress under one
 Rust supervisor, run from this repo:
 
 ```sh
-RUST_LOG=info cargo run --bin local-obs-stack --release
+make stack
 ```
 
 The supervisor builds release `av-contrib`, release `../av-mesh`, and the
@@ -93,15 +93,14 @@ The supervisor defaults the LL-HLS part target to 50 ms; override it with
 Useful overrides:
 
 ```sh
-AV_LL_HLS_PART_MS=67 \
+PART_MS=67 \
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
-  cargo run --bin local-obs-stack --release -- \
-    --stream-id 4294967351 \
-    --host local.bitneedle.com \
-    --rtmp-bind 127.0.0.1:19351 \
-    --srt-bind 127.0.0.1:27011
+  STACK_ARGS="--rtmp-bind 127.0.0.1:19351 --srt-bind 127.0.0.1:27011" \
+  make stack STREAM_ID=4294967351 HOST=local.bitneedle.com
 ```
 
 Use `--dashboard-dist /path/to/dist` to reuse a specific dashboard build. Use
 `--no-dashboard-build` to skip the Trunk build and let `av-mesh` use an existing
 dist or its fallback page. `--no-build` skips all release and dashboard builds.
+The same flags can be passed through `STACK_ARGS`. Run `make help` for service
+and dashboard tasks.
