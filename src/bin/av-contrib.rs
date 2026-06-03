@@ -1337,11 +1337,17 @@ impl IngestTelemetry {
         }
         self.update_stream_runtime(stream_id, |stream| {
             if video_units > 0 {
+                stream.video_codec = Some("h264");
+                if let (Some(width), Some(height)) = (video_width, video_height) {
+                    stream.video_width = Some(width);
+                    stream.video_height = Some(height);
+                }
                 stream.video_parts = stream.video_parts.saturating_add(1);
                 stream.video_access_units =
                     stream.video_access_units.saturating_add(video_units as u64);
             }
             if audio_units > 0 {
+                stream.audio_codec = Some("aac");
                 stream.audio_parts = stream.audio_parts.saturating_add(1);
                 stream.audio_access_units =
                     stream.audio_access_units.saturating_add(audio_units as u64);
@@ -1873,8 +1879,12 @@ struct ContribStreamRuntimeRecord {
     fmp4_init_bytes: u64,
     fmp4_publish_errors: u64,
     latest_fmp4_sequence: Option<u64>,
+    video_codec: Option<&'static str>,
+    video_width: Option<u16>,
+    video_height: Option<u16>,
     video_parts: u64,
     video_access_units: u64,
+    audio_codec: Option<&'static str>,
     audio_parts: u64,
     audio_access_units: u64,
     last_input_unix_ms: Option<u64>,
@@ -2370,8 +2380,12 @@ struct ContribStreamRuntimeSnapshot {
     fmp4_init_bytes: u64,
     fmp4_publish_errors: u64,
     latest_fmp4_sequence: Option<u64>,
+    video_codec: Option<&'static str>,
+    video_width: Option<u16>,
+    video_height: Option<u16>,
     video_parts: u64,
     video_access_units: u64,
+    audio_codec: Option<&'static str>,
     audio_parts: u64,
     audio_access_units: u64,
     last_input_unix_ms: Option<u64>,
@@ -2410,8 +2424,12 @@ impl ContribStreamRuntimeSnapshot {
             fmp4_init_bytes: record.fmp4_init_bytes,
             fmp4_publish_errors: record.fmp4_publish_errors,
             latest_fmp4_sequence: record.latest_fmp4_sequence,
+            video_codec: record.video_codec,
+            video_width: record.video_width,
+            video_height: record.video_height,
             video_parts: record.video_parts,
             video_access_units: record.video_access_units,
+            audio_codec: record.audio_codec,
             audio_parts: record.audio_parts,
             audio_access_units: record.audio_access_units,
             last_input_age_ms: record
@@ -3356,8 +3374,14 @@ mod tests {
         assert_eq!(fmp4_stream.fmp4_bytes, 8192);
         assert_eq!(fmp4_stream.fmp4_init_bytes, 512);
         assert_eq!(fmp4_stream.latest_fmp4_sequence, Some(9));
+        assert_eq!(fmp4_stream.video_codec, Some("h264"));
+        assert_eq!(fmp4_stream.video_width, Some(1280));
+        assert_eq!(fmp4_stream.video_height, Some(720));
         assert_eq!(fmp4_stream.video_parts, 1);
+        assert_eq!(fmp4_stream.video_access_units, 2);
+        assert_eq!(fmp4_stream.audio_codec, Some("aac"));
         assert_eq!(fmp4_stream.audio_parts, 1);
+        assert_eq!(fmp4_stream.audio_access_units, 1);
         assert_eq!(snapshot.status, "active");
         assert_eq!(snapshot.health.state, "active");
         assert!(snapshot.health.input_seen);
