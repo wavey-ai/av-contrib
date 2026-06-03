@@ -67,6 +67,7 @@ const UPLOAD_RESPONSE_HLS_WORKER_ID: &str = "av-contrib-upload-response-fmp4-bri
 const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
+const CONTRIB_ACTIVITY_LIMIT: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -803,17 +804,30 @@ struct IngestTelemetry {
     fmp4_publish_errors: AtomicU64,
     fmp4_last_publish_unix_ms: AtomicU64,
     recent_alerts: StdMutex<VecDeque<ContribAlert>>,
+    recent_activity: StdMutex<VecDeque<ContribActivity>>,
 }
 
 impl IngestTelemetry {
     fn record_raw_http(&self, stream_id: u64, chunks: u64, bytes: u64, datagrams: u64) {
-        self.raw_http_requests.fetch_add(1, Ordering::Relaxed);
+        let requests = self.raw_http_requests.fetch_add(1, Ordering::Relaxed) + 1;
         self.raw_http_chunks.fetch_add(chunks, Ordering::Relaxed);
         self.raw_http_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.raw_http_datagrams
             .fetch_add(datagrams, Ordering::Relaxed);
         self.raw_http_last_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        self.push_activity(ContribActivity {
+            level: "info",
+            code: "raw_http_ingest",
+            message: format!(
+                "Raw HTTP ingest request {requests} accepted {chunks} chunks for stream {stream_id}."
+            ),
+            stream_id_text: Some(stream_id.to_string()),
+            bytes: Some(bytes),
+            datagrams: Some(datagrams),
+            sequence: None,
+            seen_unix_ms: now_unix_ms(),
+        });
         trace!(
             stream_id,
             chunks,
@@ -824,12 +838,24 @@ impl IngestTelemetry {
     }
 
     fn record_media_access_unit(&self, stream_id: u64, payload_bytes: u64, datagrams: u64) {
-        self.media_requests.fetch_add(1, Ordering::Relaxed);
+        let requests = self.media_requests.fetch_add(1, Ordering::Relaxed) + 1;
         self.media_payload_bytes
             .fetch_add(payload_bytes, Ordering::Relaxed);
         self.media_datagrams.fetch_add(datagrams, Ordering::Relaxed);
         self.media_last_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        if should_sample_activity(requests, 100) {
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "media_access_unit",
+                message: format!("Forwarded media access unit {requests} for stream {stream_id}."),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: Some(payload_bytes),
+                datagrams: Some(datagrams),
+                sequence: None,
+                seen_unix_ms: now_unix_ms(),
+            });
+        }
         trace!(
             stream_id,
             payload_bytes,
@@ -839,19 +865,47 @@ impl IngestTelemetry {
     }
 
     fn record_mpeg_ts_slot(&self, protocol: &'static str, stream_id: u64, bytes: usize) {
-        self.mpeg_ts_slots.fetch_add(1, Ordering::Relaxed);
+        let slots = self.mpeg_ts_slots.fetch_add(1, Ordering::Relaxed) + 1;
         self.mpeg_ts_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
         self.mpeg_ts_last_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        if should_sample_activity(slots, 25) {
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "mpeg_ts_slot",
+                message: format!(
+                    "Read MPEG-TS slot {slots} from {protocol} for stream {stream_id}."
+                ),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: Some(bytes as u64),
+                datagrams: None,
+                sequence: Some(slots),
+                seen_unix_ms: now_unix_ms(),
+            });
+        }
         trace!(protocol, stream_id, bytes, "recorded MPEG-TS ingest slot");
     }
 
     fn record_rtmp_access_unit(&self, stream_id: u64, bytes: usize) {
-        self.rtmp_access_units.fetch_add(1, Ordering::Relaxed);
+        let access_units = self.rtmp_access_units.fetch_add(1, Ordering::Relaxed) + 1;
         self.rtmp_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         self.rtmp_last_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        if should_sample_activity(access_units, 100) {
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "rtmp_access_unit",
+                message: format!(
+                    "Forwarded RTMP access unit {access_units} for stream {stream_id}."
+                ),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: Some(bytes as u64),
+                datagrams: None,
+                sequence: Some(access_units),
+                seen_unix_ms: now_unix_ms(),
+            });
+        }
         trace!(stream_id, bytes, "recorded RTMP access unit");
     }
 
@@ -863,12 +917,26 @@ impl IngestTelemetry {
         bytes: u64,
         init_bytes: u64,
     ) {
-        self.fmp4_parts.fetch_add(1, Ordering::Relaxed);
+        let parts = self.fmp4_parts.fetch_add(1, Ordering::Relaxed) + 1;
         self.fmp4_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.fmp4_init_bytes
             .fetch_add(init_bytes, Ordering::Relaxed);
         self.fmp4_last_publish_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
+        if should_sample_activity(parts, 25) {
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "fmp4_part_published",
+                message: format!(
+                    "Published fMP4 part {sequence} for stream {stream_id} idx {stream_idx}."
+                ),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: Some(bytes),
+                datagrams: None,
+                sequence: Some(sequence),
+                seen_unix_ms: now_unix_ms(),
+            });
+        }
         trace!(
             stream_id,
             stream_idx,
@@ -895,6 +963,18 @@ impl IngestTelemetry {
             ),
             count: 1,
             last_seen_unix_ms: Some(now_unix_ms()),
+        });
+        self.push_activity(ContribActivity {
+            level: "warn",
+            code: "fmp4_publish_error",
+            message: format!(
+                "Failed to publish fMP4 part {sequence} for stream {stream_id} idx {stream_idx}: {error}"
+            ),
+            stream_id_text: Some(stream_id.to_string()),
+            bytes: None,
+            datagrams: None,
+            sequence: Some(sequence),
+            seen_unix_ms: now_unix_ms(),
         });
     }
 
@@ -952,6 +1032,13 @@ impl IngestTelemetry {
             .unwrap_or_default()
     }
 
+    fn recent_activity(&self) -> Vec<ContribActivity> {
+        self.recent_activity
+            .lock()
+            .map(|activity| activity.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn push_alert(&self, alert: ContribAlert) {
         if let Ok(mut alerts) = self.recent_alerts.lock() {
             if let Some(existing) = alerts
@@ -968,6 +1055,19 @@ impl IngestTelemetry {
             }
         }
     }
+
+    fn push_activity(&self, activity: ContribActivity) {
+        if let Ok(mut recent) = self.recent_activity.lock() {
+            recent.push_front(activity);
+            while recent.len() > CONTRIB_ACTIVITY_LIMIT {
+                recent.pop_back();
+            }
+        }
+    }
+}
+
+fn should_sample_activity(count: u64, interval: u64) -> bool {
+    count <= 3 || count % interval == 0
 }
 
 fn nonzero_unix_ms(value: u64) -> Option<u64> {
@@ -1057,6 +1157,7 @@ impl ContribStatusConfig {
             listeners: self.listeners.clone(),
             runtime,
             alerts,
+            activity: self.telemetry.recent_activity(),
         }
     }
 
@@ -1086,6 +1187,7 @@ struct ContribStatusSnapshot {
     listeners: Vec<ListenerStatus>,
     runtime: IngestRuntimeSnapshot,
     alerts: Vec<ContribAlert>,
+    activity: Vec<ContribActivity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1223,6 +1325,22 @@ struct ContribAlert {
     message: String,
     count: u64,
     last_seen_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContribActivity {
+    level: &'static str,
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_id_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    datagrams: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    seen_unix_ms: u64,
 }
 
 struct ContribRouter {
@@ -1863,6 +1981,17 @@ mod tests {
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
         assert_eq!(snapshot.runtime.fmp4.parts, 1);
         assert_eq!(snapshot.runtime.fmp4.init_bytes, 512);
+        assert!(snapshot
+            .activity
+            .iter()
+            .any(|activity| activity.code == "raw_http_ingest"
+                && activity.stream_id_text.as_deref() == Some("9007199254741993")));
+        assert!(snapshot
+            .activity
+            .iter()
+            .any(|activity| activity.code == "fmp4_part_published"
+                && activity.stream_id_text.as_deref() == Some("9007199254741994")
+                && activity.sequence == Some(9)));
 
         let rist = snapshot
             .listeners
