@@ -2094,8 +2094,8 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.0"
-source = "git+https://github.com/wavey-ai/raptor-fec.git#b37b14082a2bfc39476fdb70bdab4597ec19f6a2"
+version = "0.1.1"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#528f0051adbcf756a360e98571d79153265144d4"
 dependencies = [
  "bytes",
  "raptorq",
@@ -2104,8 +2104,8 @@ dependencies = [
 
 [[package]]
 name = "raptorq-fec-transport"
-version = "0.1.0"
-source = "git+https://github.com/wavey-ai/raptor-fec.git#b37b14082a2bfc39476fdb70bdab4597ec19f6a2"
+version = "0.1.1"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#528f0051adbcf756a360e98571d79153265144d4"
 dependencies = [
  "async-trait",
  "bytes",
