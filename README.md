@@ -57,3 +57,33 @@ test/local-video-pipeline.sh run rist-ffmpeg-librist 720p
 test/local-video-pipeline.sh run rist-rust-pure 720p
 test/local-video-pipeline.sh run rist-rust-librist 720p
 ```
+
+For local OBS testing with both mesh nodes and the contributor ingress under one
+Rust supervisor, run from this repo:
+
+```sh
+RUST_LOG=info cargo run --bin local-obs-stack --release
+```
+
+The supervisor builds release `av-contrib` and `../av-mesh` binaries, uses local
+bitneedle TLS material from `../tls/local.bitneedle.com`, starts UK and US mesh
+nodes plus one `av-contrib` ingress, and prefixes every child process
+stdout/stderr line into the supervisor stdout. By default it uses stream id `1`,
+UK egress `https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
+`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and mesh dashboards at
+`/mesh` on both ports.
+
+OBS can publish RTMP to `rtmp://local.bitneedle.com:19350/live` with stream key
+`obs-local`, or SRT to `srt://local.bitneedle.com:27001?mode=caller`. RIST is
+bound on `local.bitneedle.com:27000` with main profile and flow id `0x11223344`.
+
+Useful overrides:
+
+```sh
+RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
+  cargo run --bin local-obs-stack --release -- \
+    --stream-id 4294967351 \
+    --host local.bitneedle.com \
+    --rtmp-bind 127.0.0.1:19351 \
+    --srt-bind 127.0.0.1:27011
+```

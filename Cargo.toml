@@ -28,7 +28,7 @@ rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-
 rtmp-ingress = { git = "https://github.com/wavey-ai/rtmp-ingress.git" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 upload-response = { git = "https://github.com/wavey-ai/web-services.git", default-features = false, features = ["srt", "rist", "rist-pure"] }
