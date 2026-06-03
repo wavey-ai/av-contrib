@@ -47,9 +47,25 @@ pub struct PublishedFmp4Part {
     pub audio_units: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MpegTsContinuityIssue {
+    pub stream_type: &'static str,
+    pub dropped_payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MpegTsPayloadDrop {
+    pub stream_type: &'static str,
+    pub bytes: usize,
+}
+
 #[async_trait::async_trait]
 pub trait Fmp4PartPublisher: Send + Sync {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> Result<(), String>;
+
+    fn record_mpeg_ts_continuity_issue(&self, _issue: MpegTsContinuityIssue) {}
+
+    fn record_mpeg_ts_payload_drop(&self, _drop: MpegTsPayloadDrop) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +131,7 @@ impl TsFmp4Bridge {
         min_part_ms: u32,
         publisher: Option<Arc<dyn Fmp4PartPublisher>>,
     ) -> Self {
-        let mut context = TsDemuxContext::new();
+        let mut context = TsDemuxContext::new(publisher.clone());
         let demux = demultiplex::Demultiplex::new(&mut context);
         let segmenter = Fmp4Segmenter::new_with_publisher(
             output_stream_id,
@@ -165,7 +181,7 @@ impl TsFmp4Bridge {
     }
 
     pub fn reset(&mut self) {
-        self.context = TsDemuxContext::new();
+        self.context = TsDemuxContext::new(self.segmenter.publisher.clone());
         self.demux = demultiplex::Demultiplex::new(&mut self.context);
         self.drained_access_units.clear();
         self.segmenter.reset();
@@ -1039,13 +1055,15 @@ mod tests {
 pub struct TsDemuxContext {
     changeset: FilterChangeset<TsFilterSwitch>,
     access_units: Vec<AccessUnit>,
+    observer: Option<Arc<dyn Fmp4PartPublisher>>,
 }
 
 impl TsDemuxContext {
-    fn new() -> Self {
+    fn new(observer: Option<Arc<dyn Fmp4PartPublisher>>) -> Self {
         Self {
             changeset: FilterChangeset::default(),
             access_units: Vec::new(),
+            observer,
         }
     }
 
@@ -1068,7 +1086,11 @@ impl TsDemuxContext {
                 stream_type: StreamType::H264,
                 stream_info,
                 ..
-            } => ElementaryStreamConsumer::construct(StreamType::H264, stream_info),
+            } => ElementaryStreamConsumer::construct(
+                StreamType::H264,
+                stream_info,
+                self.observer.clone(),
+            ),
             demultiplex::FilterRequest::ByStream {
                 stream_type,
                 stream_info,
@@ -1080,7 +1102,7 @@ impl TsDemuxContext {
                     | StreamType::AUDIO_WITHOUT_TRANSPORT_SYNTAX
             ) =>
             {
-                ElementaryStreamConsumer::construct(stream_type, stream_info)
+                ElementaryStreamConsumer::construct(stream_type, stream_info, self.observer.clone())
             }
             demultiplex::FilterRequest::ByStream { stream_type, .. } => {
                 debug!(stream_type = ?stream_type, "ignoring MPEG-TS stream");
@@ -1120,20 +1142,28 @@ packet_filter_switch! {
 
 pub struct ElementaryStreamConsumer {
     stream_type: StreamType,
+    stream_type_label: &'static str,
+    observer: Option<Arc<dyn Fmp4PartPublisher>>,
     accumulated_payload: Vec<u8>,
     pts: u64,
     dts: u64,
 }
 
 impl ElementaryStreamConsumer {
-    fn construct(stream_type: StreamType, stream_info: &psi::pmt::StreamInfo) -> TsFilterSwitch {
+    fn construct(
+        stream_type: StreamType,
+        stream_info: &psi::pmt::StreamInfo,
+        observer: Option<Arc<dyn Fmp4PartPublisher>>,
+    ) -> TsFilterSwitch {
         debug!(
             pid = ?stream_info.elementary_pid(),
             stream_type = ?stream_type,
             "registered MPEG-TS elementary stream"
         );
         TsFilterSwitch::Pes(pes::PesPacketFilter::new(Self {
+            stream_type_label: stream_type_label(stream_type),
             stream_type,
+            observer,
             accumulated_payload: Vec::new(),
             pts: 0,
             dts: 0,
@@ -1148,6 +1178,12 @@ impl ElementaryStreamConsumer {
                 bytes = new_len,
                 "dropping oversized MPEG-TS PES payload"
             );
+            if let Some(observer) = &self.observer {
+                observer.record_mpeg_ts_payload_drop(MpegTsPayloadDrop {
+                    stream_type: self.stream_type_label,
+                    bytes: new_len,
+                });
+            }
             self.accumulated_payload.clear();
             return;
         }
@@ -1250,10 +1286,26 @@ impl pes::ElementaryStreamConsumer<TsDemuxContext> for ElementaryStreamConsumer 
     fn continuity_error(&mut self, _ctx: &mut TsDemuxContext) {
         let dropped_payload_bytes = self.accumulated_payload.len();
         self.accumulated_payload.clear();
+        if let Some(observer) = &self.observer {
+            observer.record_mpeg_ts_continuity_issue(MpegTsContinuityIssue {
+                stream_type: self.stream_type_label,
+                dropped_payload_bytes,
+            });
+        }
         warn!(
             stream_type = ?self.stream_type,
             dropped_payload_bytes,
             "MPEG-TS continuity error; dropping partial elementary stream payload"
         );
+    }
+}
+
+fn stream_type_label(stream_type: StreamType) -> &'static str {
+    match stream_type {
+        StreamType::H264 => "h264",
+        StreamType::ADTS => "adts",
+        StreamType::H222_0_PES_PRIVATE_DATA => "private_data",
+        StreamType::AUDIO_WITHOUT_TRANSPORT_SYNTAX => "audio",
+        _ => "other",
     }
 }

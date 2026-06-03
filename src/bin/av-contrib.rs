@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use av_contrib::fmp4_bridge::{
-    Fmp4PartPublisher, Fmp4Segmenter, PublishedFmp4Part, TimestampInput, TsFmp4Bridge,
-    DEFAULT_MIN_PART_MS,
+    Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop, PublishedFmp4Part,
+    TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use bytes::{Bytes, BytesMut};
@@ -425,6 +425,14 @@ impl Fmp4PartPublisher for TelemetryFmp4Publisher {
                 Err(error)
             }
         }
+    }
+
+    fn record_mpeg_ts_continuity_issue(&self, issue: MpegTsContinuityIssue) {
+        self.telemetry.record_mpeg_ts_continuity_issue(issue);
+    }
+
+    fn record_mpeg_ts_payload_drop(&self, drop: MpegTsPayloadDrop) {
+        self.telemetry.record_mpeg_ts_payload_drop(drop);
     }
 }
 
@@ -931,6 +939,11 @@ struct IngestTelemetry {
     mpeg_ts_slots: AtomicU64,
     mpeg_ts_bytes: AtomicU64,
     mpeg_ts_last_unix_ms: AtomicU64,
+    mpeg_ts_continuity_errors: AtomicU64,
+    mpeg_ts_continuity_dropped_bytes: AtomicU64,
+    mpeg_ts_payload_drops: AtomicU64,
+    mpeg_ts_payload_drop_bytes: AtomicU64,
+    mpeg_ts_last_error_unix_ms: AtomicU64,
     rtmp_access_units: AtomicU64,
     rtmp_bytes: AtomicU64,
     rtmp_last_unix_ms: AtomicU64,
@@ -1127,6 +1140,57 @@ impl IngestTelemetry {
             });
         }
         trace!(protocol, stream_id, bytes, "recorded MPEG-TS ingest slot");
+    }
+
+    fn record_mpeg_ts_continuity_issue(&self, issue: MpegTsContinuityIssue) {
+        let now = now_unix_ms();
+        let errors = self
+            .mpeg_ts_continuity_errors
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.mpeg_ts_continuity_dropped_bytes
+            .fetch_add(issue.dropped_payload_bytes as u64, Ordering::Relaxed);
+        self.mpeg_ts_last_error_unix_ms
+            .store(now, Ordering::Relaxed);
+        if should_sample_activity(errors, 25) {
+            self.push_activity(ContribActivity {
+                level: "warn",
+                code: "mpeg_ts_continuity_error",
+                message: format!(
+                    "MPEG-TS continuity error {errors} on {} dropped {} partial payload bytes.",
+                    issue.stream_type, issue.dropped_payload_bytes
+                ),
+                stream_id_text: None,
+                bytes: Some(issue.dropped_payload_bytes as u64),
+                datagrams: None,
+                sequence: Some(errors),
+                seen_unix_ms: now,
+            });
+        }
+    }
+
+    fn record_mpeg_ts_payload_drop(&self, drop: MpegTsPayloadDrop) {
+        let now = now_unix_ms();
+        let drops = self.mpeg_ts_payload_drops.fetch_add(1, Ordering::Relaxed) + 1;
+        self.mpeg_ts_payload_drop_bytes
+            .fetch_add(drop.bytes as u64, Ordering::Relaxed);
+        self.mpeg_ts_last_error_unix_ms
+            .store(now, Ordering::Relaxed);
+        if should_sample_activity(drops, 25) {
+            self.push_activity(ContribActivity {
+                level: "warn",
+                code: "mpeg_ts_payload_drop",
+                message: format!(
+                    "Dropped oversized MPEG-TS {} PES payload of {} bytes.",
+                    drop.stream_type, drop.bytes
+                ),
+                stream_id_text: None,
+                bytes: Some(drop.bytes as u64),
+                datagrams: None,
+                sequence: Some(drops),
+                seen_unix_ms: now,
+            });
+        }
     }
 
     fn record_rtmp_access_unit(&self, stream_id: u64, bytes: usize) {
@@ -1508,6 +1572,16 @@ impl IngestTelemetry {
                     self.mpeg_ts_last_unix_ms.load(Ordering::Relaxed),
                 ),
                 last_seen_age_ms: age_from_atomic_ms(now_ms, &self.mpeg_ts_last_unix_ms),
+                continuity_errors: self.mpeg_ts_continuity_errors.load(Ordering::Relaxed),
+                continuity_dropped_bytes: self
+                    .mpeg_ts_continuity_dropped_bytes
+                    .load(Ordering::Relaxed),
+                payload_drops: self.mpeg_ts_payload_drops.load(Ordering::Relaxed),
+                payload_drop_bytes: self.mpeg_ts_payload_drop_bytes.load(Ordering::Relaxed),
+                last_error_unix_ms: nonzero_unix_ms(
+                    self.mpeg_ts_last_error_unix_ms.load(Ordering::Relaxed),
+                ),
+                last_error_age_ms: age_from_atomic_ms(now_ms, &self.mpeg_ts_last_error_unix_ms),
             },
             rtmp: RtmpRuntimeSnapshot {
                 access_units: self.rtmp_access_units.load(Ordering::Relaxed),
@@ -1907,6 +1981,28 @@ fn derive_contrib_alerts(
         });
     }
 
+    let mpeg_ts_errors = runtime
+        .mpeg_ts
+        .continuity_errors
+        .saturating_add(runtime.mpeg_ts.payload_drops);
+    if mpeg_ts_errors > 0 {
+        alerts.push(ContribAlert {
+            level: "warn",
+            code: "mpeg_ts_input_damage",
+            message: format!(
+                "MPEG-TS input reported {} continuity error(s) and {} oversized payload drop(s), dropping {} bytes total.",
+                runtime.mpeg_ts.continuity_errors,
+                runtime.mpeg_ts.payload_drops,
+                runtime
+                    .mpeg_ts
+                    .continuity_dropped_bytes
+                    .saturating_add(runtime.mpeg_ts.payload_drop_bytes)
+            ),
+            count: mpeg_ts_errors,
+            last_seen_unix_ms: runtime.mpeg_ts.last_error_unix_ms,
+        });
+    }
+
     alerts
 }
 
@@ -1965,6 +2061,12 @@ struct MpegTsRuntimeSnapshot {
     bytes: u64,
     last_seen_unix_ms: Option<u64>,
     last_seen_age_ms: Option<u64>,
+    continuity_errors: u64,
+    continuity_dropped_bytes: u64,
+    payload_drops: u64,
+    payload_drop_bytes: u64,
+    last_error_unix_ms: Option<u64>,
+    last_error_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2850,6 +2952,14 @@ mod tests {
             3072,
         );
         telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
+        telemetry.record_mpeg_ts_continuity_issue(MpegTsContinuityIssue {
+            stream_type: "h264",
+            dropped_payload_bytes: 2048,
+        });
+        telemetry.record_mpeg_ts_payload_drop(MpegTsPayloadDrop {
+            stream_type: "adts",
+            bytes: 8192,
+        });
         telemetry.record_rtmp_access_unit(args.rtmp_stream_id, 1024);
         telemetry.record_fmp4_tracks(args.rist_stream_id, 1, 9, Some(1280), Some(720), 2, 1);
         telemetry.record_fmp4_part(args.rist_stream_id, 1, 9, 8192, 512);
@@ -2879,6 +2989,14 @@ mod tests {
         assert_eq!(snapshot.runtime.mesh_forward.media_datagrams, 3);
         assert_eq!(snapshot.runtime.mesh_forward.media_datagram_bytes, 3072);
         assert_eq!(snapshot.runtime.mpeg_ts.slots, 1);
+        assert_eq!(snapshot.runtime.mpeg_ts.continuity_errors, 1);
+        assert_eq!(snapshot.runtime.mpeg_ts.continuity_dropped_bytes, 2048);
+        assert_eq!(snapshot.runtime.mpeg_ts.payload_drops, 1);
+        assert_eq!(snapshot.runtime.mpeg_ts.payload_drop_bytes, 8192);
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "mpeg_ts_input_damage"));
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
         assert_eq!(snapshot.runtime.fmp4.parts, 1);
         assert_eq!(snapshot.runtime.fmp4.init_bytes, 512);
