@@ -965,6 +965,7 @@ struct IngestTelemetry {
     recent_hls_responses: StdMutex<VecDeque<ContribHlsResponse>>,
     ingest_sessions_started: AtomicU64,
     ingest_sessions_ended: AtomicU64,
+    stream_runtime: StdMutex<HashMap<u64, ContribStreamRuntimeRecord>>,
     protocol_runtime: StdMutex<HashMap<&'static str, ProtocolRuntimeRecord>>,
     ingest_sessions: StdMutex<HashMap<String, IngestSessionRecord>>,
     recent_alerts: StdMutex<VecDeque<ContribAlert>>,
@@ -973,13 +974,18 @@ struct IngestTelemetry {
 
 impl IngestTelemetry {
     fn record_raw_http(&self, stream_id: u64, chunks: u64, bytes: u64, datagrams: u64) {
+        let now = now_unix_ms();
         let requests = self.raw_http_requests.fetch_add(1, Ordering::Relaxed) + 1;
         self.raw_http_chunks.fetch_add(chunks, Ordering::Relaxed);
         self.raw_http_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.raw_http_datagrams
             .fetch_add(datagrams, Ordering::Relaxed);
-        self.raw_http_last_unix_ms
-            .store(now_unix_ms(), Ordering::Relaxed);
+        self.raw_http_last_unix_ms.store(now, Ordering::Relaxed);
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.input_units = stream.input_units.saturating_add(1);
+            stream.input_bytes = stream.input_bytes.saturating_add(bytes);
+            stream.last_input_unix_ms = Some(now);
+        });
         self.push_activity(ContribActivity {
             level: "info",
             code: "raw_http_ingest",
@@ -1002,12 +1008,17 @@ impl IngestTelemetry {
     }
 
     fn record_media_access_unit(&self, stream_id: u64, payload_bytes: u64, datagrams: u64) {
+        let now = now_unix_ms();
         let requests = self.media_requests.fetch_add(1, Ordering::Relaxed) + 1;
         self.media_payload_bytes
             .fetch_add(payload_bytes, Ordering::Relaxed);
         self.media_datagrams.fetch_add(datagrams, Ordering::Relaxed);
-        self.media_last_unix_ms
-            .store(now_unix_ms(), Ordering::Relaxed);
+        self.media_last_unix_ms.store(now, Ordering::Relaxed);
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.input_units = stream.input_units.saturating_add(1);
+            stream.input_bytes = stream.input_bytes.saturating_add(payload_bytes);
+            stream.last_input_unix_ms = Some(now);
+        });
         if should_sample_activity(requests, 100) {
             self.push_activity(ContribActivity {
                 level: "info",
@@ -1059,6 +1070,13 @@ impl IngestTelemetry {
             self.mesh_stream_last_unix_ms.store(now, Ordering::Relaxed);
             payloads
         };
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.mesh_payloads = stream.mesh_payloads.saturating_add(1);
+            stream.mesh_payload_bytes = stream.mesh_payload_bytes.saturating_add(payload_bytes);
+            stream.mesh_datagrams = stream.mesh_datagrams.saturating_add(datagrams);
+            stream.mesh_datagram_bytes = stream.mesh_datagram_bytes.saturating_add(datagram_bytes);
+            stream.last_mesh_forward_unix_ms = Some(now);
+        });
 
         if should_sample_activity(payloads, 100) {
             self.push_activity(ContribActivity {
@@ -1098,6 +1116,10 @@ impl IngestTelemetry {
         } else {
             self.mesh_stream_errors.fetch_add(1, Ordering::Relaxed) + 1
         };
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.mesh_errors = stream.mesh_errors.saturating_add(1);
+            stream.last_mesh_forward_unix_ms = Some(now);
+        });
         let message = format!(
             "Failed to forward {kind} payload for stream {stream_id} to mesh target {target}: {error}"
         );
@@ -1121,12 +1143,17 @@ impl IngestTelemetry {
     }
 
     fn record_mpeg_ts_slot(&self, protocol: &'static str, stream_id: u64, bytes: usize) {
+        let now = now_unix_ms();
         let slots = self.mpeg_ts_slots.fetch_add(1, Ordering::Relaxed) + 1;
         self.mpeg_ts_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
-        self.mpeg_ts_last_unix_ms
-            .store(now_unix_ms(), Ordering::Relaxed);
+        self.mpeg_ts_last_unix_ms.store(now, Ordering::Relaxed);
         self.record_protocol_unit(protocol, bytes as u64);
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.input_units = stream.input_units.saturating_add(1);
+            stream.input_bytes = stream.input_bytes.saturating_add(bytes as u64);
+            stream.last_input_unix_ms = Some(now);
+        });
         if should_sample_activity(slots, 25) {
             self.push_activity(ContribActivity {
                 level: "info",
@@ -1196,11 +1223,16 @@ impl IngestTelemetry {
     }
 
     fn record_rtmp_access_unit(&self, stream_id: u64, bytes: usize) {
+        let now = now_unix_ms();
         let access_units = self.rtmp_access_units.fetch_add(1, Ordering::Relaxed) + 1;
         self.rtmp_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.rtmp_last_unix_ms
-            .store(now_unix_ms(), Ordering::Relaxed);
+        self.rtmp_last_unix_ms.store(now, Ordering::Relaxed);
         self.record_protocol_unit("rtmp", bytes as u64);
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.input_units = stream.input_units.saturating_add(1);
+            stream.input_bytes = stream.input_bytes.saturating_add(bytes as u64);
+            stream.last_input_unix_ms = Some(now);
+        });
         if should_sample_activity(access_units, 100) {
             self.push_activity(ContribActivity {
                 level: "info",
@@ -1240,12 +1272,19 @@ impl IngestTelemetry {
         bytes: u64,
         init_bytes: u64,
     ) {
+        let now = now_unix_ms();
         let parts = self.fmp4_parts.fetch_add(1, Ordering::Relaxed) + 1;
         self.fmp4_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.fmp4_init_bytes
             .fetch_add(init_bytes, Ordering::Relaxed);
-        self.fmp4_last_publish_unix_ms
-            .store(now_unix_ms(), Ordering::Relaxed);
+        self.fmp4_last_publish_unix_ms.store(now, Ordering::Relaxed);
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.fmp4_parts = stream.fmp4_parts.saturating_add(1);
+            stream.fmp4_bytes = stream.fmp4_bytes.saturating_add(bytes);
+            stream.fmp4_init_bytes = stream.fmp4_init_bytes.saturating_add(init_bytes);
+            stream.latest_fmp4_sequence = Some(sequence);
+            stream.last_fmp4_unix_ms = Some(now);
+        });
         if should_sample_activity(parts, 25) {
             self.push_activity(ContribActivity {
                 level: "info",
@@ -1296,6 +1335,19 @@ impl IngestTelemetry {
             self.fmp4_audio_access_units
                 .fetch_add(audio_units as u64, Ordering::Relaxed);
         }
+        self.update_stream_runtime(stream_id, |stream| {
+            if video_units > 0 {
+                stream.video_parts = stream.video_parts.saturating_add(1);
+                stream.video_access_units =
+                    stream.video_access_units.saturating_add(video_units as u64);
+            }
+            if audio_units > 0 {
+                stream.audio_parts = stream.audio_parts.saturating_add(1);
+                stream.audio_access_units =
+                    stream.audio_access_units.saturating_add(audio_units as u64);
+            }
+            stream.latest_fmp4_sequence = Some(sequence);
+        });
         trace!(
             stream_id,
             stream_idx,
@@ -1315,7 +1367,13 @@ impl IngestTelemetry {
         sequence: u64,
         error: &str,
     ) {
+        let now = now_unix_ms();
         self.fmp4_publish_errors.fetch_add(1, Ordering::Relaxed);
+        self.update_stream_runtime(stream_id, |stream| {
+            stream.fmp4_publish_errors = stream.fmp4_publish_errors.saturating_add(1);
+            stream.latest_fmp4_sequence = Some(sequence);
+            stream.last_fmp4_unix_ms = Some(now);
+        });
         self.push_alert(ContribAlert {
             level: "warn",
             code: "fmp4_publish_error",
@@ -1323,7 +1381,7 @@ impl IngestTelemetry {
                 "Failed to publish fMP4 part {sequence} for stream {stream_id} idx {stream_idx}: {error}"
             ),
             count: 1,
-            last_seen_unix_ms: Some(now_unix_ms()),
+            last_seen_unix_ms: Some(now),
         });
         self.push_activity(ContribActivity {
             level: "warn",
@@ -1335,7 +1393,7 @@ impl IngestTelemetry {
             bytes: None,
             datagrams: None,
             sequence: Some(sequence),
-            seen_unix_ms: now_unix_ms(),
+            seen_unix_ms: now,
         });
     }
 
@@ -1532,6 +1590,7 @@ impl IngestTelemetry {
             .filter(|session| session.state == "active")
             .count();
         let protocols = self.protocol_snapshots(&ingest_session_records, now_ms);
+        let streams = self.stream_snapshots(now_ms);
         let mut recent_ingest_sessions = ingest_session_records
             .into_iter()
             .map(|session| IngestSessionSnapshot::from_record(session, now_ms))
@@ -1645,8 +1704,47 @@ impl IngestTelemetry {
                 ended: self.ingest_sessions_ended.load(Ordering::Relaxed),
                 recent: recent_ingest_sessions,
             },
+            streams,
             protocols,
         }
+    }
+
+    fn update_stream_runtime(
+        &self,
+        stream_id: u64,
+        update: impl FnOnce(&mut ContribStreamRuntimeRecord),
+    ) {
+        if let Ok(mut records) = self.stream_runtime.lock() {
+            let record = records
+                .entry(stream_id)
+                .or_insert_with(|| ContribStreamRuntimeRecord {
+                    stream_id_text: stream_id.to_string(),
+                    ..ContribStreamRuntimeRecord::default()
+                });
+            update(record);
+        }
+    }
+
+    fn stream_snapshots(&self, now_ms: u64) -> Vec<ContribStreamRuntimeSnapshot> {
+        let mut snapshots = self
+            .stream_runtime
+            .lock()
+            .map(|records| {
+                records
+                    .values()
+                    .cloned()
+                    .map(|record| ContribStreamRuntimeSnapshot::from_record(record, now_ms))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        snapshots.sort_by(|left, right| {
+            right
+                .last_seen_unix_ms()
+                .cmp(&left.last_seen_unix_ms())
+                .then_with(|| left.stream_id_text.cmp(&right.stream_id_text))
+        });
+        snapshots.truncate(CONTRIB_INGEST_SESSION_LIMIT);
+        snapshots
     }
 
     fn protocol_snapshots(
@@ -1758,6 +1856,30 @@ struct ProtocolRuntimeRecord {
     units: u64,
     bytes: u64,
     last_seen_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContribStreamRuntimeRecord {
+    stream_id_text: String,
+    input_units: u64,
+    input_bytes: u64,
+    mesh_payloads: u64,
+    mesh_payload_bytes: u64,
+    mesh_datagrams: u64,
+    mesh_datagram_bytes: u64,
+    mesh_errors: u64,
+    fmp4_parts: u64,
+    fmp4_bytes: u64,
+    fmp4_init_bytes: u64,
+    fmp4_publish_errors: u64,
+    latest_fmp4_sequence: Option<u64>,
+    video_parts: u64,
+    video_access_units: u64,
+    audio_parts: u64,
+    audio_access_units: u64,
+    last_input_unix_ms: Option<u64>,
+    last_mesh_forward_unix_ms: Option<u64>,
+    last_fmp4_unix_ms: Option<u64>,
 }
 
 fn nonzero_unix_ms(value: u64) -> Option<u64> {
@@ -2101,6 +2223,7 @@ struct IngestRuntimeSnapshot {
     fmp4: Fmp4RuntimeSnapshot,
     hls: HlsRuntimeSnapshot,
     ingest_sessions: IngestSessionsRuntimeSnapshot,
+    streams: Vec<ContribStreamRuntimeSnapshot>,
     protocols: Vec<ProtocolRuntimeSnapshot>,
 }
 
@@ -2229,6 +2352,93 @@ struct IngestSessionsRuntimeSnapshot {
     started: u64,
     ended: u64,
     recent: Vec<IngestSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContribStreamRuntimeSnapshot {
+    stream_id_text: String,
+    state: &'static str,
+    input_units: u64,
+    input_bytes: u64,
+    mesh_payloads: u64,
+    mesh_payload_bytes: u64,
+    mesh_datagrams: u64,
+    mesh_datagram_bytes: u64,
+    mesh_errors: u64,
+    fmp4_parts: u64,
+    fmp4_bytes: u64,
+    fmp4_init_bytes: u64,
+    fmp4_publish_errors: u64,
+    latest_fmp4_sequence: Option<u64>,
+    video_parts: u64,
+    video_access_units: u64,
+    audio_parts: u64,
+    audio_access_units: u64,
+    last_input_unix_ms: Option<u64>,
+    last_input_age_ms: Option<u64>,
+    last_mesh_forward_unix_ms: Option<u64>,
+    last_mesh_forward_age_ms: Option<u64>,
+    last_fmp4_unix_ms: Option<u64>,
+    last_fmp4_age_ms: Option<u64>,
+}
+
+impl ContribStreamRuntimeSnapshot {
+    fn from_record(record: ContribStreamRuntimeRecord, now_ms: u64) -> Self {
+        let state = if record.mesh_errors > 0 || record.fmp4_publish_errors > 0 {
+            "degraded"
+        } else if record.fmp4_parts > 0 {
+            "publishing"
+        } else if record.mesh_payloads > 0 {
+            "forwarding"
+        } else if record.input_units > 0 {
+            "ingesting"
+        } else {
+            "waiting"
+        };
+        Self {
+            stream_id_text: record.stream_id_text,
+            state,
+            input_units: record.input_units,
+            input_bytes: record.input_bytes,
+            mesh_payloads: record.mesh_payloads,
+            mesh_payload_bytes: record.mesh_payload_bytes,
+            mesh_datagrams: record.mesh_datagrams,
+            mesh_datagram_bytes: record.mesh_datagram_bytes,
+            mesh_errors: record.mesh_errors,
+            fmp4_parts: record.fmp4_parts,
+            fmp4_bytes: record.fmp4_bytes,
+            fmp4_init_bytes: record.fmp4_init_bytes,
+            fmp4_publish_errors: record.fmp4_publish_errors,
+            latest_fmp4_sequence: record.latest_fmp4_sequence,
+            video_parts: record.video_parts,
+            video_access_units: record.video_access_units,
+            audio_parts: record.audio_parts,
+            audio_access_units: record.audio_access_units,
+            last_input_age_ms: record
+                .last_input_unix_ms
+                .map(|seen| now_ms.saturating_sub(seen)),
+            last_input_unix_ms: record.last_input_unix_ms,
+            last_mesh_forward_age_ms: record
+                .last_mesh_forward_unix_ms
+                .map(|seen| now_ms.saturating_sub(seen)),
+            last_mesh_forward_unix_ms: record.last_mesh_forward_unix_ms,
+            last_fmp4_age_ms: record
+                .last_fmp4_unix_ms
+                .map(|seen| now_ms.saturating_sub(seen)),
+            last_fmp4_unix_ms: record.last_fmp4_unix_ms,
+        }
+    }
+
+    fn last_seen_unix_ms(&self) -> Option<u64> {
+        [
+            self.last_input_unix_ms,
+            self.last_mesh_forward_unix_ms,
+            self.last_fmp4_unix_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3122,6 +3332,32 @@ mod tests {
         assert_eq!(snapshot.runtime.fmp4.audio_codec, Some("aac"));
         assert_eq!(snapshot.runtime.fmp4.audio_parts, 1);
         assert_eq!(snapshot.runtime.fmp4.audio_access_units, 1);
+        let raw_stream = snapshot
+            .runtime
+            .streams
+            .iter()
+            .find(|stream| stream.stream_id_text == "9007199254741993")
+            .expect("missing raw HTTP stream runtime");
+        assert_eq!(raw_stream.state, "forwarding");
+        assert_eq!(raw_stream.input_units, 2);
+        assert_eq!(raw_stream.input_bytes, 6144);
+        assert_eq!(raw_stream.mesh_payloads, 2);
+        assert_eq!(raw_stream.mesh_payload_bytes, 6144);
+        assert_eq!(raw_stream.mesh_datagrams, 9);
+        assert_eq!(raw_stream.mesh_datagram_bytes, 9216);
+        let fmp4_stream = snapshot
+            .runtime
+            .streams
+            .iter()
+            .find(|stream| stream.stream_id_text == "9007199254741994")
+            .expect("missing fMP4 stream runtime");
+        assert_eq!(fmp4_stream.state, "publishing");
+        assert_eq!(fmp4_stream.fmp4_parts, 1);
+        assert_eq!(fmp4_stream.fmp4_bytes, 8192);
+        assert_eq!(fmp4_stream.fmp4_init_bytes, 512);
+        assert_eq!(fmp4_stream.latest_fmp4_sequence, Some(9));
+        assert_eq!(fmp4_stream.video_parts, 1);
+        assert_eq!(fmp4_stream.audio_parts, 1);
         assert_eq!(snapshot.status, "active");
         assert_eq!(snapshot.health.state, "active");
         assert!(snapshot.health.input_seen);
