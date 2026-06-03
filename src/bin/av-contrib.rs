@@ -1129,6 +1129,8 @@ impl IngestTelemetry {
             message: message.clone(),
             count: errors,
             last_seen_unix_ms: Some(now),
+            stream_id_text: Some(stream_id.to_string()),
+            protocol: None,
         });
         self.push_activity(ContribActivity {
             level: "warn",
@@ -1388,6 +1390,8 @@ impl IngestTelemetry {
             ),
             count: 1,
             last_seen_unix_ms: Some(now),
+            stream_id_text: Some(stream_id.to_string()),
+            protocol: None,
         });
         self.push_activity(ContribActivity {
             level: "warn",
@@ -1974,6 +1978,8 @@ impl ContribStatusConfig {
                 message: "No RIST, SRT, or RTMP listener is enabled; raw HTTP byte ingest remains available.".to_owned(),
                 count: 1,
                 last_seen_unix_ms: None,
+                stream_id_text: None,
+                protocol: None,
             });
         }
 
@@ -2006,7 +2012,11 @@ impl ContribStatusConfig {
         let runtime = self.telemetry.snapshot();
         let health = derive_contrib_health(&runtime, &self.hls);
         let mut alerts = self.alerts.clone();
-        alerts.extend(derive_contrib_alerts(&health, &runtime));
+        alerts.extend(derive_contrib_alerts(
+            &health,
+            &runtime,
+            &self.advertised_hls_stream_id,
+        ));
         alerts.extend(self.telemetry.recent_alerts());
         ContribStatusSnapshot {
             service: "av-contrib",
@@ -2125,6 +2135,7 @@ fn derive_contrib_health(runtime: &IngestRuntimeSnapshot, hls: &HlsStatus) -> Co
 fn derive_contrib_alerts(
     health: &ContribHealthStatus,
     runtime: &IngestRuntimeSnapshot,
+    advertised_hls_stream_id: &str,
 ) -> Vec<ContribAlert> {
     let now = now_unix_ms();
     let mut alerts = Vec::new();
@@ -2136,6 +2147,8 @@ fn derive_contrib_alerts(
             message: "No contributor input has been observed yet.".to_owned(),
             count: 1,
             last_seen_unix_ms: Some(now),
+            stream_id_text: Some(advertised_hls_stream_id.to_owned()),
+            protocol: None,
         });
     }
 
@@ -2152,6 +2165,8 @@ fn derive_contrib_alerts(
                 .last_output_age_ms
                 .and_then(|age_ms| now.checked_sub(age_ms))
                 .or(Some(now)),
+            stream_id_text: Some(advertised_hls_stream_id.to_owned()),
+            protocol: None,
         });
     }
 
@@ -2168,6 +2183,8 @@ fn derive_contrib_alerts(
                 .last_fmp4_input_age_ms
                 .and_then(|age_ms| now.checked_sub(age_ms))
                 .or(Some(now)),
+            stream_id_text: Some(advertised_hls_stream_id.to_owned()),
+            protocol: None,
         });
     }
 
@@ -2195,6 +2212,8 @@ fn derive_contrib_alerts(
             ),
             count: runtime.hls.response_errors,
             last_seen_unix_ms: last_seen,
+            stream_id_text: Some(advertised_hls_stream_id.to_owned()),
+            protocol: None,
         });
     }
 
@@ -2217,6 +2236,8 @@ fn derive_contrib_alerts(
             ),
             count: mpeg_ts_errors,
             last_seen_unix_ms: runtime.mpeg_ts.last_error_unix_ms,
+            stream_id_text: None,
+            protocol: Some("mpeg-ts"),
         });
     }
 
@@ -2600,6 +2621,10 @@ struct ContribAlert {
     message: String,
     count: u64,
     last_seen_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_id_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3327,10 +3352,13 @@ mod tests {
         assert_eq!(srt_protocol.units, 1);
         assert_eq!(srt_protocol.bytes, 1316);
         assert!(srt_protocol.last_seen_age_ms.is_some());
-        assert!(snapshot
-            .alerts
-            .iter()
-            .any(|alert| alert.code == "mpeg_ts_input_damage"));
+        assert!(
+            snapshot
+                .alerts
+                .iter()
+                .any(|alert| alert.code == "mpeg_ts_input_damage"
+                    && alert.protocol == Some("mpeg-ts"))
+        );
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
         let rtmp_protocol = snapshot
             .runtime
@@ -3411,6 +3439,7 @@ mod tests {
     #[test]
     fn contrib_status_reports_waiting_stalled_and_stale_health() {
         let args = contrib_status_args();
+        let stream_id_text = args.stream_id.to_string();
         let telemetry = Arc::new(IngestTelemetry::default());
         let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
 
@@ -3421,7 +3450,8 @@ mod tests {
         assert!(waiting
             .alerts
             .iter()
-            .any(|alert| alert.code == "waiting_for_input"));
+            .any(|alert| alert.code == "waiting_for_input"
+                && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
 
         telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
         telemetry.mpeg_ts_last_unix_ms.store(
@@ -3435,7 +3465,8 @@ mod tests {
         assert!(stalled
             .alerts
             .iter()
-            .any(|alert| alert.code == "fmp4_input_without_output"));
+            .any(|alert| alert.code == "fmp4_input_without_output"
+                && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
 
         telemetry.record_fmp4_part(args.srt_stream_id, 1, 12, 4096, 512);
         telemetry.fmp4_last_publish_unix_ms.store(
@@ -3448,12 +3479,14 @@ mod tests {
         assert!(stale
             .alerts
             .iter()
-            .any(|alert| alert.code == "fmp4_output_stale"));
+            .any(|alert| alert.code == "fmp4_output_stale"
+                && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
     }
 
     #[test]
     fn contrib_status_reports_hls_response_errors() {
         let args = contrib_status_args();
+        let stream_id_text = args.stream_id.to_string();
         let telemetry = Arc::new(IngestTelemetry::default());
         let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
         let hls_response = response(StatusCode::NOT_FOUND, None, None);
@@ -3477,7 +3510,8 @@ mod tests {
         assert!(snapshot
             .alerts
             .iter()
-            .any(|alert| alert.code == "hls_response_errors"));
+            .any(|alert| alert.code == "hls_response_errors"
+                && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
         assert!(snapshot
             .activity
             .iter()
@@ -3487,6 +3521,7 @@ mod tests {
     #[test]
     fn contrib_status_reports_mesh_forward_errors() {
         let args = contrib_status_args();
+        let stream_id_text = args.stream_id.to_string();
         let telemetry = Arc::new(IngestTelemetry::default());
         let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
 
@@ -3504,7 +3539,8 @@ mod tests {
         assert!(snapshot
             .alerts
             .iter()
-            .any(|alert| alert.code == "mesh_forward_error"));
+            .any(|alert| alert.code == "mesh_forward_error"
+                && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
         assert!(snapshot
             .activity
             .iter()
