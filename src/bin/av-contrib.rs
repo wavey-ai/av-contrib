@@ -68,6 +68,7 @@ const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 const CONTRIB_ACTIVITY_LIMIT: usize = 64;
+const CONTRIB_MIN_STALE_OUTPUT_MS: u64 = 5_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1078,6 +1079,10 @@ fn age_from_atomic_ms(now_ms: u64, value: &AtomicU64) -> Option<u64> {
     nonzero_unix_ms(value.load(Ordering::Relaxed)).map(|then| now_ms.saturating_sub(then))
 }
 
+fn youngest_age(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values.into_iter().flatten().min()
+}
+
 #[derive(Debug, Clone)]
 struct ContribStatusConfig {
     default_stream_id: String,
@@ -1137,16 +1142,13 @@ impl ContribStatusConfig {
 
     fn snapshot(&self) -> ContribStatusSnapshot {
         let runtime = self.telemetry.snapshot();
+        let health = derive_contrib_health(&runtime, &self.hls);
         let mut alerts = self.alerts.clone();
+        alerts.extend(derive_contrib_alerts(&health));
         alerts.extend(self.telemetry.recent_alerts());
-        let status = if runtime.fmp4.publish_errors > 0 {
-            "degraded"
-        } else {
-            "ok"
-        };
         ContribStatusSnapshot {
             service: "av-contrib",
-            status,
+            status: health.state,
             updated_unix_ms: now_unix_ms(),
             default_stream_id: self.default_stream_id.clone(),
             advertised_hls_stream_id: self.advertised_hls_stream_id.clone(),
@@ -1157,6 +1159,7 @@ impl ContribStatusConfig {
             listeners: self.listeners.clone(),
             runtime,
             alerts,
+            health,
             activity: self.telemetry.recent_activity(),
         }
     }
@@ -1187,7 +1190,121 @@ struct ContribStatusSnapshot {
     listeners: Vec<ListenerStatus>,
     runtime: IngestRuntimeSnapshot,
     alerts: Vec<ContribAlert>,
+    health: ContribHealthStatus,
     activity: Vec<ContribActivity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContribHealthStatus {
+    state: &'static str,
+    stale_threshold_ms: u64,
+    input_seen: bool,
+    fmp4_input_seen: bool,
+    output_seen: bool,
+    last_input_age_ms: Option<u64>,
+    last_fmp4_input_age_ms: Option<u64>,
+    last_output_age_ms: Option<u64>,
+}
+
+fn derive_contrib_health(runtime: &IngestRuntimeSnapshot, hls: &HlsStatus) -> ContribHealthStatus {
+    let stale_threshold_ms = u64::from(hls.segment_target_ms)
+        .saturating_mul(3)
+        .max(CONTRIB_MIN_STALE_OUTPUT_MS);
+    let input_seen = runtime.raw_http.requests > 0
+        || runtime.media_access_units.requests > 0
+        || runtime.mpeg_ts.slots > 0
+        || runtime.rtmp.access_units > 0;
+    let fmp4_input_seen = runtime.mpeg_ts.slots > 0 || runtime.rtmp.access_units > 0;
+    let output_seen = runtime.fmp4.parts > 0;
+    let last_input_age_ms = youngest_age([
+        runtime.raw_http.last_seen_age_ms,
+        runtime.media_access_units.last_seen_age_ms,
+        runtime.mpeg_ts.last_seen_age_ms,
+        runtime.rtmp.last_seen_age_ms,
+    ]);
+    let last_fmp4_input_age_ms = youngest_age([
+        runtime.mpeg_ts.last_seen_age_ms,
+        runtime.rtmp.last_seen_age_ms,
+    ]);
+    let output_is_stale = runtime
+        .fmp4
+        .last_publish_age_ms
+        .is_some_and(|age_ms| age_ms > stale_threshold_ms);
+    let fmp4_input_is_stale =
+        last_fmp4_input_age_ms.is_some_and(|age_ms| age_ms > stale_threshold_ms);
+    let state = if runtime.fmp4.publish_errors > 0 {
+        "degraded"
+    } else if output_seen && output_is_stale {
+        "stale"
+    } else if fmp4_input_seen && !output_seen && fmp4_input_is_stale {
+        "stalled"
+    } else if output_seen {
+        "active"
+    } else if input_seen {
+        "ingesting"
+    } else {
+        "waiting"
+    };
+
+    ContribHealthStatus {
+        state,
+        stale_threshold_ms,
+        input_seen,
+        fmp4_input_seen,
+        output_seen,
+        last_input_age_ms,
+        last_fmp4_input_age_ms,
+        last_output_age_ms: runtime.fmp4.last_publish_age_ms,
+    }
+}
+
+fn derive_contrib_alerts(health: &ContribHealthStatus) -> Vec<ContribAlert> {
+    let now = now_unix_ms();
+    let mut alerts = Vec::new();
+
+    if !health.input_seen {
+        alerts.push(ContribAlert {
+            level: "info",
+            code: "waiting_for_input",
+            message: "No contributor input has been observed yet.".to_owned(),
+            count: 1,
+            last_seen_unix_ms: Some(now),
+        });
+    }
+
+    if health.state == "stale" {
+        alerts.push(ContribAlert {
+            level: "warn",
+            code: "fmp4_output_stale",
+            message: format!(
+                "fMP4 output has not published for more than {} ms.",
+                health.stale_threshold_ms
+            ),
+            count: 1,
+            last_seen_unix_ms: health
+                .last_output_age_ms
+                .and_then(|age_ms| now.checked_sub(age_ms))
+                .or(Some(now)),
+        });
+    }
+
+    if health.state == "stalled" {
+        alerts.push(ContribAlert {
+            level: "warn",
+            code: "fmp4_input_without_output",
+            message: format!(
+                "MPEG-TS/RTMP input was observed, but no fMP4 output published within {} ms.",
+                health.stale_threshold_ms
+            ),
+            count: 1,
+            last_seen_unix_ms: health
+                .last_fmp4_input_age_ms
+                .and_then(|age_ms| now.checked_sub(age_ms))
+                .or(Some(now)),
+        });
+    }
+
+    alerts
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1925,6 +2042,33 @@ mod tests {
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
     }
 
+    fn contrib_status_args() -> Args {
+        Args {
+            http_port: 0,
+            cert: None,
+            key: None,
+            mesh_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_001)),
+            mesh_media_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_101)),
+            stream_id: 1,
+            rist_stream_id: 1,
+            srt_stream_id: 1,
+            rtmp_stream_id: 1,
+            repair_symbols: 3,
+            symbol_size: DEFAULT_SYMBOL_SIZE,
+            rist_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_000))),
+            rist_profile: RistProfile::Main,
+            rist_backend: RistBackend::Pure,
+            rist_flow_id: DEFAULT_FLOW_ID,
+            srt_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_001))),
+            rtmp_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 19_350))),
+            fmp4_part_ms: 50,
+            fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
+            playlist_count: 65,
+            playlist_buffer_kb: 800,
+        }
+    }
+
     #[test]
     fn contrib_status_uses_browser_safe_stream_ids() {
         let args = Args {
@@ -1981,6 +2125,10 @@ mod tests {
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
         assert_eq!(snapshot.runtime.fmp4.parts, 1);
         assert_eq!(snapshot.runtime.fmp4.init_bytes, 512);
+        assert_eq!(snapshot.status, "active");
+        assert_eq!(snapshot.health.state, "active");
+        assert!(snapshot.health.input_seen);
+        assert!(snapshot.health.output_seen);
         assert!(snapshot
             .activity
             .iter()
@@ -2001,6 +2149,49 @@ mod tests {
         assert!(rist.enabled);
         assert_eq!(rist.output_stream_id, "9007199254741994");
         assert_eq!(rist.flow_id.as_deref(), Some("0x11223344"));
+    }
+
+    #[test]
+    fn contrib_status_reports_waiting_stalled_and_stale_health() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
+
+        let waiting = status_config.snapshot();
+        assert_eq!(waiting.status, "waiting");
+        assert_eq!(waiting.health.state, "waiting");
+        assert!(!waiting.health.input_seen);
+        assert!(waiting
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "waiting_for_input"));
+
+        telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
+        telemetry.mpeg_ts_last_unix_ms.store(
+            now_unix_ms().saturating_sub(waiting.health.stale_threshold_ms + 1),
+            Ordering::Relaxed,
+        );
+        let stalled = status_config.snapshot();
+        assert_eq!(stalled.status, "stalled");
+        assert!(stalled.health.fmp4_input_seen);
+        assert!(!stalled.health.output_seen);
+        assert!(stalled
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "fmp4_input_without_output"));
+
+        telemetry.record_fmp4_part(args.srt_stream_id, 1, 12, 4096, 512);
+        telemetry.fmp4_last_publish_unix_ms.store(
+            now_unix_ms().saturating_sub(stalled.health.stale_threshold_ms + 1),
+            Ordering::Relaxed,
+        );
+        let stale = status_config.snapshot();
+        assert_eq!(stale.status, "stale");
+        assert!(stale.health.output_seen);
+        assert!(stale
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "fmp4_output_stale"));
     }
 
     #[tokio::test]
