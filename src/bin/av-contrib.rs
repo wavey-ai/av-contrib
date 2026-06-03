@@ -68,6 +68,7 @@ const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 const CONTRIB_ACTIVITY_LIMIT: usize = 64;
+const CONTRIB_HLS_RESPONSE_LIMIT: usize = 32;
 const CONTRIB_MIN_STALE_OUTPUT_MS: u64 = 5_000;
 
 #[derive(Debug, Parser)]
@@ -804,6 +805,11 @@ struct IngestTelemetry {
     fmp4_init_bytes: AtomicU64,
     fmp4_publish_errors: AtomicU64,
     fmp4_last_publish_unix_ms: AtomicU64,
+    hls_responses_total: AtomicU64,
+    hls_response_errors: AtomicU64,
+    hls_response_not_found: AtomicU64,
+    hls_last_response_unix_ms: AtomicU64,
+    recent_hls_responses: StdMutex<VecDeque<ContribHlsResponse>>,
     recent_alerts: StdMutex<VecDeque<ContribAlert>>,
     recent_activity: StdMutex<VecDeque<ContribActivity>>,
 }
@@ -979,6 +985,56 @@ impl IngestTelemetry {
         });
     }
 
+    fn record_hls_response(
+        &self,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        response: &HandlerResponse,
+    ) {
+        let unix_ms = now_unix_ms();
+        let status = response.status.as_u16();
+        let bytes = response
+            .body
+            .as_ref()
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        let responses = self.hls_responses_total.fetch_add(1, Ordering::Relaxed) + 1;
+        if response.status.is_client_error() || response.status.is_server_error() {
+            self.hls_response_errors.fetch_add(1, Ordering::Relaxed);
+            self.push_activity(ContribActivity {
+                level: if status >= 500 { "error" } else { "warn" },
+                code: "hls_response_error",
+                message: format!("HLS request {method} {path} returned HTTP {status}."),
+                stream_id_text: None,
+                bytes: Some(bytes),
+                datagrams: None,
+                sequence: Some(responses),
+                seen_unix_ms: unix_ms,
+            });
+        }
+        if response.status == StatusCode::NOT_FOUND {
+            self.hls_response_not_found.fetch_add(1, Ordering::Relaxed);
+        }
+        self.hls_last_response_unix_ms
+            .store(unix_ms, Ordering::Relaxed);
+
+        if let Ok(mut recent) = self.recent_hls_responses.lock() {
+            recent.push_front(ContribHlsResponse {
+                unix_ms,
+                method: method.as_str().into(),
+                path: path.into(),
+                query: query.map(ToOwned::to_owned),
+                status,
+                bytes,
+                content_type: response.content_type.clone(),
+            });
+            while recent.len() > CONTRIB_HLS_RESPONSE_LIMIT {
+                recent.pop_back();
+            }
+        }
+    }
+
     fn snapshot(&self) -> IngestRuntimeSnapshot {
         let now_ms = now_unix_ms();
         IngestRuntimeSnapshot {
@@ -1022,6 +1078,20 @@ impl IngestTelemetry {
                     self.fmp4_last_publish_unix_ms.load(Ordering::Relaxed),
                 ),
                 last_publish_age_ms: age_from_atomic_ms(now_ms, &self.fmp4_last_publish_unix_ms),
+            },
+            hls: HlsRuntimeSnapshot {
+                responses_total: self.hls_responses_total.load(Ordering::Relaxed),
+                response_errors: self.hls_response_errors.load(Ordering::Relaxed),
+                response_not_found: self.hls_response_not_found.load(Ordering::Relaxed),
+                last_response_unix_ms: nonzero_unix_ms(
+                    self.hls_last_response_unix_ms.load(Ordering::Relaxed),
+                ),
+                last_response_age_ms: age_from_atomic_ms(now_ms, &self.hls_last_response_unix_ms),
+                recent_responses: self
+                    .recent_hls_responses
+                    .lock()
+                    .map(|responses| responses.iter().cloned().collect())
+                    .unwrap_or_default(),
             },
         }
     }
@@ -1144,7 +1214,7 @@ impl ContribStatusConfig {
         let runtime = self.telemetry.snapshot();
         let health = derive_contrib_health(&runtime, &self.hls);
         let mut alerts = self.alerts.clone();
-        alerts.extend(derive_contrib_alerts(&health));
+        alerts.extend(derive_contrib_alerts(&health, &runtime));
         alerts.extend(self.telemetry.recent_alerts());
         ContribStatusSnapshot {
             service: "av-contrib",
@@ -1258,7 +1328,10 @@ fn derive_contrib_health(runtime: &IngestRuntimeSnapshot, hls: &HlsStatus) -> Co
     }
 }
 
-fn derive_contrib_alerts(health: &ContribHealthStatus) -> Vec<ContribAlert> {
+fn derive_contrib_alerts(
+    health: &ContribHealthStatus,
+    runtime: &IngestRuntimeSnapshot,
+) -> Vec<ContribAlert> {
     let now = now_unix_ms();
     let mut alerts = Vec::new();
 
@@ -1304,6 +1377,33 @@ fn derive_contrib_alerts(health: &ContribHealthStatus) -> Vec<ContribAlert> {
         });
     }
 
+    if runtime.hls.response_errors > 0 {
+        let latest_error = runtime
+            .hls
+            .recent_responses
+            .iter()
+            .find(|response| response.status >= 400);
+        let (status, path, last_seen) = latest_error
+            .map(|response| {
+                (
+                    response.status,
+                    response.path.clone(),
+                    Some(response.unix_ms),
+                )
+            })
+            .unwrap_or((0, "unknown HLS path".to_owned(), Some(now)));
+        alerts.push(ContribAlert {
+            level: if status >= 500 { "error" } else { "warn" },
+            code: "hls_response_errors",
+            message: format!(
+                "Contributor LL-HLS has returned {} non-success response(s); latest was HTTP {status} for {path}.",
+                runtime.hls.response_errors
+            ),
+            count: runtime.hls.response_errors,
+            last_seen_unix_ms: last_seen,
+        });
+    }
+
     alerts
 }
 
@@ -1314,6 +1414,7 @@ struct IngestRuntimeSnapshot {
     mpeg_ts: MpegTsRuntimeSnapshot,
     rtmp: RtmpRuntimeSnapshot,
     fmp4: Fmp4RuntimeSnapshot,
+    hls: HlsRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1359,6 +1460,29 @@ struct Fmp4RuntimeSnapshot {
     publish_errors: u64,
     last_publish_unix_ms: Option<u64>,
     last_publish_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HlsRuntimeSnapshot {
+    responses_total: u64,
+    response_errors: u64,
+    response_not_found: u64,
+    last_response_unix_ms: Option<u64>,
+    last_response_age_ms: Option<u64>,
+    recent_responses: Vec<ContribHlsResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContribHlsResponse {
+    unix_ms: u64,
+    method: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    status: u16,
+    bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1488,6 +1612,9 @@ impl ContribRouter {
         let query = req.uri().query().map(ToOwned::to_owned);
         let response = self.hls_router.route(req).await?;
         log_hls_response(&method, &path, query.as_deref(), response.status);
+        self.status
+            .telemetry
+            .record_hls_response(&method, &path, query.as_deref(), &response);
         Ok(response)
     }
 }
@@ -2192,6 +2319,39 @@ mod tests {
             .alerts
             .iter()
             .any(|alert| alert.code == "fmp4_output_stale"));
+    }
+
+    #[test]
+    fn contrib_status_reports_hls_response_errors() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
+        let hls_response = response(StatusCode::NOT_FOUND, None, None);
+
+        telemetry.record_hls_response(
+            &Method::GET,
+            "/1/stream.m3u8",
+            Some("_HLS_msn=12&_HLS_part=1"),
+            &hls_response,
+        );
+        let snapshot = status_config.snapshot();
+
+        assert_eq!(snapshot.runtime.hls.responses_total, 1);
+        assert_eq!(snapshot.runtime.hls.response_errors, 1);
+        assert_eq!(snapshot.runtime.hls.response_not_found, 1);
+        assert_eq!(
+            snapshot.runtime.hls.recent_responses[0].path,
+            "/1/stream.m3u8"
+        );
+        assert_eq!(snapshot.runtime.hls.recent_responses[0].status, 404);
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "hls_response_errors"));
+        assert!(snapshot
+            .activity
+            .iter()
+            .any(|activity| activity.code == "hls_response_error"));
     }
 
     #[tokio::test]
