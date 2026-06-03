@@ -580,6 +580,10 @@ fn print_ready(args: &Args) {
         args.host, args.us_http_port, args.stream_id
     );
     println!(
+        "[orchestrator] contrib status: https://{}:{}/api/status",
+        args.host, args.contrib_http_port
+    );
+    println!(
         "[orchestrator] LL-HLS part target: {}ms (override with AV_LL_HLS_PART_MS or --part-ms)",
         args.part_ms
     );

@@ -39,6 +39,7 @@ use web_service::{
 
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
+const CONTRIB_STATUS_PATH: &str = "/api/status";
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 
@@ -727,10 +728,189 @@ fn rtmp_output_stream_id(
     }
 }
 
+fn advertised_hls_stream_id(args: &Args) -> u64 {
+    if args.rist_bind.is_some() {
+        args.rist_stream_id
+    } else if args.srt_bind.is_some() {
+        args.srt_stream_id
+    } else if args.rtmp_bind.is_some() {
+        args.rtmp_stream_id
+    } else {
+        args.stream_id
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContribStatusConfig {
+    default_stream_id: String,
+    advertised_hls_stream_id: String,
+    advertised_hls_path: String,
+    mesh: MeshTargetStatus,
+    hls: HlsStatus,
+    fec: FecStatus,
+    listeners: Vec<ListenerStatus>,
+    alerts: Vec<ContribAlert>,
+}
+
+impl ContribStatusConfig {
+    fn from_args(args: &Args) -> Self {
+        let advertised_hls_stream_id = advertised_hls_stream_id(args);
+        let mut listeners = Vec::with_capacity(3);
+        listeners.push(ListenerStatus::rist(args));
+        listeners.push(ListenerStatus::srt(args));
+        listeners.push(ListenerStatus::rtmp(args));
+
+        let mut alerts = Vec::new();
+        if listeners.iter().all(|listener| !listener.enabled) {
+            alerts.push(ContribAlert {
+                level: "info",
+                code: "raw_ingest_only",
+                message: "No RIST, SRT, or RTMP listener is enabled; raw HTTP byte ingest remains available.".to_owned(),
+            });
+        }
+
+        Self {
+            default_stream_id: args.stream_id.to_string(),
+            advertised_hls_stream_id: advertised_hls_stream_id.to_string(),
+            advertised_hls_path: format!("/{advertised_hls_stream_id}/stream.m3u8"),
+            mesh: MeshTargetStatus {
+                byte_fec_target: args.mesh_fec_target.to_string(),
+                media_fec_target: args.mesh_media_fec_target.to_string(),
+            },
+            hls: HlsStatus {
+                part_target_ms: args.fmp4_part_ms,
+                segment_target_ms: args.fmp4_segment_ms,
+                playlist_target_duration_ms: args.hls_target_duration_ms,
+                playlist_count: args.playlist_count,
+                playlist_buffer_kb: args.playlist_buffer_kb,
+            },
+            fec: FecStatus {
+                repair_symbols: args.repair_symbols,
+                symbol_size: args.symbol_size,
+            },
+            listeners,
+            alerts,
+        }
+    }
+
+    fn snapshot(&self) -> ContribStatusSnapshot {
+        ContribStatusSnapshot {
+            service: "av-contrib",
+            status: "ok",
+            updated_unix_ms: now_unix_ms(),
+            default_stream_id: self.default_stream_id.clone(),
+            advertised_hls_stream_id: self.advertised_hls_stream_id.clone(),
+            advertised_hls_path: self.advertised_hls_path.clone(),
+            mesh: self.mesh.clone(),
+            hls: self.hls.clone(),
+            fec: self.fec.clone(),
+            listeners: self.listeners.clone(),
+            alerts: self.alerts.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContribStatusSnapshot {
+    service: &'static str,
+    status: &'static str,
+    updated_unix_ms: u64,
+    default_stream_id: String,
+    advertised_hls_stream_id: String,
+    advertised_hls_path: String,
+    mesh: MeshTargetStatus,
+    hls: HlsStatus,
+    fec: FecStatus,
+    listeners: Vec<ListenerStatus>,
+    alerts: Vec<ContribAlert>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MeshTargetStatus {
+    byte_fec_target: String,
+    media_fec_target: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HlsStatus {
+    part_target_ms: u32,
+    segment_target_ms: u32,
+    playlist_target_duration_ms: u32,
+    playlist_count: usize,
+    playlist_buffer_kb: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FecStatus {
+    repair_symbols: u32,
+    symbol_size: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ListenerStatus {
+    protocol: &'static str,
+    enabled: bool,
+    bind: Option<String>,
+    output_stream_id: String,
+    output_hls_path: String,
+    backend: Option<&'static str>,
+    profile: Option<&'static str>,
+    flow_id: Option<String>,
+}
+
+impl ListenerStatus {
+    fn rist(args: &Args) -> Self {
+        Self {
+            protocol: "rist",
+            enabled: args.rist_bind.is_some(),
+            bind: args.rist_bind.map(|bind| bind.to_string()),
+            output_stream_id: args.rist_stream_id.to_string(),
+            output_hls_path: format!("/{}/stream.m3u8", args.rist_stream_id),
+            backend: Some(args.rist_backend.as_str()),
+            profile: Some(args.rist_profile.as_str()),
+            flow_id: Some(format!("0x{:08x}", args.rist_flow_id)),
+        }
+    }
+
+    fn srt(args: &Args) -> Self {
+        Self {
+            protocol: "srt",
+            enabled: args.srt_bind.is_some(),
+            bind: args.srt_bind.map(|bind| bind.to_string()),
+            output_stream_id: args.srt_stream_id.to_string(),
+            output_hls_path: format!("/{}/stream.m3u8", args.srt_stream_id),
+            backend: None,
+            profile: None,
+            flow_id: None,
+        }
+    }
+
+    fn rtmp(args: &Args) -> Self {
+        Self {
+            protocol: "rtmp",
+            enabled: args.rtmp_bind.is_some(),
+            bind: args.rtmp_bind.map(|bind| bind.to_string()),
+            output_stream_id: args.rtmp_stream_id.to_string(),
+            output_hls_path: format!("/{}/stream.m3u8", args.rtmp_stream_id),
+            backend: None,
+            profile: None,
+            flow_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContribAlert {
+    level: &'static str,
+    code: &'static str,
+    message: String,
+}
+
 struct ContribRouter {
     forwarder: Arc<MeshForwarder>,
     default_stream_id: u64,
     hls_router: Arc<HlsRouter>,
+    status: Arc<ContribStatusConfig>,
 }
 
 impl ContribRouter {
@@ -738,11 +918,13 @@ impl ContribRouter {
         forwarder: Arc<MeshForwarder>,
         default_stream_id: u64,
         hls_router: Arc<HlsRouter>,
+        status: Arc<ContribStatusConfig>,
     ) -> Self {
         Self {
             forwarder,
             default_stream_id,
             hls_router,
+            status,
         }
     }
 
@@ -793,10 +975,19 @@ impl Router for ContribRouter {
             "/" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(
-                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /up checks health\n",
+                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /api/status returns service status for dashboards\nGET /up checks health\n",
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
+            CONTRIB_STATUS_PATH => {
+                let json = serde_json::to_vec(&self.status.snapshot())
+                    .map_err(|err| ServerError::Handler(Box::new(err)))?;
+                Ok(response(
+                    StatusCode::OK,
+                    Some(Bytes::from(json)),
+                    Some("application/json"),
+                ))
+            }
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -963,6 +1154,7 @@ async fn main() -> Result<()> {
     let (playlists, chunk_cache, m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
     let hls_router =
         Arc::new(HlsRouter::new().add_handler(Box::new(HlsHandler::new(chunk_cache, m3u8_cache))));
+    let status = Arc::new(ContribStatusConfig::from_args(&args));
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let rist_shutdown = if let Some(bind) = args.rist_bind {
         let output_stream_idx = resolve_output_stream_idx(&playlists, args.rist_stream_id).await;
@@ -1031,6 +1223,7 @@ async fn main() -> Result<()> {
         forwarder.clone(),
         args.stream_id,
         hls_router,
+        status,
     ));
     let server = H2H3Server::builder()
         .with_tls(cert, key)
@@ -1050,15 +1243,7 @@ async fn main() -> Result<()> {
         "av-contrib ready"
     );
     println!("contrib: https://127.0.0.1:{}", args.http_port);
-    let advertised_hls_stream_id = if args.rist_bind.is_some() {
-        args.rist_stream_id
-    } else if args.srt_bind.is_some() {
-        args.srt_stream_id
-    } else if args.rtmp_bind.is_some() {
-        args.rtmp_stream_id
-    } else {
-        args.stream_id
-    };
+    let advertised_hls_stream_id = advertised_hls_stream_id(&args);
     println!(
         "ll-hls:  https://127.0.0.1:{}/{}/stream.m3u8",
         args.http_port, advertised_hls_stream_id
@@ -1089,6 +1274,7 @@ async fn main() -> Result<()> {
             args.rtmp_stream_id
         );
     }
+    println!("status:  https://127.0.0.1:{}/api/status", args.http_port);
     println!("health:  https://127.0.0.1:{}/up", args.http_port);
 
     tokio::signal::ctrl_c().await?;
@@ -1263,6 +1449,55 @@ mod tests {
             9_007_199_254_741_993
         );
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
+    }
+
+    #[test]
+    fn contrib_status_uses_browser_safe_stream_ids() {
+        let args = Args {
+            http_port: 0,
+            cert: None,
+            key: None,
+            mesh_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_001)),
+            mesh_media_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_101)),
+            stream_id: 9_007_199_254_741_993,
+            rist_stream_id: 9_007_199_254_741_994,
+            srt_stream_id: 9_007_199_254_741_995,
+            rtmp_stream_id: 9_007_199_254_741_996,
+            repair_symbols: 3,
+            symbol_size: DEFAULT_SYMBOL_SIZE,
+            rist_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_000))),
+            rist_profile: RistProfile::Main,
+            rist_backend: RistBackend::Pure,
+            rist_flow_id: DEFAULT_FLOW_ID,
+            srt_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_001))),
+            rtmp_bind: None,
+            fmp4_part_ms: 50,
+            fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
+            playlist_count: 65,
+            playlist_buffer_kb: 800,
+        };
+
+        let snapshot = ContribStatusConfig::from_args(&args).snapshot();
+
+        assert_eq!(snapshot.default_stream_id, "9007199254741993");
+        assert_eq!(snapshot.advertised_hls_stream_id, "9007199254741994");
+        assert_eq!(
+            snapshot.advertised_hls_path,
+            "/9007199254741994/stream.m3u8"
+        );
+        assert_eq!(snapshot.mesh.byte_fec_target, "127.0.0.1:22001");
+        assert_eq!(snapshot.hls.part_target_ms, 50);
+        assert_eq!(snapshot.fec.repair_symbols, 3);
+
+        let rist = snapshot
+            .listeners
+            .iter()
+            .find(|listener| listener.protocol == "rist")
+            .expect("missing RIST listener status");
+        assert!(rist.enabled);
+        assert_eq!(rist.output_stream_id, "9007199254741994");
+        assert_eq!(rist.flow_id.as_deref(), Some("0x11223344"));
     }
 
     #[tokio::test]
