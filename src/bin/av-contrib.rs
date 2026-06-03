@@ -69,6 +69,7 @@ const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 const CONTRIB_ACTIVITY_LIMIT: usize = 64;
 const CONTRIB_HLS_RESPONSE_LIMIT: usize = 32;
+const CONTRIB_INGEST_SESSION_LIMIT: usize = 48;
 const CONTRIB_MIN_STALE_OUTPUT_MS: u64 = 5_000;
 
 #[derive(Debug, Parser)]
@@ -464,10 +465,11 @@ async fn run_upload_response_ts_bridge(
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                for (_, mut state) in bridges.drain() {
+                for (stream_id, mut state) in bridges.drain() {
                     if let Some(bridge) = state.bridge.as_mut() {
                         bridge.finish().await;
                     }
+                    telemetry.end_ingest_session(protocol, stream_id, "shutdown");
                 }
                 return;
             }
@@ -487,6 +489,7 @@ async fn run_upload_response_ts_bridge(
                         if let Some(output_stream_id) = state.output_stream_id {
                             playlists.fin(output_stream_id);
                         }
+                        telemetry.end_ingest_session(protocol, stream_id, "inactive");
                     }
                 }
 
@@ -505,6 +508,7 @@ async fn run_upload_response_ts_bridge(
                                 bridge: None,
                             },
                         );
+                        telemetry.ensure_ingest_session(protocol, stream_id, None, None, None, None);
                         trace!(stream_id, "tracking upload-response stream");
                     }
                     let has_active_bridge = bridges
@@ -530,6 +534,25 @@ async fn run_upload_response_ts_bridge(
                     for slot in (state.last_seen + 1)..=stream.request_last {
                         match service.tail_request(stream_id, slot).await {
                             Some(TailSlot::Headers(headers)) => {
+                                let path = Some(String::from_utf8_lossy(&headers.path).into_owned());
+                                let peer = headers.headers.iter().find_map(|header| {
+                                    let name = String::from_utf8_lossy(&header.name);
+                                    if name.eq_ignore_ascii_case("x-peer-addr")
+                                        || name.eq_ignore_ascii_case("x-rist-peer-addr")
+                                    {
+                                        Some(String::from_utf8_lossy(&header.value).into_owned())
+                                    } else {
+                                        None
+                                    }
+                                });
+                                telemetry.ensure_ingest_session(
+                                    protocol,
+                                    stream_id,
+                                    state.output_stream_id,
+                                    state.output_stream_idx,
+                                    peer,
+                                    path,
+                                );
                                 trace!(
                                     stream_id,
                                     path = %String::from_utf8_lossy(&headers.path),
@@ -550,6 +573,14 @@ async fn run_upload_response_ts_bridge(
                                     };
                                     state.output_stream_id = Some(public_stream_id);
                                     state.output_stream_idx = Some(public_stream_idx);
+                                    telemetry.ensure_ingest_session(
+                                        protocol,
+                                        stream_id,
+                                        Some(public_stream_id),
+                                        Some(public_stream_idx),
+                                        None,
+                                        None,
+                                    );
                                     state.bridge = Some(TsFmp4Bridge::new_with_publisher(
                                         public_stream_id,
                                         public_stream_idx,
@@ -579,6 +610,7 @@ async fn run_upload_response_ts_bridge(
                                     );
                                 }
                                 state.body_slots = state.body_slots.saturating_add(1);
+                                telemetry.record_ingest_session_body(protocol, stream_id, data.len());
                                 telemetry.record_mpeg_ts_slot(protocol, stream_id, data.len());
                                 debug!(
                                     stream_id,
@@ -611,6 +643,7 @@ async fn run_upload_response_ts_bridge(
                                         "upload-response stream ended without media body slots"
                                     );
                                 }
+                                telemetry.end_ingest_session(protocol, stream_id, "ended");
                                 stream_ended = true;
                             }
                             Some(TailSlot::Control(_)) => {
@@ -673,7 +706,6 @@ async fn run_rtmp_hls_bridge(
                 let pts = access_unit.pts;
                 let dts = access_unit.dts;
                 let bytes = access_unit.data.len();
-                telemetry.record_rtmp_access_unit(stream.id, bytes);
                 if !segmenters.contains_key(&stream.id) {
                     let output_stream_id = rtmp_output_stream_id(
                         &stream,
@@ -682,6 +714,14 @@ async fn run_rtmp_hls_bridge(
                     );
                     let output_stream_idx =
                         resolve_output_stream_idx(&playlists, output_stream_id).await;
+                    telemetry.ensure_ingest_session(
+                        "rtmp",
+                        stream.id,
+                        Some(output_stream_id),
+                        Some(output_stream_idx),
+                        None,
+                        Some(stream.key.clone()),
+                    );
                     tracing::info!(
                         key = %stream.key,
                         rtmp_stream_id = stream.id,
@@ -704,6 +744,8 @@ async fn run_rtmp_hls_bridge(
                         },
                     );
                 }
+                telemetry.record_ingest_session_access_unit("rtmp", stream.id, bytes);
+                telemetry.record_rtmp_access_unit(stream.id, bytes);
 
                 if let Some(state) = segmenters.get_mut(&stream.id) {
                     tracing::debug!(
@@ -731,6 +773,7 @@ async fn run_rtmp_hls_bridge(
                         "RTMP ingest stream ended"
                     );
                 }
+                telemetry.end_ingest_session("rtmp", stream.id, "ended");
             }
         }
     }
@@ -810,6 +853,9 @@ struct IngestTelemetry {
     hls_response_not_found: AtomicU64,
     hls_last_response_unix_ms: AtomicU64,
     recent_hls_responses: StdMutex<VecDeque<ContribHlsResponse>>,
+    ingest_sessions_started: AtomicU64,
+    ingest_sessions_ended: AtomicU64,
+    ingest_sessions: StdMutex<HashMap<String, IngestSessionRecord>>,
     recent_alerts: StdMutex<VecDeque<ContribAlert>>,
     recent_activity: StdMutex<VecDeque<ContribActivity>>,
 }
@@ -1035,8 +1081,161 @@ impl IngestTelemetry {
         }
     }
 
+    fn ensure_ingest_session(
+        &self,
+        protocol: &'static str,
+        stream_id: u64,
+        output_stream_id: Option<u64>,
+        output_stream_idx: Option<usize>,
+        peer: Option<String>,
+        path: Option<String>,
+    ) {
+        let now = now_unix_ms();
+        let stream_id_text = stream_id.to_string();
+        let mut started_count = None;
+
+        if let Ok(mut sessions) = self.ingest_sessions.lock() {
+            if let Some(session) = active_ingest_session_mut(&mut sessions, protocol, stream_id) {
+                session.last_seen_unix_ms = now;
+                if let Some(output_stream_id) = output_stream_id {
+                    session.output_stream_id_text = Some(output_stream_id.to_string());
+                }
+                if output_stream_idx.is_some() {
+                    session.output_stream_idx = output_stream_idx;
+                }
+                if peer.is_some() {
+                    session.peer = peer;
+                }
+                if path.is_some() {
+                    session.path = path;
+                }
+            } else {
+                let sequence = self.ingest_sessions_started.fetch_add(1, Ordering::Relaxed) + 1;
+                started_count = Some(sequence);
+                sessions.insert(
+                    ingest_session_key(protocol, stream_id, sequence),
+                    IngestSessionRecord {
+                        session_id: sequence,
+                        protocol,
+                        stream_id_text,
+                        output_stream_id_text: output_stream_id.map(|id| id.to_string()),
+                        output_stream_idx,
+                        peer,
+                        path,
+                        state: "active",
+                        started_unix_ms: now,
+                        last_seen_unix_ms: now,
+                        ended_unix_ms: None,
+                        body_slots: 0,
+                        bytes: 0,
+                        access_units: 0,
+                        end_reason: None,
+                    },
+                );
+            }
+            prune_ingest_sessions(&mut sessions);
+        }
+
+        if let Some(started_count) = started_count {
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "ingest_session_started",
+                message: format!(
+                    "{protocol} ingest session {started_count} started for stream {stream_id}."
+                ),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: None,
+                datagrams: None,
+                sequence: Some(started_count),
+                seen_unix_ms: now,
+            });
+        }
+    }
+
+    fn record_ingest_session_body(&self, protocol: &'static str, stream_id: u64, bytes: usize) {
+        self.ensure_ingest_session(protocol, stream_id, None, None, None, None);
+        let now = now_unix_ms();
+        if let Ok(mut sessions) = self.ingest_sessions.lock() {
+            if let Some(session) = active_ingest_session_mut(&mut sessions, protocol, stream_id) {
+                session.last_seen_unix_ms = now;
+                session.body_slots = session.body_slots.saturating_add(1);
+                session.bytes = session.bytes.saturating_add(bytes as u64);
+            }
+        }
+    }
+
+    fn record_ingest_session_access_unit(
+        &self,
+        protocol: &'static str,
+        stream_id: u64,
+        bytes: usize,
+    ) {
+        self.ensure_ingest_session(protocol, stream_id, None, None, None, None);
+        let now = now_unix_ms();
+        if let Ok(mut sessions) = self.ingest_sessions.lock() {
+            if let Some(session) = active_ingest_session_mut(&mut sessions, protocol, stream_id) {
+                session.last_seen_unix_ms = now;
+                session.access_units = session.access_units.saturating_add(1);
+                session.bytes = session.bytes.saturating_add(bytes as u64);
+            }
+        }
+    }
+
+    fn end_ingest_session(&self, protocol: &'static str, stream_id: u64, reason: &'static str) {
+        let now = now_unix_ms();
+        let mut ended = false;
+        if let Ok(mut sessions) = self.ingest_sessions.lock() {
+            if let Some(session) = active_ingest_session_mut(&mut sessions, protocol, stream_id) {
+                ended = true;
+                session.state = "ended";
+                session.last_seen_unix_ms = now;
+                session.ended_unix_ms = Some(now);
+                session.end_reason = Some(reason);
+            }
+            prune_ingest_sessions(&mut sessions);
+        }
+
+        if ended {
+            let ended_count = self.ingest_sessions_ended.fetch_add(1, Ordering::Relaxed) + 1;
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "ingest_session_ended",
+                message: format!(
+                    "{protocol} ingest session ended for stream {stream_id}: {reason}."
+                ),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: None,
+                datagrams: None,
+                sequence: Some(ended_count),
+                seen_unix_ms: now,
+            });
+        }
+    }
+
     fn snapshot(&self) -> IngestRuntimeSnapshot {
         let now_ms = now_unix_ms();
+        let ingest_session_records = self
+            .ingest_sessions
+            .lock()
+            .map(|sessions| sessions.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let active_ingest_sessions = ingest_session_records
+            .iter()
+            .filter(|session| session.state == "active")
+            .count();
+        let mut recent_ingest_sessions = ingest_session_records
+            .into_iter()
+            .map(|session| IngestSessionSnapshot::from_record(session, now_ms))
+            .collect::<Vec<_>>();
+        recent_ingest_sessions.sort_by(|left, right| {
+            right
+                .last_seen_unix_ms
+                .cmp(&left.last_seen_unix_ms)
+                .then_with(|| left.protocol.cmp(&right.protocol))
+                .then_with(|| left.stream_id_text.cmp(&right.stream_id_text))
+        });
+        recent_ingest_sessions.truncate(CONTRIB_INGEST_SESSION_LIMIT);
+
         IngestRuntimeSnapshot {
             raw_http: RawHttpRuntimeSnapshot {
                 requests: self.raw_http_requests.load(Ordering::Relaxed),
@@ -1092,6 +1291,12 @@ impl IngestTelemetry {
                     .lock()
                     .map(|responses| responses.iter().cloned().collect())
                     .unwrap_or_default(),
+            },
+            ingest_sessions: IngestSessionsRuntimeSnapshot {
+                active: active_ingest_sessions,
+                started: self.ingest_sessions_started.load(Ordering::Relaxed),
+                ended: self.ingest_sessions_ended.load(Ordering::Relaxed),
+                recent: recent_ingest_sessions,
             },
         }
     }
@@ -1151,6 +1356,43 @@ fn age_from_atomic_ms(now_ms: u64, value: &AtomicU64) -> Option<u64> {
 
 fn youngest_age(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
     values.into_iter().flatten().min()
+}
+
+fn ingest_session_key(protocol: &str, stream_id: u64, session_id: u64) -> String {
+    format!("{protocol}:{stream_id}:{session_id}")
+}
+
+fn active_ingest_session_mut<'a>(
+    sessions: &'a mut HashMap<String, IngestSessionRecord>,
+    protocol: &str,
+    stream_id: u64,
+) -> Option<&'a mut IngestSessionRecord> {
+    let stream_id_text = stream_id.to_string();
+    sessions.values_mut().find(|session| {
+        session.protocol == protocol
+            && session.stream_id_text == stream_id_text
+            && session.state == "active"
+    })
+}
+
+fn prune_ingest_sessions(sessions: &mut HashMap<String, IngestSessionRecord>) {
+    if sessions.len() <= CONTRIB_INGEST_SESSION_LIMIT * 2 {
+        return;
+    }
+
+    let mut inactive = sessions
+        .iter()
+        .filter(|(_, session)| session.state != "active")
+        .map(|(key, session)| (key.clone(), session.last_seen_unix_ms))
+        .collect::<Vec<_>>();
+    inactive.sort_by_key(|(_, last_seen)| *last_seen);
+
+    let remove_count = sessions
+        .len()
+        .saturating_sub(CONTRIB_INGEST_SESSION_LIMIT * 2);
+    for (key, _) in inactive.into_iter().take(remove_count) {
+        sessions.remove(&key);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1415,6 +1657,7 @@ struct IngestRuntimeSnapshot {
     rtmp: RtmpRuntimeSnapshot,
     fmp4: Fmp4RuntimeSnapshot,
     hls: HlsRuntimeSnapshot,
+    ingest_sessions: IngestSessionsRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1483,6 +1726,82 @@ struct ContribHlsResponse {
     bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IngestSessionRecord {
+    session_id: u64,
+    protocol: &'static str,
+    stream_id_text: String,
+    output_stream_id_text: Option<String>,
+    output_stream_idx: Option<usize>,
+    peer: Option<String>,
+    path: Option<String>,
+    state: &'static str,
+    started_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    ended_unix_ms: Option<u64>,
+    body_slots: u64,
+    bytes: u64,
+    access_units: u64,
+    end_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IngestSessionsRuntimeSnapshot {
+    active: usize,
+    started: u64,
+    ended: u64,
+    recent: Vec<IngestSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IngestSessionSnapshot {
+    session_id: u64,
+    protocol: &'static str,
+    stream_id_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_stream_id_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_stream_idx: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    state: &'static str,
+    started_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_unix_ms: Option<u64>,
+    age_ms: u64,
+    body_slots: u64,
+    bytes: u64,
+    access_units: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_reason: Option<&'static str>,
+}
+
+impl IngestSessionSnapshot {
+    fn from_record(record: IngestSessionRecord, now_ms: u64) -> Self {
+        Self {
+            session_id: record.session_id,
+            protocol: record.protocol,
+            stream_id_text: record.stream_id_text,
+            output_stream_id_text: record.output_stream_id_text,
+            output_stream_idx: record.output_stream_idx,
+            peer: record.peer,
+            path: record.path,
+            state: record.state,
+            started_unix_ms: record.started_unix_ms,
+            last_seen_unix_ms: record.last_seen_unix_ms,
+            ended_unix_ms: record.ended_unix_ms,
+            age_ms: now_ms.saturating_sub(record.last_seen_unix_ms),
+            body_slots: record.body_slots,
+            bytes: record.bytes,
+            access_units: record.access_units,
+            end_reason: record.end_reason,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2352,6 +2671,57 @@ mod tests {
             .activity
             .iter()
             .any(|activity| activity.code == "hls_response_error"));
+    }
+
+    #[test]
+    fn contrib_status_reports_ingest_sessions() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
+
+        telemetry.ensure_ingest_session(
+            "srt",
+            42,
+            Some(args.srt_stream_id),
+            Some(1),
+            Some("127.0.0.1:5000".into()),
+            Some("/srt/42".into()),
+        );
+        telemetry.record_ingest_session_body("srt", 42, 1316);
+        let active = status_config.snapshot();
+
+        assert_eq!(active.runtime.ingest_sessions.active, 1);
+        assert_eq!(active.runtime.ingest_sessions.started, 1);
+        assert_eq!(active.runtime.ingest_sessions.ended, 0);
+        let session = &active.runtime.ingest_sessions.recent[0];
+        assert_eq!(session.session_id, 1);
+        assert_eq!(session.protocol, "srt");
+        assert_eq!(session.stream_id_text, "42");
+        assert_eq!(session.output_stream_id_text.as_deref(), Some("1"));
+        assert_eq!(session.peer.as_deref(), Some("127.0.0.1:5000"));
+        assert_eq!(session.path.as_deref(), Some("/srt/42"));
+        assert_eq!(session.state, "active");
+        assert_eq!(session.body_slots, 1);
+        assert_eq!(session.bytes, 1316);
+        assert!(active
+            .activity
+            .iter()
+            .any(|activity| activity.code == "ingest_session_started"));
+
+        telemetry.end_ingest_session("srt", 42, "ended");
+        let ended = status_config.snapshot();
+        assert_eq!(ended.runtime.ingest_sessions.active, 0);
+        assert_eq!(ended.runtime.ingest_sessions.started, 1);
+        assert_eq!(ended.runtime.ingest_sessions.ended, 1);
+        assert_eq!(ended.runtime.ingest_sessions.recent[0].state, "ended");
+        assert_eq!(
+            ended.runtime.ingest_sessions.recent[0].end_reason,
+            Some("ended")
+        );
+        assert!(ended
+            .activity
+            .iter()
+            .any(|activity| activity.code == "ingest_session_ended"));
     }
 
     #[tokio::test]
