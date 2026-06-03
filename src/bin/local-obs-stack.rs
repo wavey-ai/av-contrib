@@ -36,6 +36,12 @@ struct Args {
     #[arg(long)]
     no_build: bool,
 
+    #[arg(long)]
+    dashboard_dist: Option<PathBuf>,
+
+    #[arg(long)]
+    no_dashboard_build: bool,
+
     #[arg(long, default_value_t = 1)]
     stream_id: u64,
 
@@ -142,6 +148,22 @@ async fn main() -> Result<()> {
         .await?;
     }
 
+    let dashboard_dist = resolve_dashboard_dist(&args, &mesh_root);
+    if !args.no_build && !args.no_dashboard_build {
+        run_dashboard_build(&mesh_root, &dashboard_dist).await?;
+    }
+    if dashboard_dist.join("index.html").exists() {
+        println!(
+            "[orchestrator] mesh dashboard dist: {}",
+            dashboard_dist.display()
+        );
+    } else {
+        println!(
+            "[orchestrator] mesh dashboard dist missing at {}; /mesh will use av-mesh fallback HTML",
+            dashboard_dist.display()
+        );
+    }
+
     let mesh_bin = target_release_bin(&mesh_root, "av-mesh");
     let contrib_bin = target_release_bin(&contrib_root, "av-contrib");
     ensure_executable(&mesh_bin, "av-mesh")?;
@@ -171,6 +193,10 @@ async fn main() -> Result<()> {
                     &tls.key,
                 ),
                 &rust_log,
+                &[(
+                    "AV_MESH_DASHBOARD_DIST",
+                    dashboard_dist.display().to_string(),
+                )],
             )
             .await?,
         );
@@ -196,6 +222,10 @@ async fn main() -> Result<()> {
                     &tls.key,
                 ),
                 &rust_log,
+                &[(
+                    "AV_MESH_DASHBOARD_DIST",
+                    dashboard_dist.display().to_string(),
+                )],
             )
             .await?,
         );
@@ -224,6 +254,7 @@ async fn main() -> Result<()> {
                 &contrib_root,
                 contrib_args(&args, &tls.cert, &tls.key),
                 &rust_log,
+                &[],
             )
             .await?,
         );
@@ -301,6 +332,48 @@ where
         .with_context(|| format!("failed to start {name}"))?;
     if !status.success() {
         bail!("{name} failed with {status}");
+    }
+    Ok(())
+}
+
+fn resolve_dashboard_dist(args: &Args, mesh_root: &Path) -> PathBuf {
+    args.dashboard_dist
+        .clone()
+        .or_else(|| std::env::var_os("AV_MESH_DASHBOARD_DIST").map(PathBuf::from))
+        .unwrap_or_else(|| mesh_root.join("dashboard").join("dist"))
+}
+
+async fn run_dashboard_build(mesh_root: &Path, dashboard_dist: &Path) -> Result<()> {
+    let dashboard_root = mesh_root.join("dashboard");
+    if !dashboard_root.join("Trunk.toml").exists() {
+        bail!(
+            "dashboard Trunk.toml not found at {}; pass --no-dashboard-build to use av-mesh fallback HTML",
+            dashboard_root.join("Trunk.toml").display()
+        );
+    }
+    println!(
+        "[orchestrator] running av-mesh dashboard build in {}",
+        dashboard_root.display()
+    );
+    let status = Command::new("trunk")
+        .args([
+            OsStr::new("build"),
+            OsStr::new("--release"),
+            OsStr::new("--dist"),
+            dashboard_dist.as_os_str(),
+        ])
+        .current_dir(&dashboard_root)
+        .env_remove("NO_COLOR")
+        .env("TRUNK_COLOR", "never")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| {
+            "failed to start av-mesh dashboard build; install trunk or pass --no-dashboard-build"
+        })?;
+    if !status.success() {
+        bail!("av-mesh dashboard build failed with {status}");
     }
     Ok(())
 }
@@ -451,6 +524,7 @@ async fn spawn_service(
     cwd: &Path,
     args: Vec<String>,
     rust_log: &str,
+    extra_env: &[(&str, String)],
 ) -> Result<Service> {
     println!(
         "[orchestrator] starting {name}: {} {}",
@@ -458,13 +532,19 @@ async fn spawn_service(
         args.join(" ")
     );
     println!("[orchestrator] {name} RUST_LOG={rust_log}");
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(&args)
         .current_dir(cwd)
         .env("RUST_LOG", rust_log)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    for (key, value) in extra_env {
+        println!("[orchestrator] {name} {key}={value}");
+        command.env(key, value);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {name}"))?;
 

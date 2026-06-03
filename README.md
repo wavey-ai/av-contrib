@@ -71,11 +71,13 @@ Rust supervisor, run from this repo:
 RUST_LOG=info cargo run --bin local-obs-stack --release
 ```
 
-The supervisor builds release `av-contrib` and `../av-mesh` binaries, uses local
-bitneedle TLS material from `../tls/local.bitneedle.com`, starts UK and US mesh
-nodes plus one `av-contrib` ingress, and prefixes every child process
-stdout/stderr line into the supervisor stdout. By default it uses stream id `1`,
-UK egress `https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
+The supervisor builds release `av-contrib`, release `../av-mesh`, and the
+`../av-mesh/dashboard` Leptos dist, then passes that dist to each mesh node with
+`AV_MESH_DASHBOARD_DIST`. It uses local bitneedle TLS material from
+`../tls/local.bitneedle.com`, starts UK and US mesh nodes plus one `av-contrib`
+ingress, and prefixes every child process stdout/stderr line into the supervisor
+stdout. By default it uses stream id `1`, UK egress
+`https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
 `https://local.bitneedle.com:19445/live/1/stream.m3u8`, and mesh dashboards at
 `/mesh` on both ports. The contributor status endpoints are available at
 `https://local.bitneedle.com:19443/api/status` and
@@ -95,3 +97,7 @@ RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
     --rtmp-bind 127.0.0.1:19351 \
     --srt-bind 127.0.0.1:27011
 ```
+
+Use `--dashboard-dist /path/to/dist` to reuse a specific dashboard build. Use
+`--no-dashboard-build` to skip the Trunk build and let `av-mesh` use an existing
+dist or its fallback page. `--no-build` skips all release and dashboard builds.
