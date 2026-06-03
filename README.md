@@ -87,10 +87,13 @@ stdout. By default it uses stream id `1`, UK egress
 OBS can publish RTMP to `rtmp://local.bitneedle.com:19350/live` with stream key
 `obs-local`, or SRT to `srt://local.bitneedle.com:27001?mode=caller`. RIST is
 bound on `local.bitneedle.com:27000` with main profile and flow id `0x11223344`.
+The supervisor defaults the LL-HLS part target to 50 ms; override it with
+`AV_LL_HLS_PART_MS` or `--part-ms`.
 
 Useful overrides:
 
 ```sh
+AV_LL_HLS_PART_MS=67 \
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
   cargo run --bin local-obs-stack --release -- \
     --stream-id 4294967351 \
