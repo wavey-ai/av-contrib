@@ -39,6 +39,12 @@ pub struct PublishedFmp4Part {
     pub sequence: u64,
     pub init: Option<Bytes>,
     pub bytes: Bytes,
+    pub video_codec: Option<&'static str>,
+    pub video_width: Option<u16>,
+    pub video_height: Option<u16>,
+    pub video_units: usize,
+    pub audio_codec: Option<&'static str>,
+    pub audio_units: usize,
 }
 
 #[async_trait::async_trait]
@@ -625,6 +631,12 @@ impl Fmp4Segmenter {
                 sequence: self.published_parts,
                 init: init_for_mesh,
                 bytes: part_bytes,
+                video_codec: (video_units > 0).then_some("h264"),
+                video_width: (video_units > 0).then_some(self.config.width),
+                video_height: (video_units > 0).then_some(self.config.height),
+                video_units,
+                audio_codec: (audio_units > 0).then_some("aac"),
+                audio_units,
             };
             if let Err(error) = publisher.publish_fmp4_part(part).await {
                 warn!(

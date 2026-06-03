@@ -400,6 +400,19 @@ impl Fmp4PartPublisher for TelemetryFmp4Publisher {
         let sequence = part.sequence;
         let bytes = part.bytes.len() as u64;
         let init_bytes = part.init.as_ref().map_or(0, |init| init.len() as u64);
+        let video_width = part.video_width;
+        let video_height = part.video_height;
+        let video_units = part.video_units;
+        let audio_units = part.audio_units;
+        self.telemetry.record_fmp4_tracks(
+            stream_id,
+            stream_idx,
+            sequence,
+            video_width,
+            video_height,
+            video_units,
+            audio_units,
+        );
         match self.inner.publish_fmp4_part(part).await {
             Ok(()) => {
                 self.telemetry
@@ -926,6 +939,12 @@ struct IngestTelemetry {
     fmp4_init_bytes: AtomicU64,
     fmp4_publish_errors: AtomicU64,
     fmp4_last_publish_unix_ms: AtomicU64,
+    fmp4_video_width: AtomicU64,
+    fmp4_video_height: AtomicU64,
+    fmp4_video_parts: AtomicU64,
+    fmp4_video_access_units: AtomicU64,
+    fmp4_audio_parts: AtomicU64,
+    fmp4_audio_access_units: AtomicU64,
     hls_responses_total: AtomicU64,
     hls_response_errors: AtomicU64,
     hls_response_not_found: AtomicU64,
@@ -1167,6 +1186,44 @@ impl IngestTelemetry {
             bytes,
             init_bytes,
             "recorded fMP4 mesh publish"
+        );
+    }
+
+    fn record_fmp4_tracks(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        sequence: u64,
+        video_width: Option<u16>,
+        video_height: Option<u16>,
+        video_units: usize,
+        audio_units: usize,
+    ) {
+        if let (Some(width), Some(height)) = (video_width, video_height) {
+            self.fmp4_video_width
+                .store(u64::from(width), Ordering::Relaxed);
+            self.fmp4_video_height
+                .store(u64::from(height), Ordering::Relaxed);
+        }
+        if video_units > 0 {
+            self.fmp4_video_parts.fetch_add(1, Ordering::Relaxed);
+            self.fmp4_video_access_units
+                .fetch_add(video_units as u64, Ordering::Relaxed);
+        }
+        if audio_units > 0 {
+            self.fmp4_audio_parts.fetch_add(1, Ordering::Relaxed);
+            self.fmp4_audio_access_units
+                .fetch_add(audio_units as u64, Ordering::Relaxed);
+        }
+        trace!(
+            stream_id,
+            stream_idx,
+            sequence,
+            video_width,
+            video_height,
+            video_units,
+            audio_units,
+            "recorded fMP4 media track metadata"
         );
     }
 
@@ -1467,6 +1524,14 @@ impl IngestTelemetry {
                     self.fmp4_last_publish_unix_ms.load(Ordering::Relaxed),
                 ),
                 last_publish_age_ms: age_from_atomic_ms(now_ms, &self.fmp4_last_publish_unix_ms),
+                video_codec: (self.fmp4_video_width.load(Ordering::Relaxed) > 0).then_some("h264"),
+                video_width: nonzero_u16(self.fmp4_video_width.load(Ordering::Relaxed)),
+                video_height: nonzero_u16(self.fmp4_video_height.load(Ordering::Relaxed)),
+                video_parts: self.fmp4_video_parts.load(Ordering::Relaxed),
+                video_access_units: self.fmp4_video_access_units.load(Ordering::Relaxed),
+                audio_codec: (self.fmp4_audio_parts.load(Ordering::Relaxed) > 0).then_some("aac"),
+                audio_parts: self.fmp4_audio_parts.load(Ordering::Relaxed),
+                audio_access_units: self.fmp4_audio_access_units.load(Ordering::Relaxed),
             },
             hls: HlsRuntimeSnapshot {
                 responses_total: self.hls_responses_total.load(Ordering::Relaxed),
@@ -1538,6 +1603,10 @@ fn should_sample_activity(count: u64, interval: u64) -> bool {
 
 fn nonzero_unix_ms(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
+}
+
+fn nonzero_u16(value: u64) -> Option<u16> {
+    (value != 0).then_some(value.min(u64::from(u16::MAX)) as u16)
 }
 
 fn age_from_atomic_ms(now_ms: u64, value: &AtomicU64) -> Option<u64> {
@@ -1914,6 +1983,14 @@ struct Fmp4RuntimeSnapshot {
     publish_errors: u64,
     last_publish_unix_ms: Option<u64>,
     last_publish_age_ms: Option<u64>,
+    video_codec: Option<&'static str>,
+    video_width: Option<u16>,
+    video_height: Option<u16>,
+    video_parts: u64,
+    video_access_units: u64,
+    audio_codec: Option<&'static str>,
+    audio_parts: u64,
+    audio_access_units: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2774,6 +2851,7 @@ mod tests {
         );
         telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
         telemetry.record_rtmp_access_unit(args.rtmp_stream_id, 1024);
+        telemetry.record_fmp4_tracks(args.rist_stream_id, 1, 9, Some(1280), Some(720), 2, 1);
         telemetry.record_fmp4_part(args.rist_stream_id, 1, 9, 8192, 512);
         let status_config = ContribStatusConfig::from_args(&args, telemetry);
         let event = status_config.sse_event().unwrap();
@@ -2804,6 +2882,14 @@ mod tests {
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
         assert_eq!(snapshot.runtime.fmp4.parts, 1);
         assert_eq!(snapshot.runtime.fmp4.init_bytes, 512);
+        assert_eq!(snapshot.runtime.fmp4.video_codec, Some("h264"));
+        assert_eq!(snapshot.runtime.fmp4.video_width, Some(1280));
+        assert_eq!(snapshot.runtime.fmp4.video_height, Some(720));
+        assert_eq!(snapshot.runtime.fmp4.video_parts, 1);
+        assert_eq!(snapshot.runtime.fmp4.video_access_units, 2);
+        assert_eq!(snapshot.runtime.fmp4.audio_codec, Some("aac"));
+        assert_eq!(snapshot.runtime.fmp4.audio_parts, 1);
+        assert_eq!(snapshot.runtime.fmp4.audio_access_units, 1);
         assert_eq!(snapshot.status, "active");
         assert_eq!(snapshot.health.state, "active");
         assert!(snapshot.health.input_seen);
