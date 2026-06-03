@@ -215,10 +215,11 @@ struct MeshForwarder {
     media_socket: Arc<UdpSocket>,
     media_target: SocketAddr,
     next_media_sequence: Arc<AtomicU64>,
+    telemetry: Arc<IngestTelemetry>,
 }
 
 impl MeshForwarder {
-    async fn new(args: &Args) -> Result<Self> {
+    async fn new(args: &Args, telemetry: Arc<IngestTelemetry>) -> Result<Self> {
         let byte_socket = UdpSocket::bind(local_sender_addr(args.mesh_fec_target))
             .await
             .with_context(|| {
@@ -246,6 +247,7 @@ impl MeshForwarder {
             media_socket: Arc::new(media_socket),
             media_target: args.mesh_media_fec_target,
             next_media_sequence: Arc::new(AtomicU64::new(0)),
+            telemetry,
         })
     }
 
@@ -257,7 +259,7 @@ impl MeshForwarder {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let datagrams = {
+        let datagrams = match {
             let mut encoders = self.byte_encoders.lock().await;
             let encoder = encoders.entry(stream_id).or_insert_with(|| {
                 let mut encoder = FecDatagramEncoder::webtransport_with_stream_prefix(stream_id);
@@ -269,16 +271,47 @@ impl MeshForwarder {
             });
             encoder
                 .encode_payload(bytes)
-                .context("failed to encode stream slot for mesh RaptorQ-FEC")?
+                .context("failed to encode stream slot for mesh RaptorQ-FEC")
+        } {
+            Ok(datagrams) => datagrams,
+            Err(error) => {
+                self.telemetry.record_mesh_forward_error(
+                    "stream",
+                    stream_id,
+                    self.byte_target,
+                    &error,
+                );
+                return Err(error);
+            }
         };
+        let datagram_bytes = datagrams
+            .iter()
+            .map(|datagram| datagram.len() as u64)
+            .sum::<u64>();
         for datagram in &datagrams {
-            self.byte_socket
+            if let Err(error) = self
+                .byte_socket
                 .send_to(datagram, self.byte_target)
                 .await
-                .with_context(|| {
-                    format!("failed to forward stream slot to {}", self.byte_target)
-                })?;
+                .with_context(|| format!("failed to forward stream slot to {}", self.byte_target))
+            {
+                self.telemetry.record_mesh_forward_error(
+                    "stream",
+                    stream_id,
+                    self.byte_target,
+                    &error,
+                );
+                return Err(error);
+            }
         }
+        self.telemetry.record_mesh_forward_success(
+            "stream",
+            stream_id,
+            self.byte_target,
+            bytes.len() as u64,
+            datagrams.len() as u64,
+            datagram_bytes,
+        );
         Ok(datagrams.len())
     }
 
@@ -287,15 +320,31 @@ impl MeshForwarder {
         metadata: MediaFrameMetadata,
         payload: &[u8],
     ) -> Result<usize> {
-        let datagrams = {
+        let stream_id = metadata.stream_id;
+        let datagrams = match {
             let mut encoder = self.media_encoder.lock().await;
             encoder
                 .encode_frame(MediaFrame { metadata, payload })
-                .context("failed to encode media access unit for mesh RaptorQ-FEC")?
-                .datagrams
+                .context("failed to encode media access unit for mesh RaptorQ-FEC")
+        } {
+            Ok(encoded) => encoded.datagrams,
+            Err(error) => {
+                self.telemetry.record_mesh_forward_error(
+                    "media",
+                    stream_id,
+                    self.media_target,
+                    &error,
+                );
+                return Err(error);
+            }
         };
+        let datagram_bytes = datagrams
+            .iter()
+            .map(|datagram| datagram.len() as u64)
+            .sum::<u64>();
         for datagram in &datagrams {
-            self.media_socket
+            if let Err(error) = self
+                .media_socket
                 .send_to(datagram, self.media_target)
                 .await
                 .with_context(|| {
@@ -303,8 +352,25 @@ impl MeshForwarder {
                         "failed to forward media access unit to {}",
                         self.media_target
                     )
-                })?;
+                })
+            {
+                self.telemetry.record_mesh_forward_error(
+                    "media",
+                    stream_id,
+                    self.media_target,
+                    &error,
+                );
+                return Err(error);
+            }
         }
+        self.telemetry.record_mesh_forward_success(
+            "media",
+            stream_id,
+            self.media_target,
+            payload.len() as u64,
+            datagrams.len() as u64,
+            datagram_bytes,
+        );
         Ok(datagrams.len())
     }
 }
@@ -837,6 +903,18 @@ struct IngestTelemetry {
     media_payload_bytes: AtomicU64,
     media_datagrams: AtomicU64,
     media_last_unix_ms: AtomicU64,
+    mesh_stream_payloads: AtomicU64,
+    mesh_stream_payload_bytes: AtomicU64,
+    mesh_stream_datagrams: AtomicU64,
+    mesh_stream_datagram_bytes: AtomicU64,
+    mesh_stream_errors: AtomicU64,
+    mesh_stream_last_unix_ms: AtomicU64,
+    mesh_media_payloads: AtomicU64,
+    mesh_media_payload_bytes: AtomicU64,
+    mesh_media_datagrams: AtomicU64,
+    mesh_media_datagram_bytes: AtomicU64,
+    mesh_media_errors: AtomicU64,
+    mesh_media_last_unix_ms: AtomicU64,
     mpeg_ts_slots: AtomicU64,
     mpeg_ts_bytes: AtomicU64,
     mpeg_ts_last_unix_ms: AtomicU64,
@@ -915,6 +993,98 @@ impl IngestTelemetry {
             datagrams,
             "recorded media access-unit ingest"
         );
+    }
+
+    fn record_mesh_forward_success(
+        &self,
+        kind: &'static str,
+        stream_id: u64,
+        target: SocketAddr,
+        payload_bytes: u64,
+        datagrams: u64,
+        datagram_bytes: u64,
+    ) {
+        let now = now_unix_ms();
+        let payloads = if kind == "media" {
+            let payloads = self.mesh_media_payloads.fetch_add(1, Ordering::Relaxed) + 1;
+            self.mesh_media_payload_bytes
+                .fetch_add(payload_bytes, Ordering::Relaxed);
+            self.mesh_media_datagrams
+                .fetch_add(datagrams, Ordering::Relaxed);
+            self.mesh_media_datagram_bytes
+                .fetch_add(datagram_bytes, Ordering::Relaxed);
+            self.mesh_media_last_unix_ms.store(now, Ordering::Relaxed);
+            payloads
+        } else {
+            let payloads = self.mesh_stream_payloads.fetch_add(1, Ordering::Relaxed) + 1;
+            self.mesh_stream_payload_bytes
+                .fetch_add(payload_bytes, Ordering::Relaxed);
+            self.mesh_stream_datagrams
+                .fetch_add(datagrams, Ordering::Relaxed);
+            self.mesh_stream_datagram_bytes
+                .fetch_add(datagram_bytes, Ordering::Relaxed);
+            self.mesh_stream_last_unix_ms.store(now, Ordering::Relaxed);
+            payloads
+        };
+
+        if should_sample_activity(payloads, 100) {
+            self.push_activity(ContribActivity {
+                level: "info",
+                code: "mesh_forward",
+                message: format!(
+                    "Forwarded {kind} payload {payloads} for stream {stream_id} to mesh target {target}."
+                ),
+                stream_id_text: Some(stream_id.to_string()),
+                bytes: Some(payload_bytes),
+                datagrams: Some(datagrams),
+                sequence: Some(payloads),
+                seen_unix_ms: now,
+            });
+        }
+        trace!(
+            kind,
+            stream_id,
+            target = %target,
+            payload_bytes,
+            datagrams,
+            datagram_bytes,
+            "recorded mesh forward success"
+        );
+    }
+
+    fn record_mesh_forward_error(
+        &self,
+        kind: &'static str,
+        stream_id: u64,
+        target: SocketAddr,
+        error: &anyhow::Error,
+    ) {
+        let now = now_unix_ms();
+        let errors = if kind == "media" {
+            self.mesh_media_errors.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.mesh_stream_errors.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        let message = format!(
+            "Failed to forward {kind} payload for stream {stream_id} to mesh target {target}: {error}"
+        );
+        self.push_alert(ContribAlert {
+            level: "warn",
+            code: "mesh_forward_error",
+            message: message.clone(),
+            count: errors,
+            last_seen_unix_ms: Some(now),
+        });
+        self.push_activity(ContribActivity {
+            level: "warn",
+            code: "mesh_forward_error",
+            message,
+            stream_id_text: Some(stream_id.to_string()),
+            bytes: None,
+            datagrams: None,
+            sequence: Some(errors),
+            seen_unix_ms: now,
+        });
     }
 
     fn record_mpeg_ts_slot(&self, protocol: &'static str, stream_id: u64, bytes: usize) {
@@ -1254,6 +1424,26 @@ impl IngestTelemetry {
                 last_seen_unix_ms: nonzero_unix_ms(self.media_last_unix_ms.load(Ordering::Relaxed)),
                 last_seen_age_ms: age_from_atomic_ms(now_ms, &self.media_last_unix_ms),
             },
+            mesh_forward: MeshForwardRuntimeSnapshot {
+                stream_payloads: self.mesh_stream_payloads.load(Ordering::Relaxed),
+                stream_payload_bytes: self.mesh_stream_payload_bytes.load(Ordering::Relaxed),
+                stream_datagrams: self.mesh_stream_datagrams.load(Ordering::Relaxed),
+                stream_datagram_bytes: self.mesh_stream_datagram_bytes.load(Ordering::Relaxed),
+                stream_errors: self.mesh_stream_errors.load(Ordering::Relaxed),
+                stream_last_unix_ms: nonzero_unix_ms(
+                    self.mesh_stream_last_unix_ms.load(Ordering::Relaxed),
+                ),
+                stream_last_age_ms: age_from_atomic_ms(now_ms, &self.mesh_stream_last_unix_ms),
+                media_payloads: self.mesh_media_payloads.load(Ordering::Relaxed),
+                media_payload_bytes: self.mesh_media_payload_bytes.load(Ordering::Relaxed),
+                media_datagrams: self.mesh_media_datagrams.load(Ordering::Relaxed),
+                media_datagram_bytes: self.mesh_media_datagram_bytes.load(Ordering::Relaxed),
+                media_errors: self.mesh_media_errors.load(Ordering::Relaxed),
+                media_last_unix_ms: nonzero_unix_ms(
+                    self.mesh_media_last_unix_ms.load(Ordering::Relaxed),
+                ),
+                media_last_age_ms: age_from_atomic_ms(now_ms, &self.mesh_media_last_unix_ms),
+            },
             mpeg_ts: MpegTsRuntimeSnapshot {
                 slots: self.mpeg_ts_slots.load(Ordering::Relaxed),
                 bytes: self.mpeg_ts_bytes.load(Ordering::Relaxed),
@@ -1544,7 +1734,9 @@ fn derive_contrib_health(runtime: &IngestRuntimeSnapshot, hls: &HlsStatus) -> Co
         .is_some_and(|age_ms| age_ms > stale_threshold_ms);
     let fmp4_input_is_stale =
         last_fmp4_input_age_ms.is_some_and(|age_ms| age_ms > stale_threshold_ms);
-    let state = if runtime.fmp4.publish_errors > 0 {
+    let mesh_forward_errors =
+        runtime.mesh_forward.stream_errors + runtime.mesh_forward.media_errors;
+    let state = if runtime.fmp4.publish_errors > 0 || mesh_forward_errors > 0 {
         "degraded"
     } else if output_seen && output_is_stale {
         "stale"
@@ -1653,6 +1845,7 @@ fn derive_contrib_alerts(
 struct IngestRuntimeSnapshot {
     raw_http: RawHttpRuntimeSnapshot,
     media_access_units: MediaRuntimeSnapshot,
+    mesh_forward: MeshForwardRuntimeSnapshot,
     mpeg_ts: MpegTsRuntimeSnapshot,
     rtmp: RtmpRuntimeSnapshot,
     fmp4: Fmp4RuntimeSnapshot,
@@ -1677,6 +1870,24 @@ struct MediaRuntimeSnapshot {
     datagrams: u64,
     last_seen_unix_ms: Option<u64>,
     last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MeshForwardRuntimeSnapshot {
+    stream_payloads: u64,
+    stream_payload_bytes: u64,
+    stream_datagrams: u64,
+    stream_datagram_bytes: u64,
+    stream_errors: u64,
+    stream_last_unix_ms: Option<u64>,
+    stream_last_age_ms: Option<u64>,
+    media_payloads: u64,
+    media_payload_bytes: u64,
+    media_datagrams: u64,
+    media_datagram_bytes: u64,
+    media_errors: u64,
+    media_last_unix_ms: Option<u64>,
+    media_last_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2174,8 +2385,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let (cert, key) = load_tls(&args)?;
-    let forwarder = Arc::new(MeshForwarder::new(&args).await?);
     let telemetry = Arc::new(IngestTelemetry::default());
+    let forwarder = Arc::new(MeshForwarder::new(&args, Arc::clone(&telemetry)).await?);
     let mesh_publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
     let publisher: Arc<dyn Fmp4PartPublisher> = Arc::new(TelemetryFmp4Publisher {
         inner: mesh_publisher,
@@ -2545,6 +2756,22 @@ mod tests {
         let telemetry = Arc::new(IngestTelemetry::default());
         telemetry.record_raw_http(args.stream_id, 2, 4096, 6);
         telemetry.record_media_access_unit(args.stream_id, 2048, 3);
+        telemetry.record_mesh_forward_success(
+            "stream",
+            args.stream_id,
+            args.mesh_fec_target,
+            4096,
+            6,
+            6144,
+        );
+        telemetry.record_mesh_forward_success(
+            "media",
+            args.stream_id,
+            args.mesh_media_fec_target,
+            2048,
+            3,
+            3072,
+        );
         telemetry.record_mpeg_ts_slot("srt", args.srt_stream_id, 1316);
         telemetry.record_rtmp_access_unit(args.rtmp_stream_id, 1024);
         telemetry.record_fmp4_part(args.rist_stream_id, 1, 9, 8192, 512);
@@ -2567,6 +2794,12 @@ mod tests {
         assert_eq!(snapshot.runtime.raw_http.requests, 1);
         assert_eq!(snapshot.runtime.raw_http.bytes, 4096);
         assert_eq!(snapshot.runtime.media_access_units.requests, 1);
+        assert_eq!(snapshot.runtime.mesh_forward.stream_payloads, 1);
+        assert_eq!(snapshot.runtime.mesh_forward.stream_datagrams, 6);
+        assert_eq!(snapshot.runtime.mesh_forward.stream_datagram_bytes, 6144);
+        assert_eq!(snapshot.runtime.mesh_forward.media_payloads, 1);
+        assert_eq!(snapshot.runtime.mesh_forward.media_datagrams, 3);
+        assert_eq!(snapshot.runtime.mesh_forward.media_datagram_bytes, 3072);
         assert_eq!(snapshot.runtime.mpeg_ts.slots, 1);
         assert_eq!(snapshot.runtime.rtmp.access_units, 1);
         assert_eq!(snapshot.runtime.fmp4.parts, 1);
@@ -2674,6 +2907,33 @@ mod tests {
     }
 
     #[test]
+    fn contrib_status_reports_mesh_forward_errors() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
+
+        telemetry.record_mesh_forward_error(
+            "stream",
+            args.stream_id,
+            args.mesh_fec_target,
+            &anyhow::anyhow!("send queue closed"),
+        );
+
+        let snapshot = status_config.snapshot();
+        assert_eq!(snapshot.status, "degraded");
+        assert_eq!(snapshot.health.state, "degraded");
+        assert_eq!(snapshot.runtime.mesh_forward.stream_errors, 1);
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "mesh_forward_error"));
+        assert!(snapshot
+            .activity
+            .iter()
+            .any(|activity| activity.code == "mesh_forward_error"));
+    }
+
+    #[test]
     fn contrib_status_reports_ingest_sessions() {
         let args = contrib_status_args();
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -2752,7 +3012,10 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
         };
-        let forwarder = MeshForwarder::new(&args).await.unwrap();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap();
         let stream_id = 77;
         forwarder
             .forward_stream_slot(stream_id, b"non-obs-stream-bytes")
@@ -2773,5 +3036,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(payload, b"non-obs-stream-bytes");
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.mesh_forward.stream_payloads, 1);
+        assert!(snapshot.mesh_forward.stream_datagrams > 0);
+        assert!(snapshot.mesh_forward.stream_payload_bytes > 0);
+        assert!(snapshot.mesh_forward.stream_datagram_bytes > 0);
+        assert_eq!(snapshot.mesh_forward.stream_errors, 0);
     }
 }
