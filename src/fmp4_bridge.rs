@@ -11,8 +11,9 @@ use access_unit::{
 use boxer::fmp4::{box_fmp4_with_init, AdtsHeader, AvcDecoderConfigurationRecord, Config};
 use bytes::{Bytes, BytesMut};
 use h264::{
-    Bitstream, Decode, NALUnit, SequenceParameterSet, NAL_UNIT_TYPE_MASK,
-    NAL_UNIT_TYPE_PICTURE_PARAMETER_SET, NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET,
+    Bitstream, Decode, NALUnit, SequenceParameterSet, NAL_UNIT_TYPE_CODED_SLICE_OF_IDR_PICTURE,
+    NAL_UNIT_TYPE_MASK, NAL_UNIT_TYPE_PICTURE_PARAMETER_SET, NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET,
+    NAL_UNIT_TYPE_SUPPLEMENTAL_ENHANCEMENT_INFORMATION,
 };
 use mpeg2ts_reader::demultiplex::{self, FilterChangeset};
 use mpeg2ts_reader::packet_filter_switch;
@@ -374,33 +375,59 @@ impl Fmp4Segmenter {
             let config_changed = self.config_signature.as_ref() != Some(&signature);
             if config_changed {
                 if had_config {
-                    if self.config.width == config.width && self.config.height == config.height {
+                    let current_width = self.config.width;
+                    let current_height = self.config.height;
+                    let same_dimensions =
+                        current_width == config.width && current_height == config.height;
+
+                    if !access_unit.key {
+                        if same_dimensions {
+                            debug!(
+                                output_stream_id = self.output_stream_id,
+                                current_width,
+                                current_height,
+                                "ignoring same-resolution non-key H.264 config update"
+                            );
+                        } else {
+                            warn!(
+                                output_stream_id = self.output_stream_id,
+                                current_width,
+                                current_height,
+                                new_width = config.width,
+                                new_height = config.height,
+                                "dropping non-key access unit carrying mid-stream H.264 resolution change"
+                            );
+                            return;
+                        }
+                    } else if same_dimensions {
+                        self.flush_current().await;
+                        self.clear_pending_media();
+                        self.install_h264_config(config, signature);
+                        accepted_config_changed = true;
+
                         debug!(
                             output_stream_id = self.output_stream_id,
-                            width = self.config.width,
-                            height = self.config.height,
-                            "ignoring same-resolution mid-stream H.264 config update"
+                            current_width,
+                            current_height,
+                            "accepted keyframe same-resolution H.264 config update"
                         );
                     } else {
-                        warn!(
+                        info!(
                             output_stream_id = self.output_stream_id,
-                            current_width = self.config.width,
-                            current_height = self.config.height,
+                            current_width,
+                            current_height,
                             new_width = config.width,
                             new_height = config.height,
-                            "ignoring mid-stream H.264 resolution change"
+                            "accepted keyframe H.264 resolution change"
                         );
+                        self.flush_current().await;
+                        self.clear_pending_media();
+                        self.install_h264_config(config, signature);
+                        accepted_config_changed = true;
                     }
                 } else {
                     self.clear_pending_media();
-
-                    self.sps = Some(signature.sps.clone());
-                    self.pps = Some(signature.pps.clone());
-                    self.config = config;
-                    self.config_signature = Some(signature);
-                    self.force_next_init = true;
-                    self.started_video = false;
-                    self.warned_no_config = false;
+                    self.install_h264_config(config, signature);
                     accepted_config_changed = true;
 
                     info!(
@@ -413,8 +440,19 @@ impl Fmp4Segmenter {
             }
         }
 
-        if !strip_h264_parameter_sets(&mut access_unit) {
-            return;
+        match strip_h264_parameter_sets(&mut access_unit) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                warn!(
+                    output_stream_id = self.output_stream_id,
+                    output_stream_idx = self.output_stream_idx,
+                    bytes = access_unit.data.len(),
+                    error = ?error,
+                    "dropping malformed length-prefixed H.264 sample"
+                );
+                return;
+            }
         }
 
         if self.config.avcc.is_none() {
@@ -468,6 +506,16 @@ impl Fmp4Segmenter {
         self.video_timestamps.push(access_unit.dts);
         self.video_buf.push(access_unit);
         self.started_video = true;
+    }
+
+    fn install_h264_config(&mut self, config: Config, signature: H264ConfigSignature) {
+        self.sps = Some(signature.sps.clone());
+        self.pps = Some(signature.pps.clone());
+        self.config = config;
+        self.config_signature = Some(signature);
+        self.force_next_init = true;
+        self.started_video = false;
+        self.warned_no_config = false;
     }
 
     async fn push_audio(&mut self, access_unit: AccessUnit) {
@@ -740,15 +788,21 @@ impl Fmp4Segmenter {
         let mut candidate_sps = self.sps.clone();
         let mut candidate_pps = self.pps.clone();
         let mut data = access_unit.data.as_ref();
-        while data.len() >= 4 {
-            let nalu_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            data = &data[4..];
-            if data.len() < nalu_len {
-                break;
-            }
-
-            let nalu = &data[..nalu_len];
-            data = &data[nalu_len..];
+        loop {
+            let nalu = match next_h264_length_prefixed_nalu(&mut data) {
+                Ok(Some(nalu)) => nalu,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        output_stream_id = self.output_stream_id,
+                        output_stream_idx = self.output_stream_idx,
+                        bytes = access_unit.data.len(),
+                        error = ?error,
+                        "rejecting malformed length-prefixed H.264 config sample"
+                    );
+                    return None;
+                }
+            };
             if nalu.is_empty() {
                 continue;
             }
@@ -773,62 +827,19 @@ impl Fmp4Segmenter {
         let (Some(sps), Some(pps)) = (&candidate_sps, &candidate_pps) else {
             return None;
         };
-        let bitstream = Bitstream::new(sps.iter().copied());
-        let Ok(mut nalu) = NALUnit::decode(bitstream) else {
-            return None;
+        let (decoded_sps, width, height) = match decode_h264_sps(sps) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                warn!(
+                    output_stream_id = self.output_stream_id,
+                    output_stream_idx = self.output_stream_idx,
+                    sps_bytes = sps.len(),
+                    error = ?error,
+                    "rejecting invalid H.264 SPS"
+                );
+                return None;
+            }
         };
-        let mut rbsp = Bitstream::new(&mut nalu.rbsp_byte);
-        let Ok(decoded_sps) = SequenceParameterSet::decode(&mut rbsp) else {
-            return None;
-        };
-
-        let width_samples = decoded_sps.pic_width_in_samples();
-        let width_crop = decoded_sps
-            .frame_crop_right_offset
-            .0
-            .checked_add(decoded_sps.frame_crop_left_offset.0)?
-            .checked_mul(2)?;
-        let height_samples = decoded_sps.frame_height_in_mbs().checked_mul(16)?;
-        let height_crop = decoded_sps
-            .frame_crop_bottom_offset
-            .0
-            .checked_add(decoded_sps.frame_crop_top_offset.0)?
-            .checked_mul(2)?;
-        let Some(width) = width_samples
-            .checked_sub(width_crop)
-            .and_then(|value| u16::try_from(value).ok())
-        else {
-            warn!(
-                width_samples,
-                width_crop, "rejecting invalid H.264 SPS width"
-            );
-            return None;
-        };
-        let Some(height) = height_samples
-            .checked_sub(height_crop)
-            .and_then(|value| u16::try_from(value).ok())
-        else {
-            warn!(
-                height_samples,
-                height_crop, "rejecting invalid H.264 SPS height"
-            );
-            return None;
-        };
-        if width < MIN_H264_WIDTH
-            || height < MIN_H264_HEIGHT
-            || width > MAX_H264_DIMENSION
-            || height > MAX_H264_DIMENSION
-        {
-            warn!(
-                width,
-                height,
-                min_width = MIN_H264_WIDTH,
-                min_height = MIN_H264_HEIGHT,
-                max_dimension = MAX_H264_DIMENSION,
-                "rejecting implausible H.264 SPS dimensions"
-            );
-            return None;
-        }
         Some((
             Config {
                 width,
@@ -875,6 +886,126 @@ fn is_supported_audio(stream_type: u8) -> bool {
     )
 }
 
+fn h264_display_dimensions(sps: &SequenceParameterSet) -> Option<(u16, u16)> {
+    let width_crop = sps
+        .frame_crop_left_offset
+        .0
+        .checked_add(sps.frame_crop_right_offset.0)?
+        .checked_mul(sps.crop_unit_x())?;
+    let height_crop = sps
+        .frame_crop_top_offset
+        .0
+        .checked_add(sps.frame_crop_bottom_offset.0)?
+        .checked_mul(sps.crop_unit_y())?;
+    let width = sps
+        .pic_width_in_samples()
+        .checked_sub(width_crop)
+        .and_then(|value| u16::try_from(value).ok())?;
+    let height = sps
+        .frame_height_in_mbs()
+        .checked_mul(16)?
+        .checked_sub(height_crop)
+        .and_then(|value| u16::try_from(value).ok())?;
+    Some((width, height))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264SpsValidationError {
+    UndecodableNalu,
+    UndecodableRbsp,
+    InvalidDimensions,
+    ImplausibleDimensions { width: u16, height: u16 },
+}
+
+fn decode_h264_sps(sps: &[u8]) -> Result<(SequenceParameterSet, u16, u16), H264SpsValidationError> {
+    let bitstream = Bitstream::new(sps.iter().copied());
+    let mut nalu =
+        NALUnit::decode(bitstream).map_err(|_| H264SpsValidationError::UndecodableNalu)?;
+    let mut rbsp = Bitstream::new(&mut nalu.rbsp_byte);
+    let decoded_sps = SequenceParameterSet::decode(&mut rbsp)
+        .map_err(|_| H264SpsValidationError::UndecodableRbsp)?;
+
+    let (width, height) =
+        h264_display_dimensions(&decoded_sps).ok_or(H264SpsValidationError::InvalidDimensions)?;
+    if width < MIN_H264_WIDTH
+        || height < MIN_H264_HEIGHT
+        || width > MAX_H264_DIMENSION
+        || height > MAX_H264_DIMENSION
+    {
+        return Err(H264SpsValidationError::ImplausibleDimensions { width, height });
+    }
+
+    Ok((decoded_sps, width, height))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264SampleError {
+    TruncatedLengthPrefix { remaining: usize },
+    TruncatedNalu { declared: usize, remaining: usize },
+}
+
+fn next_h264_length_prefixed_nalu<'a>(
+    data: &mut &'a [u8],
+) -> Result<Option<&'a [u8]>, H264SampleError> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data.len() < 4 {
+        return Err(H264SampleError::TruncatedLengthPrefix {
+            remaining: data.len(),
+        });
+    }
+
+    let nalu_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    *data = &data[4..];
+    if data.len() < nalu_len {
+        return Err(H264SampleError::TruncatedNalu {
+            declared: nalu_len,
+            remaining: data.len(),
+        });
+    }
+
+    let nalu = &data[..nalu_len];
+    *data = &data[nalu_len..];
+    Ok(Some(nalu))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264NaluAppend {
+    Appended { keyframe: bool },
+    RejectedSps(H264SpsValidationError),
+    Ignored,
+}
+
+fn append_h264_nalu_to_avcc_sample(sample: &mut BytesMut, nalu: &[u8]) -> H264NaluAppend {
+    if nalu.is_empty() || (nalu[0] & 0x80) != 0 {
+        return H264NaluAppend::Ignored;
+    }
+
+    let nalu_type = nalu[0] & NAL_UNIT_TYPE_MASK;
+    match nalu_type {
+        1
+        | NAL_UNIT_TYPE_CODED_SLICE_OF_IDR_PICTURE
+        | NAL_UNIT_TYPE_SUPPLEMENTAL_ENHANCEMENT_INFORMATION
+        | NAL_UNIT_TYPE_PICTURE_PARAMETER_SET => {
+            sample.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+            sample.extend_from_slice(nalu);
+            H264NaluAppend::Appended {
+                keyframe: nalu_type == NAL_UNIT_TYPE_CODED_SLICE_OF_IDR_PICTURE,
+            }
+        }
+        NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET => match decode_h264_sps(nalu) {
+            Ok(_) => {
+                sample.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+                sample.extend_from_slice(nalu);
+                H264NaluAppend::Appended { keyframe: false }
+            }
+            Err(error) => H264NaluAppend::RejectedSps(error),
+        },
+        _ => H264NaluAppend::Ignored,
+    }
+}
+
 fn ensure_h264_length_prefixed(access_unit: &mut AccessUnit) -> bool {
     if !looks_like_annex_b(&access_unit.data) {
         return true;
@@ -888,20 +1019,16 @@ fn ensure_h264_length_prefixed(access_unit: &mut AccessUnit) -> bool {
             continue;
         }
 
-        let nalu_type = nalu[0] & h264::NAL_UNIT_TYPE_MASK;
-        match nalu_type {
-            1
-            | 5
-            | 6
-            | NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET
-            | NAL_UNIT_TYPE_PICTURE_PARAMETER_SET => {
-                sample.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
-                sample.extend_from_slice(nalu);
-                if nalu_type == 5 {
-                    key = true;
-                }
+        match append_h264_nalu_to_avcc_sample(&mut sample, nalu) {
+            H264NaluAppend::Appended { keyframe } => key |= keyframe,
+            H264NaluAppend::RejectedSps(error) => {
+                debug!(
+                    sps_bytes = nalu.len(),
+                    error = ?error,
+                    "dropping invalid H.264 SPS NALU before AVCC packetization"
+                );
             }
-            _ => {}
+            H264NaluAppend::Ignored => {}
         }
     }
 
@@ -918,18 +1045,13 @@ fn looks_like_annex_b(data: &[u8]) -> bool {
     data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
 }
 
-fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> bool {
+fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> Result<bool, H264SampleError> {
     let mut data = access_unit.data.as_ref();
     let mut sample = BytesMut::with_capacity(access_unit.data.len());
-    while data.len() >= 4 {
-        let nalu_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        data = &data[4..];
-        if data.len() < nalu_len {
-            return false;
-        }
-
-        let nalu = &data[..nalu_len];
-        data = &data[nalu_len..];
+    loop {
+        let Some(nalu) = next_h264_length_prefixed_nalu(&mut data)? else {
+            break;
+        };
         if nalu.is_empty() {
             continue;
         }
@@ -943,12 +1065,12 @@ fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> bool {
         }
     }
 
-    if !data.is_empty() || sample.is_empty() {
-        return false;
+    if sample.is_empty() {
+        return Ok(false);
     }
 
     access_unit.data = sample.freeze();
-    true
+    Ok(true)
 }
 
 fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSignature> {
@@ -998,6 +1120,37 @@ mod tests {
         out.extend_from_slice(nalu);
     }
 
+    fn h264_annex_b_sample(nalus: &[&[u8]]) -> Bytes {
+        let mut data = BytesMut::new();
+        for nalu in nalus {
+            data.extend_from_slice(&[0x00, 0x00, 0x01]);
+            data.extend_from_slice(nalu);
+        }
+        data.freeze()
+    }
+
+    const H264_SPS_720P: &[u8] = &[
+        0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xec, 0x05, 0xa8, 0x08, 0x08, 0x0a, 0x00,
+        0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x65, 0x1e, 0x30, 0x65, 0x40,
+    ];
+    const H264_SPS_360P: &[u8] = &[
+        0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80, 0xbf, 0xe5, 0xc0, 0x5a, 0x80, 0x80, 0x80, 0xa0,
+        0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x06, 0x51, 0xe2, 0xc5, 0xd4,
+    ];
+    const H264_PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+    const H264_CHANGED_PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x81];
+    const H264_IDR: &[u8] = &[0x65, 0x88, 0x84, 0x00];
+    const H264_NON_IDR: &[u8] = &[0x41, 0x9a, 0x22];
+    const H264_INVALID_SPS: &[u8] = &[0x67, 0x00];
+
+    fn h264_sample(sps: &[u8], pps: &[u8], media: &[u8]) -> Bytes {
+        let mut data = BytesMut::new();
+        push_len_prefixed_nalu(&mut data, sps);
+        push_len_prefixed_nalu(&mut data, pps);
+        push_len_prefixed_nalu(&mut data, media);
+        data.freeze()
+    }
+
     #[test]
     fn fmp4_segmenter_rebases_large_mpeg_ts_timestamps() {
         let (playlists, _, _) = Playlists::new(Options::default());
@@ -1045,10 +1198,166 @@ mod tests {
         let mut access_unit = h264_access_unit(0, 0);
         access_unit.data = data.freeze();
 
-        assert!(strip_h264_parameter_sets(&mut access_unit));
+        assert!(strip_h264_parameter_sets(&mut access_unit).unwrap());
 
         let nalus: Vec<&[u8]> = h264::iterate_avcc(&access_unit.data, 4).collect();
         assert_eq!(nalus, vec![&[0x65, 0x05, 0x06][..]]);
+    }
+
+    #[test]
+    fn rejects_truncated_h264_length_prefixed_sample() {
+        let mut data = BytesMut::new();
+        data.extend_from_slice(&5u32.to_be_bytes());
+        data.extend_from_slice(&[0x65, 0x88]);
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.data = data.freeze();
+
+        assert_eq!(
+            strip_h264_parameter_sets(&mut access_unit),
+            Err(H264SampleError::TruncatedNalu {
+                declared: 5,
+                remaining: 2
+            })
+        );
+    }
+
+    #[test]
+    fn annex_b_packetization_keeps_valid_h264_sps() {
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.key = false;
+        access_unit.data = h264_annex_b_sample(&[H264_SPS_720P, H264_PPS, H264_IDR]);
+
+        assert!(ensure_h264_length_prefixed(&mut access_unit));
+        assert!(access_unit.key);
+
+        let nalus: Vec<&[u8]> = h264::iterate_avcc(&access_unit.data, 4).collect();
+        assert_eq!(
+            nalus,
+            vec![H264_SPS_720P, H264_PPS, &[0x65, 0x88, 0x84][..]]
+        );
+    }
+
+    #[test]
+    fn annex_b_packetization_drops_invalid_h264_sps_candidates() {
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.key = false;
+        access_unit.data = h264_annex_b_sample(&[H264_INVALID_SPS, H264_NON_IDR]);
+
+        assert!(ensure_h264_length_prefixed(&mut access_unit));
+        assert!(!access_unit.key);
+
+        let nalus: Vec<&[u8]> = h264::iterate_avcc(&access_unit.data, 4).collect();
+        assert_eq!(nalus, vec![H264_NON_IDR]);
+    }
+
+    #[test]
+    fn parses_h264_sps_display_dimensions_with_spec_crop_units() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let mut segmenter = Fmp4Segmenter::new(
+            0,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+        );
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
+
+        let (config, _) = segmenter.parse_h264_config(&access_unit).unwrap();
+        assert_eq!((config.width, config.height), (1280, 720));
+
+        access_unit.data = h264_sample(H264_SPS_360P, H264_PPS, H264_IDR);
+        let (config, _) = segmenter.parse_h264_config(&access_unit).unwrap();
+        assert_eq!((config.width, config.height), (640, 360));
+    }
+
+    #[tokio::test]
+    async fn accepts_keyframe_h264_config_update() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let mut segmenter = Fmp4Segmenter::new(
+            0,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+        );
+        let mut initial = h264_access_unit(0, 0);
+        initial.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
+        let (config, signature) = segmenter.parse_h264_config(&initial).unwrap();
+        segmenter.install_h264_config(config, signature);
+        assert_eq!(
+            (segmenter.config.width, segmenter.config.height),
+            (1280, 720)
+        );
+
+        let mut changed = h264_access_unit(90_000, 90_000);
+        changed.key = true;
+        changed.data = h264_sample(H264_SPS_360P, H264_PPS, H264_IDR);
+        segmenter.push_video(changed).await;
+
+        assert_eq!(
+            (segmenter.config.width, segmenter.config.height),
+            (640, 360)
+        );
+        assert_eq!(segmenter.video_buf.len(), 1);
+        assert!(segmenter.force_next_init);
+    }
+
+    #[tokio::test]
+    async fn drops_non_key_h264_config_update() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let mut segmenter = Fmp4Segmenter::new(
+            0,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+        );
+        let mut initial = h264_access_unit(0, 0);
+        initial.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
+        let (config, signature) = segmenter.parse_h264_config(&initial).unwrap();
+        segmenter.install_h264_config(config, signature);
+
+        let mut changed = h264_access_unit(90_000, 90_000);
+        changed.key = false;
+        changed.data = h264_sample(H264_SPS_360P, H264_PPS, H264_NON_IDR);
+        segmenter.push_video(changed).await;
+
+        assert_eq!(
+            (segmenter.config.width, segmenter.config.height),
+            (1280, 720)
+        );
+        assert!(segmenter.video_buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeps_same_resolution_non_key_h264_config_update() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let mut segmenter = Fmp4Segmenter::new(
+            0,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+        );
+        let mut initial = h264_access_unit(0, 0);
+        initial.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
+        let (config, signature) = segmenter.parse_h264_config(&initial).unwrap();
+        segmenter.install_h264_config(config, signature);
+
+        let media = &[0x41, 0x9a, 0x22];
+        let mut changed = h264_access_unit(90_000, 90_000);
+        changed.key = false;
+        changed.data = h264_sample(H264_SPS_720P, H264_CHANGED_PPS, media);
+        segmenter.push_video(changed).await;
+
+        assert_eq!(
+            (segmenter.config.width, segmenter.config.height),
+            (1280, 720)
+        );
+        assert_eq!(segmenter.video_buf.len(), 1);
+        let nalus: Vec<&[u8]> = h264::iterate_avcc(&segmenter.video_buf[0].data, 4).collect();
+        assert_eq!(nalus, vec![&media[..]]);
     }
 }
 
@@ -1235,20 +1544,17 @@ impl pes::ElementaryStreamConsumer<TsDemuxContext> for ElementaryStreamConsumer 
                         continue;
                     }
 
-                    let nalu_type = nalu[0] & h264::NAL_UNIT_TYPE_MASK;
-                    match nalu_type {
-                        1
-                        | 5
-                        | 6
-                        | NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET
-                        | NAL_UNIT_TYPE_PICTURE_PARAMETER_SET => {
-                            sample.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
-                            sample.extend_from_slice(nalu);
-                            if nalu_type == 5 {
-                                key = true;
-                            }
+                    match append_h264_nalu_to_avcc_sample(&mut sample, nalu) {
+                        H264NaluAppend::Appended { keyframe } => key |= keyframe,
+                        H264NaluAppend::RejectedSps(error) => {
+                            debug!(
+                                stream_type = ?self.stream_type,
+                                sps_bytes = nalu.len(),
+                                error = ?error,
+                                "dropping invalid H.264 SPS NALU before MPEG-TS access unit emission"
+                            );
                         }
-                        _ => {}
+                        H264NaluAppend::Ignored => {}
                     }
                 }
 

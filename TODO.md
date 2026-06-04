@@ -18,9 +18,22 @@
     close with `Error closing file`.
 - Treat the FFmpeg/librist close status as unresolved until isolated; do not
   hide it as a pass.
-- The fMP4 bridge still logs guarded implausible SPS and ignored mid-stream
-  resolution changes during otherwise readable HLS output. Audit H.264
-  parsing/packetization before calling this clean.
+- Current fMP4/H.264 bridge status:
+  - Length-prefixed H.264 access units now reject truncated length prefixes and
+    truncated NALUs explicitly instead of silently disappearing.
+  - SPS display dimensions now use the H.264 crop units with checked arithmetic.
+  - Annex B to AVCC packetization validates SPS NALUs before emitting access
+    units, so false SPS candidates from MPEG-TS payload scanning do not reach
+    the fMP4 config parser.
+  - Keyframe AVC config changes force a fresh init segment; non-key resolution
+    changes are still dropped; same-resolution non-key SPS/PPS churn is stripped
+    and kept as media.
+  - Verified with `cargo test --locked fmp4_bridge -- --nocapture`,
+    `cargo test --locked`, and a 30-second `srt 360p` smoke. The smoke stayed
+    LL-HLS-readable and the latest log no longer contains fMP4 `WARN`, SPS
+    rejection, implausible SPS, or same-resolution non-key config-drop messages.
+  - Remaining protocol issue: the FFmpeg/librist close status below is still
+    unresolved and should stay visible until isolated.
 
 ## Next Protocol Checks
 
