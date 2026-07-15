@@ -360,6 +360,42 @@ struct Args {
     #[arg(long, env = "AV_RELAY_PATH_OBSERVED_AT_UNIX_MS")]
     relay_path_observed_at_unix_ms: Option<u64>,
 
+    /// Controller-observed loss across the independent warm-secondary route.
+    #[arg(
+        long,
+        env = "AV_RELAY_SECONDARY_PATH_LOSS_FRACTION",
+        default_value_t = 0.0
+    )]
+    relay_secondary_path_loss_fraction: f32,
+
+    /// Fastest measured direct origin-to-destination RTT used by the warm route.
+    #[arg(
+        long,
+        env = "AV_RELAY_SECONDARY_PATH_BEST_DIRECT_RTT_MS",
+        default_value_t = 0.0
+    )]
+    relay_secondary_path_best_direct_rtt_ms: f32,
+
+    /// Controller-observed end-to-end RTT through the warm parent.
+    #[arg(long, env = "AV_RELAY_SECONDARY_PATH_RTT_MS", default_value_t = 0.0)]
+    relay_secondary_path_rtt_ms: f32,
+
+    /// Controller-observed warm-route jitter.
+    #[arg(long, env = "AV_RELAY_SECONDARY_PATH_JITTER_MS", default_value_t = 0.0)]
+    relay_secondary_path_jitter_ms: f32,
+
+    /// Controller-observed warm-route queue delay.
+    #[arg(
+        long,
+        env = "AV_RELAY_SECONDARY_PATH_QUEUE_DELAY_MS",
+        default_value_t = 0.0
+    )]
+    relay_secondary_path_queue_delay_ms: f32,
+
+    /// Wall-clock age anchor supplied with the warm-route observation.
+    #[arg(long, env = "AV_RELAY_SECONDARY_PATH_OBSERVED_AT_UNIX_MS")]
+    relay_secondary_path_observed_at_unix_ms: Option<u64>,
+
     /// Estimated maximum error of the host realtime clock used in MOBJ timestamps.
     #[arg(
         long,
@@ -621,7 +657,8 @@ impl RelaySessionPublisher {
                 }
             }
         }
-        let path_metrics = relay_path_metrics(args)?;
+        let primary_path_metrics = relay_path_metrics(args)?;
+        let secondary_path_metrics = relay_secondary_path_metrics(args)?;
         let primary = PrivateUdpTransport::bind(PrivateUdpConfig::new(
             primary_bind,
             primary_target,
@@ -633,7 +670,7 @@ impl RelaySessionPublisher {
         .with_context(|| {
             format!("failed to bind primary RelaySession UDP carrier for {primary_target}")
         })?;
-        primary.set_path_metrics(path_metrics);
+        primary.set_path_metrics(primary_path_metrics);
         let secondary = if let (Some(secondary_target), Some(secondary_bind)) =
             (args.relay_secondary_target, secondary_bind)
         {
@@ -648,14 +685,17 @@ impl RelaySessionPublisher {
             .with_context(|| {
                 format!("failed to bind secondary RelaySession UDP carrier for {secondary_target}")
             })?;
-            transport.set_path_metrics(path_metrics);
+            transport.set_path_metrics(secondary_path_metrics);
             Some(transport)
         } else {
             None
         };
 
         let mut encoder = RaptorQObjectEncoder::default();
-        encoder.update_path_metrics(path_metrics);
+        encoder.update_path_metrics(adaptive_relay_path_metrics(
+            primary_path_metrics,
+            secondary_path_metrics,
+        ));
 
         Ok(Some(Self {
             encoder: Mutex::new(encoder),
@@ -895,42 +935,97 @@ fn relay_path_metrics_configured(args: &Args) -> bool {
         || args.relay_path_observed_at_unix_ms.is_some()
 }
 
+fn relay_secondary_path_metrics_configured(args: &Args) -> bool {
+    args.relay_secondary_path_loss_fraction != 0.0
+        || args.relay_secondary_path_best_direct_rtt_ms != 0.0
+        || args.relay_secondary_path_rtt_ms != 0.0
+        || args.relay_secondary_path_jitter_ms != 0.0
+        || args.relay_secondary_path_queue_delay_ms != 0.0
+        || args.relay_secondary_path_observed_at_unix_ms.is_some()
+}
+
 fn relay_path_metrics(args: &Args) -> Result<PathMetrics> {
-    for (flag, value) in [
-        (
-            "--relay-path-best-direct-rtt-ms",
-            args.relay_path_best_direct_rtt_ms,
-        ),
-        ("--relay-path-rtt-ms", args.relay_path_rtt_ms),
-        ("--relay-path-jitter-ms", args.relay_path_jitter_ms),
-        (
-            "--relay-path-queue-delay-ms",
-            args.relay_path_queue_delay_ms,
-        ),
+    path_metrics_from_values(
+        "--relay-path",
+        args.relay_path_loss_fraction,
+        args.relay_path_best_direct_rtt_ms,
+        args.relay_path_rtt_ms,
+        args.relay_path_jitter_ms,
+        args.relay_path_queue_delay_ms,
+        args.relay_path_observed_at_unix_ms,
+    )
+}
+
+fn relay_secondary_path_metrics(args: &Args) -> Result<PathMetrics> {
+    if !relay_secondary_path_metrics_configured(args) {
+        return relay_path_metrics(args);
+    }
+    path_metrics_from_values(
+        "--relay-secondary-path",
+        args.relay_secondary_path_loss_fraction,
+        args.relay_secondary_path_best_direct_rtt_ms,
+        args.relay_secondary_path_rtt_ms,
+        args.relay_secondary_path_jitter_ms,
+        args.relay_secondary_path_queue_delay_ms,
+        args.relay_secondary_path_observed_at_unix_ms,
+    )
+}
+
+fn path_metrics_from_values(
+    prefix: &str,
+    loss_fraction: f32,
+    best_direct_rtt_ms: f32,
+    rtt_ms: f32,
+    jitter_ms: f32,
+    queue_delay_ms: f32,
+    observed_at_unix_ms: Option<u64>,
+) -> Result<PathMetrics> {
+    for (suffix, value) in [
+        ("best-direct-rtt-ms", best_direct_rtt_ms),
+        ("rtt-ms", rtt_ms),
+        ("jitter-ms", jitter_ms),
+        ("queue-delay-ms", queue_delay_ms),
     ] {
         if !value.is_finite() || value < 0.0 {
-            bail!("{flag} must be a finite non-negative value");
+            bail!("{prefix}-{suffix} must be a finite non-negative value");
         }
     }
-    if !args.relay_path_loss_fraction.is_finite()
-        || !(0.0..=1.0).contains(&args.relay_path_loss_fraction)
-    {
-        bail!("--relay-path-loss-fraction must be between zero and one");
+    if !loss_fraction.is_finite() || !(0.0..=1.0).contains(&loss_fraction) {
+        bail!("{prefix}-loss-fraction must be between zero and one");
     }
-    if args.relay_path_rtt_ms > 0.0 && args.relay_path_best_direct_rtt_ms == 0.0 {
-        bail!("--relay-path-best-direct-rtt-ms must be positive when route RTT is observed");
+    if rtt_ms > 0.0 && best_direct_rtt_ms == 0.0 {
+        bail!("{prefix}-best-direct-rtt-ms must be positive when route RTT is observed");
     }
     Ok(PathMetrics {
-        observed_at_us: args
-            .relay_path_observed_at_unix_ms
+        observed_at_us: observed_at_unix_ms
             .unwrap_or_default()
             .saturating_mul(1_000),
-        rtt_ms: args.relay_path_rtt_ms,
-        jitter_ms: args.relay_path_jitter_ms,
-        loss_fraction: args.relay_path_loss_fraction,
-        queue_delay_ms: args.relay_path_queue_delay_ms,
+        rtt_ms,
+        jitter_ms,
+        loss_fraction,
+        queue_delay_ms,
         ..PathMetrics::default()
     })
+}
+
+fn adaptive_relay_path_metrics(primary: PathMetrics, secondary: PathMetrics) -> PathMetrics {
+    PathMetrics {
+        observed_at_us: primary.observed_at_us.max(secondary.observed_at_us),
+        rtt_ms: primary.rtt_ms.max(secondary.rtt_ms),
+        jitter_ms: primary.jitter_ms.max(secondary.jitter_ms),
+        loss_fraction: (primary.loss_fraction + secondary.loss_fraction
+            - primary.loss_fraction * secondary.loss_fraction)
+            .clamp(0.0, 1.0),
+        queue_delay_ms: primary.queue_delay_ms.max(secondary.queue_delay_ms),
+        goodput_bps: match (primary.goodput_bps, secondary.goodput_bps) {
+            (Some(primary), Some(secondary)) => Some(primary.min(secondary)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        },
+        deadline_hit_fraction: primary
+            .deadline_hit_fraction
+            .min(secondary.deadline_hit_fraction),
+    }
 }
 
 #[derive(Clone)]
@@ -3388,6 +3483,46 @@ impl ContribStatusConfig {
                 relay_path_jitter_ms: args.relay_path_jitter_ms,
                 relay_path_queue_delay_ms: args.relay_path_queue_delay_ms,
                 relay_path_observed_at_unix_ms: args.relay_path_observed_at_unix_ms,
+                relay_secondary_path_observation_source: if relay_secondary_path_metrics_configured(
+                    args,
+                ) {
+                    "controller-seeded"
+                } else {
+                    "primary-policy-fallback"
+                },
+                relay_secondary_path_loss_fraction: if relay_secondary_path_metrics_configured(args)
+                {
+                    args.relay_secondary_path_loss_fraction
+                } else {
+                    args.relay_path_loss_fraction
+                },
+                relay_secondary_path_best_direct_rtt_ms: if relay_secondary_path_metrics_configured(
+                    args,
+                ) {
+                    args.relay_secondary_path_best_direct_rtt_ms
+                } else {
+                    args.relay_path_best_direct_rtt_ms
+                },
+                relay_secondary_path_rtt_ms: if relay_secondary_path_metrics_configured(args) {
+                    args.relay_secondary_path_rtt_ms
+                } else {
+                    args.relay_path_rtt_ms
+                },
+                relay_secondary_path_jitter_ms: if relay_secondary_path_metrics_configured(args) {
+                    args.relay_secondary_path_jitter_ms
+                } else {
+                    args.relay_path_jitter_ms
+                },
+                relay_secondary_path_queue_delay_ms: if relay_secondary_path_metrics_configured(
+                    args,
+                ) {
+                    args.relay_secondary_path_queue_delay_ms
+                } else {
+                    args.relay_path_queue_delay_ms
+                },
+                relay_secondary_path_observed_at_unix_ms: args
+                    .relay_secondary_path_observed_at_unix_ms
+                    .or(args.relay_path_observed_at_unix_ms),
                 media_object_clock_id: AV_CONTRIB_CLOCK_ID,
                 media_object_clock_confidence: "estimated",
                 media_object_clock_estimated_error_ms: args.wall_clock_estimated_error_ms,
@@ -3585,6 +3720,109 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_session_path_observation_age_seconds {}\n",
             snapshot.updated_unix_ms.saturating_sub(observed_at_unix_ms) as f64 / 1_000.0
         ));
+    }
+    for (name, help) in [
+        (
+            "av_contrib_relay_session_route_observation_info",
+            "Controller observation source for each independent relay route.",
+        ),
+        (
+            "av_contrib_relay_session_route_loss_fraction",
+            "Observed loss fraction for each independent relay route.",
+        ),
+        (
+            "av_contrib_relay_session_route_rtt_seconds",
+            "Observed end-to-end round-trip time for each independent relay route.",
+        ),
+        (
+            "av_contrib_relay_session_route_best_direct_rtt_seconds",
+            "Fastest measured direct round-trip time used by each relay route.",
+        ),
+        (
+            "av_contrib_relay_session_route_jitter_seconds",
+            "Observed jitter for each independent relay route.",
+        ),
+        (
+            "av_contrib_relay_session_route_queue_delay_seconds",
+            "Observed queue delay for each independent relay route.",
+        ),
+        (
+            "av_contrib_relay_session_route_stretch_ratio",
+            "Relay-route RTT divided by the fastest measured direct RTT for each path.",
+        ),
+        (
+            "av_contrib_relay_session_route_observation_age_seconds",
+            "Wall-clock age of each independent controller route observation.",
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+    }
+    for (
+        path,
+        source,
+        loss,
+        best_direct_rtt_ms,
+        rtt_ms,
+        jitter_ms,
+        queue_delay_ms,
+        observed_at_unix_ms,
+    ) in [
+        (
+            "primary",
+            snapshot.mesh.relay_path_observation_source,
+            snapshot.mesh.relay_path_loss_fraction,
+            snapshot.mesh.relay_path_best_direct_rtt_ms,
+            snapshot.mesh.relay_path_rtt_ms,
+            snapshot.mesh.relay_path_jitter_ms,
+            snapshot.mesh.relay_path_queue_delay_ms,
+            snapshot.mesh.relay_path_observed_at_unix_ms,
+        ),
+        (
+            "secondary",
+            snapshot.mesh.relay_secondary_path_observation_source,
+            snapshot.mesh.relay_secondary_path_loss_fraction,
+            snapshot.mesh.relay_secondary_path_best_direct_rtt_ms,
+            snapshot.mesh.relay_secondary_path_rtt_ms,
+            snapshot.mesh.relay_secondary_path_jitter_ms,
+            snapshot.mesh.relay_secondary_path_queue_delay_ms,
+            snapshot.mesh.relay_secondary_path_observed_at_unix_ms,
+        ),
+    ] {
+        output.push_str(&format!(
+            "av_contrib_relay_session_route_observation_info{{path=\"{path}\",source=\"{}\"}} 1\n",
+            prometheus_label_value(source)
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_route_loss_fraction{{path=\"{path}\"}} {loss}\n"
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_route_rtt_seconds{{path=\"{path}\"}} {}\n",
+            f64::from(rtt_ms) / 1_000.0
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_route_best_direct_rtt_seconds{{path=\"{path}\"}} {}\n",
+            f64::from(best_direct_rtt_ms) / 1_000.0
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_route_jitter_seconds{{path=\"{path}\"}} {}\n",
+            f64::from(jitter_ms) / 1_000.0
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_route_queue_delay_seconds{{path=\"{path}\"}} {}\n",
+            f64::from(queue_delay_ms) / 1_000.0
+        ));
+        if best_direct_rtt_ms > 0.0 {
+            output.push_str(&format!(
+                "av_contrib_relay_session_route_stretch_ratio{{path=\"{path}\"}} {}\n",
+                rtt_ms / best_direct_rtt_ms
+            ));
+        }
+        if let Some(observed_at_unix_ms) = observed_at_unix_ms {
+            output.push_str(&format!(
+                "av_contrib_relay_session_route_observation_age_seconds{{path=\"{path}\"}} {}\n",
+                snapshot.updated_unix_ms.saturating_sub(observed_at_unix_ms) as f64 / 1_000.0
+            ));
+        }
     }
     push_prometheus_metric_header(
         &mut output,
@@ -4806,6 +5044,13 @@ struct MeshTargetStatus {
     relay_path_jitter_ms: f32,
     relay_path_queue_delay_ms: f32,
     relay_path_observed_at_unix_ms: Option<u64>,
+    relay_secondary_path_observation_source: &'static str,
+    relay_secondary_path_loss_fraction: f32,
+    relay_secondary_path_best_direct_rtt_ms: f32,
+    relay_secondary_path_rtt_ms: f32,
+    relay_secondary_path_jitter_ms: f32,
+    relay_secondary_path_queue_delay_ms: f32,
+    relay_secondary_path_observed_at_unix_ms: Option<u64>,
     media_object_clock_id: &'static str,
     media_object_clock_confidence: &'static str,
     media_object_clock_estimated_error_ms: u64,
@@ -5972,6 +6217,12 @@ mod tests {
         args.relay_path_jitter_ms = 1.5;
         args.relay_path_queue_delay_ms = 2.0;
         args.relay_path_observed_at_unix_ms = Some(now_unix_ms());
+        args.relay_secondary_path_loss_fraction = 0.02;
+        args.relay_secondary_path_best_direct_rtt_ms = 246.7;
+        args.relay_secondary_path_rtt_ms = 261.5;
+        args.relay_secondary_path_jitter_ms = 0.7;
+        args.relay_secondary_path_queue_delay_ms = 1.0;
+        args.relay_secondary_path_observed_at_unix_ms = Some(now_unix_ms());
 
         let telemetry = Arc::new(IngestTelemetry::default());
         let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
@@ -5983,6 +6234,11 @@ mod tests {
         assert_eq!(
             relay.secondary.as_ref().unwrap().local_addr().unwrap(),
             secondary_bind
+        );
+        assert_eq!(relay.primary.path_metrics().rtt_ms, 253.0);
+        assert_eq!(
+            relay.secondary.as_ref().unwrap().path_metrics().rtt_ms,
+            261.5
         );
         let media = Bytes::from(
             (0..24_000)
@@ -6182,6 +6438,12 @@ mod tests {
         assert!((metric_value("av_contrib_relay_session_path_rtt_seconds") - 0.253).abs() < 1e-6);
         assert!(relay_metrics.contains("av_contrib_relay_session_path_observation_age_seconds "));
         assert!(relay_metrics
+            .contains("av_contrib_relay_session_route_rtt_seconds{path=\"primary\"} 0.253\n"));
+        assert!(relay_metrics
+            .contains("av_contrib_relay_session_route_rtt_seconds{path=\"secondary\"} 0.2615\n"));
+        assert!(relay_metrics
+            .contains("av_contrib_relay_session_route_loss_fraction{path=\"secondary\"} 0.02\n"));
+        assert!(relay_metrics
             .contains("av_contrib_relay_session_deadline_objects_total{outcome=\"hit\"} 1\n"));
         assert!(relay_metrics
             .contains("av_contrib_relay_session_deadline_objects_total{outcome=\"miss\"} 0\n"));
@@ -6236,6 +6498,16 @@ mod tests {
         assert_eq!(status.mesh.relay_path_best_direct_rtt_ms, 246.7);
         assert_eq!(status.mesh.relay_path_rtt_ms, 253.0);
         assert!(status.mesh.relay_path_observed_at_unix_ms.is_some());
+        assert_eq!(
+            status.mesh.relay_secondary_path_observation_source,
+            "controller-seeded"
+        );
+        assert_eq!(status.mesh.relay_secondary_path_loss_fraction, 0.02);
+        assert_eq!(status.mesh.relay_secondary_path_rtt_ms, 261.5);
+        assert!(status
+            .mesh
+            .relay_secondary_path_observed_at_unix_ms
+            .is_some());
         assert_eq!(status.mesh.media_object_clock_id, AV_CONTRIB_CLOCK_ID);
         assert_eq!(status.mesh.media_object_clock_confidence, "estimated");
         assert_eq!(status.mesh.media_object_clock_estimated_error_ms, 1_000);
@@ -6297,6 +6569,38 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("finite non-negative"));
+
+        args.relay_path_rtt_ms = 0.0;
+        args.relay_secondary_path_loss_fraction = 1.01;
+        assert!(relay_secondary_path_metrics(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("between zero and one"));
+    }
+
+    #[test]
+    fn adaptive_repair_accounts_for_both_independent_paths() {
+        let combined = adaptive_relay_path_metrics(
+            PathMetrics {
+                loss_fraction: 0.02,
+                rtt_ms: 244.0,
+                jitter_ms: 0.8,
+                deadline_hit_fraction: 0.999,
+                ..PathMetrics::default()
+            },
+            PathMetrics {
+                loss_fraction: 0.01,
+                rtt_ms: 251.0,
+                jitter_ms: 0.6,
+                deadline_hit_fraction: 0.998,
+                ..PathMetrics::default()
+            },
+        );
+
+        assert!((combined.loss_fraction - 0.0298).abs() < 0.000_001);
+        assert_eq!(combined.rtt_ms, 251.0);
+        assert_eq!(combined.jitter_ms, 0.8);
+        assert_eq!(combined.deadline_hit_fraction, 0.998);
     }
 
     #[tokio::test]
@@ -6554,6 +6858,12 @@ mod tests {
             relay_path_jitter_ms: 0.0,
             relay_path_queue_delay_ms: 0.0,
             relay_path_observed_at_unix_ms: None,
+            relay_secondary_path_loss_fraction: 0.0,
+            relay_secondary_path_best_direct_rtt_ms: 0.0,
+            relay_secondary_path_rtt_ms: 0.0,
+            relay_secondary_path_jitter_ms: 0.0,
+            relay_secondary_path_queue_delay_ms: 0.0,
+            relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: None,
             stream_id: 1,
@@ -6602,6 +6912,12 @@ mod tests {
             relay_path_jitter_ms: 0.0,
             relay_path_queue_delay_ms: 0.0,
             relay_path_observed_at_unix_ms: None,
+            relay_secondary_path_loss_fraction: 0.0,
+            relay_secondary_path_best_direct_rtt_ms: 0.0,
+            relay_secondary_path_rtt_ms: 0.0,
+            relay_secondary_path_jitter_ms: 0.0,
+            relay_secondary_path_queue_delay_ms: 0.0,
+            relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: None,
             stream_id: 9_007_199_254_741_993,
@@ -7126,6 +7442,12 @@ mod tests {
             relay_path_jitter_ms: 0.0,
             relay_path_queue_delay_ms: 0.0,
             relay_path_observed_at_unix_ms: None,
+            relay_secondary_path_loss_fraction: 0.0,
+            relay_secondary_path_best_direct_rtt_ms: 0.0,
+            relay_secondary_path_rtt_ms: 0.0,
+            relay_secondary_path_jitter_ms: 0.0,
+            relay_secondary_path_queue_delay_ms: 0.0,
+            relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: None,
             stream_id: 1,
@@ -7282,6 +7604,12 @@ mod tests {
             relay_path_jitter_ms: 0.0,
             relay_path_queue_delay_ms: 0.0,
             relay_path_observed_at_unix_ms: None,
+            relay_secondary_path_loss_fraction: 0.0,
+            relay_secondary_path_best_direct_rtt_ms: 0.0,
+            relay_secondary_path_rtt_ms: 0.0,
+            relay_secondary_path_jitter_ms: 0.0,
+            relay_secondary_path_queue_delay_ms: 0.0,
+            relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: Some(daw_bind),
             stream_id: 1,
@@ -7407,6 +7735,12 @@ mod tests {
             relay_path_jitter_ms: 0.0,
             relay_path_queue_delay_ms: 0.0,
             relay_path_observed_at_unix_ms: None,
+            relay_secondary_path_loss_fraction: 0.0,
+            relay_secondary_path_best_direct_rtt_ms: 0.0,
+            relay_secondary_path_rtt_ms: 0.0,
+            relay_secondary_path_jitter_ms: 0.0,
+            relay_secondary_path_queue_delay_ms: 0.0,
+            relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: Some(daw_bind),
             stream_id: 1,
