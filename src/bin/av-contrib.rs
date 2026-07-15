@@ -476,6 +476,45 @@ struct RelayPublishOutcome {
     repair_symbols: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCarrierPath {
+    Primary,
+    Secondary,
+}
+
+fn resolve_relay_lane_results(
+    primary: Result<()>,
+    secondary: Option<Result<()>>,
+    secondary_carries_source: bool,
+) -> Result<bool> {
+    match (primary, secondary) {
+        (Ok(()), None | Some(Ok(()))) => Ok(false),
+        (Ok(()), Some(Err(_))) => Ok(true),
+        (Err(_), Some(Ok(()))) if secondary_carries_source => Ok(true),
+        (Err(primary), Some(Ok(()))) => Err(primary).context(
+            "primary RelaySession lane failed and the secondary lane is repair-only",
+        ),
+        (Err(primary), Some(Err(secondary))) => Err(anyhow::anyhow!(
+            "all configured RelaySession lanes failed; primary: {primary:#}; secondary: {secondary:#}"
+        )),
+        (Err(primary), None) => {
+            Err(primary).context("the only configured RelaySession lane failed")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayPipelineStage {
+    Total,
+    EncodeWait,
+    Encode,
+    Schedule,
+    PrimarySourceSend,
+    SecondarySourceSend,
+    PrimaryRepairSend,
+    SecondaryRepairSend,
+}
+
 struct RelaySessionPublisher {
     encoder: Mutex<RaptorQObjectEncoder>,
     primary: PrivateUdpTransport,
@@ -594,19 +633,42 @@ impl RelaySessionPublisher {
     }
 
     async fn publish_object(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
+        let started = Instant::now();
+        let result = self.publish_object_inner(object).await;
+        self.telemetry
+            .record_relay_session_stage_duration(RelayPipelineStage::Total, started.elapsed());
+        result
+    }
+
+    async fn publish_object_inner(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
         let deadline = relay_deadline_for_object(object)?;
         if deadline.is_expired_at(now_unix_us()) {
+            self.telemetry
+                .relay_expired_objects
+                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .relay_deadline_misses
+                .fetch_add(1, Ordering::Relaxed);
             bail!("canonical media object expired before RelaySession encoding");
         }
-        let encoded = {
-            let mut encoder = self.encoder.lock().await;
-            encoder.encode_object_with_inferred_priority(
-                object,
-                self.generation,
-                self.subscription_id,
-                deadline,
-            )
-        };
+        let encode_wait_started = Instant::now();
+        let mut encoder = self.encoder.lock().await;
+        self.telemetry.record_relay_session_stage_duration(
+            RelayPipelineStage::EncodeWait,
+            encode_wait_started.elapsed(),
+        );
+        let encode_started = Instant::now();
+        let encoded = encoder.encode_object_with_inferred_priority(
+            object,
+            self.generation,
+            self.subscription_id,
+            deadline,
+        );
+        drop(encoder);
+        self.telemetry.record_relay_session_stage_duration(
+            RelayPipelineStage::Encode,
+            encode_started.elapsed(),
+        );
         let EncodedRaptorQObject {
             announcement,
             source_symbols,
@@ -618,36 +680,100 @@ impl RelaySessionPublisher {
                 return Err(error).context("failed to RaptorQ-protect canonical media object");
             }
         };
+
+        let schedule_started = Instant::now();
         let source_count = source_symbols.len();
         let repair_count = repair_symbols.len();
-
-        for symbol in source_symbols {
-            if self.secondary_seed_source {
-                self.send_symbol(&self.primary, symbol.clone()).await?;
-                self.send_symbol(
-                    self.secondary
-                        .as_ref()
-                        .expect("validated warm secondary target"),
-                    symbol,
-                )
-                .await?;
-            } else {
-                self.send_symbol(&self.primary, symbol).await?;
-            }
-        }
-
-        let repair_transport = self.secondary.as_ref().unwrap_or(&self.primary);
-        if self.secondary.is_none() && repair_count > 0 {
+        let repair_uses_primary = self.secondary.is_none();
+        if repair_uses_primary && repair_count > 0 {
             self.telemetry
                 .relay_repair_primary_fallback_objects
                 .fetch_add(1, Ordering::Relaxed);
         }
-        for symbol in repair_symbols {
-            self.send_symbol(repair_transport, symbol).await?;
+        self.telemetry.record_relay_session_stage_duration(
+            RelayPipelineStage::Schedule,
+            schedule_started.elapsed(),
+        );
+
+        let primary_lane = async {
+            for symbol in source_symbols.iter().cloned() {
+                self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
+                    .await?;
+            }
+            if repair_uses_primary {
+                for symbol in repair_symbols.iter().cloned() {
+                    self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
+                        .await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let secondary_lane = async {
+            if let Some(secondary) = self.secondary.as_ref() {
+                if self.secondary_seed_source {
+                    for symbol in source_symbols.iter().cloned() {
+                        self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
+                            .await?;
+                    }
+                }
+                for symbol in repair_symbols.iter().cloned() {
+                    self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
+                        .await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let secondary_configured = self.secondary.is_some();
+        let (primary_result, secondary_result) = tokio::join!(primary_lane, secondary_lane);
+        self.telemetry
+            .record_relay_session_lane_object(RelayCarrierPath::Primary, primary_result.is_ok());
+        if secondary_configured {
+            self.telemetry.record_relay_session_lane_object(
+                RelayCarrierPath::Secondary,
+                secondary_result.is_ok(),
+            );
+        }
+        let survived_lane_failure = match resolve_relay_lane_results(
+            primary_result,
+            secondary_configured.then_some(secondary_result),
+            self.secondary_seed_source,
+        ) {
+            Ok(survived_lane_failure) => survived_lane_failure,
+            Err(error) => {
+                self.telemetry
+                    .relay_all_lanes_failed_objects
+                    .fetch_add(1, Ordering::Relaxed);
+                if deadline.is_expired_at(now_unix_us()) {
+                    self.telemetry
+                        .relay_expired_objects
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .relay_deadline_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        if survived_lane_failure {
+            self.telemetry
+                .relay_surviving_lane_objects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if deadline.is_expired_at(now_unix_us()) {
+            self.telemetry
+                .relay_expired_objects
+                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .relay_deadline_misses
+                .fetch_add(1, Ordering::Relaxed);
+            bail!("canonical media object expired while RelaySession symbols were emitted");
         }
 
         self.telemetry
             .relay_objects_sent
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .relay_deadline_hits
             .fetch_add(1, Ordering::Relaxed);
         self.telemetry
             .relay_last_deadline_unix_us
@@ -662,32 +788,65 @@ impl RelaySessionPublisher {
     async fn send_symbol(
         &self,
         transport: &PrivateUdpTransport,
+        path: RelayCarrierPath,
         symbol: relay_session::RelayDatagram,
     ) -> Result<()> {
+        let started = Instant::now();
         let role = symbol.role;
-        if symbol.deadline.is_expired_at(now_unix_us()) {
+        let result = if symbol.deadline.is_expired_at(now_unix_us()) {
             self.telemetry.record_relay_session_send_error(role);
-            bail!("RelaySession symbol expired before carrier send");
-        }
-        let wire_bytes = match relay_datagram_len(&symbol) {
-            Ok(bytes) => bytes as u64,
-            Err(error) => {
+            self.telemetry
+                .relay_expired_symbols
+                .fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::anyhow!(
+                "RelaySession symbol expired before carrier send"
+            ))
+        } else {
+            let wire_bytes = match relay_datagram_len(&symbol) {
+                Ok(bytes) => bytes as u64,
+                Err(error) => {
+                    self.telemetry.record_relay_session_send_error(role);
+                    self.telemetry.record_relay_session_stage_duration(
+                        relay_send_stage(path, role),
+                        started.elapsed(),
+                    );
+                    return Err(error).context("failed to measure RelaySession datagram");
+                }
+            };
+            if let Err(error) = transport.send_datagram(symbol).await {
                 self.telemetry.record_relay_session_send_error(role);
-                return Err(error).context("failed to measure RelaySession datagram");
+                Err(error).with_context(|| {
+                    format!(
+                        "failed to send RelaySession datagram to {}",
+                        transport.peer_addr()
+                    )
+                })
+            } else {
+                self.telemetry
+                    .record_relay_session_send_success(role, wire_bytes);
+                Ok(())
             }
         };
-        if let Err(error) = transport.send_datagram(symbol).await {
-            self.telemetry.record_relay_session_send_error(role);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to send RelaySession datagram to {}",
-                    transport.peer_addr()
-                )
-            });
-        }
         self.telemetry
-            .record_relay_session_send_success(role, wire_bytes);
-        Ok(())
+            .record_relay_session_stage_duration(relay_send_stage(path, role), started.elapsed());
+        result
+    }
+}
+
+fn relay_send_stage(path: RelayCarrierPath, role: MediaDatagramRole) -> RelayPipelineStage {
+    match (path, role) {
+        (RelayCarrierPath::Primary, MediaDatagramRole::Source) => {
+            RelayPipelineStage::PrimarySourceSend
+        }
+        (RelayCarrierPath::Secondary, MediaDatagramRole::Source) => {
+            RelayPipelineStage::SecondarySourceSend
+        }
+        (RelayCarrierPath::Primary, MediaDatagramRole::Repair) => {
+            RelayPipelineStage::PrimaryRepairSend
+        }
+        (RelayCarrierPath::Secondary, MediaDatagramRole::Repair) => {
+            RelayPipelineStage::SecondaryRepairSend
+        }
     }
 }
 
@@ -1895,7 +2054,25 @@ struct IngestTelemetry {
     relay_repair_datagram_bytes: AtomicU64,
     relay_repair_errors: AtomicU64,
     relay_repair_primary_fallback_objects: AtomicU64,
+    relay_primary_lane_objects_succeeded: AtomicU64,
+    relay_primary_lane_objects_failed: AtomicU64,
+    relay_secondary_lane_objects_succeeded: AtomicU64,
+    relay_secondary_lane_objects_failed: AtomicU64,
+    relay_surviving_lane_objects: AtomicU64,
+    relay_all_lanes_failed_objects: AtomicU64,
+    relay_expired_objects: AtomicU64,
+    relay_expired_symbols: AtomicU64,
+    relay_deadline_hits: AtomicU64,
+    relay_deadline_misses: AtomicU64,
     relay_last_deadline_unix_us: AtomicU64,
+    relay_total_duration: AtomicDurationHistogram,
+    relay_encode_wait_duration: AtomicDurationHistogram,
+    relay_encode_duration: AtomicDurationHistogram,
+    relay_schedule_duration: AtomicDurationHistogram,
+    relay_primary_source_send_duration: AtomicDurationHistogram,
+    relay_secondary_source_send_duration: AtomicDurationHistogram,
+    relay_primary_repair_send_duration: AtomicDurationHistogram,
+    relay_secondary_repair_send_duration: AtomicDurationHistogram,
     mpeg_ts_slots: AtomicU64,
     mpeg_ts_bytes: AtomicU64,
     mpeg_ts_last_unix_ms: AtomicU64,
@@ -1956,8 +2133,32 @@ impl IngestTelemetry {
         .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_relay_session_lane_object(&self, path: RelayCarrierPath, succeeded: bool) {
+        match (path, succeeded) {
+            (RelayCarrierPath::Primary, true) => &self.relay_primary_lane_objects_succeeded,
+            (RelayCarrierPath::Primary, false) => &self.relay_primary_lane_objects_failed,
+            (RelayCarrierPath::Secondary, true) => &self.relay_secondary_lane_objects_succeeded,
+            (RelayCarrierPath::Secondary, false) => &self.relay_secondary_lane_objects_failed,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_relay_session_encode_error(&self) {
         self.relay_encode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_relay_session_stage_duration(&self, stage: RelayPipelineStage, duration: Duration) {
+        let histogram = match stage {
+            RelayPipelineStage::Total => &self.relay_total_duration,
+            RelayPipelineStage::EncodeWait => &self.relay_encode_wait_duration,
+            RelayPipelineStage::Encode => &self.relay_encode_duration,
+            RelayPipelineStage::Schedule => &self.relay_schedule_duration,
+            RelayPipelineStage::PrimarySourceSend => &self.relay_primary_source_send_duration,
+            RelayPipelineStage::SecondarySourceSend => &self.relay_secondary_source_send_duration,
+            RelayPipelineStage::PrimaryRepairSend => &self.relay_primary_repair_send_duration,
+            RelayPipelineStage::SecondaryRepairSend => &self.relay_secondary_repair_send_duration,
+        };
+        histogram.record(duration);
     }
 
     fn record_mesh_forward_duration(&self, kind: &'static str, duration: Duration) {
@@ -2694,6 +2895,26 @@ impl IngestTelemetry {
                 repair_primary_fallback_objects: self
                     .relay_repair_primary_fallback_objects
                     .load(Ordering::Relaxed),
+                primary_lane_objects_succeeded: self
+                    .relay_primary_lane_objects_succeeded
+                    .load(Ordering::Relaxed),
+                primary_lane_objects_failed: self
+                    .relay_primary_lane_objects_failed
+                    .load(Ordering::Relaxed),
+                secondary_lane_objects_succeeded: self
+                    .relay_secondary_lane_objects_succeeded
+                    .load(Ordering::Relaxed),
+                secondary_lane_objects_failed: self
+                    .relay_secondary_lane_objects_failed
+                    .load(Ordering::Relaxed),
+                surviving_lane_objects: self.relay_surviving_lane_objects.load(Ordering::Relaxed),
+                all_lanes_failed_objects: self
+                    .relay_all_lanes_failed_objects
+                    .load(Ordering::Relaxed),
+                expired_objects: self.relay_expired_objects.load(Ordering::Relaxed),
+                expired_symbols: self.relay_expired_symbols.load(Ordering::Relaxed),
+                deadline_hits: self.relay_deadline_hits.load(Ordering::Relaxed),
+                deadline_misses: self.relay_deadline_misses.load(Ordering::Relaxed),
                 last_deadline_unix_us: nonzero_unix_us(
                     self.relay_last_deadline_unix_us.load(Ordering::Relaxed),
                 ),
@@ -2701,6 +2922,16 @@ impl IngestTelemetry {
                     self.relay_last_deadline_unix_us.load(Ordering::Relaxed),
                 )
                 .map(|deadline| deadline.saturating_sub(now_ms.saturating_mul(1_000))),
+                stages: RelaySessionStageRuntimeSnapshot {
+                    total: self.relay_total_duration.snapshot(),
+                    encode_wait: self.relay_encode_wait_duration.snapshot(),
+                    encode: self.relay_encode_duration.snapshot(),
+                    schedule: self.relay_schedule_duration.snapshot(),
+                    primary_source_send: self.relay_primary_source_send_duration.snapshot(),
+                    secondary_source_send: self.relay_secondary_source_send_duration.snapshot(),
+                    primary_repair_send: self.relay_primary_repair_send_duration.snapshot(),
+                    secondary_repair_send: self.relay_secondary_repair_send_duration.snapshot(),
+                },
             },
             mpeg_ts: MpegTsRuntimeSnapshot {
                 slots: self.mpeg_ts_slots.load(Ordering::Relaxed),
@@ -3528,6 +3759,133 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
 
     push_prometheus_metric_header(
         &mut output,
+        "av_contrib_relay_session_lane_objects_total",
+        "Canonical RelaySession objects by carrier lane and send outcome.",
+        "counter",
+    );
+    for (path, succeeded, failed) in [
+        (
+            "primary",
+            runtime.relay_session.primary_lane_objects_succeeded,
+            runtime.relay_session.primary_lane_objects_failed,
+        ),
+        (
+            "secondary",
+            runtime.relay_session.secondary_lane_objects_succeeded,
+            runtime.relay_session.secondary_lane_objects_failed,
+        ),
+    ] {
+        output.push_str(&format!(
+            "av_contrib_relay_session_lane_objects_total{{path=\"{path}\",outcome=\"success\"}} {succeeded}\n"
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_lane_objects_total{{path=\"{path}\",outcome=\"failure\"}} {failed}\n"
+        ));
+    }
+    for (name, help, value) in [
+        (
+            "av_contrib_relay_session_surviving_lane_objects_total",
+            "Canonical objects emitted before deadline while another configured lane failed.",
+            runtime.relay_session.surviving_lane_objects,
+        ),
+        (
+            "av_contrib_relay_session_all_lanes_failed_objects_total",
+            "Canonical objects for which every complete configured RelaySession lane failed.",
+            runtime.relay_session.all_lanes_failed_objects,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_deadline_objects_total",
+        "Canonical RelaySession objects by sender deadline outcome.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_contrib_relay_session_deadline_objects_total{{outcome=\"hit\"}} {}\n",
+        runtime.relay_session.deadline_hits
+    ));
+    output.push_str(&format!(
+        "av_contrib_relay_session_deadline_objects_total{{outcome=\"miss\"}} {}\n",
+        runtime.relay_session.deadline_misses
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_expired_objects_total",
+        "Canonical objects that expired before the full RelaySession emission completed.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_contrib_relay_session_expired_objects_total {}\n",
+        runtime.relay_session.expired_objects
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_expired_symbols_total",
+        "RaptorQ symbols dropped at the contributor after their media deadline.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_contrib_relay_session_expired_symbols_total {}\n",
+        runtime.relay_session.expired_symbols
+    ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_stage_duration_seconds",
+        "RelaySession contribution latency by bounded RaptorQ and carrier stage.",
+        "histogram",
+    );
+    for (stage, histogram) in [
+        ("total", &runtime.relay_session.stages.total),
+        ("encode_wait", &runtime.relay_session.stages.encode_wait),
+        ("encode", &runtime.relay_session.stages.encode),
+        ("schedule", &runtime.relay_session.stages.schedule),
+        (
+            "send_primary_source",
+            &runtime.relay_session.stages.primary_source_send,
+        ),
+        (
+            "send_secondary_source",
+            &runtime.relay_session.stages.secondary_source_send,
+        ),
+        (
+            "send_primary_repair",
+            &runtime.relay_session.stages.primary_repair_send,
+        ),
+        (
+            "send_secondary_repair",
+            &runtime.relay_session.stages.secondary_repair_send,
+        ),
+    ] {
+        for (upper_bound_us, count) in DURATION_HISTOGRAM_BUCKETS_US
+            .iter()
+            .zip(histogram.buckets.iter())
+        {
+            output.push_str(&format!(
+                "av_contrib_relay_session_stage_duration_seconds_bucket{{stage=\"{stage}\",le=\"{}\"}} {count}\n",
+                *upper_bound_us as f64 / 1_000_000.0
+            ));
+        }
+        output.push_str(&format!(
+            "av_contrib_relay_session_stage_duration_seconds_bucket{{stage=\"{stage}\",le=\"+Inf\"}} {}\n",
+            histogram.count
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_stage_duration_seconds_sum{{stage=\"{stage}\"}} {}\n",
+            histogram.sum_us as f64 / 1_000_000.0
+        ));
+        output.push_str(&format!(
+            "av_contrib_relay_session_stage_duration_seconds_count{{stage=\"{stage}\"}} {}\n",
+            histogram.count
+        ));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
         "av_contrib_mesh_forward_duration_seconds",
         "Time spent encoding and sending one contributor payload to the mesh.",
         "histogram",
@@ -4011,8 +4369,31 @@ struct RelaySessionRuntimeSnapshot {
     repair_datagram_bytes: u64,
     repair_errors: u64,
     repair_primary_fallback_objects: u64,
+    primary_lane_objects_succeeded: u64,
+    primary_lane_objects_failed: u64,
+    secondary_lane_objects_succeeded: u64,
+    secondary_lane_objects_failed: u64,
+    surviving_lane_objects: u64,
+    all_lanes_failed_objects: u64,
+    expired_objects: u64,
+    expired_symbols: u64,
+    deadline_hits: u64,
+    deadline_misses: u64,
     last_deadline_unix_us: Option<u64>,
     last_deadline_headroom_us: Option<u64>,
+    stages: RelaySessionStageRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelaySessionStageRuntimeSnapshot {
+    total: DurationHistogramSnapshot,
+    encode_wait: DurationHistogramSnapshot,
+    encode: DurationHistogramSnapshot,
+    schedule: DurationHistogramSnapshot,
+    primary_source_send: DurationHistogramSnapshot,
+    secondary_source_send: DurationHistogramSnapshot,
+    primary_repair_send: DurationHistogramSnapshot,
+    secondary_repair_send: DurationHistogramSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5613,6 +5994,33 @@ mod tests {
         assert_eq!(snapshot.relay_session.source_errors, 0);
         assert_eq!(snapshot.relay_session.repair_errors, 0);
         assert_eq!(snapshot.relay_session.repair_primary_fallback_objects, 0);
+        assert_eq!(snapshot.relay_session.primary_lane_objects_succeeded, 1);
+        assert_eq!(snapshot.relay_session.primary_lane_objects_failed, 0);
+        assert_eq!(snapshot.relay_session.secondary_lane_objects_succeeded, 1);
+        assert_eq!(snapshot.relay_session.secondary_lane_objects_failed, 0);
+        assert_eq!(snapshot.relay_session.surviving_lane_objects, 0);
+        assert_eq!(snapshot.relay_session.all_lanes_failed_objects, 0);
+        assert_eq!(snapshot.relay_session.deadline_hits, 1);
+        assert_eq!(snapshot.relay_session.deadline_misses, 0);
+        assert_eq!(snapshot.relay_session.expired_objects, 0);
+        assert_eq!(snapshot.relay_session.expired_symbols, 0);
+        assert_eq!(snapshot.relay_session.stages.total.count, 1);
+        assert_eq!(snapshot.relay_session.stages.encode_wait.count, 1);
+        assert_eq!(snapshot.relay_session.stages.encode.count, 1);
+        assert_eq!(snapshot.relay_session.stages.schedule.count, 1);
+        assert_eq!(
+            snapshot.relay_session.stages.primary_source_send.count,
+            primary.len() as u64
+        );
+        assert_eq!(
+            snapshot.relay_session.stages.secondary_source_send.count,
+            secondary_source.len() as u64
+        );
+        assert_eq!(
+            snapshot.relay_session.stages.secondary_repair_send.count,
+            secondary_repair.len() as u64
+        );
+        assert_eq!(snapshot.relay_session.stages.primary_repair_send.count, 0);
         assert!(snapshot
             .relay_session
             .last_deadline_unix_us
@@ -5648,6 +6056,27 @@ mod tests {
         );
         assert!((metric_value("av_contrib_relay_session_path_rtt_seconds") - 0.253).abs() < 1e-6);
         assert!(relay_metrics.contains("av_contrib_relay_session_path_observation_age_seconds "));
+        assert!(relay_metrics
+            .contains("av_contrib_relay_session_deadline_objects_total{outcome=\"hit\"} 1\n"));
+        assert!(relay_metrics
+            .contains("av_contrib_relay_session_deadline_objects_total{outcome=\"miss\"} 0\n"));
+        assert!(relay_metrics.contains(
+            "av_contrib_relay_session_stage_duration_seconds_count{stage=\"total\"} 1\n"
+        ));
+        assert!(relay_metrics.contains(&format!(
+            "av_contrib_relay_session_stage_duration_seconds_count{{stage=\"send_secondary_repair\"}} {}\n",
+            secondary_repair.len()
+        )));
+        assert!(relay_metrics.contains(
+            "av_contrib_relay_session_lane_objects_total{path=\"primary\",outcome=\"success\"} 1\n"
+        ));
+        assert!(relay_metrics.contains(
+            "av_contrib_relay_session_lane_objects_total{path=\"secondary\",outcome=\"failure\"} 0\n"
+        ));
+        assert!(relay_metrics.contains("av_contrib_relay_session_surviving_lane_objects_total 0\n"));
+        assert!(
+            relay_metrics.contains("av_contrib_relay_session_all_lanes_failed_objects_total 0\n")
+        );
         let status = status_config.snapshot();
         assert!(status.mesh.relay_primary_configured);
         assert!(status.mesh.relay_secondary_configured);
@@ -5682,6 +6111,47 @@ mod tests {
     }
 
     #[test]
+    fn relay_session_lane_resolution_preserves_independent_parent_availability() {
+        assert!(!resolve_relay_lane_results(Ok(()), Some(Ok(())), true).unwrap());
+        assert!(resolve_relay_lane_results(
+            Ok(()),
+            Some(Err(anyhow::anyhow!("secondary unavailable"))),
+            true,
+        )
+        .unwrap());
+        assert!(resolve_relay_lane_results(
+            Err(anyhow::anyhow!("primary unavailable")),
+            Some(Ok(())),
+            true,
+        )
+        .unwrap());
+        assert!(resolve_relay_lane_results(
+            Err(anyhow::anyhow!("primary unavailable")),
+            Some(Ok(())),
+            false,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("repair-only"));
+        assert!(resolve_relay_lane_results(
+            Err(anyhow::anyhow!("primary unavailable")),
+            Some(Err(anyhow::anyhow!("secondary unavailable"))),
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("all configured RelaySession lanes failed"));
+        assert!(resolve_relay_lane_results(
+            Err(anyhow::anyhow!("primary unavailable")),
+            None,
+            false,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("only configured RelaySession lane failed"));
+    }
+
+    #[test]
     fn relay_path_observations_reject_invalid_controller_inputs() {
         let mut args = contrib_status_args();
         args.relay_path_loss_fraction = 1.01;
@@ -5696,6 +6166,58 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("finite non-negative"));
+    }
+
+    #[tokio::test]
+    async fn relay_session_drops_an_expired_object_before_encoding_and_counts_one_miss() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(receiver.local_addr().unwrap());
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = Bytes::from_static(b"expired-media");
+        let (initialization, configuration_epoch) =
+            build_fmp4_initialization_object(8, b"expired-init").unwrap();
+        let published_at_unix_ns = i64::try_from(
+            now_unix_us()
+                .saturating_sub(2_000_000)
+                .saturating_mul(1_000),
+        )
+        .unwrap();
+        let part = test_fmp4_part(
+            8,
+            1,
+            false,
+            1,
+            0,
+            None,
+            payload.clone(),
+            published_at_unix_ns,
+        );
+        let object = build_fmp4_media_object(
+            &part,
+            &payload,
+            initialization.key().clone(),
+            configuration_epoch,
+            1,
+            1_000,
+        )
+        .unwrap();
+
+        let error = relay.publish_object(&object).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expired before RelaySession encoding"));
+        let snapshot = telemetry.snapshot().relay_session;
+        assert_eq!(snapshot.objects_sent, 0);
+        assert_eq!(snapshot.deadline_hits, 0);
+        assert_eq!(snapshot.deadline_misses, 1);
+        assert_eq!(snapshot.expired_objects, 1);
+        assert_eq!(snapshot.stages.total.count, 1);
+        assert_eq!(snapshot.stages.encode.count, 0);
     }
 
     #[tokio::test]
