@@ -26,7 +26,7 @@ av-hls = { path = "../av-service/av-hls" }
 http = "1"
 mpeg2ts-reader = { git = "https://github.com/wavey-ai/mpeg2ts-reader.git" }
 media-object = { path = "../media-object" }
-media-capability = { path = "../Needletail/crates/media-capability" }
+media-capability = { path = "../needletail/crates/media-capability" }
 playlists = { path = "../playlists" }
 raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
 raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
