@@ -2968,14 +2968,25 @@ impl ContribStatusConfig {
                 relay_primary_configured: args.relay_primary_target.is_some(),
                 relay_secondary_configured: args.relay_secondary_target.is_some(),
                 relay_carrier: args.relay_primary_target.map(|_| "private-udp"),
+                relay_trust: args
+                    .relay_primary_target
+                    .map(|_| "controlled-qualification"),
+                relay_primary_id: args
+                    .relay_primary_target
+                    .map(|_| args.relay_primary_id.clone()),
                 relay_primary_target: args.relay_primary_target.map(|target| target.to_string()),
                 relay_primary_bind: args.relay_primary_bind.map(|bind| bind.to_string()),
+                relay_secondary_id: args
+                    .relay_secondary_target
+                    .map(|_| args.relay_secondary_id.clone()),
                 relay_secondary_target: args
                     .relay_secondary_target
                     .map(|target| target.to_string()),
                 relay_secondary_bind: args.relay_secondary_bind.map(|bind| bind.to_string()),
                 relay_secondary_source_seeded: args.relay_secondary_seed_source,
                 relay_exclusive: args.relay_exclusive,
+                relay_topology_generation: args.relay_topology_generation,
+                relay_subscription_id: args.relay_subscription_id,
                 relay_deadline_ms: args.relay_deadline_ms,
                 media_object_clock_id: AV_CONTRIB_CLOCK_ID,
                 media_object_clock_confidence: "estimated",
@@ -4111,15 +4122,23 @@ struct MeshTargetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_carrier: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    relay_trust: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_primary_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     relay_primary_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_primary_bind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_secondary_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_secondary_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_secondary_bind: Option<String>,
     relay_secondary_source_seeded: bool,
     relay_exclusive: bool,
+    relay_topology_generation: u64,
+    relay_subscription_id: u64,
     relay_deadline_ms: u64,
     media_object_clock_id: &'static str,
     media_object_clock_confidence: &'static str,
