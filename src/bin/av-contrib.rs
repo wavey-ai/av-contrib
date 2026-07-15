@@ -93,7 +93,11 @@ fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
     Ok(Bytes::from(out))
 }
 
-fn build_fmp4_initialization_object(stream_id: u64, payload: &[u8]) -> Result<(MediaObject, u64)> {
+fn build_fmp4_initialization_object(
+    stream_id: u64,
+    source_epoch: u64,
+    payload: &[u8],
+) -> Result<(MediaObject, u64)> {
     let payload_hash = PayloadHash::digest(payload);
     let mut epoch_bytes = [0_u8; 8];
     epoch_bytes.copy_from_slice(&payload_hash.as_bytes()[..8]);
@@ -102,7 +106,7 @@ fn build_fmp4_initialization_object(stream_id: u64, payload: &[u8]) -> Result<(M
         MEDIA_OBJECT_TENANT,
         stream_id.to_string(),
         FMP4_INITIALIZATION_TRACK,
-        0,
+        source_epoch,
         configuration_epoch,
         0,
         MEDIA_OBJECT_VERSION,
@@ -123,6 +127,7 @@ fn build_fmp4_media_object(
     payload: &[u8],
     initialization_key: ObjectKey,
     configuration_epoch: u64,
+    source_epoch: u64,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
 ) -> Result<MediaObject> {
@@ -133,7 +138,7 @@ fn build_fmp4_media_object(
         MEDIA_OBJECT_TENANT,
         part.stream_id.to_string(),
         FMP4_MEDIA_TRACK,
-        0,
+        source_epoch,
         0,
         part.sequence,
         MEDIA_OBJECT_VERSION,
@@ -1040,6 +1045,7 @@ struct MeshForwarder {
     media_socket: Arc<UdpSocket>,
     media_target: SocketAddr,
     next_media_sequence: Arc<AtomicU64>,
+    source_epoch: u64,
     fmp4_initializations: Arc<Mutex<HashMap<u64, (ObjectKey, u64)>>>,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
@@ -1083,6 +1089,11 @@ impl MeshForwarder {
                 )
             })?;
 
+        let source_epoch = now_unix_us().max(1);
+        telemetry
+            .media_object_source_epoch
+            .store(source_epoch, Ordering::Release);
+
         Ok(Self {
             byte_socket: Arc::new(byte_socket),
             byte_target: args.mesh_fec_target,
@@ -1094,6 +1105,7 @@ impl MeshForwarder {
             media_socket: Arc::new(media_socket),
             media_target: args.mesh_media_fec_target,
             next_media_sequence: Arc::new(AtomicU64::new(0)),
+            source_epoch,
             fmp4_initializations: Arc::new(Mutex::new(HashMap::new())),
             delivery_budget_ms: args.relay_deadline_ms,
             estimated_clock_error_ns,
@@ -1486,7 +1498,7 @@ impl Fmp4PartPublisher for MeshForwarder {
         let initialization = part
             .init
             .as_ref()
-            .map(|init| build_fmp4_initialization_object(part.stream_id, init))
+            .map(|init| build_fmp4_initialization_object(part.stream_id, self.source_epoch, init))
             .transpose()
             .map_err(|error| error.to_string())?;
         let (initialization_key, configuration_epoch) =
@@ -1525,6 +1537,7 @@ impl Fmp4PartPublisher for MeshForwarder {
             &bundled_media,
             initialization_key,
             configuration_epoch,
+            self.source_epoch,
             self.delivery_budget_ms,
             self.estimated_clock_error_ns,
         )
@@ -1558,11 +1571,25 @@ impl Fmp4PartPublisher for MeshForwarder {
 struct TelemetryFmp4Publisher {
     inner: Arc<dyn Fmp4PartPublisher>,
     telemetry: Arc<IngestTelemetry>,
+    canonical_sequences: Mutex<HashMap<u64, u64>>,
 }
 
 #[async_trait::async_trait]
 impl Fmp4PartPublisher for TelemetryFmp4Publisher {
-    async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
+    async fn publish_fmp4_part(
+        &self,
+        mut part: PublishedFmp4Part,
+    ) -> std::result::Result<(), String> {
+        // Segmenters may be recreated when an ingest protocol reconnects.
+        // Keep the canonical object sequence at the shared publisher boundary
+        // so it remains contiguous for the entire source incarnation.
+        part.sequence = {
+            let mut sequences = self.canonical_sequences.lock().await;
+            let next = sequences.entry(part.stream_id).or_insert(0);
+            let sequence = *next;
+            *next = next.saturating_add(1);
+            sequence
+        };
         let stream_id = part.stream_id;
         let stream_idx = part.stream_idx;
         let sequence = part.sequence;
@@ -2145,6 +2172,7 @@ fn histogram_percentile_upper_bound_us(
 
 #[derive(Debug, Default)]
 struct IngestTelemetry {
+    media_object_source_epoch: AtomicU64,
     raw_http_requests: AtomicU64,
     raw_http_chunks: AtomicU64,
     raw_http_bytes: AtomicU64,
@@ -3526,6 +3554,9 @@ impl ContribStatusConfig {
                 media_object_clock_id: AV_CONTRIB_CLOCK_ID,
                 media_object_clock_confidence: "estimated",
                 media_object_clock_estimated_error_ms: args.wall_clock_estimated_error_ms,
+                media_object_source_epoch: telemetry
+                    .media_object_source_epoch
+                    .load(Ordering::Acquire),
             },
             hls: HlsStatus {
                 part_target_ms: args.fmp4_part_ms,
@@ -3824,6 +3855,16 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             ));
         }
     }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_media_object_source_epoch",
+        "Current canonical media-object source incarnation epoch.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_media_object_source_epoch {}\n",
+        snapshot.mesh.media_object_source_epoch
+    ));
     push_prometheus_metric_header(
         &mut output,
         "av_contrib_media_object_clock_estimated_error_seconds",
@@ -5054,6 +5095,7 @@ struct MeshTargetStatus {
     media_object_clock_id: &'static str,
     media_object_clock_confidence: &'static str,
     media_object_clock_estimated_error_ms: u64,
+    media_object_source_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5442,6 +5484,7 @@ async fn main() -> Result<()> {
     let publisher: Arc<dyn Fmp4PartPublisher> = Arc::new(TelemetryFmp4Publisher {
         inner: mesh_publisher,
         telemetry: telemetry.clone(),
+        canonical_sequences: Mutex::new(HashMap::new()),
     });
     let (playlists, chunk_cache, m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
     let hls_router =
@@ -5928,6 +5971,8 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::time::timeout;
 
+    const TEST_SOURCE_EPOCH: u64 = 1_784_151_600_000_001;
+
     #[allow(clippy::too_many_arguments)]
     fn test_fmp4_part(
         stream_id: u64,
@@ -6031,13 +6076,14 @@ mod tests {
         let media = Bytes::from_static(b"moofmdat");
         let bundled = encode_mesh_fmp4_slot(Some(&init), &media).unwrap();
         let (initialization, configuration_epoch) =
-            build_fmp4_initialization_object(77, &init).unwrap();
+            build_fmp4_initialization_object(77, TEST_SOURCE_EPOCH, &init).unwrap();
         let part = test_fmp4_part(77, 42, true, 3, 4, Some(init), media, PUBLISHED_NS);
         let original = build_fmp4_media_object(
             &part,
             &bundled,
             initialization.key().clone(),
             configuration_epoch,
+            TEST_SOURCE_EPOCH,
             1_000,
             250_000,
         )
@@ -6048,6 +6094,7 @@ mod tests {
         assert_eq!(object, original);
         assert_eq!(object.key().stream(), "77");
         assert_eq!(object.key().track(), FMP4_MEDIA_TRACK);
+        assert_eq!(object.key().epoch(), TEST_SOURCE_EPOCH);
         assert_eq!(object.key().object(), 42);
         assert_eq!(object.kind(), ObjectKind::Media);
         assert!(object.is_keyframe());
@@ -6098,9 +6145,9 @@ mod tests {
         let media = Bytes::from_static(b"stable-media");
         let bundled = encode_mesh_fmp4_slot(Some(&init), &media).unwrap();
         let (first_initialization, first_epoch) =
-            build_fmp4_initialization_object(9, &init).unwrap();
+            build_fmp4_initialization_object(9, TEST_SOURCE_EPOCH, &init).unwrap();
         let (retry_initialization, retry_epoch) =
-            build_fmp4_initialization_object(9, &init).unwrap();
+            build_fmp4_initialization_object(9, TEST_SOURCE_EPOCH, &init).unwrap();
         assert_eq!(first_initialization, retry_initialization);
         assert_eq!(first_epoch, retry_epoch);
 
@@ -6120,6 +6167,7 @@ mod tests {
                 &bundled,
                 first_initialization.key().clone(),
                 first_epoch,
+                TEST_SOURCE_EPOCH,
                 900,
                 500_000,
             )
@@ -6133,12 +6181,16 @@ mod tests {
             media_object::encode(&retry).unwrap()
         );
         assert_eq!(first.dependencies(), &[first_initialization.key().clone()]);
+        let (next_incarnation, _) =
+            build_fmp4_initialization_object(9, TEST_SOURCE_EPOCH + 1, b"stable-init").unwrap();
+        assert_ne!(first_initialization.key(), next_incarnation.key());
     }
 
     #[test]
     fn muxed_audio_video_uses_audio_priority_until_a_keyframe() {
         let init = Bytes::from_static(b"muxed-init");
-        let (initialization, epoch) = build_fmp4_initialization_object(11, &init).unwrap();
+        let (initialization, epoch) =
+            build_fmp4_initialization_object(11, TEST_SOURCE_EPOCH, &init).unwrap();
         let delta = test_fmp4_part(
             11,
             1,
@@ -6154,6 +6206,7 @@ mod tests {
             b"delta",
             initialization.key().clone(),
             epoch,
+            TEST_SOURCE_EPOCH,
             1_000,
             500_000,
         )
@@ -6179,6 +6232,7 @@ mod tests {
             b"key",
             initialization.key().clone(),
             epoch,
+            TEST_SOURCE_EPOCH,
             1_000,
             500_000,
         )
@@ -6248,7 +6302,7 @@ mod tests {
         let init = Bytes::from_static(b"ftypmoov");
         let bundled = encode_mesh_fmp4_slot(Some(&init), &media).unwrap();
         let (initialization, configuration_epoch) =
-            build_fmp4_initialization_object(77, &init).unwrap();
+            build_fmp4_initialization_object(77, TEST_SOURCE_EPOCH, &init).unwrap();
         let part = test_fmp4_part(
             77,
             42,
@@ -6264,6 +6318,7 @@ mod tests {
             &bundled,
             initialization.key().clone(),
             configuration_epoch,
+            TEST_SOURCE_EPOCH,
             args.relay_deadline_ms,
             1_000_000,
         )
@@ -6411,6 +6466,9 @@ mod tests {
             .last_deadline_headroom_us
             .is_some_and(|headroom| headroom > 0));
 
+        telemetry
+            .media_object_source_epoch
+            .store(TEST_SOURCE_EPOCH, Ordering::Release);
         let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
         let relay_metrics = String::from_utf8(status_config.prometheus_metrics().to_vec()).unwrap();
         assert!(relay_metrics
@@ -6420,6 +6478,9 @@ mod tests {
         assert!(relay_metrics.contains("av_contrib_relay_session_last_deadline_seconds "));
         assert!(relay_metrics.contains("av_contrib_relay_session_last_deadline_headroom_seconds "));
         assert!(relay_metrics.contains("av_contrib_media_object_clock_estimated_error_seconds 1\n"));
+        assert!(relay_metrics.contains(&format!(
+            "av_contrib_media_object_source_epoch {TEST_SOURCE_EPOCH}\n"
+        )));
         assert!(relay_metrics.contains(
             "av_contrib_relay_session_path_observation_info{source=\"controller-seeded\"} 1\n"
         ));
@@ -6615,7 +6676,7 @@ mod tests {
             .unwrap();
         let payload = Bytes::from_static(b"expired-media");
         let (initialization, configuration_epoch) =
-            build_fmp4_initialization_object(8, b"expired-init").unwrap();
+            build_fmp4_initialization_object(8, TEST_SOURCE_EPOCH, b"expired-init").unwrap();
         let published_at_unix_ns = i64::try_from(
             now_unix_us()
                 .saturating_sub(2_000_000)
@@ -6637,6 +6698,7 @@ mod tests {
             &payload,
             initialization.key().clone(),
             configuration_epoch,
+            TEST_SOURCE_EPOCH,
             1,
             1_000,
         )
@@ -6667,7 +6729,7 @@ mod tests {
             .unwrap();
         let payload = vec![0x5a; 12_000];
         let (initialization, configuration_epoch) =
-            build_fmp4_initialization_object(8, b"single-parent-init").unwrap();
+            build_fmp4_initialization_object(8, TEST_SOURCE_EPOCH, b"single-parent-init").unwrap();
         let part = test_fmp4_part(
             8,
             3,
@@ -6683,6 +6745,7 @@ mod tests {
             &payload,
             initialization.key().clone(),
             configuration_epoch,
+            TEST_SOURCE_EPOCH,
             5_000,
             1_000_000,
         )
