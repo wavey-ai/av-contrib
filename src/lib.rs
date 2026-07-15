@@ -1,4 +1,5 @@
 pub mod fmp4_bridge;
+pub mod ingress_authorization;
 
 use access_unit::{detect_audio, h264, AudioType};
 #[cfg(test)]

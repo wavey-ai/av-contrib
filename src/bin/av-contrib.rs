@@ -3,6 +3,11 @@ use av_contrib::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop, PublishedFmp4Part,
     TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
+use av_contrib::ingress_authorization::{
+    decode_envelope_header_bytes, gate_from_bootstrap_path, parse_bearer_header,
+    parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
+    PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
+};
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use av_hls::{HlsHandler, HlsRouter};
 use av_upload_response::{
@@ -17,15 +22,18 @@ use av_web_service::{
 use bytes::{Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use http::{header::CONTENT_LENGTH, Method, Request, Response, StatusCode};
+use http::{
+    header::{AUTHORIZATION, CONTENT_LENGTH},
+    Method, Request, Response, StatusCode,
+};
 use media_object::{
     ClockConfidence, ClockTimestamp, MediaObject, ObjectKey, ObjectKind, PayloadHash, Stage,
     StageTimestamp,
 };
 use raptorq_datagram_fec::{
-    source_symbol_count, DatagramFecEncoder, DatagramFecHeader, MediaFecDecoder, MediaFecEncoder,
-    MediaFrame, MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE, HEADER_LEN,
-    MAX_SOURCE_SYMBOLS_PER_BLOCK,
+    source_symbol_count, DatagramFecEncoder, DatagramFecHeader, MediaCodec, MediaFecDecoder,
+    MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE,
+    ENCODING_PACKET_HEADER_LEN, HEADER_LEN, MAX_SOURCE_SYMBOLS_PER_BLOCK,
 };
 use relay_session::{
     encoded_datagram_len as relay_datagram_len, EncodedRaptorQObject, MediaDatagramRole,
@@ -1054,6 +1062,17 @@ struct MeshForwarder {
     telemetry: Arc<IngestTelemetry>,
 }
 
+#[derive(Debug)]
+struct AuthorizedDatagramLimitExceeded;
+
+impl std::fmt::Display for AuthorizedDatagramLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authorized media datagram limit exceeded")
+    }
+}
+
+impl std::error::Error for AuthorizedDatagramLimitExceeded {}
+
 impl MeshForwarder {
     async fn new(args: &Args, telemetry: Arc<IngestTelemetry>) -> Result<Self> {
         if args.relay_deadline_ms == 0 {
@@ -1120,13 +1139,34 @@ impl MeshForwarder {
     }
 
     async fn forward_stream_slot(&self, stream_id: u64, bytes: &[u8]) -> Result<usize> {
+        self.forward_stream_slot_with_limit(stream_id, bytes, None)
+            .await
+    }
+
+    async fn forward_stream_slot_with_limit(
+        &self,
+        stream_id: u64,
+        bytes: &[u8],
+        max_datagram_bytes: Option<u32>,
+    ) -> Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
         }
+        let symbol_size = if let Some(maximum) = max_datagram_bytes {
+            let overhead = std::mem::size_of::<u64>() + HEADER_LEN + ENCODING_PACKET_HEADER_LEN;
+            let maximum = usize::try_from(maximum)
+                .ok()
+                .and_then(|maximum| maximum.checked_sub(overhead))
+                .and_then(|maximum| u16::try_from(maximum).ok())
+                .filter(|maximum| *maximum > 0)
+                .ok_or_else(|| anyhow::Error::new(AuthorizedDatagramLimitExceeded))?;
+            self.symbol_size.min(maximum)
+        } else {
+            self.symbol_size
+        };
         let started = Instant::now();
         let encode_wait_started = Instant::now();
-        let geometry = match stream_fec_geometry(bytes.len(), self.symbol_size, self.repair_symbols)
-        {
+        let geometry = match stream_fec_geometry(bytes.len(), symbol_size, self.repair_symbols) {
             Ok(geometry) => geometry,
             Err(error) => {
                 self.telemetry.record_mesh_forward_stage_duration(
@@ -1161,7 +1201,7 @@ impl MeshForwarder {
             stream_id,
             bytes,
             self.repair_symbols,
-            self.symbol_size,
+            symbol_size,
             block_id,
             packet_sequence,
         ) {
@@ -1183,6 +1223,14 @@ impl MeshForwarder {
                 return Err(error);
             }
         };
+        if let Some(maximum) = max_datagram_bytes {
+            if datagrams
+                .iter()
+                .any(|datagram| datagram.len() > maximum as usize)
+            {
+                return Err(anyhow::Error::new(AuthorizedDatagramLimitExceeded));
+            }
+        }
         self.telemetry.record_mesh_forward_stage_duration(
             "stream",
             "encode",
@@ -1241,6 +1289,7 @@ impl MeshForwarder {
         &self,
         metadata: MediaFrameMetadata,
         payload: &[u8],
+        max_datagram_bytes: Option<u32>,
     ) -> Result<usize> {
         let started = Instant::now();
         let stream_id = metadata.stream_id;
@@ -1277,6 +1326,14 @@ impl MeshForwarder {
                 return Err(error);
             }
         };
+        if let Some(maximum) = max_datagram_bytes {
+            if datagrams
+                .iter()
+                .any(|datagram| datagram.len() > maximum as usize)
+            {
+                return Err(anyhow::Error::new(AuthorizedDatagramLimitExceeded));
+            }
+        }
         let datagram_bytes = datagrams
             .iter()
             .map(|datagram| datagram.len() as u64)
@@ -1458,7 +1515,7 @@ async fn run_daw_media_udp_ingest(
                         let sequence = frame.metadata.sequence;
                         let payload_bytes = frame.payload.len();
                         if let Err(error) = forwarder
-                            .forward_media_access_unit(frame.metadata, &frame.payload)
+                            .forward_media_access_unit(frame.metadata, &frame.payload, None)
                             .await
                         {
                             warn!(
@@ -5200,6 +5257,7 @@ struct ContribRouter {
     default_stream_id: u64,
     hls_router: Arc<HlsRouter>,
     status: Arc<ContribStatusConfig>,
+    publish_ingress_gate: Option<Arc<PublishIngressGate>>,
 }
 
 impl ContribRouter {
@@ -5208,12 +5266,14 @@ impl ContribRouter {
         default_stream_id: u64,
         hls_router: Arc<HlsRouter>,
         status: Arc<ContribStatusConfig>,
+        publish_ingress_gate: Option<Arc<PublishIngressGate>>,
     ) -> Self {
         Self {
             forwarder,
             default_stream_id,
             hls_router,
             status,
+            publish_ingress_gate,
         }
     }
 
@@ -5280,11 +5340,17 @@ impl Router for ContribRouter {
                     Some("application/json"),
                 ))
             }
-            CONTRIB_METRICS_PATH => Ok(response(
-                StatusCode::OK,
-                Some(self.status.prometheus_metrics()),
-                Some(PROMETHEUS_CONTENT_TYPE),
-            )),
+            CONTRIB_METRICS_PATH => {
+                let mut metrics = self.status.prometheus_metrics().to_vec();
+                if let Some(gate) = &self.publish_ingress_gate {
+                    metrics.extend_from_slice(gate.prometheus_metrics().as_bytes());
+                }
+                Ok(response(
+                    StatusCode::OK,
+                    Some(Bytes::from(metrics)),
+                    Some(PROMETHEUS_CONTENT_TYPE),
+                ))
+            }
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -5319,6 +5385,12 @@ impl Router for ContribRouter {
                     Some(Bytes::from_static(b"use POST or PUT /ingest\n")),
                     Some("text/plain"),
                 ));
+            }
+
+            if let Some(gate) = &self.publish_ingress_gate {
+                if let Err(error) = gate.authorize_legacy_path() {
+                    return Ok(publish_authorization_response(&error));
+                }
             }
 
             let stream_id = parse_stream_id_query(req.uri().query(), self.default_stream_id)
@@ -5380,22 +5452,159 @@ impl Router for ContribRouter {
                 now_unix_ms(),
             )
             .map_err(ServerError::Config)?;
-            let Some(payload) =
-                read_body_bytes_limited(&mut body, MAX_MEDIA_ACCESS_UNIT_BYTES).await?
-            else {
-                return Ok(payload_too_large_response(MAX_MEDIA_ACCESS_UNIT_BYTES));
+            let mut admission = None;
+            let mut authorized_ack_metadata = None;
+            if let Some(gate) = &self.publish_ingress_gate {
+                if gate.mode() != PublishAuthorizationMode::Off {
+                    let extracted = extract_publish_ingress_request(&req);
+                    match extracted {
+                        Ok((compact_jws, envelope_json, content_length)) => {
+                            let request = PublishIngressRequest {
+                                compact_jws,
+                                envelope_json: &envelope_json,
+                                content_length,
+                                legacy_stream_id: params.stream_id,
+                                now_unix_seconds: now_unix_seconds(),
+                            };
+                            match gate.authorize(&request) {
+                                Ok(value) => admission = Some(value),
+                                Err(error) => {
+                                    return Ok(publish_authorization_response(&error));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Err(error) = gate.handle_integration_error(error) {
+                                return Ok(publish_authorization_response(&error));
+                            }
+                        }
+                    }
+                    if gate.mode() == PublishAuthorizationMode::Enforce {
+                        let lease = admission
+                            .as_ref()
+                            .and_then(|value| value.lease())
+                            .expect("enforce admission always carries a lease");
+                        authorized_ack_metadata =
+                            match legacy_ack_metadata_for_publish_lease(&params, lease) {
+                                Ok(metadata) => Some(metadata),
+                                Err(error) => {
+                                    let _ = gate.handle_integration_error(error.clone());
+                                    return Ok(publish_authorization_response(&error));
+                                }
+                            };
+                    }
+                }
+            }
+            let body_limit = admission
+                .as_ref()
+                .and_then(|value| value.lease())
+                .filter(|_| {
+                    self.publish_ingress_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.mode() == PublishAuthorizationMode::Enforce)
+                })
+                .map_or(MAX_MEDIA_ACCESS_UNIT_BYTES, |lease| {
+                    (lease.envelope().payload_bytes() as usize).min(MAX_MEDIA_ACCESS_UNIT_BYTES)
+                });
+            let Some(payload) = read_body_bytes_limited(&mut body, body_limit).await? else {
+                return Ok(payload_too_large_response(body_limit));
             };
-            let sequence = params
-                .sequence
-                .unwrap_or_else(|| self.forwarder.allocate_media_sequence());
-            let metadata = params
-                .metadata_for_payload(sequence, &payload)
-                .map_err(ServerError::Config)?;
-            let datagrams = self
-                .forwarder
-                .forward_media_access_unit(metadata, &payload)
-                .await
-                .map_err(|err| ServerError::Config(err.to_string()))?;
+            if let (Some(gate), Some(lease)) = (
+                self.publish_ingress_gate.as_ref(),
+                admission.as_ref().and_then(|value| value.lease()),
+            ) {
+                if let Err(error) =
+                    gate.revalidate_before_forward(lease, payload.len(), now_unix_seconds())
+                {
+                    return Ok(publish_authorization_response(&error));
+                }
+            }
+            // In enforce mode this reduced metadata exists only for the legacy
+            // HTTP acknowledgement. The forwarded bytes are the canonical
+            // MOBJ built below and retain the complete authenticated identity.
+            let metadata = if let Some(metadata) = authorized_ack_metadata {
+                metadata
+            } else {
+                let sequence = params
+                    .sequence
+                    .unwrap_or_else(|| self.forwarder.allocate_media_sequence());
+                params
+                    .metadata_for_payload(sequence, &payload)
+                    .map_err(ServerError::Config)?
+            };
+            let max_datagram_bytes = admission
+                .as_ref()
+                .and_then(|value| value.lease())
+                .filter(|_| {
+                    self.publish_ingress_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.mode() == PublishAuthorizationMode::Enforce)
+                })
+                .map(PublishLease::max_datagram_bytes);
+            let enforced_lease = admission
+                .as_ref()
+                .and_then(|value| value.lease())
+                .filter(|_| {
+                    self.publish_ingress_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.mode() == PublishAuthorizationMode::Enforce)
+                });
+            let forwarded = if let Some(lease) = enforced_lease {
+                match lease.canonical_media_object(&payload) {
+                    Ok(object) => match media_object::encode(&object) {
+                        Ok(encoded) if encoded.len() <= MAX_STREAM_FEC_OBJECT_BYTES => {
+                            self.forwarder
+                                .forward_stream_slot_with_limit(
+                                    lease.carrier_stream_id(),
+                                    &encoded,
+                                    max_datagram_bytes,
+                                )
+                                .await
+                        }
+                        Ok(_) => {
+                            let error = PublishIngressError::integration(
+                                PublishRejectionCode::EnvelopeTooLarge,
+                                "canonical_media_object",
+                            );
+                            if let Some(gate) = &self.publish_ingress_gate {
+                                let _ = gate.handle_integration_error(error.clone());
+                            }
+                            return Ok(publish_authorization_response(&error));
+                        }
+                        Err(_) => Err(anyhow::anyhow!(
+                            "canonical authorized media object could not be encoded"
+                        )),
+                    },
+                    Err(error) => {
+                        if let Some(gate) = &self.publish_ingress_gate {
+                            let _ = gate.handle_integration_error(error.clone());
+                        }
+                        return Ok(publish_authorization_response(&error));
+                    }
+                }
+            } else {
+                self.forwarder
+                    .forward_media_access_unit(metadata, &payload, None)
+                    .await
+            };
+            let datagrams = match forwarded {
+                Ok(datagrams) => datagrams,
+                Err(error)
+                    if error
+                        .downcast_ref::<AuthorizedDatagramLimitExceeded>()
+                        .is_some() =>
+                {
+                    let rejection = PublishIngressError::integration(
+                        PublishRejectionCode::DatagramLimit,
+                        "max_datagram_bytes",
+                    );
+                    if let Some(gate) = &self.publish_ingress_gate {
+                        let _ = gate.handle_integration_error(rejection.clone());
+                    }
+                    return Ok(publish_authorization_response(&rejection));
+                }
+                Err(error) => return Err(ServerError::Config(error.to_string())),
+            };
             let ack = MediaAck {
                 stream_id: metadata.stream_id,
                 stream_id_text: metadata.stream_id.to_string(),
@@ -5477,6 +5686,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let publish_ingress_gate = load_publish_ingress_gate()?;
+    validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
     let (cert, key) = load_tls(&args)?;
     let telemetry = Arc::new(IngestTelemetry::default());
     let forwarder = Arc::new(MeshForwarder::new(&args, Arc::clone(&telemetry)).await?);
@@ -5581,6 +5792,7 @@ async fn main() -> Result<()> {
         args.stream_id,
         hls_router,
         status,
+        publish_ingress_gate,
     ));
     let server = H2H3Server::builder()
         .with_tls(cert, key)
@@ -5691,6 +5903,204 @@ fn response(
         content_type: content_type.map(ToOwned::to_owned),
         ..Default::default()
     }
+}
+
+#[derive(Serialize)]
+struct PublishAuthorizationErrorBody {
+    error: &'static str,
+    reason: &'static str,
+    field: &'static str,
+}
+
+fn publish_authorization_response(error: &PublishIngressError) -> HandlerResponse {
+    let status = match error.code() {
+        PublishRejectionCode::MissingCapability
+        | PublishRejectionCode::MalformedAuthorization
+        | PublishRejectionCode::InvalidSignature
+        | PublishRejectionCode::CapabilityRejected => StatusCode::UNAUTHORIZED,
+        PublishRejectionCode::CapabilityExpired | PublishRejectionCode::RevokedBinding => {
+            StatusCode::GONE
+        }
+        PublishRejectionCode::CapabilityReplay | PublishRejectionCode::FrameReplay => {
+            StatusCode::CONFLICT
+        }
+        PublishRejectionCode::WrongScope
+        | PublishRejectionCode::StreamMismatch
+        | PublishRejectionCode::LegacyPath
+        | PublishRejectionCode::TalkbackIsolation => StatusCode::FORBIDDEN,
+        PublishRejectionCode::EnvelopeTooLarge
+        | PublishRejectionCode::CapabilityTooLarge
+        | PublishRejectionCode::DatagramLimit => StatusCode::PAYLOAD_TOO_LARGE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    let body = serde_json::to_vec(&PublishAuthorizationErrorBody {
+        error: "publish_authorization_rejected",
+        reason: error.code().as_str(),
+        field: error.field(),
+    })
+    .unwrap_or_else(|_| b"{\"error\":\"publish_authorization_rejected\"}".to_vec());
+    response(status, Some(Bytes::from(body)), Some("application/json"))
+}
+
+fn extract_publish_ingress_request(
+    req: &Request<()>,
+) -> Result<(&str, Vec<u8>, u64), PublishIngressError> {
+    if req.headers().get_all(AUTHORIZATION).iter().count() > 1 {
+        return Err(PublishIngressError::integration(
+            PublishRejectionCode::MalformedAuthorization,
+            "authorization",
+        ));
+    }
+    if req
+        .headers()
+        .get_all(MEDIA_FRAME_ENVELOPE_HEADER)
+        .iter()
+        .count()
+        > 1
+    {
+        return Err(PublishIngressError::integration(
+            PublishRejectionCode::MalformedEnvelope,
+            "frame_envelope",
+        ));
+    }
+    if req.headers().get_all(CONTENT_LENGTH).iter().count() > 1 {
+        return Err(PublishIngressError::integration(
+            PublishRejectionCode::InvalidContentLength,
+            "content_length",
+        ));
+    }
+    let compact_jws = parse_bearer_header(req.headers().get(AUTHORIZATION).map(|v| v.as_bytes()))?;
+    let envelope_json = decode_envelope_header_bytes(
+        req.headers()
+            .get(MEDIA_FRAME_ENVELOPE_HEADER)
+            .map(|value| value.as_bytes()),
+    )?;
+    let content_length =
+        parse_content_length_header(req.headers().get(CONTENT_LENGTH).map(|v| v.as_bytes()))?;
+    Ok((compact_jws, envelope_json, content_length))
+}
+
+fn legacy_ack_metadata_for_publish_lease(
+    params: &MediaAccessUnitParams,
+    lease: &PublishLease,
+) -> Result<MediaFrameMetadata, PublishIngressError> {
+    if params
+        .sequence
+        .is_some_and(|sequence| sequence != lease.envelope().sequence())
+    {
+        return Err(PublishIngressError::integration(
+            PublishRejectionCode::ConfigurationMismatch,
+            "sequence",
+        ));
+    }
+    let codec = match lease.configuration().payload_format() {
+        media_object::MediaFramePayloadFormat::Opus => MediaCodec::Opus,
+        media_object::MediaFramePayloadFormat::PcmS24le
+        | media_object::MediaFramePayloadFormat::Flac
+        | media_object::MediaFramePayloadFormat::Json
+        | media_object::MediaFramePayloadFormat::Opaque => MediaCodec::Data,
+    };
+    if params.codec_explicit && params.codec != codec {
+        return Err(PublishIngressError::integration(
+            PublishRejectionCode::ConfigurationMismatch,
+            "payload_format",
+        ));
+    }
+    let capture_pts = u128::try_from(lease.envelope().capture_pts()).map_err(|_| {
+        PublishIngressError::integration(PublishRejectionCode::ConfigurationMismatch, "capture_pts")
+    })?;
+    let timebase = u128::from(lease.configuration().capture_timebase_hz());
+    let pts_ms = capture_pts
+        .checked_mul(1_000)
+        .and_then(|value| u64::try_from(value / timebase).ok())
+        .ok_or_else(|| {
+            PublishIngressError::integration(
+                PublishRejectionCode::ConfigurationMismatch,
+                "capture_pts",
+            )
+        })?;
+    let duration_ms = u128::from(lease.envelope().duration_ticks())
+        .checked_mul(1_000)
+        .map(|value| value.div_ceil(timebase).max(1))
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= u32::from(u16::MAX))
+        .ok_or_else(|| {
+            PublishIngressError::integration(
+                PublishRejectionCode::ConfigurationMismatch,
+                "duration_ticks",
+            )
+        })?;
+    let mut secure = params.clone();
+    secure.sequence = Some(lease.envelope().sequence());
+    secure.pts_ms = pts_ms;
+    secure.dts_ms = None;
+    secure.duration_ms = duration_ms;
+    secure.codec = codec;
+    secure.codec_explicit = true;
+    secure.metadata(lease.envelope().sequence()).map_err(|_| {
+        PublishIngressError::integration(
+            PublishRejectionCode::ConfigurationMismatch,
+            "media_metadata",
+        )
+    })
+}
+
+fn load_publish_ingress_gate() -> Result<Option<Arc<PublishIngressGate>>> {
+    let mode = match std::env::var("AV_MEDIA_CAPABILITY_PUBLISH_MODE")
+        .unwrap_or_else(|_| "off".to_owned())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" => PublishAuthorizationMode::Off,
+        "observe" | "dark" => PublishAuthorizationMode::Observe,
+        "enforce" => PublishAuthorizationMode::Enforce,
+        _ => bail!("AV_MEDIA_CAPABILITY_PUBLISH_MODE must be off, observe, or enforce"),
+    };
+    if mode == PublishAuthorizationMode::Off {
+        return Ok(None);
+    }
+    if mode == PublishAuthorizationMode::Enforce
+        && !cfg!(feature = "media_capability_enforce_publish_v1")
+    {
+        bail!("publish enforcement requires the media_capability_enforce_publish_v1 Cargo feature");
+    }
+    let path = std::env::var_os("AV_MEDIA_CAPABILITY_PUBLISH_BUNDLE")
+        .map(PathBuf::from)
+        .context(
+            "AV_MEDIA_CAPABILITY_PUBLISH_BUNDLE is required when publish authorization is enabled",
+        )?;
+    let gate = gate_from_bootstrap_path(&path, mode)
+        .context("invalid public publish-authorization bundle")?;
+    Ok(Some(Arc::new(gate)))
+}
+
+fn validate_enforced_ingress_adapters(
+    args: &Args,
+    gate: Option<&PublishIngressGate>,
+) -> Result<()> {
+    if !gate.is_some_and(|gate| gate.mode() == PublishAuthorizationMode::Enforce) {
+        return Ok(());
+    }
+    let mut legacy = Vec::new();
+    if args.daw_media_bind.is_some() {
+        legacy.push("DAW UDP");
+    }
+    if args.rist_bind.is_some() {
+        legacy.push("RIST");
+    }
+    if args.srt_bind.is_some() {
+        legacy.push("SRT");
+    }
+    if args.rtmp_bind.is_some() {
+        legacy.push("RTMP");
+    }
+    if !legacy.is_empty() {
+        bail!(
+            "publish enforcement cannot start unauthenticated legacy adapters: {}",
+            legacy.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn log_hls_response(method: &Method, path: &str, query: Option<&str>, status: StatusCode) {
@@ -5942,6 +6352,13 @@ fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -7225,6 +7642,7 @@ mod tests {
             args.stream_id,
             Arc::new(HlsRouter::new()),
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            None,
         );
         let req = Request::builder()
             .method(Method::GET)
@@ -7478,7 +7896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_slot_forwarder_uses_stream_prefixed_fec() {
+    async fn authorized_stream_slot_forwarder_preserves_canonical_identity_and_datagram_limit() {
         let mesh_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mesh_target = mesh_socket.local_addr().unwrap();
         let args = Args {
@@ -7536,8 +7954,28 @@ mod tests {
             .await
             .unwrap();
         let stream_id = 77;
+        let canonical_payload = b"authenticated-media";
+        let key = ObjectKey::for_payload(
+            "ten_wire",
+            stream_id.to_string(),
+            "cfg_wire",
+            8,
+            17,
+            9,
+            1,
+            canonical_payload,
+        )
+        .unwrap();
+        let object = MediaObject::builder(key, ObjectKind::Media, canonical_payload.to_vec())
+            .with_configuration_epoch(23)
+            .with_metadata("media-control-contract", b"v1".to_vec())
+            .with_metadata("media-frame-configuration-v1", b"canonical-config".to_vec())
+            .with_metadata("media-frame-envelope-v1", b"canonical-envelope".to_vec())
+            .build()
+            .unwrap();
+        let wire = media_object::encode(&object).unwrap();
         forwarder
-            .forward_stream_slot(stream_id, b"non-obs-stream-bytes")
+            .forward_stream_slot_with_limit(stream_id, &wire, Some(1_200))
             .await
             .unwrap();
 
@@ -7546,6 +7984,7 @@ mod tests {
         let payload = timeout(Duration::from_secs(3), async {
             loop {
                 let (len, _peer) = mesh_socket.recv_from(&mut buf).await.unwrap();
+                assert!(len <= 1_200);
                 if let Some(payload) = decoder.push_datagram(&buf[..len]).unwrap() {
                     break payload;
                 }
@@ -7554,7 +7993,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(payload, b"non-obs-stream-bytes");
+        assert_eq!(payload, wire);
+        let decoded = media_object::decode(&payload).unwrap();
+        assert_eq!(decoded.key().tenant(), "ten_wire");
+        assert_eq!(decoded.key().stream(), "77");
+        assert_eq!(decoded.key().track(), "cfg_wire");
+        assert_eq!(decoded.key().epoch(), 8);
+        assert_eq!(decoded.key().group(), 17);
+        assert_eq!(decoded.key().object(), 9);
+        assert_eq!(decoded.configuration_epoch(), 23);
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.mesh_forward.stream_payloads, 1);
         assert!(snapshot.mesh_forward.stream_datagrams > 0);
