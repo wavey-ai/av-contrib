@@ -4,13 +4,34 @@ use av_contrib::fmp4_bridge::{
     TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
 use av_contrib::{codec_name, MediaAccessUnitParams};
+use av_hls::{HlsHandler, HlsRouter};
+use av_upload_response::{
+    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
+    SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
+};
+use av_web_service::{
+    load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
+    HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
+    WebTransportHandler,
+};
 use bytes::{Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use hls::{HlsHandler, HlsRouter};
-use http::{Method, Request, Response, StatusCode};
-use raptorq_datagram_fec::{MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SYMBOL_SIZE};
-use raptorq_fec_transport::FecDatagramEncoder;
+use http::{header::CONTENT_LENGTH, Method, Request, Response, StatusCode};
+use media_object::{
+    ClockConfidence, ClockTimestamp, MediaObject, ObjectKey, ObjectKind, PayloadHash, Stage,
+    StageTimestamp,
+};
+use raptorq_datagram_fec::{
+    source_symbol_count, DatagramFecEncoder, DatagramFecHeader, MediaFecDecoder, MediaFecEncoder,
+    MediaFrame, MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE, HEADER_LEN,
+    MAX_SOURCE_SYMBOLS_PER_BLOCK,
+};
+use relay_session::{
+    encoded_datagram_len as relay_datagram_len, EncodedRaptorQObject, MediaDatagramRole,
+    MediaDeadline, ObjectAnnouncement, PrivateUdpConfig, PrivateUdpTransport, RaptorQObjectEncoder,
+    RelayLimits, RelayTransport, SubscriptionId, TopologyGeneration,
+};
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
 use serde::Serialize;
@@ -18,31 +39,38 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     Arc, Mutex as StdMutex,
 };
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Mutex};
-use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info, trace};
-use upload_response::{
-    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
-    RistIngest as UploadRistIngest, RistProfile as UploadRistProfile, SrtIngest as UploadSrtIngest,
-    TailSlot, UploadResponseConfig, UploadResponseService,
-};
-use web_service::{
-    load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
-    HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
-    WebTransportHandler,
-};
+use tokio::sync::{watch, Mutex, RwLock};
+use tokio::time::{interval, Instant, MissedTickBehavior};
+use tracing::{debug, info, trace, warn};
 
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
 const CONTRIB_STATUS_PATH: &str = "/api/status";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
+const CONTRIB_METRICS_PATH: &str = "/metrics";
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const DAW_RELAY_SUBSCRIBE_MESSAGE: &[u8] = b"WAVEY-DAW-SUBSCRIBE/1";
+const DAW_RELAY_UNSUBSCRIBE_MESSAGE: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/1";
+const DAW_RELAY_SUBSCRIBE_ACK: &[u8] = b"WAVEY-DAW-SUBSCRIBED/1";
+const DAW_RELAY_TARGET_TTL: Duration = Duration::from_secs(15);
+const DAW_RELAY_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
+const MEDIA_OBJECT_TENANT: &str = "default";
+const FMP4_MEDIA_TRACK: &str = "muxed-fmp4";
+const FMP4_INITIALIZATION_TRACK: &str = "muxed-fmp4-init";
+const MEDIA_OBJECT_VERSION: u32 = 1;
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
+const AV_CONTRIB_CLOCK_ID: &str = "system:realtime:av-contrib";
+const DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS: u64 = 1_000;
+const DEFAULT_RELAY_DEADLINE_MS: u64 = 1_000;
+const DEFAULT_RELAY_TOPOLOGY_GENERATION: u64 = 1;
+const DEFAULT_RELAY_SUBSCRIPTION_ID: u64 = 1;
 
 fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
     let init_len = init.map_or(0, Bytes::len);
@@ -63,6 +91,144 @@ fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
     out.extend_from_slice(media);
     Ok(Bytes::from(out))
 }
+
+fn build_fmp4_initialization_object(stream_id: u64, payload: &[u8]) -> Result<(MediaObject, u64)> {
+    let payload_hash = PayloadHash::digest(payload);
+    let mut epoch_bytes = [0_u8; 8];
+    epoch_bytes.copy_from_slice(&payload_hash.as_bytes()[..8]);
+    let configuration_epoch = u64::from_be_bytes(epoch_bytes);
+    let key = ObjectKey::new(
+        MEDIA_OBJECT_TENANT,
+        stream_id.to_string(),
+        FMP4_INITIALIZATION_TRACK,
+        0,
+        configuration_epoch,
+        0,
+        MEDIA_OBJECT_VERSION,
+        payload_hash,
+    )
+    .context("invalid canonical fMP4 initialization identity")?;
+    let object = MediaObject::builder(key, ObjectKind::Initialization, payload.to_vec())
+        .with_configuration_epoch(configuration_epoch)
+        .with_metadata("container", b"fmp4".to_vec())
+        .with_metadata("payload-format", b"fmp4-init-v1".to_vec())
+        .build()
+        .context("invalid canonical fMP4 initialization object")?;
+    Ok((object, configuration_epoch))
+}
+
+fn build_fmp4_media_object(
+    part: &PublishedFmp4Part,
+    payload: &[u8],
+    initialization_key: ObjectKey,
+    configuration_epoch: u64,
+    delivery_budget_ms: u64,
+    estimated_clock_error_ns: u64,
+) -> Result<MediaObject> {
+    if delivery_budget_ms == 0 {
+        bail!("canonical media delivery budget must be positive");
+    }
+    let key = ObjectKey::for_payload(
+        MEDIA_OBJECT_TENANT,
+        part.stream_id.to_string(),
+        FMP4_MEDIA_TRACK,
+        0,
+        0,
+        part.sequence,
+        MEDIA_OBJECT_VERSION,
+        payload,
+    )
+    .context("invalid canonical fMP4 media identity")?;
+    let packaged =
+        canonical_contributor_timestamp(part.packaged_at_unix_ns, estimated_clock_error_ns)?;
+    let published =
+        canonical_contributor_timestamp(part.published_at_unix_ns, estimated_clock_error_ns)?;
+    let deadline_ns = i128::from(part.published_at_unix_ns)
+        .checked_add(i128::from(delivery_budget_ms) * 1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .context("canonical media deadline exceeds Unix-nanosecond range")?;
+    let deadline = canonical_contributor_timestamp(deadline_ns, estimated_clock_error_ns)?;
+
+    let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+        .with_keyframe(part.keyframe)
+        .with_configuration_epoch(configuration_epoch)
+        .with_deadline(deadline)
+        .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, packaged))
+        .with_stage_timestamp(StageTimestamp::new(Stage::Published, published))
+        .with_dependency(initialization_key)
+        .with_metadata("container", b"fmp4".to_vec())
+        .with_metadata("duration-ms", part.duration_ms.to_string().into_bytes())
+        .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
+        .with_metadata(
+            "scheduler-class",
+            fmp4_scheduler_class(part).as_bytes().to_vec(),
+        )
+        .with_metadata(
+            "track-composition",
+            fmp4_track_composition(part).as_bytes().to_vec(),
+        );
+    if let Some(codec) = part.video_codec {
+        builder = builder.with_metadata("video-codec", codec.as_bytes().to_vec());
+    }
+    if let Some(codec) = part.audio_codec {
+        builder = builder.with_metadata("audio-codec", codec.as_bytes().to_vec());
+    }
+    builder
+        .build()
+        .context("invalid canonical fMP4 media object")
+}
+
+fn canonical_contributor_timestamp(
+    unix_time_ns: i64,
+    estimated_clock_error_ns: u64,
+) -> Result<ClockTimestamp> {
+    ClockTimestamp::new(
+        unix_time_ns,
+        AV_CONTRIB_CLOCK_ID,
+        ClockConfidence::estimated(estimated_clock_error_ns),
+    )
+    .context("invalid av-contrib wall-clock timestamp")
+}
+
+fn relay_deadline_for_object(object: &MediaObject) -> Result<MediaDeadline> {
+    let deadline = object
+        .deadline()
+        .context("RelaySession live media requires a canonical object deadline")?;
+    let deadline_ns = u64::try_from(deadline.unix_time_ns())
+        .context("RelaySession wire deadline requires a non-negative Unix timestamp")?;
+    Ok(MediaDeadline::from_micros(deadline_ns.div_ceil(1_000)))
+}
+
+fn fmp4_scheduler_class(part: &PublishedFmp4Part) -> &'static str {
+    if part.keyframe {
+        "video-keyframe"
+    } else if part.audio_units > 0 {
+        "audio"
+    } else if part.video_units > 0 {
+        "video-delta"
+    } else {
+        "data"
+    }
+}
+
+fn fmp4_track_composition(part: &PublishedFmp4Part) -> &'static str {
+    match (part.video_units > 0, part.audio_units > 0) {
+        (true, true) => "audio+video",
+        (true, false) => "video",
+        (false, true) => "audio",
+        (false, false) => "empty",
+    }
+}
+
+fn encode_canonical_media_object(object: &MediaObject) -> Result<Bytes> {
+    Ok(Bytes::from(
+        media_object::encode(object).context("failed to encode canonical media object")?,
+    ))
+}
+
+fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
+    datagram.starts_with(MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
+}
 const UPLOAD_RESPONSE_HLS_WORKER_ID: &str = "av-contrib-upload-response-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
@@ -71,11 +237,18 @@ const CONTRIB_ACTIVITY_LIMIT: usize = 64;
 const CONTRIB_HLS_RESPONSE_LIMIT: usize = 32;
 const CONTRIB_INGEST_SESSION_LIMIT: usize = 48;
 const CONTRIB_MIN_STALE_OUTPUT_MS: u64 = 5_000;
+const MAX_STREAM_FEC_OBJECT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_FEC_DATAGRAMS: u32 = 32_768;
+const MAX_MEDIA_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
+const DURATION_HISTOGRAM_BUCKETS_US: [u64; 13] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000,
+];
 
 #[derive(Debug, Parser)]
 #[command(
     name = "av-contrib",
-    about = "Run a contributor-facing web-service that forwards bytes into av-mesh"
+    about = "Run a contributor-facing AV service that forwards bytes into av-mesh"
 )]
 struct Args {
     #[arg(long, default_value_t = 9443)]
@@ -92,6 +265,83 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:12101")]
     mesh_media_fec_target: SocketAddr,
+
+    /// Opt in to RelaySession live-media emission toward the assigned primary.
+    #[arg(long, env = "AV_RELAY_PRIMARY_TARGET")]
+    relay_primary_target: Option<SocketAddr>,
+
+    /// Stable source endpoint registered as the contributor on the primary relay.
+    #[arg(long, env = "AV_RELAY_PRIMARY_BIND")]
+    relay_primary_bind: Option<SocketAddr>,
+
+    /// Send initial RaptorQ repair symbols through an independent warm parent.
+    #[arg(long, env = "AV_RELAY_SECONDARY_TARGET")]
+    relay_secondary_target: Option<SocketAddr>,
+
+    /// Stable source endpoint registered as the contributor on the secondary relay.
+    #[arg(long, env = "AV_RELAY_SECONDARY_BIND")]
+    relay_secondary_bind: Option<SocketAddr>,
+
+    /// Keep the independent backbone parent warm with the complete source
+    /// symbol set as well as its repair lane. Origin fanout remains bounded to
+    /// the two compiled backbone parents and promotion needs no object refill.
+    #[arg(long, env = "AV_RELAY_SECONDARY_SEED_SOURCE")]
+    relay_secondary_seed_source: bool,
+
+    /// Publish live fMP4 objects through RelaySession only. This makes DAG
+    /// qualification unable to pass through the older byte-FEC cache lane.
+    #[arg(long, env = "AV_RELAY_EXCLUSIVE")]
+    relay_exclusive: bool,
+
+    #[arg(long, env = "AV_RELAY_LOCAL_ID", default_value = "av-contrib")]
+    relay_local_id: String,
+
+    #[arg(
+        long,
+        env = "AV_RELAY_PRIMARY_ID",
+        default_value = "needletail-relay-primary"
+    )]
+    relay_primary_id: String,
+
+    #[arg(
+        long,
+        env = "AV_RELAY_SECONDARY_ID",
+        default_value = "needletail-relay-secondary"
+    )]
+    relay_secondary_id: String,
+
+    #[arg(
+        long,
+        env = "AV_RELAY_TOPOLOGY_GENERATION",
+        default_value_t = DEFAULT_RELAY_TOPOLOGY_GENERATION
+    )]
+    relay_topology_generation: u64,
+
+    #[arg(
+        long,
+        env = "AV_RELAY_SUBSCRIPTION_ID",
+        default_value_t = DEFAULT_RELAY_SUBSCRIPTION_ID
+    )]
+    relay_subscription_id: u64,
+
+    /// Canonical fMP4 delivery budget from publication handoff to object expiry.
+    #[arg(
+        long,
+        env = "AV_RELAY_DEADLINE_MS",
+        default_value_t = DEFAULT_RELAY_DEADLINE_MS
+    )]
+    relay_deadline_ms: u64,
+
+    /// Estimated maximum error of the host realtime clock used in MOBJ timestamps.
+    #[arg(
+        long,
+        env = "AV_WALL_CLOCK_ESTIMATED_ERROR_MS",
+        default_value_t = DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS
+    )]
+    wall_clock_estimated_error_ms: u64,
+
+    #[arg(long)]
+    daw_media_bind: Option<SocketAddr>,
 
     #[arg(long, default_value_t = 1)]
     stream_id: u64,
@@ -169,26 +419,15 @@ impl From<RistProfile> for UploadPureRistProfile {
     }
 }
 
-impl From<RistProfile> for UploadRistProfile {
-    fn from(profile: RistProfile) -> Self {
-        match profile {
-            RistProfile::Simple => Self::Simple,
-            RistProfile::Main => Self::Main,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RistBackend {
     Pure,
-    Librist,
 }
 
 impl RistBackend {
     fn as_str(self) -> &'static str {
         match self {
             Self::Pure => "pure",
-            Self::Librist => "librist",
         }
     }
 }
@@ -197,29 +436,266 @@ impl RistBackend {
 struct RistIngestConfig {
     bind: SocketAddr,
     profile: RistProfile,
-    backend: RistBackend,
     flow_id: u32,
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
 }
 
+#[derive(Debug)]
+struct RelayPublishOutcome {
+    announcement: ObjectAnnouncement,
+    source_symbols: usize,
+    repair_symbols: usize,
+}
+
+struct RelaySessionPublisher {
+    encoder: Mutex<RaptorQObjectEncoder>,
+    primary: PrivateUdpTransport,
+    secondary: Option<PrivateUdpTransport>,
+    secondary_seed_source: bool,
+    generation: TopologyGeneration,
+    subscription_id: SubscriptionId,
+    telemetry: Arc<IngestTelemetry>,
+}
+
+impl RelaySessionPublisher {
+    async fn new(args: &Args, telemetry: Arc<IngestTelemetry>) -> Result<Option<Self>> {
+        let Some(primary_target) = args.relay_primary_target else {
+            if args.relay_primary_bind.is_some()
+                || args.relay_secondary_target.is_some()
+                || args.relay_secondary_bind.is_some()
+            {
+                bail!("relay bind and secondary settings require --relay-primary-target");
+            }
+            return Ok(None);
+        };
+        if args.relay_secondary_target.is_none() && args.relay_secondary_bind.is_some() {
+            bail!("--relay-secondary-bind requires --relay-secondary-target");
+        }
+        if args.relay_secondary_seed_source && args.relay_secondary_target.is_none() {
+            bail!("--relay-secondary-seed-source requires --relay-secondary-target");
+        }
+        if args.relay_secondary_target == Some(primary_target) {
+            bail!("relay primary and secondary targets must use distinct socket addresses");
+        }
+        if args.relay_deadline_ms == 0 {
+            bail!("--relay-deadline-ms must be positive");
+        }
+
+        let limits = RelayLimits::default();
+        let primary_bind = relay_bind_addr(
+            "--relay-primary-bind",
+            args.relay_primary_bind,
+            primary_target,
+        )?;
+        let secondary_bind = args
+            .relay_secondary_target
+            .map(|target| {
+                relay_bind_addr("--relay-secondary-bind", args.relay_secondary_bind, target)
+            })
+            .transpose()?;
+        let mut endpoints = vec![("primary target", primary_target)];
+        if let Some(bind) = args.relay_primary_bind {
+            endpoints.push(("primary bind", bind));
+        }
+        if let Some(target) = args.relay_secondary_target {
+            endpoints.push(("secondary target", target));
+        }
+        if let Some(bind) = args.relay_secondary_bind {
+            endpoints.push(("secondary bind", bind));
+        }
+        for left in 0..endpoints.len() {
+            for right in (left + 1)..endpoints.len() {
+                if endpoints[left].1 == endpoints[right].1 {
+                    bail!(
+                        "relay {} and {} must use distinct socket addresses",
+                        endpoints[left].0,
+                        endpoints[right].0
+                    );
+                }
+            }
+        }
+        let primary = PrivateUdpTransport::bind(PrivateUdpConfig::new(
+            primary_bind,
+            primary_target,
+            args.relay_local_id.clone(),
+            args.relay_primary_id.clone(),
+            limits,
+        )?)
+        .await
+        .with_context(|| {
+            format!("failed to bind primary RelaySession UDP carrier for {primary_target}")
+        })?;
+        let secondary = if let (Some(secondary_target), Some(secondary_bind)) =
+            (args.relay_secondary_target, secondary_bind)
+        {
+            Some(
+                PrivateUdpTransport::bind(PrivateUdpConfig::new(
+                    secondary_bind,
+                    secondary_target,
+                    args.relay_local_id.clone(),
+                    args.relay_secondary_id.clone(),
+                    limits,
+                )?)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to bind secondary RelaySession UDP carrier for {secondary_target}"
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Some(Self {
+            encoder: Mutex::new(RaptorQObjectEncoder::default()),
+            primary,
+            secondary,
+            secondary_seed_source: args.relay_secondary_seed_source,
+            generation: TopologyGeneration::new(args.relay_topology_generation)?,
+            subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
+            telemetry,
+        }))
+    }
+
+    async fn publish_object(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
+        let deadline = relay_deadline_for_object(object)?;
+        if deadline.is_expired_at(now_unix_us()) {
+            bail!("canonical media object expired before RelaySession encoding");
+        }
+        let encoded = {
+            let mut encoder = self.encoder.lock().await;
+            encoder.encode_object_with_inferred_priority(
+                object,
+                self.generation,
+                self.subscription_id,
+                deadline,
+            )
+        };
+        let EncodedRaptorQObject {
+            announcement,
+            source_symbols,
+            repair_symbols,
+        } = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.telemetry.record_relay_session_encode_error();
+                return Err(error).context("failed to RaptorQ-protect canonical media object");
+            }
+        };
+        let source_count = source_symbols.len();
+        let repair_count = repair_symbols.len();
+
+        for symbol in source_symbols {
+            if self.secondary_seed_source {
+                self.send_symbol(&self.primary, symbol.clone()).await?;
+                self.send_symbol(
+                    self.secondary
+                        .as_ref()
+                        .expect("validated warm secondary target"),
+                    symbol,
+                )
+                .await?;
+            } else {
+                self.send_symbol(&self.primary, symbol).await?;
+            }
+        }
+
+        let repair_transport = self.secondary.as_ref().unwrap_or(&self.primary);
+        if self.secondary.is_none() && repair_count > 0 {
+            self.telemetry
+                .relay_repair_primary_fallback_objects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        for symbol in repair_symbols {
+            self.send_symbol(repair_transport, symbol).await?;
+        }
+
+        self.telemetry
+            .relay_objects_sent
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .relay_last_deadline_unix_us
+            .store(deadline.expires_at_us, Ordering::Relaxed);
+        Ok(RelayPublishOutcome {
+            announcement,
+            source_symbols: source_count,
+            repair_symbols: repair_count,
+        })
+    }
+
+    async fn send_symbol(
+        &self,
+        transport: &PrivateUdpTransport,
+        symbol: relay_session::RelayDatagram,
+    ) -> Result<()> {
+        let role = symbol.role;
+        if symbol.deadline.is_expired_at(now_unix_us()) {
+            self.telemetry.record_relay_session_send_error(role);
+            bail!("RelaySession symbol expired before carrier send");
+        }
+        let wire_bytes = match relay_datagram_len(&symbol) {
+            Ok(bytes) => bytes as u64,
+            Err(error) => {
+                self.telemetry.record_relay_session_send_error(role);
+                return Err(error).context("failed to measure RelaySession datagram");
+            }
+        };
+        if let Err(error) = transport.send_datagram(symbol).await {
+            self.telemetry.record_relay_session_send_error(role);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to send RelaySession datagram to {}",
+                    transport.peer_addr()
+                )
+            });
+        }
+        self.telemetry
+            .record_relay_session_send_success(role, wire_bytes);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct MeshForwarder {
     byte_socket: Arc<UdpSocket>,
     byte_target: SocketAddr,
-    byte_encoders: Arc<Mutex<HashMap<u64, FecDatagramEncoder>>>,
+    next_byte_block_id: Arc<AtomicU32>,
+    next_byte_packet_sequence: Arc<AtomicU32>,
     repair_symbols: u32,
     symbol_size: u16,
     media_encoder: Arc<Mutex<MediaFecEncoder>>,
     media_socket: Arc<UdpSocket>,
     media_target: SocketAddr,
     next_media_sequence: Arc<AtomicU64>,
+    fmp4_initializations: Arc<Mutex<HashMap<u64, (ObjectKey, u64)>>>,
+    delivery_budget_ms: u64,
+    estimated_clock_error_ns: u64,
+    relay: Option<Arc<RelaySessionPublisher>>,
+    relay_exclusive: bool,
     telemetry: Arc<IngestTelemetry>,
 }
 
 impl MeshForwarder {
     async fn new(args: &Args, telemetry: Arc<IngestTelemetry>) -> Result<Self> {
+        if args.relay_deadline_ms == 0 {
+            bail!("--relay-deadline-ms must be positive");
+        }
+        if args.wall_clock_estimated_error_ms == 0 {
+            bail!("--wall-clock-estimated-error-ms must be positive");
+        }
+        let estimated_clock_error_ns = args
+            .wall_clock_estimated_error_ms
+            .checked_mul(1_000_000)
+            .context("--wall-clock-estimated-error-ms exceeds nanosecond range")?;
+        let relay = RelaySessionPublisher::new(args, Arc::clone(&telemetry))
+            .await?
+            .map(Arc::new);
+        if args.relay_exclusive && relay.is_none() {
+            bail!("--relay-exclusive requires --relay-primary-target");
+        }
         let byte_socket = UdpSocket::bind(local_sender_addr(args.mesh_fec_target))
             .await
             .with_context(|| {
@@ -240,13 +716,19 @@ impl MeshForwarder {
         Ok(Self {
             byte_socket: Arc::new(byte_socket),
             byte_target: args.mesh_fec_target,
-            byte_encoders: Arc::new(Mutex::new(HashMap::new())),
+            next_byte_block_id: Arc::new(AtomicU32::new(0)),
+            next_byte_packet_sequence: Arc::new(AtomicU32::new(0)),
             repair_symbols: args.repair_symbols,
             symbol_size: args.symbol_size,
             media_encoder: Arc::new(Mutex::new(MediaFecEncoder::default())),
             media_socket: Arc::new(media_socket),
             media_target: args.mesh_media_fec_target,
             next_media_sequence: Arc::new(AtomicU64::new(0)),
+            fmp4_initializations: Arc::new(Mutex::new(HashMap::new())),
+            delivery_budget_ms: args.relay_deadline_ms,
+            estimated_clock_error_ns,
+            relay,
+            relay_exclusive: args.relay_exclusive,
             telemetry,
         })
     }
@@ -259,35 +741,76 @@ impl MeshForwarder {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let datagrams = match {
-            let mut encoders = self.byte_encoders.lock().await;
-            let encoder = encoders.entry(stream_id).or_insert_with(|| {
-                let mut encoder = FecDatagramEncoder::webtransport_with_stream_prefix(stream_id);
-                encoder
-                    .fec_encoder_mut()
-                    .set_repair_symbols(self.repair_symbols);
-                encoder.fec_encoder_mut().set_symbol_size(self.symbol_size);
-                encoder
-            });
-            encoder
-                .encode_payload(bytes)
-                .context("failed to encode stream slot for mesh RaptorQ-FEC")
-        } {
-            Ok(datagrams) => datagrams,
+        let started = Instant::now();
+        let encode_wait_started = Instant::now();
+        let geometry = match stream_fec_geometry(bytes.len(), self.symbol_size, self.repair_symbols)
+        {
+            Ok(geometry) => geometry,
             Err(error) => {
+                self.telemetry.record_mesh_forward_stage_duration(
+                    "stream",
+                    "encode_wait",
+                    encode_wait_started.elapsed(),
+                );
                 self.telemetry.record_mesh_forward_error(
                     "stream",
                     stream_id,
                     self.byte_target,
                     &error,
                 );
+                self.telemetry
+                    .record_mesh_forward_duration("stream", started.elapsed());
                 return Err(error);
             }
         };
+        let block_id = self
+            .next_byte_block_id
+            .fetch_add(geometry.block_count, Ordering::Relaxed);
+        let packet_sequence = self
+            .next_byte_packet_sequence
+            .fetch_add(geometry.packet_count, Ordering::Relaxed);
+        self.telemetry.record_mesh_forward_stage_duration(
+            "stream",
+            "encode_wait",
+            encode_wait_started.elapsed(),
+        );
+        let encode_started = Instant::now();
+        let datagrams = match encode_stream_fec_payload(
+            stream_id,
+            bytes,
+            self.repair_symbols,
+            self.symbol_size,
+            block_id,
+            packet_sequence,
+        ) {
+            Ok(datagrams) => datagrams,
+            Err(error) => {
+                self.telemetry.record_mesh_forward_stage_duration(
+                    "stream",
+                    "encode",
+                    encode_started.elapsed(),
+                );
+                self.telemetry.record_mesh_forward_error(
+                    "stream",
+                    stream_id,
+                    self.byte_target,
+                    &error,
+                );
+                self.telemetry
+                    .record_mesh_forward_duration("stream", started.elapsed());
+                return Err(error);
+            }
+        };
+        self.telemetry.record_mesh_forward_stage_duration(
+            "stream",
+            "encode",
+            encode_started.elapsed(),
+        );
         let datagram_bytes = datagrams
             .iter()
             .map(|datagram| datagram.len() as u64)
             .sum::<u64>();
+        let send_started = Instant::now();
         for datagram in &datagrams {
             if let Err(error) = self
                 .byte_socket
@@ -295,15 +818,25 @@ impl MeshForwarder {
                 .await
                 .with_context(|| format!("failed to forward stream slot to {}", self.byte_target))
             {
+                self.telemetry.record_mesh_forward_stage_duration(
+                    "stream",
+                    "send",
+                    send_started.elapsed(),
+                );
                 self.telemetry.record_mesh_forward_error(
                     "stream",
                     stream_id,
                     self.byte_target,
                     &error,
                 );
+                self.telemetry
+                    .record_mesh_forward_duration("stream", started.elapsed());
                 return Err(error);
             }
         }
+        self.telemetry
+            .record_mesh_forward_stage_duration("stream", "send", send_started.elapsed());
+        let telemetry_started = Instant::now();
         self.telemetry.record_mesh_forward_success(
             "stream",
             stream_id,
@@ -312,6 +845,13 @@ impl MeshForwarder {
             datagrams.len() as u64,
             datagram_bytes,
         );
+        self.telemetry.record_mesh_forward_stage_duration(
+            "stream",
+            "telemetry",
+            telemetry_started.elapsed(),
+        );
+        self.telemetry
+            .record_mesh_forward_duration("stream", started.elapsed());
         Ok(datagrams.len())
     }
 
@@ -320,13 +860,28 @@ impl MeshForwarder {
         metadata: MediaFrameMetadata,
         payload: &[u8],
     ) -> Result<usize> {
+        let started = Instant::now();
         let stream_id = metadata.stream_id;
-        let datagrams = match {
+        let encode_wait_started = Instant::now();
+        let encoded = {
             let mut encoder = self.media_encoder.lock().await;
-            encoder
+            self.telemetry.record_mesh_forward_stage_duration(
+                "media",
+                "encode_wait",
+                encode_wait_started.elapsed(),
+            );
+            let encode_started = Instant::now();
+            let encoded = encoder
                 .encode_frame(MediaFrame { metadata, payload })
-                .context("failed to encode media access unit for mesh RaptorQ-FEC")
-        } {
+                .context("failed to encode media access unit for mesh RaptorQ-FEC");
+            self.telemetry.record_mesh_forward_stage_duration(
+                "media",
+                "encode",
+                encode_started.elapsed(),
+            );
+            encoded
+        };
+        let datagrams = match encoded {
             Ok(encoded) => encoded.datagrams,
             Err(error) => {
                 self.telemetry.record_mesh_forward_error(
@@ -335,6 +890,8 @@ impl MeshForwarder {
                     self.media_target,
                     &error,
                 );
+                self.telemetry
+                    .record_mesh_forward_duration("media", started.elapsed());
                 return Err(error);
             }
         };
@@ -342,6 +899,7 @@ impl MeshForwarder {
             .iter()
             .map(|datagram| datagram.len() as u64)
             .sum::<u64>();
+        let send_started = Instant::now();
         for datagram in &datagrams {
             if let Err(error) = self
                 .media_socket
@@ -354,15 +912,25 @@ impl MeshForwarder {
                     )
                 })
             {
+                self.telemetry.record_mesh_forward_stage_duration(
+                    "media",
+                    "send",
+                    send_started.elapsed(),
+                );
                 self.telemetry.record_mesh_forward_error(
                     "media",
                     stream_id,
                     self.media_target,
                     &error,
                 );
+                self.telemetry
+                    .record_mesh_forward_duration("media", started.elapsed());
                 return Err(error);
             }
         }
+        self.telemetry
+            .record_mesh_forward_stage_duration("media", "send", send_started.elapsed());
+        let telemetry_started = Instant::now();
         self.telemetry.record_mesh_forward_success(
             "media",
             stream_id,
@@ -371,19 +939,249 @@ impl MeshForwarder {
             datagrams.len() as u64,
             datagram_bytes,
         );
+        self.telemetry.record_mesh_forward_stage_duration(
+            "media",
+            "telemetry",
+            telemetry_started.elapsed(),
+        );
+        self.telemetry
+            .record_mesh_forward_duration("media", started.elapsed());
         Ok(datagrams.len())
+    }
+
+    async fn forward_audio_epoch_datagram(&self, datagram: &[u8]) -> Result<()> {
+        if datagram.is_empty() {
+            return Ok(());
+        }
+        self.media_socket
+            .send_to(datagram, self.media_target)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to forward audio epoch datagram to {}",
+                    self.media_target
+                )
+            })?;
+        trace!(
+            target = %self.media_target,
+            datagram_bytes = datagram.len(),
+            "forwarded multichannel audio epoch datagram to mesh"
+        );
+        Ok(())
+    }
+}
+
+type DawRelayTargets = Arc<RwLock<HashMap<SocketAddr, Instant>>>;
+
+async fn relay_daw_media_datagram(
+    socket: &UdpSocket,
+    targets: &DawRelayTargets,
+    source: SocketAddr,
+    datagram: &[u8],
+) {
+    let now = Instant::now();
+    let relay_targets = {
+        let mut targets = targets.write().await;
+        targets.retain(|_, expires_at| *expires_at > now);
+        targets
+            .keys()
+            .copied()
+            .filter(|target| *target != source)
+            .collect::<Vec<_>>()
+    };
+
+    for target in relay_targets {
+        if let Err(error) = socket.send_to(datagram, target).await {
+            warn!(
+                source = %source,
+                target = %target,
+                error = %error,
+                "failed to relay DAW media datagram"
+            );
+        }
+    }
+}
+
+async fn run_daw_media_udp_ingest(
+    socket: UdpSocket,
+    forwarder: Arc<MeshForwarder>,
+    targets: DawRelayTargets,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<()> {
+    let bind = socket.local_addr()?;
+    let mut decoders = HashMap::<SocketAddr, MediaFecDecoder>::new();
+    let mut buf = vec![0u8; 65_536];
+    let mut cleanup = interval(DAW_RELAY_CLEANUP_INTERVAL);
+    cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!(bind = %bind, "DAW media UDP relay shutting down");
+                return Ok(());
+            }
+            _ = cleanup.tick() => {
+                let now = Instant::now();
+                let mut targets = targets.write().await;
+                targets.retain(|_, expires_at| *expires_at > now);
+            }
+            received = socket.recv_from(&mut buf) => {
+                let (len, peer) = received?;
+                if len == 0 {
+                    continue;
+                }
+                let datagram = &buf[..len];
+
+                if datagram == DAW_RELAY_SUBSCRIBE_MESSAGE {
+                    let expires_at = Instant::now() + DAW_RELAY_TARGET_TTL;
+                    targets.write().await.insert(peer, expires_at);
+                    if let Err(error) = socket.send_to(DAW_RELAY_SUBSCRIBE_ACK, peer).await {
+                        warn!(peer = %peer, error = %error, "failed to acknowledge DAW relay subscription");
+                    }
+                    trace!(peer = %peer, "registered DAW relay subscriber");
+                    continue;
+                }
+
+                if datagram == DAW_RELAY_UNSUBSCRIBE_MESSAGE {
+                    targets.write().await.remove(&peer);
+                    decoders.remove(&peer);
+                    trace!(peer = %peer, "removed DAW relay subscriber");
+                    continue;
+                }
+
+                if datagram == DAW_RELAY_SUBSCRIBE_ACK {
+                    continue;
+                }
+
+                relay_daw_media_datagram(&socket, &targets, peer, datagram).await;
+
+                if is_multichannel_audio_transport_datagram(datagram) {
+                    if let Err(error) = forwarder.forward_audio_epoch_datagram(datagram).await {
+                        warn!(
+                            peer = %peer,
+                            error = %error,
+                            "failed to forward DAW audio epoch datagram to mesh"
+                        );
+                    }
+                    continue;
+                }
+
+                let decoded = {
+                    let decoder = decoders.entry(peer).or_default();
+                    decoder.push_datagram(datagram)
+                };
+                match decoded {
+                    Ok(Some(frame)) => {
+                        let stream_id = frame.metadata.stream_id;
+                        let sequence = frame.metadata.sequence;
+                        let payload_bytes = frame.payload.len();
+                        if let Err(error) = forwarder
+                            .forward_media_access_unit(frame.metadata, &frame.payload)
+                            .await
+                        {
+                            warn!(
+                                peer = %peer,
+                                stream_id,
+                                sequence,
+                                error = %error,
+                                "failed to forward decoded DAW media access unit to mesh"
+                            );
+                        } else {
+                            trace!(
+                                peer = %peer,
+                                stream_id,
+                                sequence,
+                                payload_bytes,
+                                "forwarded decoded DAW media access unit to mesh"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            peer = %peer,
+                            error = %error,
+                            "failed to decode DAW media-FEC datagram"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Fmp4PartPublisher for MeshForwarder {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
-        let payload = encode_mesh_fmp4_slot(part.init.as_ref(), &part.bytes)
+        let initialization = part
+            .init
+            .as_ref()
+            .map(|init| build_fmp4_initialization_object(part.stream_id, init))
+            .transpose()
             .map_err(|error| error.to_string())?;
-        self.forward_stream_slot(part.stream_id, &payload)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let (initialization_key, configuration_epoch) =
+            if let Some((object, epoch)) = initialization {
+                let initialization_envelope =
+                    encode_canonical_media_object(&object).map_err(|error| error.to_string())?;
+                if !self.relay_exclusive {
+                    self.forward_stream_slot(part.stream_id, &initialization_envelope)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                let key = object.key().clone();
+                self.fmp4_initializations
+                    .lock()
+                    .await
+                    .insert(part.stream_id, (key.clone(), epoch));
+                (key, epoch)
+            } else {
+                self.fmp4_initializations
+                    .lock()
+                    .await
+                    .get(&part.stream_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "fMP4 media part {} for stream {} has no initialization dependency",
+                            part.sequence, part.stream_id
+                        )
+                    })?
+            };
+
+        let bundled_media = encode_mesh_fmp4_slot(part.init.as_ref(), &part.bytes)
+            .map_err(|error| error.to_string())?;
+        let media_object = build_fmp4_media_object(
+            &part,
+            &bundled_media,
+            initialization_key,
+            configuration_epoch,
+            self.delivery_budget_ms,
+            self.estimated_clock_error_ns,
+        )
+        .map_err(|error| error.to_string())?;
+        let media =
+            encode_canonical_media_object(&media_object).map_err(|error| error.to_string())?;
+        if !self.relay_exclusive {
+            self.forward_stream_slot(part.stream_id, &media)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        if let Some(relay) = &self.relay {
+            let outcome = relay
+                .publish_object(&media_object)
+                .await
+                .map_err(|error| error.to_string())?;
+            trace!(
+                stream_id = part.stream_id,
+                sequence = part.sequence,
+                object_key = ?outcome.announcement.key,
+                source_symbols = outcome.source_symbols,
+                repair_symbols = outcome.repair_symbols,
+                "published canonical fMP4 object through RelaySession"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -444,23 +1242,14 @@ async fn start_rist_ingest(
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
     let service = Arc::new(UploadResponseService::new(upload_response_config()));
-    let rist_shutdown = match config.backend {
-        RistBackend::Pure => UploadPureRistIngest::new(service.clone())
-            .with_profile(config.profile.into())
-            .with_flow_id(config.flow_id)
-            .start(config.bind)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("failed to bind pure Rust RIST contributor frontend: {error}")
-            })?,
-        RistBackend::Librist => UploadRistIngest::new(service.clone())
-            .with_profile(config.profile.into())
-            .start(config.bind)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("failed to bind librist contributor frontend: {error}")
-            })?,
-    };
+    let rist_shutdown = UploadPureRistIngest::new(service.clone())
+        .with_profile(config.profile.into())
+        .with_flow_id(config.flow_id)
+        .start(config.bind)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("failed to bind pure Rust RIST contributor frontend: {error}")
+        })?;
     tokio::spawn(run_upload_response_ts_bridge(
         service,
         playlists,
@@ -475,7 +1264,7 @@ async fn start_rist_ingest(
     info!(
         bind = %config.bind,
         profile = config.profile.as_str(),
-        backend = config.backend.as_str(),
+        backend = RistBackend::Pure.as_str(),
         flow_id = format_args!("0x{:08x}", config.flow_id),
         output_stream_id = config.output_stream_id,
         output_stream_idx = config.output_stream_idx,
@@ -534,6 +1323,7 @@ async fn start_srt_ingest(
     Ok(srt_shutdown)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_upload_response_ts_bridge(
     service: Arc<UploadResponseService>,
     playlists: Arc<playlists::Playlists>,
@@ -582,10 +1372,10 @@ async fn run_upload_response_ts_bridge(
 
                 for stream in streams {
                     let stream_id = stream.stream_id;
-                    if !bridges.contains_key(&stream_id) {
-                        bridges.insert(
-                            stream_id,
-                            UploadTsBridgeState {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        bridges.entry(stream_id)
+                    {
+                        entry.insert(UploadTsBridgeState {
                                 output_stream_id: None,
                                 output_stream_idx: None,
                                 last_seen: 0,
@@ -593,8 +1383,7 @@ async fn run_upload_response_ts_bridge(
                                 body_slots: 0,
                                 ended: false,
                                 bridge: None,
-                            },
-                        );
+                            });
                         telemetry.ensure_ingest_session(protocol, stream_id, None, None, None, None);
                         trace!(stream_id, "tracking upload-response stream");
                     }
@@ -913,6 +1702,77 @@ fn advertised_hls_stream_id(args: &Args) -> u64 {
     }
 }
 
+#[derive(Debug)]
+struct AtomicDurationHistogram {
+    count: AtomicU64,
+    sum_us: AtomicU64,
+    max_us: AtomicU64,
+    buckets: [AtomicU64; DURATION_HISTOGRAM_BUCKETS_US.len()],
+}
+
+impl Default for AtomicDurationHistogram {
+    fn default() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl AtomicDurationHistogram {
+    fn record(&self, duration: Duration) {
+        let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.max_us.fetch_max(duration_us, Ordering::Relaxed);
+        for (index, upper_bound_us) in DURATION_HISTOGRAM_BUCKETS_US.iter().enumerate() {
+            if duration_us <= *upper_bound_us {
+                self.buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> DurationHistogramSnapshot {
+        let count = self.count.load(Ordering::Relaxed);
+        let buckets = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        DurationHistogramSnapshot {
+            count,
+            sum_us: self.sum_us.load(Ordering::Relaxed),
+            p95_us: histogram_percentile_upper_bound_us(
+                count,
+                &buckets,
+                95,
+                self.max_us.load(Ordering::Relaxed),
+            ),
+            buckets,
+        }
+    }
+}
+
+fn histogram_percentile_upper_bound_us(
+    count: u64,
+    buckets: &[u64],
+    percentile: u64,
+    max_us: u64,
+) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let rank = count.saturating_mul(percentile).saturating_add(99) / 100;
+    buckets
+        .iter()
+        .enumerate()
+        .find(|(_, bucket_count)| **bucket_count >= rank)
+        .map(|(index, _)| DURATION_HISTOGRAM_BUCKETS_US[index])
+        .or(Some(max_us))
+}
+
 #[derive(Debug, Default)]
 struct IngestTelemetry {
     raw_http_requests: AtomicU64,
@@ -930,12 +1790,32 @@ struct IngestTelemetry {
     mesh_stream_datagram_bytes: AtomicU64,
     mesh_stream_errors: AtomicU64,
     mesh_stream_last_unix_ms: AtomicU64,
+    mesh_stream_duration: AtomicDurationHistogram,
+    mesh_stream_encode_wait_duration: AtomicDurationHistogram,
+    mesh_stream_encode_duration: AtomicDurationHistogram,
+    mesh_stream_send_duration: AtomicDurationHistogram,
+    mesh_stream_telemetry_duration: AtomicDurationHistogram,
     mesh_media_payloads: AtomicU64,
     mesh_media_payload_bytes: AtomicU64,
     mesh_media_datagrams: AtomicU64,
     mesh_media_datagram_bytes: AtomicU64,
     mesh_media_errors: AtomicU64,
     mesh_media_last_unix_ms: AtomicU64,
+    mesh_media_duration: AtomicDurationHistogram,
+    mesh_media_encode_wait_duration: AtomicDurationHistogram,
+    mesh_media_encode_duration: AtomicDurationHistogram,
+    mesh_media_send_duration: AtomicDurationHistogram,
+    mesh_media_telemetry_duration: AtomicDurationHistogram,
+    relay_objects_sent: AtomicU64,
+    relay_encode_errors: AtomicU64,
+    relay_source_datagrams: AtomicU64,
+    relay_source_datagram_bytes: AtomicU64,
+    relay_source_errors: AtomicU64,
+    relay_repair_datagrams: AtomicU64,
+    relay_repair_datagram_bytes: AtomicU64,
+    relay_repair_errors: AtomicU64,
+    relay_repair_primary_fallback_objects: AtomicU64,
+    relay_last_deadline_unix_us: AtomicU64,
     mpeg_ts_slots: AtomicU64,
     mpeg_ts_bytes: AtomicU64,
     mpeg_ts_last_unix_ms: AtomicU64,
@@ -973,6 +1853,61 @@ struct IngestTelemetry {
 }
 
 impl IngestTelemetry {
+    fn record_relay_session_send_success(&self, role: MediaDatagramRole, wire_bytes: u64) {
+        let (datagrams, bytes) = match role {
+            MediaDatagramRole::Source => (
+                &self.relay_source_datagrams,
+                &self.relay_source_datagram_bytes,
+            ),
+            MediaDatagramRole::Repair => (
+                &self.relay_repair_datagrams,
+                &self.relay_repair_datagram_bytes,
+            ),
+        };
+        datagrams.fetch_add(1, Ordering::Relaxed);
+        bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+    }
+
+    fn record_relay_session_send_error(&self, role: MediaDatagramRole) {
+        match role {
+            MediaDatagramRole::Source => &self.relay_source_errors,
+            MediaDatagramRole::Repair => &self.relay_repair_errors,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_relay_session_encode_error(&self) {
+        self.relay_encode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_mesh_forward_duration(&self, kind: &'static str, duration: Duration) {
+        if kind == "media" {
+            self.mesh_media_duration.record(duration);
+        } else {
+            self.mesh_stream_duration.record(duration);
+        }
+    }
+
+    fn record_mesh_forward_stage_duration(
+        &self,
+        kind: &'static str,
+        stage: &'static str,
+        duration: Duration,
+    ) {
+        let histogram = match (kind, stage) {
+            ("media", "encode_wait") => &self.mesh_media_encode_wait_duration,
+            ("media", "encode") => &self.mesh_media_encode_duration,
+            ("media", "send") => &self.mesh_media_send_duration,
+            ("media", "telemetry") => &self.mesh_media_telemetry_duration,
+            (_, "encode_wait") => &self.mesh_stream_encode_wait_duration,
+            (_, "encode") => &self.mesh_stream_encode_duration,
+            (_, "send") => &self.mesh_stream_send_duration,
+            (_, "telemetry") => &self.mesh_stream_telemetry_duration,
+            _ => return,
+        };
+        histogram.record(duration);
+    }
+
     fn record_raw_http(&self, stream_id: u64, chunks: u64, bytes: u64, datagrams: u64) {
         let now = now_unix_ms();
         let requests = self.raw_http_requests.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1311,6 +2246,7 @@ impl IngestTelemetry {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_fmp4_tracks(
         &self,
         stream_id: u64,
@@ -1609,7 +2545,7 @@ impl IngestTelemetry {
             right
                 .last_seen_unix_ms
                 .cmp(&left.last_seen_unix_ms)
-                .then_with(|| left.protocol.cmp(&right.protocol))
+                .then_with(|| left.protocol.cmp(right.protocol))
                 .then_with(|| left.stream_id_text.cmp(&right.stream_id_text))
         });
         recent_ingest_sessions.truncate(CONTRIB_INGEST_SESSION_LIMIT);
@@ -1642,6 +2578,13 @@ impl IngestTelemetry {
                     self.mesh_stream_last_unix_ms.load(Ordering::Relaxed),
                 ),
                 stream_last_age_ms: age_from_atomic_ms(now_ms, &self.mesh_stream_last_unix_ms),
+                stream_duration: self.mesh_stream_duration.snapshot(),
+                stream_stages: MeshForwardStageRuntimeSnapshot {
+                    encode_wait: self.mesh_stream_encode_wait_duration.snapshot(),
+                    encode: self.mesh_stream_encode_duration.snapshot(),
+                    send: self.mesh_stream_send_duration.snapshot(),
+                    telemetry: self.mesh_stream_telemetry_duration.snapshot(),
+                },
                 media_payloads: self.mesh_media_payloads.load(Ordering::Relaxed),
                 media_payload_bytes: self.mesh_media_payload_bytes.load(Ordering::Relaxed),
                 media_datagrams: self.mesh_media_datagrams.load(Ordering::Relaxed),
@@ -1651,6 +2594,33 @@ impl IngestTelemetry {
                     self.mesh_media_last_unix_ms.load(Ordering::Relaxed),
                 ),
                 media_last_age_ms: age_from_atomic_ms(now_ms, &self.mesh_media_last_unix_ms),
+                media_duration: self.mesh_media_duration.snapshot(),
+                media_stages: MeshForwardStageRuntimeSnapshot {
+                    encode_wait: self.mesh_media_encode_wait_duration.snapshot(),
+                    encode: self.mesh_media_encode_duration.snapshot(),
+                    send: self.mesh_media_send_duration.snapshot(),
+                    telemetry: self.mesh_media_telemetry_duration.snapshot(),
+                },
+            },
+            relay_session: RelaySessionRuntimeSnapshot {
+                objects_sent: self.relay_objects_sent.load(Ordering::Relaxed),
+                encode_errors: self.relay_encode_errors.load(Ordering::Relaxed),
+                source_datagrams: self.relay_source_datagrams.load(Ordering::Relaxed),
+                source_datagram_bytes: self.relay_source_datagram_bytes.load(Ordering::Relaxed),
+                source_errors: self.relay_source_errors.load(Ordering::Relaxed),
+                repair_datagrams: self.relay_repair_datagrams.load(Ordering::Relaxed),
+                repair_datagram_bytes: self.relay_repair_datagram_bytes.load(Ordering::Relaxed),
+                repair_errors: self.relay_repair_errors.load(Ordering::Relaxed),
+                repair_primary_fallback_objects: self
+                    .relay_repair_primary_fallback_objects
+                    .load(Ordering::Relaxed),
+                last_deadline_unix_us: nonzero_unix_us(
+                    self.relay_last_deadline_unix_us.load(Ordering::Relaxed),
+                ),
+                last_deadline_headroom_us: nonzero_unix_us(
+                    self.relay_last_deadline_unix_us.load(Ordering::Relaxed),
+                )
+                .map(|deadline| deadline.saturating_sub(now_ms.saturating_mul(1_000))),
             },
             mpeg_ts: MpegTsRuntimeSnapshot {
                 slots: self.mpeg_ts_slots.load(Ordering::Relaxed),
@@ -1858,7 +2828,7 @@ impl IngestTelemetry {
 }
 
 fn should_sample_activity(count: u64, interval: u64) -> bool {
-    count <= 3 || count % interval == 0
+    count <= 3 || count.is_multiple_of(interval)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1897,6 +2867,10 @@ struct ContribStreamRuntimeRecord {
 }
 
 fn nonzero_unix_ms(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn nonzero_unix_us(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
 }
 
@@ -1965,10 +2939,11 @@ struct ContribStatusConfig {
 impl ContribStatusConfig {
     fn from_args(args: &Args, telemetry: Arc<IngestTelemetry>) -> Self {
         let advertised_hls_stream_id = advertised_hls_stream_id(args);
-        let mut listeners = Vec::with_capacity(3);
-        listeners.push(ListenerStatus::rist(args));
-        listeners.push(ListenerStatus::srt(args));
-        listeners.push(ListenerStatus::rtmp(args));
+        let listeners = vec![
+            ListenerStatus::rist(args),
+            ListenerStatus::srt(args),
+            ListenerStatus::rtmp(args),
+        ];
 
         let mut alerts = Vec::new();
         if listeners.iter().all(|listener| !listener.enabled) {
@@ -1990,6 +2965,21 @@ impl ContribStatusConfig {
             mesh: MeshTargetStatus {
                 byte_fec_target: args.mesh_fec_target.to_string(),
                 media_fec_target: args.mesh_media_fec_target.to_string(),
+                relay_primary_configured: args.relay_primary_target.is_some(),
+                relay_secondary_configured: args.relay_secondary_target.is_some(),
+                relay_carrier: args.relay_primary_target.map(|_| "private-udp"),
+                relay_primary_target: args.relay_primary_target.map(|target| target.to_string()),
+                relay_primary_bind: args.relay_primary_bind.map(|bind| bind.to_string()),
+                relay_secondary_target: args
+                    .relay_secondary_target
+                    .map(|target| target.to_string()),
+                relay_secondary_bind: args.relay_secondary_bind.map(|bind| bind.to_string()),
+                relay_secondary_source_seeded: args.relay_secondary_seed_source,
+                relay_exclusive: args.relay_exclusive,
+                relay_deadline_ms: args.relay_deadline_ms,
+                media_object_clock_id: AV_CONTRIB_CLOCK_ID,
+                media_object_clock_confidence: "estimated",
+                media_object_clock_estimated_error_ms: args.wall_clock_estimated_error_ms,
             },
             hls: HlsStatus {
                 part_target_ms: args.fmp4_part_ms,
@@ -2046,6 +3036,537 @@ impl ContribStatusConfig {
         event.extend_from_slice(b"\n\n");
         Ok(event.freeze())
     }
+
+    fn prometheus_metrics(&self) -> Bytes {
+        Bytes::from(render_contrib_prometheus_metrics(&self.snapshot()))
+    }
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn push_prometheus_metric_header(output: &mut String, name: &str, help: &str, metric_type: &str) {
+    output.push_str("# HELP ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(help);
+    output.push('\n');
+    output.push_str("# TYPE ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(metric_type);
+    output.push('\n');
+}
+
+fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String {
+    let runtime = &snapshot.runtime;
+    let mut output = String::with_capacity(8 * 1024);
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_health",
+        "Current contributor service health state.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_health{{state=\"{}\"}} 1\n",
+        prometheus_label_value(snapshot.health.state)
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_llhls_part_target_seconds",
+        "Configured LL-HLS part target in seconds.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_llhls_part_target_seconds {}\n",
+        f64::from(snapshot.hls.part_target_ms) / 1_000.0
+    ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_carrier_configured",
+        "Configured RelaySession live carriers by bounded parent path.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_relay_session_carrier_configured{{path=\"primary\"}} {}\n",
+        u8::from(snapshot.mesh.relay_primary_configured)
+    ));
+    output.push_str(&format!(
+        "av_contrib_relay_session_carrier_configured{{path=\"secondary\"}} {}\n",
+        u8::from(snapshot.mesh.relay_secondary_configured)
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_deadline_budget_seconds",
+        "Configured canonical live-object and RelaySession delivery budget.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_relay_session_deadline_budget_seconds {}\n",
+        snapshot.mesh.relay_deadline_ms as f64 / 1_000.0
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_media_object_clock_estimated_error_seconds",
+        "Configured maximum error estimate for canonical media-object wall-clock timestamps.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_media_object_clock_estimated_error_seconds {}\n",
+        snapshot.mesh.media_object_clock_estimated_error_ms as f64 / 1_000.0
+    ));
+    if let Some(deadline_unix_us) = runtime.relay_session.last_deadline_unix_us {
+        push_prometheus_metric_header(
+            &mut output,
+            "av_contrib_relay_session_last_deadline_seconds",
+            "Unix expiry of the latest successfully emitted RelaySession object.",
+            "gauge",
+        );
+        output.push_str(&format!(
+            "av_contrib_relay_session_last_deadline_seconds {}\n",
+            deadline_unix_us as f64 / 1_000_000.0
+        ));
+    }
+    if let Some(headroom_us) = runtime.relay_session.last_deadline_headroom_us {
+        push_prometheus_metric_header(
+            &mut output,
+            "av_contrib_relay_session_last_deadline_headroom_seconds",
+            "Remaining headroom for the latest successfully emitted RelaySession deadline.",
+            "gauge",
+        );
+        output.push_str(&format!(
+            "av_contrib_relay_session_last_deadline_headroom_seconds {}\n",
+            headroom_us as f64 / 1_000_000.0
+        ));
+    }
+
+    for (name, help, value) in [
+        (
+            "av_contrib_raw_http_requests_total",
+            "Raw HTTP contributor ingest requests.",
+            runtime.raw_http.requests,
+        ),
+        (
+            "av_contrib_raw_http_bytes_total",
+            "Raw HTTP contributor ingest payload bytes.",
+            runtime.raw_http.bytes,
+        ),
+        (
+            "av_contrib_media_access_units_total",
+            "Media access units accepted by contributor ingest.",
+            runtime.media_access_units.requests,
+        ),
+        (
+            "av_contrib_media_access_unit_bytes_total",
+            "Media access-unit payload bytes accepted by contributor ingest.",
+            runtime.media_access_units.payload_bytes,
+        ),
+        (
+            "av_contrib_mpeg_ts_slots_total",
+            "MPEG-TS slots accepted from reliable ingest transports.",
+            runtime.mpeg_ts.slots,
+        ),
+        (
+            "av_contrib_mpeg_ts_bytes_total",
+            "MPEG-TS bytes accepted from reliable ingest transports.",
+            runtime.mpeg_ts.bytes,
+        ),
+        (
+            "av_contrib_mpeg_ts_continuity_errors_total",
+            "MPEG-TS continuity errors detected at contributor ingest.",
+            runtime.mpeg_ts.continuity_errors,
+        ),
+        (
+            "av_contrib_mpeg_ts_dropped_bytes_total",
+            "MPEG-TS bytes dropped after continuity damage or oversized payloads.",
+            runtime
+                .mpeg_ts
+                .continuity_dropped_bytes
+                .saturating_add(runtime.mpeg_ts.payload_drop_bytes),
+        ),
+        (
+            "av_contrib_rtmp_access_units_total",
+            "RTMP access units accepted by contributor ingest.",
+            runtime.rtmp.access_units,
+        ),
+        (
+            "av_contrib_rtmp_bytes_total",
+            "RTMP access-unit bytes accepted by contributor ingest.",
+            runtime.rtmp.bytes,
+        ),
+        (
+            "av_contrib_fmp4_parts_total",
+            "CMAF/fMP4 parts published by contributor ingest.",
+            runtime.fmp4.parts,
+        ),
+        (
+            "av_contrib_fmp4_bytes_total",
+            "CMAF/fMP4 media bytes published by contributor ingest.",
+            runtime.fmp4.bytes,
+        ),
+        (
+            "av_contrib_fmp4_publish_errors_total",
+            "CMAF/fMP4 publish failures.",
+            runtime.fmp4.publish_errors,
+        ),
+        (
+            "av_contrib_hls_responses_total",
+            "Contributor LL-HLS responses.",
+            runtime.hls.responses_total,
+        ),
+        (
+            "av_contrib_hls_response_errors_total",
+            "Contributor LL-HLS non-success responses.",
+            runtime.hls.response_errors,
+        ),
+        (
+            "av_contrib_hls_not_found_total",
+            "Contributor LL-HLS not-found responses.",
+            runtime.hls.response_not_found,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_ingest_sessions",
+        "Contributor ingest sessions by lifecycle state.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_contrib_ingest_sessions{{state=\"active\"}} {}\n",
+        runtime.ingest_sessions.active
+    ));
+    output.push_str(&format!(
+        "av_contrib_ingest_sessions{{state=\"ended\"}} {}\n",
+        runtime.ingest_sessions.ended
+    ));
+
+    for (kind, payloads, payload_bytes, datagrams, datagram_bytes, errors) in [
+        (
+            "stream",
+            runtime.mesh_forward.stream_payloads,
+            runtime.mesh_forward.stream_payload_bytes,
+            runtime.mesh_forward.stream_datagrams,
+            runtime.mesh_forward.stream_datagram_bytes,
+            runtime.mesh_forward.stream_errors,
+        ),
+        (
+            "media",
+            runtime.mesh_forward.media_payloads,
+            runtime.mesh_forward.media_payload_bytes,
+            runtime.mesh_forward.media_datagrams,
+            runtime.mesh_forward.media_datagram_bytes,
+            runtime.mesh_forward.media_errors,
+        ),
+    ] {
+        for (name, help, value) in [
+            (
+                "av_contrib_mesh_forward_payloads_total",
+                "Payloads forwarded from contributor ingest to the mesh.",
+                payloads,
+            ),
+            (
+                "av_contrib_mesh_forward_payload_bytes_total",
+                "Payload bytes forwarded from contributor ingest to the mesh.",
+                payload_bytes,
+            ),
+            (
+                "av_contrib_mesh_forward_datagrams_total",
+                "FEC datagrams forwarded from contributor ingest to the mesh.",
+                datagrams,
+            ),
+            (
+                "av_contrib_mesh_forward_datagram_bytes_total",
+                "FEC datagram bytes forwarded from contributor ingest to the mesh.",
+                datagram_bytes,
+            ),
+            (
+                "av_contrib_mesh_forward_errors_total",
+                "Contributor-to-mesh forwarding failures.",
+                errors,
+            ),
+        ] {
+            if kind == "stream" {
+                push_prometheus_metric_header(&mut output, name, help, "counter");
+            }
+            output.push_str(&format!("{name}{{kind=\"{kind}\"}} {value}\n"));
+        }
+    }
+
+    for (name, help, value) in [
+        (
+            "av_contrib_relay_session_objects_total",
+            "Canonical media objects emitted through RelaySession.",
+            runtime.relay_session.objects_sent,
+        ),
+        (
+            "av_contrib_relay_session_encode_errors_total",
+            "Canonical media objects rejected during RelaySession RaptorQ encoding.",
+            runtime.relay_session.encode_errors,
+        ),
+        (
+            "av_contrib_relay_session_repair_primary_fallback_objects_total",
+            "RelaySession objects whose repair symbols used the primary carrier fallback.",
+            runtime.relay_session.repair_primary_fallback_objects,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+    for (role, datagrams, datagram_bytes, errors) in [
+        (
+            "source",
+            runtime.relay_session.source_datagrams,
+            runtime.relay_session.source_datagram_bytes,
+            runtime.relay_session.source_errors,
+        ),
+        (
+            "repair",
+            runtime.relay_session.repair_datagrams,
+            runtime.relay_session.repair_datagram_bytes,
+            runtime.relay_session.repair_errors,
+        ),
+    ] {
+        for (name, help, value) in [
+            (
+                "av_contrib_relay_session_datagrams_total",
+                "RelaySession datagrams sent by bounded symbol role.",
+                datagrams,
+            ),
+            (
+                "av_contrib_relay_session_datagram_bytes_total",
+                "RelaySession wire bytes sent by bounded symbol role.",
+                datagram_bytes,
+            ),
+            (
+                "av_contrib_relay_session_send_errors_total",
+                "RelaySession send failures by bounded symbol role.",
+                errors,
+            ),
+        ] {
+            if role == "source" {
+                push_prometheus_metric_header(&mut output, name, help, "counter");
+            }
+            output.push_str(&format!("{name}{{role=\"{role}\"}} {value}\n"));
+        }
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_mesh_forward_duration_seconds",
+        "Time spent encoding and sending one contributor payload to the mesh.",
+        "histogram",
+    );
+    for (kind, histogram) in [
+        ("stream", &runtime.mesh_forward.stream_duration),
+        ("media", &runtime.mesh_forward.media_duration),
+    ] {
+        for (upper_bound_us, count) in DURATION_HISTOGRAM_BUCKETS_US
+            .iter()
+            .zip(histogram.buckets.iter())
+        {
+            output.push_str(&format!(
+                "av_contrib_mesh_forward_duration_seconds_bucket{{kind=\"{kind}\",le=\"{}\"}} {count}\n",
+                *upper_bound_us as f64 / 1_000_000.0
+            ));
+        }
+        output.push_str(&format!(
+            "av_contrib_mesh_forward_duration_seconds_bucket{{kind=\"{kind}\",le=\"+Inf\"}} {}\n",
+            histogram.count
+        ));
+        output.push_str(&format!(
+            "av_contrib_mesh_forward_duration_seconds_sum{{kind=\"{kind}\"}} {}\n",
+            histogram.sum_us as f64 / 1_000_000.0
+        ));
+        output.push_str(&format!(
+            "av_contrib_mesh_forward_duration_seconds_count{{kind=\"{kind}\"}} {}\n",
+            histogram.count
+        ));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_mesh_forward_stage_duration_seconds",
+        "Contributor-to-mesh forwarding time by bounded hot-path stage.",
+        "histogram",
+    );
+    for (kind, stages) in [
+        ("stream", &runtime.mesh_forward.stream_stages),
+        ("media", &runtime.mesh_forward.media_stages),
+    ] {
+        for (stage, histogram) in [
+            ("encode_wait", &stages.encode_wait),
+            ("encode", &stages.encode),
+            ("send", &stages.send),
+            ("telemetry", &stages.telemetry),
+        ] {
+            for (upper_bound_us, count) in DURATION_HISTOGRAM_BUCKETS_US
+                .iter()
+                .zip(histogram.buckets.iter())
+            {
+                output.push_str(&format!(
+                    "av_contrib_mesh_forward_stage_duration_seconds_bucket{{kind=\"{kind}\",stage=\"{stage}\",le=\"{}\"}} {count}\n",
+                    *upper_bound_us as f64 / 1_000_000.0
+                ));
+            }
+            output.push_str(&format!(
+                "av_contrib_mesh_forward_stage_duration_seconds_bucket{{kind=\"{kind}\",stage=\"{stage}\",le=\"+Inf\"}} {}\n",
+                histogram.count
+            ));
+            output.push_str(&format!(
+                "av_contrib_mesh_forward_stage_duration_seconds_sum{{kind=\"{kind}\",stage=\"{stage}\"}} {}\n",
+                histogram.sum_us as f64 / 1_000_000.0
+            ));
+            output.push_str(&format!(
+                "av_contrib_mesh_forward_stage_duration_seconds_count{{kind=\"{kind}\",stage=\"{stage}\"}} {}\n",
+                histogram.count
+            ));
+        }
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_last_seen_age_seconds",
+        "Age of the most recent contributor pipeline event by stage.",
+        "gauge",
+    );
+    for (stage, age_ms) in [
+        ("input", snapshot.health.last_input_age_ms),
+        ("fmp4_input", snapshot.health.last_fmp4_input_age_ms),
+        ("fmp4_output", snapshot.health.last_output_age_ms),
+        ("mesh_stream", runtime.mesh_forward.stream_last_age_ms),
+        ("mesh_media", runtime.mesh_forward.media_last_age_ms),
+    ] {
+        if let Some(age_ms) = age_ms {
+            output.push_str(&format!(
+                "av_contrib_last_seen_age_seconds{{stage=\"{stage}\"}} {}\n",
+                age_ms as f64 / 1_000.0
+            ));
+        }
+    }
+
+    for (name, help, metric_type) in [
+        (
+            "av_contrib_stream_input_bytes_total",
+            "Contributor input bytes by stream.",
+            "counter",
+        ),
+        (
+            "av_contrib_stream_mesh_bytes_total",
+            "Contributor-to-mesh payload bytes by stream.",
+            "counter",
+        ),
+        (
+            "av_contrib_stream_mesh_errors_total",
+            "Contributor-to-mesh forwarding errors by stream.",
+            "counter",
+        ),
+        (
+            "av_contrib_stream_fmp4_parts_total",
+            "CMAF/fMP4 parts published by stream.",
+            "counter",
+        ),
+        (
+            "av_contrib_stream_latest_fmp4_sequence",
+            "Latest CMAF/fMP4 part sequence published by stream.",
+            "gauge",
+        ),
+        (
+            "av_contrib_stream_last_seen_age_seconds",
+            "Age of the most recent event by stream and stage.",
+            "gauge",
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+    }
+    for stream in &runtime.streams {
+        let stream_id = prometheus_label_value(&stream.stream_id_text);
+        let state = prometheus_label_value(stream.state);
+        let labels = format!("stream_id=\"{stream_id}\",state=\"{state}\"");
+        output.push_str(&format!(
+            "av_contrib_stream_input_bytes_total{{{labels}}} {}\n",
+            stream.input_bytes
+        ));
+        output.push_str(&format!(
+            "av_contrib_stream_mesh_bytes_total{{{labels}}} {}\n",
+            stream.mesh_payload_bytes
+        ));
+        output.push_str(&format!(
+            "av_contrib_stream_mesh_errors_total{{{labels}}} {}\n",
+            stream.mesh_errors
+        ));
+        output.push_str(&format!(
+            "av_contrib_stream_fmp4_parts_total{{{labels}}} {}\n",
+            stream.fmp4_parts
+        ));
+        if let Some(sequence) = stream.latest_fmp4_sequence {
+            output.push_str(&format!(
+                "av_contrib_stream_latest_fmp4_sequence{{{labels}}} {sequence}\n"
+            ));
+        }
+        for (stage, age_ms) in [
+            ("input", stream.last_input_age_ms),
+            ("mesh_forward", stream.last_mesh_forward_age_ms),
+            ("fmp4", stream.last_fmp4_age_ms),
+        ] {
+            if let Some(age_ms) = age_ms {
+                output.push_str(&format!(
+                    "av_contrib_stream_last_seen_age_seconds{{{labels},stage=\"{stage}\"}} {}\n",
+                    age_ms as f64 / 1_000.0
+                ));
+            }
+        }
+    }
+
+    for (name, help, metric_type) in [
+        (
+            "av_contrib_protocol_units_total",
+            "Ingest units received by contributor protocol.",
+            "counter",
+        ),
+        (
+            "av_contrib_protocol_bytes_total",
+            "Ingest bytes received by contributor protocol.",
+            "counter",
+        ),
+        (
+            "av_contrib_protocol_sessions",
+            "Ingest sessions by contributor protocol and state.",
+            "gauge",
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+    }
+    for protocol in &runtime.protocols {
+        let protocol_name = prometheus_label_value(protocol.protocol);
+        output.push_str(&format!(
+            "av_contrib_protocol_units_total{{protocol=\"{protocol_name}\"}} {}\n",
+            protocol.units
+        ));
+        output.push_str(&format!(
+            "av_contrib_protocol_bytes_total{{protocol=\"{protocol_name}\"}} {}\n",
+            protocol.bytes
+        ));
+        output.push_str(&format!(
+            "av_contrib_protocol_sessions{{protocol=\"{protocol_name}\",state=\"active\"}} {}\n",
+            protocol.active_sessions
+        ));
+        output.push_str(&format!(
+            "av_contrib_protocol_sessions{{protocol=\"{protocol_name}\",state=\"ended\"}} {}\n",
+            protocol.ended_sessions
+        ));
+    }
+
+    output
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2106,7 +3627,12 @@ fn derive_contrib_health(runtime: &IngestRuntimeSnapshot, hls: &HlsStatus) -> Co
         last_fmp4_input_age_ms.is_some_and(|age_ms| age_ms > stale_threshold_ms);
     let mesh_forward_errors =
         runtime.mesh_forward.stream_errors + runtime.mesh_forward.media_errors;
-    let state = if runtime.fmp4.publish_errors > 0 || mesh_forward_errors > 0 {
+    let relay_errors = runtime
+        .relay_session
+        .encode_errors
+        .saturating_add(runtime.relay_session.source_errors)
+        .saturating_add(runtime.relay_session.repair_errors);
+    let state = if runtime.fmp4.publish_errors > 0 || mesh_forward_errors > 0 || relay_errors > 0 {
         "degraded"
     } else if output_seen && output_is_stale {
         "stale"
@@ -2249,6 +3775,7 @@ struct IngestRuntimeSnapshot {
     raw_http: RawHttpRuntimeSnapshot,
     media_access_units: MediaRuntimeSnapshot,
     mesh_forward: MeshForwardRuntimeSnapshot,
+    relay_session: RelaySessionRuntimeSnapshot,
     mpeg_ts: MpegTsRuntimeSnapshot,
     rtmp: RtmpRuntimeSnapshot,
     fmp4: Fmp4RuntimeSnapshot,
@@ -2286,6 +3813,8 @@ struct MeshForwardRuntimeSnapshot {
     stream_errors: u64,
     stream_last_unix_ms: Option<u64>,
     stream_last_age_ms: Option<u64>,
+    stream_duration: DurationHistogramSnapshot,
+    stream_stages: MeshForwardStageRuntimeSnapshot,
     media_payloads: u64,
     media_payload_bytes: u64,
     media_datagrams: u64,
@@ -2293,6 +3822,39 @@ struct MeshForwardRuntimeSnapshot {
     media_errors: u64,
     media_last_unix_ms: Option<u64>,
     media_last_age_ms: Option<u64>,
+    media_duration: DurationHistogramSnapshot,
+    media_stages: MeshForwardStageRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MeshForwardStageRuntimeSnapshot {
+    encode_wait: DurationHistogramSnapshot,
+    encode: DurationHistogramSnapshot,
+    send: DurationHistogramSnapshot,
+    telemetry: DurationHistogramSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelaySessionRuntimeSnapshot {
+    objects_sent: u64,
+    encode_errors: u64,
+    source_datagrams: u64,
+    source_datagram_bytes: u64,
+    source_errors: u64,
+    repair_datagrams: u64,
+    repair_datagram_bytes: u64,
+    repair_errors: u64,
+    repair_primary_fallback_objects: u64,
+    last_deadline_unix_us: Option<u64>,
+    last_deadline_headroom_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DurationHistogramSnapshot {
+    count: u64,
+    sum_us: u64,
+    p95_us: Option<u64>,
+    buckets: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2544,6 +4106,24 @@ impl IngestSessionSnapshot {
 struct MeshTargetStatus {
     byte_fec_target: String,
     media_fec_target: String,
+    relay_primary_configured: bool,
+    relay_secondary_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_carrier: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_primary_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_primary_bind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_secondary_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_secondary_bind: Option<String>,
+    relay_secondary_source_seeded: bool,
+    relay_exclusive: bool,
+    relay_deadline_ms: u64,
+    media_object_clock_id: &'static str,
+    media_object_clock_confidence: &'static str,
+    media_object_clock_estimated_error_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2715,7 +4295,7 @@ impl Router for ContribRouter {
             "/" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(
-                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /api/status returns service status for dashboards\nGET /api/status/events streams service status as SSE\nGET /up checks health\n",
+                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /api/status returns service status for Needletail Mission Control\nGET /api/status/events streams service status as SSE\nGET /metrics returns Prometheus metrics\nGET /up checks health\n",
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
@@ -2728,6 +4308,11 @@ impl Router for ContribRouter {
                     Some("application/json"),
                 ))
             }
+            CONTRIB_METRICS_PATH => Ok(response(
+                StatusCode::OK,
+                Some(self.status.prometheus_metrics()),
+                Some(PROMETHEUS_CONTENT_TYPE),
+            )),
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -2814,13 +4399,20 @@ impl Router for ContribRouter {
                 ));
             }
 
+            if content_length_exceeds(&req, MAX_MEDIA_ACCESS_UNIT_BYTES) {
+                return Ok(payload_too_large_response(MAX_MEDIA_ACCESS_UNIT_BYTES));
+            }
             let params = MediaAccessUnitParams::parse(
                 req.uri().query(),
                 self.default_stream_id,
                 now_unix_ms(),
             )
             .map_err(ServerError::Config)?;
-            let payload = read_body_bytes(&mut body).await?;
+            let Some(payload) =
+                read_body_bytes_limited(&mut body, MAX_MEDIA_ACCESS_UNIT_BYTES).await?
+            else {
+                return Ok(payload_too_large_response(MAX_MEDIA_ACCESS_UNIT_BYTES));
+            };
             let sequence = params
                 .sequence
                 .unwrap_or_else(|| self.forwarder.allocate_media_sequence());
@@ -2908,7 +4500,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "av_contrib=info,web_service=info".into()),
+                .unwrap_or_else(|_| "av_contrib=info,av_web_service=info".into()),
         )
         .init();
 
@@ -2933,7 +4525,6 @@ async fn main() -> Result<()> {
                 RistIngestConfig {
                     bind,
                     profile: args.rist_profile,
-                    backend: args.rist_backend,
                     flow_id: args.rist_flow_id,
                     output_stream_id: args.rist_stream_id,
                     output_stream_idx,
@@ -2992,6 +4583,26 @@ async fn main() -> Result<()> {
     } else {
         (None, None, None)
     };
+    let daw_media_task = if let Some(bind) = args.daw_media_bind {
+        let socket = UdpSocket::bind(bind)
+            .await
+            .with_context(|| format!("failed to bind DAW media UDP relay on {bind}"))?;
+        let local_addr = socket.local_addr()?;
+        let targets = Arc::new(RwLock::new(HashMap::new()));
+        info!(
+            bind = %local_addr,
+            mesh_media_fec_target = %args.mesh_media_fec_target,
+            "DAW media UDP relay listening"
+        );
+        Some(tokio::spawn(run_daw_media_udp_ingest(
+            socket,
+            forwarder.clone(),
+            targets,
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
     let router = Box::new(ContribRouter::new(
         forwarder.clone(),
         args.stream_id,
@@ -3023,6 +4634,20 @@ async fn main() -> Result<()> {
     );
     println!("bytes:   udp+stream-fec://{}", args.mesh_fec_target);
     println!("media:   udp+media-fec://{}", args.mesh_media_fec_target);
+    if let Some(target) = args.relay_primary_target {
+        println!(
+            "relay-primary:   {} -> udp+relay-session://{target}",
+            args.relay_primary_bind
+                .map_or_else(|| "ephemeral".to_owned(), |bind| bind.to_string())
+        );
+    }
+    if let Some(target) = args.relay_secondary_target {
+        println!(
+            "relay-secondary: {} -> udp+relay-session://{target}",
+            args.relay_secondary_bind
+                .map_or_else(|| "ephemeral".to_owned(), |bind| bind.to_string())
+        );
+    }
     if let Some(bind) = args.rist_bind {
         println!(
             "rist:    rist://127.0.0.1:{} backend={} profile={} flow_id=0x{:08x} stream_id={}",
@@ -3046,6 +4671,9 @@ async fn main() -> Result<()> {
             bind.port(),
             args.rtmp_stream_id
         );
+    }
+    if let Some(bind) = args.daw_media_bind {
+        println!("daw:     udp+daw-media://{}", bind);
     }
     println!("status:  https://127.0.0.1:{}/api/status", args.http_port);
     println!(
@@ -3071,6 +4699,9 @@ async fn main() -> Result<()> {
         let _ = finished.await;
     }
     if let Some(task) = rtmp_task {
+        let _ = task.await;
+    }
+    if let Some(task) = daw_media_task {
         let _ = task.await;
     }
     Ok(())
@@ -3117,12 +4748,40 @@ fn log_hls_response(method: &Method, path: &str, query: Option<&str>, status: St
     }
 }
 
-async fn read_body_bytes(body: &mut BodyStream) -> HandlerResult<Bytes> {
+fn content_length_exceeds(req: &Request<()>, maximum: usize) -> bool {
+    req.headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > maximum as u64)
+}
+
+fn payload_too_large_response(maximum: usize) -> HandlerResponse {
+    response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Some(Bytes::from(format!(
+            "media access unit exceeds {maximum} bytes\n"
+        ))),
+        Some("text/plain; charset=utf-8"),
+    )
+}
+
+async fn read_body_bytes_limited(
+    body: &mut BodyStream,
+    maximum: usize,
+) -> HandlerResult<Option<Bytes>> {
     let mut bytes = BytesMut::new();
     while let Some(next) = body.next().await {
-        bytes.extend_from_slice(&next?);
+        let chunk = next?;
+        let Some(next_len) = bytes.len().checked_add(chunk.len()) else {
+            return Ok(None);
+        };
+        if next_len > maximum {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes.freeze())
+    Ok(Some(bytes.freeze()))
 }
 
 fn load_tls(args: &Args) -> Result<(String, String)> {
@@ -3168,6 +4827,126 @@ fn local_sender_addr(peer: SocketAddr) -> SocketAddr {
     }
 }
 
+fn relay_bind_addr(
+    flag: &'static str,
+    configured: Option<SocketAddr>,
+    target: SocketAddr,
+) -> Result<SocketAddr> {
+    let Some(bind) = configured else {
+        return Ok(local_sender_addr(target));
+    };
+    if bind.port() == 0 {
+        bail!("{flag} must use a fixed non-zero port");
+    }
+    if bind.ip().is_unspecified() {
+        bail!("{flag} must use the source IP registered by its relay peer");
+    }
+    if bind.is_ipv4() != target.is_ipv4() {
+        bail!("{flag} and its relay target must use the same address family");
+    }
+    Ok(bind)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamFecGeometry {
+    block_count: u32,
+    packet_count: u32,
+    repair_symbols: u32,
+}
+
+fn stream_fec_geometry(
+    payload_len: usize,
+    symbol_size: u16,
+    repair_symbols_per_legacy_block: u32,
+) -> Result<StreamFecGeometry> {
+    let symbol_size = symbol_size.max(1);
+    let raptorq_max_payload = usize::try_from(MAX_SOURCE_SYMBOLS_PER_BLOCK)
+        .context("RaptorQ source-symbol bound does not fit this platform")?
+        .checked_mul(usize::from(symbol_size))
+        .context("RaptorQ stream object size bound overflowed")?;
+    let max_object_payload = raptorq_max_payload.min(MAX_STREAM_FEC_OBJECT_BYTES);
+    if payload_len > max_object_payload {
+        bail!(
+            "stream slot is too large for one RaptorQ source block: got {payload_len} bytes, max is {max_object_payload} bytes for {symbol_size}-byte symbols"
+        );
+    }
+
+    // The old chunked encoder emitted `repair_symbols` for every four source
+    // symbols. Preserve that wire-overhead/recovery budget while protecting the
+    // whole application object as one block so the receiver commits one slot.
+    let max_block_payload = usize::from(DEFAULT_SOURCE_SYMBOLS) * usize::from(symbol_size);
+    let legacy_block_count = payload_len.max(1).div_ceil(max_block_payload);
+    let repair_symbols = u32::try_from(
+        (legacy_block_count as u64)
+            .checked_mul(u64::from(repair_symbols_per_legacy_block))
+            .context("RaptorQ repair-symbol count overflowed")?,
+    )
+    .context("RaptorQ repair-symbol count exceeds the wire sequence space")?;
+    let packet_count = u32::from(source_symbol_count(payload_len, symbol_size))
+        .checked_add(repair_symbols)
+        .context("RaptorQ packet count exceeds the wire sequence space")?;
+    if packet_count > MAX_STREAM_FEC_DATAGRAMS {
+        bail!(
+            "stream slot requires {packet_count} RaptorQ datagrams; limit is {MAX_STREAM_FEC_DATAGRAMS}"
+        );
+    }
+
+    Ok(StreamFecGeometry {
+        block_count: 1,
+        packet_count,
+        repair_symbols,
+    })
+}
+
+fn encode_stream_fec_payload(
+    stream_id: u64,
+    payload: &[u8],
+    repair_symbols: u32,
+    symbol_size: u16,
+    initial_block_id: u32,
+    initial_packet_sequence: u32,
+) -> Result<Vec<Bytes>> {
+    let geometry = stream_fec_geometry(payload.len(), symbol_size, repair_symbols)?;
+    let mut encoder = DatagramFecEncoder::new()
+        .with_initial_block_id(initial_block_id)
+        .with_symbol_size(symbol_size);
+    let datagrams = encoder
+        .encode_object_with_repair_symbols(payload, geometry.repair_symbols)
+        .context("failed to encode stream slot for mesh RaptorQ-FEC")?;
+    if encoder.block_id() != initial_block_id.wrapping_add(geometry.block_count)
+        || datagrams.len() != geometry.packet_count as usize
+    {
+        bail!(
+            "RaptorQ-FEC geometry changed while reserving concurrent wire ids: expected {} block(s) and {} packet(s), encoded {} block(s) and {} packet(s)",
+            geometry.block_count,
+            geometry.packet_count,
+            encoder.block_id().wrapping_sub(initial_block_id),
+            datagrams.len(),
+        );
+    }
+    let stream_prefix = stream_id.to_be_bytes();
+    datagrams
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut datagram)| {
+            let mut header = DatagramFecHeader::decode(&datagram)
+                .context("failed to decode newly encoded RaptorQ-FEC header")?;
+            header.packet_sequence = initial_packet_sequence.wrapping_add(index as u32);
+            header.packet_crc32 = header
+                .compute_packet_crc32(&datagram[HEADER_LEN..])
+                .context("failed to update RaptorQ-FEC packet CRC")?;
+            header
+                .encode(&mut datagram[..HEADER_LEN])
+                .context("failed to write updated RaptorQ-FEC header")?;
+
+            let mut framed = Vec::with_capacity(stream_prefix.len() + datagram.len());
+            framed.extend_from_slice(&stream_prefix);
+            framed.extend_from_slice(&datagram);
+            Ok(Bytes::from(framed))
+        })
+        .collect()
+}
+
 fn parse_stream_id_query(
     query: Option<&str>,
     default_stream_id: u64,
@@ -3193,6 +4972,13 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_unix_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
     let trimmed = value.trim();
     if let Some(hex) = trimmed
@@ -3208,9 +4994,39 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raptorq_fec_transport::FecDatagramDecoder;
+    use raptorq_fec_transport::{split_stream_id_prefix, FecDatagramDecoder};
     use std::net::Ipv4Addr;
     use tokio::time::timeout;
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_fmp4_part(
+        stream_id: u64,
+        sequence: u64,
+        keyframe: bool,
+        video_units: usize,
+        audio_units: usize,
+        init: Option<Bytes>,
+        bytes: Bytes,
+        published_at_unix_ns: i64,
+    ) -> PublishedFmp4Part {
+        PublishedFmp4Part {
+            stream_id,
+            stream_idx: 0,
+            sequence,
+            duration_ms: 67,
+            packaged_at_unix_ns: published_at_unix_ns - 2_000_000,
+            published_at_unix_ns,
+            init,
+            bytes,
+            keyframe,
+            video_codec: (video_units > 0).then_some("h264"),
+            video_width: (video_units > 0).then_some(1_280),
+            video_height: (video_units > 0).then_some(720),
+            video_units,
+            audio_codec: (audio_units > 0).then_some("aac"),
+            audio_units,
+        }
+    }
 
     #[test]
     fn parses_decimal_and_hex_rist_flow_ids() {
@@ -3228,6 +5044,605 @@ mod tests {
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
     }
 
+    #[test]
+    fn media_access_unit_content_length_is_admitted_within_bound() {
+        let accepted = Request::builder()
+            .header(CONTENT_LENGTH, MAX_MEDIA_ACCESS_UNIT_BYTES.to_string())
+            .body(())
+            .unwrap();
+        let rejected = Request::builder()
+            .header(
+                CONTENT_LENGTH,
+                (MAX_MEDIA_ACCESS_UNIT_BYTES + 1).to_string(),
+            )
+            .body(())
+            .unwrap();
+
+        assert!(!content_length_exceeds(
+            &accepted,
+            MAX_MEDIA_ACCESS_UNIT_BYTES
+        ));
+        assert!(content_length_exceeds(
+            &rejected,
+            MAX_MEDIA_ACCESS_UNIT_BYTES
+        ));
+    }
+
+    #[tokio::test]
+    async fn media_access_unit_streaming_body_stops_at_bound() {
+        let mut accepted: BodyStream = futures_util::stream::iter([
+            Ok::<_, ServerError>(Bytes::from_static(b"1234")),
+            Ok::<_, ServerError>(Bytes::from_static(b"5678")),
+        ])
+        .boxed();
+        assert_eq!(
+            read_body_bytes_limited(&mut accepted, 8)
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"12345678")
+        );
+
+        let mut rejected: BodyStream = futures_util::stream::iter([
+            Ok::<_, ServerError>(Bytes::from_static(b"1234")),
+            Ok::<_, ServerError>(Bytes::from_static(b"56789")),
+        ])
+        .boxed();
+        assert!(read_body_bytes_limited(&mut rejected, 8)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_fmp4_object_preserves_dependency_timing_duration_and_exact_envelope() {
+        const PUBLISHED_NS: i64 = 1_721_000_000_300_000_000;
+        let init = Bytes::from_static(b"ftypmoov");
+        let media = Bytes::from_static(b"moofmdat");
+        let bundled = encode_mesh_fmp4_slot(Some(&init), &media).unwrap();
+        let (initialization, configuration_epoch) =
+            build_fmp4_initialization_object(77, &init).unwrap();
+        let part = test_fmp4_part(77, 42, true, 3, 4, Some(init), media, PUBLISHED_NS);
+        let original = build_fmp4_media_object(
+            &part,
+            &bundled,
+            initialization.key().clone(),
+            configuration_epoch,
+            1_000,
+            250_000,
+        )
+        .unwrap();
+        let envelope = encode_canonical_media_object(&original).unwrap();
+        let object = media_object::decode(&envelope).unwrap();
+
+        assert_eq!(object, original);
+        assert_eq!(object.key().stream(), "77");
+        assert_eq!(object.key().track(), FMP4_MEDIA_TRACK);
+        assert_eq!(object.key().object(), 42);
+        assert_eq!(object.kind(), ObjectKind::Media);
+        assert!(object.is_keyframe());
+        assert_eq!(object.configuration_epoch(), configuration_epoch);
+        assert_eq!(object.dependencies(), &[initialization.key().clone()]);
+        assert!(object.capture_timestamp().is_none());
+        assert_eq!(object.stage_timestamps().len(), 2);
+        assert_eq!(object.stage_timestamps()[0].stage(), Stage::Packaged);
+        assert_eq!(
+            object.stage_timestamps()[0].timestamp().unix_time_ns(),
+            PUBLISHED_NS - 2_000_000
+        );
+        assert_eq!(object.stage_timestamps()[1].stage(), Stage::Published);
+        assert_eq!(
+            object.stage_timestamps()[1].timestamp().unix_time_ns(),
+            PUBLISHED_NS
+        );
+        assert_eq!(
+            object.deadline().unwrap().unix_time_ns(),
+            PUBLISHED_NS + 1_000_000_000
+        );
+        assert_eq!(
+            object.deadline().unwrap().confidence(),
+            ClockConfidence::estimated(250_000)
+        );
+        assert_eq!(object.metadata().get("container").unwrap(), b"fmp4");
+        assert_eq!(object.metadata().get("duration-ms").unwrap(), b"67");
+        assert_eq!(
+            object.metadata().get("payload-format").unwrap(),
+            b"fmp4-slot-v1"
+        );
+        assert_eq!(
+            object.metadata().get("scheduler-class").unwrap(),
+            b"video-keyframe"
+        );
+        assert_eq!(
+            object.metadata().get("track-composition").unwrap(),
+            b"audio+video"
+        );
+        assert_eq!(object.metadata().get("audio-codec").unwrap(), b"aac");
+        assert_eq!(object.metadata().get("video-codec").unwrap(), b"h264");
+        assert_eq!(object.payload(), bundled.as_ref());
+    }
+
+    #[test]
+    fn canonical_fmp4_retry_and_initialization_identity_are_deterministic() {
+        let init = Bytes::from_static(b"stable-init");
+        let media = Bytes::from_static(b"stable-media");
+        let bundled = encode_mesh_fmp4_slot(Some(&init), &media).unwrap();
+        let (first_initialization, first_epoch) =
+            build_fmp4_initialization_object(9, &init).unwrap();
+        let (retry_initialization, retry_epoch) =
+            build_fmp4_initialization_object(9, &init).unwrap();
+        assert_eq!(first_initialization, retry_initialization);
+        assert_eq!(first_epoch, retry_epoch);
+
+        let part = test_fmp4_part(
+            9,
+            12,
+            false,
+            1,
+            1,
+            Some(init),
+            media,
+            1_721_000_000_500_000_000,
+        );
+        let build = || {
+            build_fmp4_media_object(
+                &part,
+                &bundled,
+                first_initialization.key().clone(),
+                first_epoch,
+                900,
+                500_000,
+            )
+            .unwrap()
+        };
+        let first = build();
+        let retry = build();
+        assert_eq!(first, retry);
+        assert_eq!(
+            media_object::encode(&first).unwrap(),
+            media_object::encode(&retry).unwrap()
+        );
+        assert_eq!(first.dependencies(), &[first_initialization.key().clone()]);
+    }
+
+    #[test]
+    fn muxed_audio_video_uses_audio_priority_until_a_keyframe() {
+        let init = Bytes::from_static(b"muxed-init");
+        let (initialization, epoch) = build_fmp4_initialization_object(11, &init).unwrap();
+        let delta = test_fmp4_part(
+            11,
+            1,
+            false,
+            2,
+            2,
+            None,
+            Bytes::from_static(b"delta"),
+            1_721_000_000_500_000_000,
+        );
+        let delta = build_fmp4_media_object(
+            &delta,
+            b"delta",
+            initialization.key().clone(),
+            epoch,
+            1_000,
+            500_000,
+        )
+        .unwrap();
+        assert_eq!(delta.metadata().get("scheduler-class").unwrap(), b"audio");
+        assert_eq!(
+            relay_session::priority_for_object(&delta),
+            relay_session::MediaPriority::Audio
+        );
+
+        let key = test_fmp4_part(
+            11,
+            2,
+            true,
+            2,
+            2,
+            None,
+            Bytes::from_static(b"key"),
+            1_721_000_000_600_000_000,
+        );
+        let key = build_fmp4_media_object(
+            &key,
+            b"key",
+            initialization.key().clone(),
+            epoch,
+            1_000,
+            500_000,
+        )
+        .unwrap();
+        assert_eq!(
+            key.metadata().get("scheduler-class").unwrap(),
+            b"video-keyframe"
+        );
+        assert_eq!(
+            relay_session::priority_for_object(&key),
+            relay_session::MediaPriority::VideoKey
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_session_routes_source_and_secondary_repair_and_recovers_exact_object() {
+        let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_sender_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let secondary_sender_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let primary_bind = primary_sender_reservation.local_addr().unwrap();
+        let secondary_bind = secondary_sender_reservation.local_addr().unwrap();
+        drop((primary_sender_reservation, secondary_sender_reservation));
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_receiver.local_addr().unwrap());
+        args.relay_primary_bind = Some(primary_bind);
+        args.relay_secondary_target = Some(secondary_receiver.local_addr().unwrap());
+        args.relay_secondary_bind = Some(secondary_bind);
+        args.relay_secondary_seed_source = true;
+        args.relay_topology_generation = 7;
+        args.relay_subscription_id = 19;
+        args.relay_deadline_ms = 5_000;
+
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        let sender_addr = relay.primary.local_addr().unwrap();
+        assert_eq!(sender_addr, primary_bind);
+        assert_eq!(
+            relay.secondary.as_ref().unwrap().local_addr().unwrap(),
+            secondary_bind
+        );
+        let media = Bytes::from(
+            (0..24_000)
+                .map(|index| ((index * 31 + 17) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let init = Bytes::from_static(b"ftypmoov");
+        let bundled = encode_mesh_fmp4_slot(Some(&init), &media).unwrap();
+        let (initialization, configuration_epoch) =
+            build_fmp4_initialization_object(77, &init).unwrap();
+        let part = test_fmp4_part(
+            77,
+            42,
+            true,
+            8,
+            8,
+            Some(init),
+            media,
+            i64::try_from(now_unix_us().saturating_mul(1_000).saturating_add(123)).unwrap(),
+        );
+        let object = build_fmp4_media_object(
+            &part,
+            &bundled,
+            initialization.key().clone(),
+            configuration_epoch,
+            args.relay_deadline_ms,
+            1_000_000,
+        )
+        .unwrap();
+        let exact_envelope = media_object::encode(&object).unwrap();
+
+        let outcome = relay.publish_object(&object).await.unwrap();
+        let canonical_deadline_ns =
+            u64::try_from(object.deadline().unwrap().unix_time_ns()).unwrap();
+        assert_eq!(
+            outcome.announcement.deadline,
+            MediaDeadline::from_micros(canonical_deadline_ns.div_ceil(1_000))
+        );
+        assert_eq!(relay.primary.local_addr().unwrap(), sender_addr);
+        assert!(outcome.source_symbols > 5);
+        assert!(outcome.repair_symbols > 0);
+
+        async fn receive_symbols(
+            socket: &UdpSocket,
+            count: usize,
+        ) -> Vec<relay_session::RelayDatagram> {
+            let limits = RelayLimits::default();
+            let mut wire = vec![0u8; limits.max_datagram_bytes];
+            let mut symbols = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut wire))
+                    .await
+                    .expect("RelaySession datagram timeout")
+                    .expect("RelaySession UDP receive");
+                symbols.push(
+                    relay_session::decode_datagram(&wire[..len], limits)
+                        .expect("RelaySession wire decode"),
+                );
+            }
+            symbols
+        }
+
+        let primary = receive_symbols(&primary_receiver, outcome.source_symbols).await;
+        let secondary = receive_symbols(
+            &secondary_receiver,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        let (secondary_source, secondary_repair): (Vec<_>, Vec<_>) = secondary
+            .into_iter()
+            .partition(|symbol| symbol.role == MediaDatagramRole::Source);
+        assert!(primary.iter().all(|symbol| {
+            symbol.object_key == *object.key()
+                && symbol.role == MediaDatagramRole::Source
+                && symbol.path_intent == relay_session::MediaPathIntent::PrimarySource
+                && symbol.generation.get() == 7
+                && symbol.subscription_id.get() == 19
+                && !symbol.deadline.is_expired_at(now_unix_us())
+        }));
+        assert_eq!(secondary_source.len(), primary.len());
+        assert!(secondary_source
+            .iter()
+            .zip(&primary)
+            .all(|(warm, primary)| {
+                warm.object_key == primary.object_key
+                    && warm.role == MediaDatagramRole::Source
+                    && warm.path_intent == relay_session::MediaPathIntent::PrimarySource
+                    && warm.coding == primary.coding
+                    && warm.fec_datagram == primary.fec_datagram
+            }));
+        assert!(secondary_repair.iter().all(|symbol| {
+            symbol.object_key == *object.key()
+                && symbol.role == MediaDatagramRole::Repair
+                && symbol.path_intent == relay_session::MediaPathIntent::SecondaryRepair
+                && symbol.coding == primary[0].coding
+                && symbol.deadline == primary[0].deadline
+        }));
+
+        let mut assembler =
+            relay_session::ObjectAssembler::new(outcome.announcement, RelayLimits::default())
+                .unwrap();
+        let mut recovered = None;
+        for symbol in primary.iter().skip(1) {
+            recovered = assembler.push_symbol(symbol).unwrap();
+            if recovered.is_some() {
+                break;
+            }
+        }
+        for symbol in &secondary_repair {
+            if recovered.is_none() {
+                recovered = assembler.push_symbol(symbol).unwrap();
+            }
+        }
+        let recovered = recovered.expect("secondary repair recovers the lost source symbol");
+        assert_eq!(recovered, object);
+        assert_eq!(media_object::encode(&recovered).unwrap(), exact_envelope);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.relay_session.objects_sent, 1);
+        assert_eq!(
+            snapshot.relay_session.source_datagrams,
+            (primary.len() + secondary_source.len()) as u64
+        );
+        assert_eq!(
+            snapshot.relay_session.repair_datagrams,
+            secondary_repair.len() as u64
+        );
+        assert_eq!(snapshot.relay_session.source_errors, 0);
+        assert_eq!(snapshot.relay_session.repair_errors, 0);
+        assert_eq!(snapshot.relay_session.repair_primary_fallback_objects, 0);
+        assert!(snapshot
+            .relay_session
+            .last_deadline_unix_us
+            .is_some_and(|deadline| deadline > now_unix_us()));
+        assert!(snapshot
+            .relay_session
+            .last_deadline_headroom_us
+            .is_some_and(|headroom| headroom > 0));
+
+        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
+        let relay_metrics = String::from_utf8(status_config.prometheus_metrics().to_vec()).unwrap();
+        assert!(relay_metrics
+            .contains("av_contrib_relay_session_carrier_configured{path=\"primary\"} 1\n"));
+        assert!(relay_metrics
+            .contains("av_contrib_relay_session_carrier_configured{path=\"secondary\"} 1\n"));
+        assert!(relay_metrics.contains("av_contrib_relay_session_last_deadline_seconds "));
+        assert!(relay_metrics.contains("av_contrib_relay_session_last_deadline_headroom_seconds "));
+        assert!(relay_metrics.contains("av_contrib_media_object_clock_estimated_error_seconds 1\n"));
+        let status = status_config.snapshot();
+        assert!(status.mesh.relay_primary_configured);
+        assert!(status.mesh.relay_secondary_configured);
+        assert_eq!(status.mesh.relay_carrier, Some("private-udp"));
+        assert!(status.mesh.relay_secondary_source_seeded);
+        assert_eq!(
+            status.mesh.relay_primary_target.as_deref(),
+            args.relay_primary_target
+                .map(|target| target.to_string())
+                .as_deref()
+        );
+        assert_eq!(
+            status.mesh.relay_primary_bind.as_deref(),
+            Some(primary_bind.to_string()).as_deref()
+        );
+        assert_eq!(
+            status.mesh.relay_secondary_bind.as_deref(),
+            Some(secondary_bind.to_string()).as_deref()
+        );
+        assert_eq!(status.mesh.relay_deadline_ms, 5_000);
+        assert_eq!(status.mesh.media_object_clock_id, AV_CONTRIB_CLOCK_ID);
+        assert_eq!(status.mesh.media_object_clock_confidence, "estimated");
+        assert_eq!(status.mesh.media_object_clock_estimated_error_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn relay_session_uses_primary_repair_fallback_for_single_parent() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(receiver.local_addr().unwrap());
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = vec![0x5a; 12_000];
+        let (initialization, configuration_epoch) =
+            build_fmp4_initialization_object(8, b"single-parent-init").unwrap();
+        let part = test_fmp4_part(
+            8,
+            3,
+            true,
+            3,
+            0,
+            None,
+            Bytes::copy_from_slice(&payload),
+            i64::try_from(now_unix_us().saturating_mul(1_000)).unwrap(),
+        );
+        let object = build_fmp4_media_object(
+            &part,
+            &payload,
+            initialization.key().clone(),
+            configuration_epoch,
+            5_000,
+            1_000_000,
+        )
+        .unwrap();
+
+        let outcome = relay.publish_object(&object).await.unwrap();
+        assert!(outcome.repair_symbols > 0);
+        let expected = outcome.source_symbols + outcome.repair_symbols;
+        let limits = RelayLimits::default();
+        let mut wire = vec![0u8; limits.max_datagram_bytes];
+        let mut source = 0;
+        let mut repair = 0;
+        for _ in 0..expected {
+            let (len, _) = timeout(Duration::from_secs(3), receiver.recv_from(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            match relay_session::decode_datagram(&wire[..len], limits)
+                .unwrap()
+                .role
+            {
+                MediaDatagramRole::Source => source += 1,
+                MediaDatagramRole::Repair => repair += 1,
+            }
+        }
+        assert_eq!(source, outcome.source_symbols);
+        assert_eq!(repair, outcome.repair_symbols);
+        assert_eq!(
+            telemetry
+                .relay_repair_primary_fallback_objects
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_session_rejects_unpairable_fixed_endpoints() {
+        let mut args = contrib_status_args();
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 31_001));
+        args.relay_primary_target = Some(endpoint);
+        args.relay_primary_bind = Some(endpoint);
+        let error = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .err()
+            .expect("duplicate bind and target must be rejected");
+        assert!(error.to_string().contains("distinct socket addresses"));
+
+        assert!(relay_bind_addr(
+            "--relay-primary-bind",
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            endpoint,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fixed non-zero port"));
+        assert!(relay_bind_addr(
+            "--relay-primary-bind",
+            Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 31_002))),
+            endpoint,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("source IP"));
+    }
+
+    #[test]
+    fn parallel_stream_encoder_reserves_exact_unique_wire_ids() {
+        let stream_id = 77;
+        let symbol_size = 64;
+        let repair_symbols = 2;
+        let payload = vec![0x5a; usize::from(DEFAULT_SOURCE_SYMBOLS) * 64 * 2 + 17];
+        let geometry = stream_fec_geometry(payload.len(), symbol_size, repair_symbols).unwrap();
+        let datagrams =
+            encode_stream_fec_payload(stream_id, &payload, repair_symbols, symbol_size, 10, 100)
+                .unwrap();
+
+        assert_eq!(geometry.block_count, 1);
+        assert_eq!(geometry.packet_count as usize, datagrams.len());
+        let mut block_ids = HashSet::new();
+        let mut packet_sequences = HashSet::new();
+        for datagram in &datagrams {
+            let (decoded_stream_id, raw) = split_stream_id_prefix(datagram).unwrap();
+            assert_eq!(decoded_stream_id, stream_id);
+            let header = DatagramFecHeader::decode(raw).unwrap();
+            header.payload(raw).unwrap();
+            block_ids.insert(header.block_id);
+            packet_sequences.insert(header.packet_sequence);
+        }
+        assert_eq!(block_ids, HashSet::from([10]));
+        assert_eq!(packet_sequences.len(), datagrams.len());
+        assert_eq!(packet_sequences.iter().min(), Some(&100));
+        assert_eq!(
+            packet_sequences.iter().max(),
+            Some(&(100 + datagrams.len() as u32 - 1))
+        );
+
+        let mut decoder = FecDatagramDecoder::webtransport_with_stream_prefix(stream_id);
+        let decoded = datagrams
+            .iter()
+            .skip(1)
+            .filter_map(|datagram| decoder.push_datagram(datagram).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, vec![payload]);
+    }
+
+    #[test]
+    fn stream_fec_geometry_rejects_objects_beyond_raptorq_kmax() {
+        let error = stream_fec_geometry(
+            usize::try_from(MAX_SOURCE_SYMBOLS_PER_BLOCK).unwrap() + 1,
+            1,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn stream_fec_geometry_enforces_application_object_and_datagram_bounds() {
+        let object_error =
+            stream_fec_geometry(MAX_STREAM_FEC_OBJECT_BYTES + 1, 1_316, 1).unwrap_err();
+        assert!(object_error.to_string().contains("too large"));
+
+        let datagram_error = stream_fec_geometry(32_768, 1, 8).unwrap_err();
+        assert!(datagram_error.to_string().contains("RaptorQ datagrams"));
+    }
+
+    #[test]
+    fn stream_fec_roundtrips_one_large_object_after_source_loss_and_reordering() {
+        let stream_id = 77;
+        let payload = (0..6_001)
+            .map(|index| ((index * 31 + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let datagrams =
+            encode_stream_fec_payload(stream_id, &payload, 1, 1_316, 40, 1_000).unwrap();
+        assert_eq!(datagrams.len(), 7);
+        assert!(datagrams.iter().all(|datagram| {
+            let (_, raw) = split_stream_id_prefix(datagram).unwrap();
+            DatagramFecHeader::decode(raw).unwrap().block_id == 40
+        }));
+
+        let mut decoder = FecDatagramDecoder::webtransport_with_stream_prefix(stream_id);
+        let decoded = datagrams
+            .iter()
+            .skip(1)
+            .rev()
+            .filter_map(|datagram| decoder.push_datagram(datagram).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, vec![payload]);
+    }
+
     fn contrib_status_args() -> Args {
         Args {
             http_port: 0,
@@ -3235,6 +5650,20 @@ mod tests {
             key: None,
             mesh_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_001)),
             mesh_media_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_101)),
+            relay_primary_target: None,
+            relay_primary_bind: None,
+            relay_secondary_target: None,
+            relay_secondary_bind: None,
+            relay_secondary_seed_source: false,
+            relay_exclusive: false,
+            relay_local_id: "av-contrib-test".to_owned(),
+            relay_primary_id: "primary-test".to_owned(),
+            relay_secondary_id: "secondary-test".to_owned(),
+            relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
+            relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
+            relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
+            daw_media_bind: None,
             stream_id: 1,
             rist_stream_id: 1,
             srt_stream_id: 1,
@@ -3263,6 +5692,20 @@ mod tests {
             key: None,
             mesh_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_001)),
             mesh_media_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22_101)),
+            relay_primary_target: None,
+            relay_primary_bind: None,
+            relay_secondary_target: None,
+            relay_secondary_bind: None,
+            relay_secondary_seed_source: false,
+            relay_exclusive: false,
+            relay_local_id: "av-contrib-test".to_owned(),
+            relay_primary_id: "primary-test".to_owned(),
+            relay_secondary_id: "secondary-test".to_owned(),
+            relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
+            relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
+            relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
+            daw_media_bind: None,
             stream_id: 9_007_199_254_741_993,
             rist_stream_id: 9_007_199_254_741_994,
             srt_stream_id: 9_007_199_254_741_995,
@@ -3434,6 +5877,93 @@ mod tests {
         assert!(rist.enabled);
         assert_eq!(rist.output_stream_id, "9007199254741994");
         assert_eq!(rist.flow_id.as_deref(), Some("0x11223344"));
+    }
+
+    #[test]
+    fn contrib_prometheus_metrics_expose_hot_path_counters_and_stream_health() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        telemetry.record_raw_http(args.stream_id, 2, 4_096, 6);
+        telemetry.record_mesh_forward_success(
+            "stream",
+            args.stream_id,
+            args.mesh_fec_target,
+            4_096,
+            6,
+            6_144,
+        );
+        telemetry.record_mesh_forward_duration("stream", Duration::from_micros(750));
+        telemetry.record_mesh_forward_stage_duration(
+            "stream",
+            "encode_wait",
+            Duration::from_micros(250),
+        );
+        telemetry.relay_objects_sent.fetch_add(1, Ordering::Relaxed);
+        telemetry.record_relay_session_send_success(MediaDatagramRole::Source, 1_200);
+        telemetry.record_relay_session_send_success(MediaDatagramRole::Repair, 1_200);
+        telemetry.record_fmp4_part(args.stream_id, 1, 42, 8_192, 512);
+        let status = ContribStatusConfig::from_args(&args, telemetry);
+
+        let metrics = String::from_utf8(status.prometheus_metrics().to_vec()).unwrap();
+
+        assert!(metrics.contains("# TYPE av_contrib_health gauge\n"));
+        assert!(metrics.contains("av_contrib_health{state=\"active\"} 1\n"));
+        assert!(metrics.contains("av_contrib_raw_http_bytes_total 4096\n"));
+        assert!(metrics.contains("av_contrib_mesh_forward_datagrams_total{kind=\"stream\"} 6\n"));
+        assert!(metrics.contains(
+            "av_contrib_mesh_forward_duration_seconds_bucket{kind=\"stream\",le=\"0.001\"} 1\n"
+        ));
+        assert!(metrics
+            .contains("av_contrib_mesh_forward_duration_seconds_sum{kind=\"stream\"} 0.00075\n"));
+        assert!(metrics.contains(
+            "av_contrib_mesh_forward_stage_duration_seconds_bucket{kind=\"stream\",stage=\"encode_wait\",le=\"0.00025\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "av_contrib_stream_latest_fmp4_sequence{stream_id=\"1\",state=\"publishing\"} 42\n"
+        ));
+        assert!(metrics.contains("av_contrib_relay_session_objects_total 1\n"));
+        assert!(
+            metrics.contains("av_contrib_relay_session_carrier_configured{path=\"primary\"} 0\n")
+        );
+        assert!(metrics.contains("av_contrib_relay_session_deadline_budget_seconds 1\n"));
+        assert!(metrics.contains("av_contrib_relay_session_datagrams_total{role=\"source\"} 1\n"));
+        assert!(metrics.contains("av_contrib_relay_session_datagrams_total{role=\"repair\"} 1\n"));
+        assert!(metrics
+            .contains("av_contrib_relay_session_datagram_bytes_total{role=\"source\"} 1200\n"));
+        assert_eq!(prometheus_label_value("node\\\"\n"), "node\\\\\\\"\\n");
+    }
+
+    #[tokio::test]
+    async fn contrib_metrics_route_serves_prometheus_exposition() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        telemetry.record_raw_http(args.stream_id, 1, 1_024, 2);
+        let forwarder = Arc::new(
+            MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap(),
+        );
+        let router = ContribRouter::new(
+            forwarder,
+            args.stream_id,
+            Arc::new(HlsRouter::new()),
+            Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(CONTRIB_METRICS_PATH)
+            .body(())
+            .unwrap();
+
+        let response = router.route(req).await.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some(PROMETHEUS_CONTENT_TYPE)
+        );
+        let metrics = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(metrics.contains("av_contrib_raw_http_bytes_total 1024\n"));
     }
 
     #[test]
@@ -3627,6 +6157,20 @@ mod tests {
             key: None,
             mesh_fec_target: mesh_target,
             mesh_media_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            relay_primary_target: None,
+            relay_primary_bind: None,
+            relay_secondary_target: None,
+            relay_secondary_bind: None,
+            relay_secondary_seed_source: false,
+            relay_exclusive: false,
+            relay_local_id: "av-contrib-test".to_owned(),
+            relay_primary_id: "primary-test".to_owned(),
+            relay_secondary_id: "secondary-test".to_owned(),
+            relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
+            relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
+            relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
+            daw_media_bind: None,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -3675,5 +6219,272 @@ mod tests {
         assert!(snapshot.mesh_forward.stream_payload_bytes > 0);
         assert!(snapshot.mesh_forward.stream_datagram_bytes > 0);
         assert_eq!(snapshot.mesh_forward.stream_errors, 0);
+        assert_eq!(snapshot.mesh_forward.stream_stages.encode_wait.count, 1);
+        assert_eq!(snapshot.mesh_forward.stream_stages.encode.count, 1);
+        assert_eq!(snapshot.mesh_forward.stream_stages.send.count, 1);
+        assert_eq!(snapshot.mesh_forward.stream_stages.telemetry.count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_slot_forwarder_encodes_same_stream_concurrently_without_wire_id_collisions() {
+        let mesh_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.mesh_fec_target = mesh_socket.local_addr().unwrap();
+        args.mesh_media_fec_target = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(
+            MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap(),
+        );
+        let stream_id = 77;
+        let payload_count = 32u32;
+        let mut tasks = Vec::new();
+        let mut expected_payloads = HashSet::new();
+        for index in 0..payload_count {
+            let mut payload = vec![0x5a; 4_096];
+            payload[..4].copy_from_slice(&index.to_be_bytes());
+            expected_payloads.insert(payload.clone());
+            let forwarder = Arc::clone(&forwarder);
+            tasks.push(tokio::spawn(async move {
+                forwarder
+                    .forward_stream_slot(stream_id, &payload)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut expected_datagrams = 0usize;
+        for task in tasks {
+            expected_datagrams += task.await.unwrap();
+        }
+
+        let mut decoder = FecDatagramDecoder::webtransport_with_stream_prefix(stream_id);
+        let mut buf = vec![0u8; 65_536];
+        let mut block_ids = HashSet::new();
+        let mut packet_sequences = HashSet::new();
+        let mut decoded_payloads = HashSet::new();
+        timeout(Duration::from_secs(3), async {
+            for _ in 0..expected_datagrams {
+                let (len, _peer) = mesh_socket.recv_from(&mut buf).await.unwrap();
+                let datagram = &buf[..len];
+                let (decoded_stream_id, raw) = split_stream_id_prefix(datagram).unwrap();
+                assert_eq!(decoded_stream_id, stream_id);
+                let header = DatagramFecHeader::decode(raw).unwrap();
+                header.payload(raw).unwrap();
+                block_ids.insert(header.block_id);
+                assert!(packet_sequences.insert(header.packet_sequence));
+                if let Some(payload) = decoder.push_datagram(datagram).unwrap() {
+                    decoded_payloads.insert(payload);
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(block_ids.len(), payload_count as usize);
+        assert_eq!(packet_sequences.len(), expected_datagrams);
+        assert_eq!(decoded_payloads, expected_payloads);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.mesh_forward.stream_payloads, payload_count as u64);
+        assert_eq!(
+            snapshot.mesh_forward.stream_stages.encode_wait.count,
+            payload_count as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn daw_media_udp_ingest_relays_and_forwards_decoded_media_to_mesh() {
+        use raptorq_datagram_fec::{MediaCodec, MediaFecDecoder, MediaFecEncoder, MediaFrame};
+
+        let mesh_media_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mesh_media_target = mesh_media_socket.local_addr().unwrap();
+        let daw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let daw_bind = daw_socket.local_addr().unwrap();
+        let args = Args {
+            http_port: 0,
+            cert: None,
+            key: None,
+            mesh_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            mesh_media_fec_target: mesh_media_target,
+            relay_primary_target: None,
+            relay_primary_bind: None,
+            relay_secondary_target: None,
+            relay_secondary_bind: None,
+            relay_secondary_seed_source: false,
+            relay_exclusive: false,
+            relay_local_id: "av-contrib-test".to_owned(),
+            relay_primary_id: "primary-test".to_owned(),
+            relay_secondary_id: "secondary-test".to_owned(),
+            relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
+            relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
+            relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
+            daw_media_bind: Some(daw_bind),
+            stream_id: 1,
+            rist_stream_id: 0,
+            srt_stream_id: 6,
+            rtmp_stream_id: 7,
+            repair_symbols: 1,
+            symbol_size: DEFAULT_SYMBOL_SIZE,
+            rist_bind: None,
+            rist_profile: RistProfile::Main,
+            rist_backend: RistBackend::Pure,
+            rist_flow_id: DEFAULT_FLOW_ID,
+            srt_bind: None,
+            rtmp_bind: None,
+            fmp4_part_ms: DEFAULT_MIN_PART_MS,
+            fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
+            playlist_count: 65,
+            playlist_buffer_kb: 800,
+        };
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
+        let targets = Arc::new(RwLock::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_daw_media_udp_ingest(
+            daw_socket,
+            forwarder,
+            targets,
+            shutdown_rx,
+        ));
+
+        let subscriber = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        subscriber
+            .send_to(DAW_RELAY_SUBSCRIBE_MESSAGE, daw_bind)
+            .await
+            .unwrap();
+        let mut relay_buf = vec![0u8; 65_536];
+        let (ack_len, _peer) =
+            timeout(Duration::from_secs(3), subscriber.recv_from(&mut relay_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&relay_buf[..ack_len], DAW_RELAY_SUBSCRIBE_ACK);
+
+        let metadata = MediaFrameMetadata::new(9, 4, 100, MediaCodec::Opus);
+        let mut source_encoder = MediaFecEncoder::default();
+        let encoded = source_encoder
+            .encode_frame(MediaFrame {
+                metadata,
+                payload: b"opus-soundkit-frame",
+            })
+            .unwrap();
+        let first_source_datagram = encoded.datagrams[0].clone();
+
+        let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for datagram in &encoded.datagrams {
+            source.send_to(datagram, daw_bind).await.unwrap();
+        }
+
+        let relayed = timeout(Duration::from_secs(3), async {
+            loop {
+                let (len, _peer) = subscriber.recv_from(&mut relay_buf).await.unwrap();
+                if relay_buf[..len] == first_source_datagram {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            relayed.is_ok(),
+            "subscriber did not receive exact relayed DAW datagram"
+        );
+
+        let mut mesh_decoder = MediaFecDecoder::new();
+        let mut mesh_buf = vec![0u8; 65_536];
+        let frame = timeout(Duration::from_secs(3), async {
+            loop {
+                let (len, _peer) = mesh_media_socket.recv_from(&mut mesh_buf).await.unwrap();
+                if let Some(frame) = mesh_decoder.push_datagram(&mesh_buf[..len]).unwrap() {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(frame.metadata.stream_id, metadata.stream_id);
+        assert_eq!(frame.metadata.pts_ms, metadata.pts_ms);
+        assert_eq!(frame.metadata.codec, MediaCodec::Opus);
+        assert_eq!(frame.payload, b"opus-soundkit-frame");
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn daw_media_udp_ingest_forwards_audio_epoch_datagrams_to_mesh() {
+        let mesh_media_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mesh_media_target = mesh_media_socket.local_addr().unwrap();
+        let daw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let daw_bind = daw_socket.local_addr().unwrap();
+        let args = Args {
+            http_port: 0,
+            cert: None,
+            key: None,
+            mesh_fec_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            mesh_media_fec_target: mesh_media_target,
+            relay_primary_target: None,
+            relay_primary_bind: None,
+            relay_secondary_target: None,
+            relay_secondary_bind: None,
+            relay_secondary_seed_source: false,
+            relay_exclusive: false,
+            relay_local_id: "av-contrib-test".to_owned(),
+            relay_primary_id: "primary-test".to_owned(),
+            relay_secondary_id: "secondary-test".to_owned(),
+            relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
+            relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
+            relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
+            daw_media_bind: Some(daw_bind),
+            stream_id: 1,
+            rist_stream_id: 0,
+            srt_stream_id: 6,
+            rtmp_stream_id: 7,
+            repair_symbols: 1,
+            symbol_size: DEFAULT_SYMBOL_SIZE,
+            rist_bind: None,
+            rist_profile: RistProfile::Main,
+            rist_backend: RistBackend::Pure,
+            rist_flow_id: DEFAULT_FLOW_ID,
+            srt_bind: None,
+            rtmp_bind: None,
+            fmp4_part_ms: DEFAULT_MIN_PART_MS,
+            fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
+            playlist_count: 65,
+            playlist_buffer_kb: 800,
+        };
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
+        let targets = Arc::new(RwLock::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_daw_media_udp_ingest(
+            daw_socket,
+            forwarder,
+            targets,
+            shutdown_rx,
+        ));
+
+        let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let epoch_datagram = Bytes::from_static(b"AEP1source-or-repair-shard");
+        assert!(is_multichannel_audio_transport_datagram(&epoch_datagram));
+        source.send_to(&epoch_datagram, daw_bind).await.unwrap();
+
+        let mut mesh_buf = vec![0u8; 65_536];
+        let (len, _peer) = timeout(
+            Duration::from_secs(3),
+            mesh_media_socket.recv_from(&mut mesh_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&mesh_buf[..len], epoch_datagram.as_ref());
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
     }
 }

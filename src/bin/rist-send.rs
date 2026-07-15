@@ -37,6 +37,7 @@ struct Args {
     history_packets: usize,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Sender {
     Simple(SimpleMioSender),
     Main(MainMioSender),

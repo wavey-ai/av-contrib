@@ -22,6 +22,7 @@ use mpeg2ts_reader::psi;
 use mpeg2ts_reader::StreamType;
 use playlists::Playlists;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 const TICKS_PER_SECOND: u64 = 90_000;
@@ -38,8 +39,15 @@ pub struct PublishedFmp4Part {
     pub stream_id: u64,
     pub stream_idx: usize,
     pub sequence: u64,
+    /// Actual duration reported by the fMP4 packager.
+    pub duration_ms: u32,
+    /// Wall-clock time immediately after the immutable fMP4 bytes were boxed.
+    pub packaged_at_unix_ns: i64,
+    /// Wall-clock time when the immutable part was handed to its publisher.
+    pub published_at_unix_ns: i64,
     pub init: Option<Bytes>,
     pub bytes: Bytes,
+    pub keyframe: bool,
     pub video_codec: Option<&'static str>,
     pub video_width: Option<u16>,
     pub video_height: Option<u16>,
@@ -591,9 +599,7 @@ impl Fmp4Segmenter {
     }
 
     fn flush_reason_before(&self, access_unit: &AccessUnit) -> Option<&'static str> {
-        let Some(first_dts) = self.video_timestamps.first().copied() else {
-            return None;
-        };
+        let first_dts = self.video_timestamps.first().copied()?;
         let elapsed = access_unit.dts.saturating_sub(first_dts);
         if elapsed >= self.min_part_ticks {
             Some(if access_unit.key {
@@ -659,6 +665,7 @@ impl Fmp4Segmenter {
             return;
         }
 
+        let packaged_at_unix_ns = now_unix_ns();
         let init_for_mesh = fmp4.init.clone();
         let init_published = init_for_mesh.is_some();
         let duration = fmp4.duration;
@@ -688,13 +695,19 @@ impl Fmp4Segmenter {
             return;
         }
 
+        let mut mesh_publish_succeeded = self.publisher.is_none();
         if let Some(publisher) = &self.publisher {
+            let published_at_unix_ns = now_unix_ns();
             let part = PublishedFmp4Part {
                 stream_id: self.output_stream_id,
                 stream_idx: self.output_stream_idx,
                 sequence: self.published_parts,
+                duration_ms: duration,
+                packaged_at_unix_ns,
+                published_at_unix_ns,
                 init: init_for_mesh,
                 bytes: part_bytes,
+                keyframe: key,
                 video_codec: (video_units > 0).then_some("h264"),
                 video_width: (video_units > 0).then_some(self.config.width),
                 video_height: (video_units > 0).then_some(self.config.height),
@@ -710,6 +723,7 @@ impl Fmp4Segmenter {
                     "failed to publish fMP4 part into mesh"
                 );
             } else {
+                mesh_publish_succeeded = true;
                 debug!(
                     output_stream_id = self.output_stream_id,
                     output_stream_idx = self.output_stream_idx,
@@ -720,9 +734,11 @@ impl Fmp4Segmenter {
             }
         }
 
-        if init_published {
+        if init_published && mesh_publish_succeeded {
             self.last_init_signature = Some(init_signature);
             self.force_next_init = false;
+        } else if init_published {
+            self.force_next_init = true;
         }
 
         self.published_parts += 1;
@@ -739,7 +755,7 @@ impl Fmp4Segmenter {
             published_parts = self.published_parts,
             "published fMP4 HLS part details"
         );
-        if self.published_parts <= 3 || self.published_parts % 25 == 0 {
+        if self.published_parts <= 3 || self.published_parts.is_multiple_of(25) {
             info!(
                 output_stream_id = self.output_stream_id,
                 output_stream_idx = self.output_stream_idx,
@@ -862,6 +878,13 @@ impl Fmp4Segmenter {
 
 fn ms_to_ticks(ms: u32) -> u64 {
     u64::from(ms) * TICKS_PER_SECOND / 1_000
+}
+
+fn now_unix_ns() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),
+    }
 }
 
 fn ms_to_ticks_u64(ms: u64) -> u64 {
@@ -1048,10 +1071,7 @@ fn looks_like_annex_b(data: &[u8]) -> bool {
 fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> Result<bool, H264SampleError> {
     let mut data = access_unit.data.as_ref();
     let mut sample = BytesMut::with_capacity(access_unit.data.len());
-    loop {
-        let Some(nalu) = next_h264_length_prefixed_nalu(&mut data)? else {
-            break;
-        };
+    while let Some(nalu) = next_h264_length_prefixed_nalu(&mut data)? {
         if nalu.is_empty() {
             continue;
         }
@@ -1092,6 +1112,20 @@ fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSigna
 mod tests {
     use super::*;
     use playlists::Options;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct CapturingPublisher {
+        parts: StdMutex<Vec<PublishedFmp4Part>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Fmp4PartPublisher for CapturingPublisher {
+        async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> Result<(), String> {
+            self.parts.lock().unwrap().push(part);
+            Ok(())
+        }
+    }
 
     fn h264_access_unit(pts: u64, dts: u64) -> AccessUnit {
         AccessUnit {
@@ -1149,6 +1183,35 @@ mod tests {
         push_len_prefixed_nalu(&mut data, pps);
         push_len_prefixed_nalu(&mut data, media);
         data.freeze()
+    }
+
+    #[tokio::test]
+    async fn publisher_receives_packager_duration_and_ordered_wall_clock_stages() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let publisher = Arc::new(CapturingPublisher::default());
+        let mut segmenter = Fmp4Segmenter::new_with_publisher(
+            77,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+            Some(publisher.clone()),
+        );
+        let mut first = h264_access_unit(0, 0);
+        first.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
+        segmenter.push_access_unit(first).await;
+
+        let mut second = h264_access_unit(6_000, 6_000);
+        second.key = false;
+        let mut second_data = BytesMut::new();
+        push_len_prefixed_nalu(&mut second_data, H264_NON_IDR);
+        second.data = second_data.freeze();
+        segmenter.push_access_unit(second).await;
+
+        let parts = publisher.parts.lock().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].duration_ms > 0);
+        assert!(parts[0].published_at_unix_ns >= parts[0].packaged_at_unix_ns);
     }
 
     #[test]
@@ -1377,7 +1440,7 @@ impl TsDemuxContext {
     }
 
     fn drain_access_units_into(&mut self, out: &mut Vec<AccessUnit>) {
-        out.extend(self.access_units.drain(..));
+        out.append(&mut self.access_units);
     }
 
     fn construct_filter(&mut self, request: demultiplex::FilterRequest<'_, '_>) -> TsFilterSwitch {
@@ -1571,17 +1634,17 @@ impl pes::ElementaryStreamConsumer<TsDemuxContext> for ElementaryStreamConsumer 
             }
             StreamType::ADTS
             | StreamType::H222_0_PES_PRIVATE_DATA
-            | StreamType::AUDIO_WITHOUT_TRANSPORT_SYNTAX => {
-                if !self.accumulated_payload.is_empty() {
-                    ctx.access_units.push(AccessUnit {
-                        key: false,
-                        pts: self.pts,
-                        dts: self.dts,
-                        data: Bytes::from(std::mem::take(&mut self.accumulated_payload)),
-                        stream_type: self.stream_type.into(),
-                        id: 0,
-                    });
-                }
+            | StreamType::AUDIO_WITHOUT_TRANSPORT_SYNTAX
+                if !self.accumulated_payload.is_empty() =>
+            {
+                ctx.access_units.push(AccessUnit {
+                    key: false,
+                    pts: self.pts,
+                    dts: self.dts,
+                    data: Bytes::from(std::mem::take(&mut self.accumulated_payload)),
+                    stream_type: self.stream_type.into(),
+                    id: 0,
+                });
             }
             _ => {}
         }

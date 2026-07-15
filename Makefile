@@ -2,6 +2,7 @@ SHELL := /bin/sh
 
 CARGO ?= cargo
 MAKE ?= make
+NEEDLETAIL_ROOT ?= ../needletail
 
 RUST_LOG ?= info
 HOST ?= local.bitneedle.com
@@ -26,47 +27,33 @@ SERVICE_ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help stack stack-debug stack-fast service build build-release fmt test \
-	dashboard-build dashboard-serve dashboard-check
+	mission-control-build mission-control-serve mission-control-check
 
 help:
 	@printf '%s\n' 'av-contrib tasks'
 	@printf '%s\n' ''
-	@printf '%s\n' '  make stack             Run release local OBS stack: 2 mesh nodes + contrib + dashboard'
-	@printf '%s\n' '  make stack-debug       Run debug local OBS stack'
-	@printf '%s\n' '  make stack-fast        Run existing release binaries and existing dashboard dist'
+	@printf '%s\n' '  make stack             Run the Needletail local constellation'
+	@printf '%s\n' '  make stack-debug       Run the Needletail local constellation in debug mode'
+	@printf '%s\n' '  make stack-fast        Run Needletail with existing release binaries and Mission Control assets'
 	@printf '%s\n' '  make service           Run only av-contrib against the local UK mesh sockets'
-	@printf '%s\n' '  make dashboard-build   Build the av-mesh Leptos dashboard'
-	@printf '%s\n' '  make dashboard-serve   Serve the av-mesh Leptos dashboard with Trunk'
+	@printf '%s\n' '  make mission-control-build Build Needletail Mission Control'
+	@printf '%s\n' '  make mission-control-serve Serve Needletail Mission Control'
 	@printf '%s\n' '  make build-release     Build av-contrib release binaries'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.bitneedle.com'
 
 stack:
-	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) \
-	$(CARGO) run --bin local-obs-stack --release -- \
-		--host $(HOST) \
-		--stream-id $(STREAM_ID) \
-		--part-ms $(PART_MS) \
-		$(STACK_ARGS)
+	$(MAKE) -C $(NEEDLETAIL_ROOT) local HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
+		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 stack-debug:
-	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) \
-	$(CARGO) run --bin local-obs-stack -- \
-		--host $(HOST) \
-		--stream-id $(STREAM_ID) \
-		--part-ms $(PART_MS) \
-		$(STACK_ARGS)
+	$(MAKE) -C $(NEEDLETAIL_ROOT) local-debug HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
+		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 stack-fast:
-	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) \
-	$(CARGO) run --bin local-obs-stack --release -- \
-		--host $(HOST) \
-		--stream-id $(STREAM_ID) \
-		--part-ms $(PART_MS) \
-		--no-build \
-		--no-dashboard-build \
-		$(STACK_ARGS)
+	$(MAKE) -C $(NEEDLETAIL_ROOT) local-fast HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
+		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 service:
 	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) \
@@ -99,11 +86,11 @@ fmt:
 test:
 	$(CARGO) test --locked
 
-dashboard-build:
-	$(MAKE) -C ../av-mesh dashboard-build
+mission-control-build:
+	$(MAKE) -C $(NEEDLETAIL_ROOT) mission-control-build
 
-dashboard-serve:
-	$(MAKE) -C ../av-mesh dashboard-serve
+mission-control-serve:
+	$(MAKE) -C $(NEEDLETAIL_ROOT) mission-control-serve
 
-dashboard-check:
-	$(MAKE) -C ../av-mesh dashboard-check
+mission-control-check:
+	$(MAKE) -C $(NEEDLETAIL_ROOT) mission-control-check

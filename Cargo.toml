@@ -17,12 +17,14 @@ clap = { version = "4.5", features = ["derive", "env"] }
 form_urlencoded = "1.2"
 futures-util = "0.3"
 h264 = { git = "https://github.com/wavey-ai/av-rs.git" }
-hls = { git = "https://github.com/wavey-ai/web-services.git" }
+av-hls = { path = "../av-service/av-hls" }
 http = "1"
 mpeg2ts-reader = { git = "https://github.com/wavey-ai/mpeg2ts-reader.git" }
-playlists = { git = "https://github.com/wavey-ai/playlists.git" }
-raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git" }
-raptorq-fec-transport = { git = "https://github.com/wavey-ai/raptor-fec.git" }
+media-object = { path = "../media-object" }
+playlists = { path = "../playlists" }
+raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
+relay-session = { path = "../relay-session" }
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git" }
 rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git" }
 rtmp-ingress = { git = "https://github.com/wavey-ai/rtmp-ingress.git" }
@@ -31,5 +33,15 @@ serde_json = "1.0"
 tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-upload-response = { git = "https://github.com/wavey-ai/web-services.git", default-features = false, features = ["srt", "rist", "rist-pure"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git" }
+av-upload-response = { path = "../av-service/av-upload-response", default-features = false, features = ["srt", "rist-pure"] }
+av-web-service = { path = "../av-service/av-web-service" }
+
+[patch."https://github.com/wavey-ai/playlists.git"]
+playlists = { path = "../playlists" }
+
+[patch."https://github.com/wavey-ai/raptor-fec.git"]
+raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
+
+[patch."https://github.com/wavey-ai/rtmp-ingress.git"]
+rtmp-ingress = { path = "../rtmp-ingress" }
