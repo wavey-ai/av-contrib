@@ -71,6 +71,7 @@ const DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS: u64 = 1_000;
 const DEFAULT_RELAY_DEADLINE_MS: u64 = 1_000;
 const DEFAULT_RELAY_TOPOLOGY_GENERATION: u64 = 1;
 const DEFAULT_RELAY_SUBSCRIPTION_ID: u64 = 1;
+const RELAY_LANE_IMPAIRED_HOLD_MS: u64 = 3_000;
 
 fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
     let init_len = init.map_or(0, Bytes::len);
@@ -480,6 +481,41 @@ struct RelayPublishOutcome {
 enum RelayCarrierPath {
     Primary,
     Secondary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RelayLaneState {
+    Unknown = 0,
+    Healthy = 1,
+    Impaired = 2,
+}
+
+impl RelayLaneState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Healthy => "healthy",
+            Self::Impaired => "impaired",
+        }
+    }
+}
+
+fn relay_lane_state(
+    now_ms: u64,
+    last_success_unix_ms: u64,
+    last_failure_unix_ms: u64,
+) -> RelayLaneState {
+    if last_success_unix_ms == 0 && last_failure_unix_ms == 0 {
+        RelayLaneState::Unknown
+    } else if last_failure_unix_ms > 0
+        && (last_success_unix_ms <= last_failure_unix_ms
+            || now_ms.saturating_sub(last_failure_unix_ms) < RELAY_LANE_IMPAIRED_HOLD_MS)
+    {
+        RelayLaneState::Impaired
+    } else {
+        RelayLaneState::Healthy
+    }
 }
 
 fn resolve_relay_lane_results(
@@ -2056,8 +2092,12 @@ struct IngestTelemetry {
     relay_repair_primary_fallback_objects: AtomicU64,
     relay_primary_lane_objects_succeeded: AtomicU64,
     relay_primary_lane_objects_failed: AtomicU64,
+    relay_primary_lane_last_success_unix_ms: AtomicU64,
+    relay_primary_lane_last_failure_unix_ms: AtomicU64,
     relay_secondary_lane_objects_succeeded: AtomicU64,
     relay_secondary_lane_objects_failed: AtomicU64,
+    relay_secondary_lane_last_success_unix_ms: AtomicU64,
+    relay_secondary_lane_last_failure_unix_ms: AtomicU64,
     relay_surviving_lane_objects: AtomicU64,
     relay_all_lanes_failed_objects: AtomicU64,
     relay_expired_objects: AtomicU64,
@@ -2134,13 +2174,35 @@ impl IngestTelemetry {
     }
 
     fn record_relay_session_lane_object(&self, path: RelayCarrierPath, succeeded: bool) {
-        match (path, succeeded) {
-            (RelayCarrierPath::Primary, true) => &self.relay_primary_lane_objects_succeeded,
-            (RelayCarrierPath::Primary, false) => &self.relay_primary_lane_objects_failed,
-            (RelayCarrierPath::Secondary, true) => &self.relay_secondary_lane_objects_succeeded,
-            (RelayCarrierPath::Secondary, false) => &self.relay_secondary_lane_objects_failed,
+        let (counter, last_success, last_failure) = match (path, succeeded) {
+            (RelayCarrierPath::Primary, true) => (
+                &self.relay_primary_lane_objects_succeeded,
+                &self.relay_primary_lane_last_success_unix_ms,
+                &self.relay_primary_lane_last_failure_unix_ms,
+            ),
+            (RelayCarrierPath::Primary, false) => (
+                &self.relay_primary_lane_objects_failed,
+                &self.relay_primary_lane_last_success_unix_ms,
+                &self.relay_primary_lane_last_failure_unix_ms,
+            ),
+            (RelayCarrierPath::Secondary, true) => (
+                &self.relay_secondary_lane_objects_succeeded,
+                &self.relay_secondary_lane_last_success_unix_ms,
+                &self.relay_secondary_lane_last_failure_unix_ms,
+            ),
+            (RelayCarrierPath::Secondary, false) => (
+                &self.relay_secondary_lane_objects_failed,
+                &self.relay_secondary_lane_last_success_unix_ms,
+                &self.relay_secondary_lane_last_failure_unix_ms,
+            ),
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        let observed_at = now_unix_ms();
+        if succeeded {
+            last_success.store(observed_at, Ordering::Release);
+        } else {
+            last_failure.store(observed_at, Ordering::Release);
         }
-        .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_relay_session_encode_error(&self) {
@@ -2901,12 +2963,28 @@ impl IngestTelemetry {
                 primary_lane_objects_failed: self
                     .relay_primary_lane_objects_failed
                     .load(Ordering::Relaxed),
+                primary_lane_state: relay_lane_state(
+                    now_ms,
+                    self.relay_primary_lane_last_success_unix_ms
+                        .load(Ordering::Acquire),
+                    self.relay_primary_lane_last_failure_unix_ms
+                        .load(Ordering::Acquire),
+                )
+                .as_str(),
                 secondary_lane_objects_succeeded: self
                     .relay_secondary_lane_objects_succeeded
                     .load(Ordering::Relaxed),
                 secondary_lane_objects_failed: self
                     .relay_secondary_lane_objects_failed
                     .load(Ordering::Relaxed),
+                secondary_lane_state: relay_lane_state(
+                    now_ms,
+                    self.relay_secondary_lane_last_success_unix_ms
+                        .load(Ordering::Acquire),
+                    self.relay_secondary_lane_last_failure_unix_ms
+                        .load(Ordering::Acquire),
+                )
+                .as_str(),
                 surviving_lane_objects: self.relay_surviving_lane_objects.load(Ordering::Relaxed),
                 all_lanes_failed_objects: self
                     .relay_all_lanes_failed_objects
@@ -3782,6 +3860,23 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_session_lane_objects_total{{path=\"{path}\",outcome=\"failure\"}} {failed}\n"
         ));
     }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_relay_session_lane_health",
+        "Current RelaySession carrier-lane health as a one-hot gauge.",
+        "gauge",
+    );
+    for (path, current_state) in [
+        ("primary", runtime.relay_session.primary_lane_state),
+        ("secondary", runtime.relay_session.secondary_lane_state),
+    ] {
+        for state in ["unknown", "healthy", "impaired"] {
+            output.push_str(&format!(
+                "av_contrib_relay_session_lane_health{{path=\"{path}\",state=\"{state}\"}} {}\n",
+                u8::from(current_state == state)
+            ));
+        }
+    }
     for (name, help, value) in [
         (
             "av_contrib_relay_session_surviving_lane_objects_total",
@@ -4151,12 +4246,9 @@ fn derive_contrib_health(runtime: &IngestRuntimeSnapshot, hls: &HlsStatus) -> Co
         last_fmp4_input_age_ms.is_some_and(|age_ms| age_ms > stale_threshold_ms);
     let mesh_forward_errors =
         runtime.mesh_forward.stream_errors + runtime.mesh_forward.media_errors;
-    let relay_errors = runtime
-        .relay_session
-        .encode_errors
-        .saturating_add(runtime.relay_session.source_errors)
-        .saturating_add(runtime.relay_session.repair_errors);
-    let state = if runtime.fmp4.publish_errors > 0 || mesh_forward_errors > 0 || relay_errors > 0 {
+    let relay_lane_impaired = runtime.relay_session.impaired_lane_count() > 0;
+    let state = if runtime.fmp4.publish_errors > 0 || mesh_forward_errors > 0 || relay_lane_impaired
+    {
         "degraded"
     } else if output_seen && output_is_stale {
         "stale"
@@ -4235,6 +4327,28 @@ fn derive_contrib_alerts(
                 .or(Some(now)),
             stream_id_text: Some(advertised_hls_stream_id.to_owned()),
             protocol: None,
+        });
+    }
+
+    let impaired_lanes = [
+        ("primary", runtime.relay_session.primary_lane_state),
+        ("secondary", runtime.relay_session.secondary_lane_state),
+    ]
+    .into_iter()
+    .filter_map(|(path, state)| (state == "impaired").then_some(path))
+    .collect::<Vec<_>>();
+    if !impaired_lanes.is_empty() {
+        alerts.push(ContribAlert {
+            level: "warn",
+            code: "relay_lane_impaired",
+            message: format!(
+                "Relay parent lane currently impaired: {}. Delivery continues through each healthy complete lane.",
+                impaired_lanes.join(", ")
+            ),
+            count: impaired_lanes.len() as u64,
+            last_seen_unix_ms: Some(now),
+            stream_id_text: Some(advertised_hls_stream_id.to_owned()),
+            protocol: Some("relay-session"),
         });
     }
 
@@ -4371,8 +4485,10 @@ struct RelaySessionRuntimeSnapshot {
     repair_primary_fallback_objects: u64,
     primary_lane_objects_succeeded: u64,
     primary_lane_objects_failed: u64,
+    primary_lane_state: &'static str,
     secondary_lane_objects_succeeded: u64,
     secondary_lane_objects_failed: u64,
+    secondary_lane_state: &'static str,
     surviving_lane_objects: u64,
     all_lanes_failed_objects: u64,
     expired_objects: u64,
@@ -4382,6 +4498,13 @@ struct RelaySessionRuntimeSnapshot {
     last_deadline_unix_us: Option<u64>,
     last_deadline_headroom_us: Option<u64>,
     stages: RelaySessionStageRuntimeSnapshot,
+}
+
+impl RelaySessionRuntimeSnapshot {
+    fn impaired_lane_count(&self) -> u64 {
+        u64::from(self.primary_lane_state == "impaired")
+            + u64::from(self.secondary_lane_state == "impaired")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5996,8 +6119,10 @@ mod tests {
         assert_eq!(snapshot.relay_session.repair_primary_fallback_objects, 0);
         assert_eq!(snapshot.relay_session.primary_lane_objects_succeeded, 1);
         assert_eq!(snapshot.relay_session.primary_lane_objects_failed, 0);
+        assert_eq!(snapshot.relay_session.primary_lane_state, "healthy");
         assert_eq!(snapshot.relay_session.secondary_lane_objects_succeeded, 1);
         assert_eq!(snapshot.relay_session.secondary_lane_objects_failed, 0);
+        assert_eq!(snapshot.relay_session.secondary_lane_state, "healthy");
         assert_eq!(snapshot.relay_session.surviving_lane_objects, 0);
         assert_eq!(snapshot.relay_session.all_lanes_failed_objects, 0);
         assert_eq!(snapshot.relay_session.deadline_hits, 1);
@@ -6072,6 +6197,12 @@ mod tests {
         ));
         assert!(relay_metrics.contains(
             "av_contrib_relay_session_lane_objects_total{path=\"secondary\",outcome=\"failure\"} 0\n"
+        ));
+        assert!(relay_metrics.contains(
+            "av_contrib_relay_session_lane_health{path=\"primary\",state=\"healthy\"} 1\n"
+        ));
+        assert!(relay_metrics.contains(
+            "av_contrib_relay_session_lane_health{path=\"primary\",state=\"impaired\"} 0\n"
         ));
         assert!(relay_metrics.contains("av_contrib_relay_session_surviving_lane_objects_total 0\n"));
         assert!(
@@ -6813,6 +6944,59 @@ mod tests {
             .activity
             .iter()
             .any(|activity| activity.code == "hls_response_error"));
+    }
+
+    #[test]
+    fn contrib_status_tracks_current_relay_lane_health_and_recovers() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
+
+        telemetry.record_fmp4_part(args.stream_id, 1, 12, 4_096, 512);
+        telemetry.record_relay_session_lane_object(RelayCarrierPath::Primary, true);
+        telemetry.record_relay_session_lane_object(RelayCarrierPath::Secondary, true);
+        assert_eq!(status_config.snapshot().status, "active");
+
+        telemetry.record_relay_session_send_error(MediaDatagramRole::Source);
+        telemetry.record_relay_session_lane_object(RelayCarrierPath::Primary, false);
+        let impaired = status_config.snapshot();
+        assert_eq!(impaired.status, "degraded");
+        assert_eq!(
+            impaired.runtime.relay_session.primary_lane_state,
+            "impaired"
+        );
+        assert_eq!(
+            impaired.runtime.relay_session.secondary_lane_state,
+            "healthy"
+        );
+        assert!(impaired
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "relay_lane_impaired"));
+
+        telemetry.record_relay_session_lane_object(RelayCarrierPath::Primary, true);
+        assert_eq!(status_config.snapshot().status, "degraded");
+
+        telemetry.relay_primary_lane_last_failure_unix_ms.store(
+            now_unix_ms().saturating_sub(RELAY_LANE_IMPAIRED_HOLD_MS + 1),
+            Ordering::Release,
+        );
+        telemetry.record_relay_session_lane_object(RelayCarrierPath::Primary, true);
+        let recovered = status_config.snapshot();
+        assert_eq!(recovered.status, "active");
+        assert_eq!(recovered.runtime.relay_session.source_errors, 1);
+        assert_eq!(
+            recovered.runtime.relay_session.primary_lane_objects_failed,
+            1
+        );
+        assert_eq!(
+            recovered.runtime.relay_session.primary_lane_state,
+            "healthy"
+        );
+        assert!(!recovered
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "relay_lane_impaired"));
     }
 
     #[test]
