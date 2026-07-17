@@ -1,8 +1,10 @@
 //! Asynchronous AEP1 lossless-audio to LL-HLS packaging.
 //!
 //! The UDP receive loop only copies an AEP1 datagram into a bounded queue. FEC
-//! recovery, optional PCM-to-FLAC encoding, fMP4 boxing, playlist mutation, and
-//! canonical mesh publication all happen in the worker owned by this module.
+//! recovery happens in the worker owned by this module. Optional PCM-to-FLAC
+//! encoding, fMP4 boxing, playlist mutation, and canonical mesh publication are
+//! sharded by LL-HLS rendition so wide logical streams can use multiple cores
+//! while preserving ordering within each rendition.
 
 use crate::fmp4_bridge::{Fmp4PartPublisher, Fmp4Segmenter, TimestampInput, DEFAULT_MIN_PART_MS};
 use access_unit::{AccessUnit, PSI_STREAM_PRIVATE_DATA};
@@ -23,9 +25,11 @@ use std::sync::{
     Arc,
 };
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 pub const DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY: usize = 4_096;
+const RENDITION_WORKER_QUEUE_CAPACITY: usize = 1_024;
 const AUDIO_GROUP_FLAG_DISCONTINUITY: u8 = 1 << 0;
 const AUDIO_GROUP_FLAG_ERASURE: u8 = 1 << 1;
 static WORKER_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
@@ -108,6 +112,11 @@ struct RenditionState {
     segmenter: Fmp4Segmenter,
 }
 
+struct RenditionWorker {
+    sender: mpsc::Sender<DecodedMultichannelAudioGroup>,
+    handle: JoinHandle<()>,
+}
+
 impl std::fmt::Debug for RenditionState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -142,7 +151,7 @@ pub async fn run_audio_epoch_hls_worker(
 ) {
     let transport = MultichannelAudioTransportAdapter::udp(65_535);
     let mut receivers = HashMap::<SocketAddr, MultichannelAudioReceiver>::new();
-    let mut renditions = HashMap::<RenditionKey, RenditionState>::new();
+    let mut rendition_workers = HashMap::<RenditionKey, RenditionWorker>::new();
 
     loop {
         tokio::select! {
@@ -169,9 +178,13 @@ pub async fn run_audio_epoch_hls_worker(
                                 u64::from(group.raptorq_recovered_fragments),
                                 Ordering::Relaxed,
                             );
-                            if let Err(error) = package_group(&config, &mut renditions, group).await {
+                            if let Err(error) = dispatch_group_to_rendition_worker(
+                                &config,
+                                &mut rendition_workers,
+                                group,
+                            ).await {
                                 WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                warn!(peer = %message.peer, error = %error, "failed to package recovered AEP1 group into LL-HLS");
+                                warn!(peer = %message.peer, error = %error, "failed to dispatch recovered AEP1 group to LL-HLS rendition worker");
                             }
                         }
                     }
@@ -202,9 +215,11 @@ pub async fn run_audio_epoch_hls_worker(
                     u64::from(group.raptorq_recovered_fragments),
                     Ordering::Relaxed,
                 );
-                if let Err(error) = package_group(&config, &mut renditions, group).await {
+                if let Err(error) =
+                    dispatch_group_to_rendition_worker(&config, &mut rendition_workers, group).await
+                {
                     WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    warn!(peer = %message.peer, error = %error, "failed to drain AEP1 group into LL-HLS");
+                    warn!(peer = %message.peer, error = %error, "failed to drain AEP1 group into LL-HLS rendition worker");
                 }
             }
         } else {
@@ -212,10 +227,81 @@ pub async fn run_audio_epoch_hls_worker(
         }
     }
 
+    let renditions = rendition_workers.len();
+    stop_rendition_workers(rendition_workers).await;
+    info!(renditions, "AEP1 LL-HLS worker stopped");
+}
+
+async fn dispatch_group_to_rendition_worker(
+    config: &AudioEpochHlsConfig,
+    workers: &mut HashMap<RenditionKey, RenditionWorker>,
+    group: DecodedMultichannelAudioGroup,
+) -> Result<(), String> {
+    let key = RenditionKey {
+        session_id: group.session_id,
+        group_id: group.group_id,
+    };
+    let sender = match workers.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut().sender.clone(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let (sender, receiver) = mpsc::channel(RENDITION_WORKER_QUEUE_CAPACITY);
+            let handle = tokio::spawn(run_rendition_worker(config.clone(), key, receiver));
+            entry
+                .insert(RenditionWorker {
+                    sender: sender.clone(),
+                    handle,
+                })
+                .sender
+                .clone()
+        }
+    };
+    sender
+        .send(group)
+        .await
+        .map_err(|_| format!("AEP1 LL-HLS rendition worker {key:?} stopped"))?;
+    Ok(())
+}
+
+async fn run_rendition_worker(
+    config: AudioEpochHlsConfig,
+    key: RenditionKey,
+    mut input: mpsc::Receiver<DecodedMultichannelAudioGroup>,
+) {
+    let mut renditions = HashMap::<RenditionKey, RenditionState>::new();
+    while let Some(group) = input.recv().await {
+        if let Err(error) = package_group(&config, &mut renditions, group).await {
+            WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                session_id = key.session_id,
+                group_id = key.group_id,
+                error = %error,
+                "failed to package recovered AEP1 group into LL-HLS"
+            );
+        }
+    }
+
     for rendition in renditions.values_mut() {
         rendition.segmenter.finish().await;
     }
-    info!(renditions = renditions.len(), "AEP1 LL-HLS worker stopped");
+    debug!(
+        session_id = key.session_id,
+        group_id = key.group_id,
+        "AEP1 LL-HLS rendition worker stopped"
+    );
+}
+
+async fn stop_rendition_workers(workers: HashMap<RenditionKey, RenditionWorker>) {
+    let mut handles = Vec::with_capacity(workers.len());
+    for (_, worker) in workers {
+        drop(worker.sender);
+        handles.push(worker.handle);
+    }
+    for handle in handles {
+        if let Err(error) = handle.await {
+            WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %error, "AEP1 LL-HLS rendition worker join failed");
+        }
+    }
 }
 
 async fn package_group(
@@ -526,6 +612,7 @@ mod tests {
     };
     use soundkit::audio_packet::Encoder as _;
     use soundkit_opus::OpusEncoder;
+    use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
@@ -719,6 +806,95 @@ mod tests {
             .as_ref()
             .is_some_and(|init| init.windows(4).any(|bytes| bytes == b"fLaC"))));
         assert_eq!(playlists.active(), 1);
+    }
+
+    #[tokio::test]
+    async fn wide_aep1_pcm_stream_shards_into_parallel_lossless_ll_hls_renditions() {
+        let options = Options {
+            num_playlists: 64,
+            part_target_ms: 5,
+            ..Options::default()
+        };
+        let (playlists, _, _) = Playlists::new(options);
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let config = AudioEpochHlsConfig::new(20, 5, playlists.clone(), publisher);
+        let (tx, rx) = channel(512);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_audio_epoch_hls_worker(config, rx, shutdown_rx));
+
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let peer: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        for epoch_id in 0..2_u64 {
+            let sample_count = 240 * 8;
+            let payloads = (0..16_u16)
+                .map(|group_id| {
+                    (0..sample_count)
+                        .flat_map(|sample| {
+                            let value = ((sample as i32 * 97)
+                                + (i32::from(group_id) * 1_013)
+                                + (epoch_id as i32 * 31))
+                                % 1_000_000
+                                - 500_000;
+                            let bytes = value.to_le_bytes();
+                            [bytes[0], bytes[1], bytes[2]]
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let groups = payloads
+                .iter()
+                .enumerate()
+                .map(|(index, payload)| MultichannelAudioGroup {
+                    group_id: index as u16,
+                    channel_start: index as u16 * 8,
+                    channel_count: 8,
+                    payload_kind: AudioPayloadKind::Pcm,
+                    sample_format: AudioSampleFormat::S24Le,
+                    flags: 0,
+                    payload,
+                })
+                .collect::<Vec<_>>();
+            let encoded = sender
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 128,
+                    config_generation: 1,
+                    epoch_id,
+                    pts_samples: epoch_id * 240,
+                    sample_rate: 48_000,
+                    frame_count: 240,
+                    groups: &groups,
+                })
+                .unwrap();
+            let wrapped = transport.wrap_epoch(encoded).unwrap();
+            for datagram in wrapped.datagrams {
+                tx.send(AudioEpochHlsDatagram {
+                    peer,
+                    bytes: datagram.payload,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        let _ = shutdown_tx.send(());
+        worker.await.unwrap();
+
+        let parts = captured.parts.lock().unwrap();
+        assert!(!parts.is_empty());
+        let streams = parts
+            .iter()
+            .map(|part| part.stream_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(streams, (20..36).collect::<HashSet<_>>());
+        assert!(parts.iter().all(|part| part.audio_codec == Some("flac")));
+        assert!(parts.iter().all(|part| part.video_units == 0));
+        assert_eq!(playlists.active(), 16);
     }
 
     async fn assert_long_flac_rendition(part_ms: u32, expected_parts: usize) {

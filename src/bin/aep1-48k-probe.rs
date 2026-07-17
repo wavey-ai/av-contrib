@@ -22,7 +22,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{interval_at, sleep_until, timeout, Instant as TokioInstant, MissedTickBehavior};
 
 const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: u16 = 2;
+const DEFAULT_CHANNELS: u16 = 2;
+const DEFAULT_GROUP_CHANNELS: u16 = 8;
+const FLAC_MAX_CHANNELS: u16 = 8;
+const LOGICAL_MAX_CHANNELS: u16 = 128;
 const FRAME_COUNT: u32 = 240;
 const FRAME_DURATION: Duration = Duration::from_millis(5);
 const MAX_DATAGRAM_BYTES: usize = 1_200;
@@ -47,6 +50,15 @@ enum Command {
         session_id: Option<u64>,
         #[arg(long, value_enum, default_value_t = ProbePayload::Flac)]
         payload: ProbePayload,
+        /// Logical channel count for the generated publication.
+        #[arg(long, default_value_t = DEFAULT_CHANNELS)]
+        channels: u16,
+        /// Maximum channels per AEP1 group / LL-HLS FLAC rendition.
+        #[arg(long, default_value_t = DEFAULT_GROUP_CHANNELS)]
+        group_channels: u16,
+        /// Deterministic source signal used to size codec and transport work.
+        #[arg(long, value_enum, default_value_t = ProbeSignal::Decorrelated)]
+        signal: ProbeSignal,
         #[arg(long, default_value_t = 0)]
         group_id: u16,
         #[arg(long, default_value_t = 12)]
@@ -152,13 +164,37 @@ impl ProbePayload {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProbeSignal {
+    /// Per-channel tones plus deterministic dither. More realistic than duplicated stereo sine.
+    Decorrelated,
+    /// Deterministic pseudo-random S24 samples. Useful as a near-worst-case lossless payload.
+    Noise,
+    /// Legacy duplicated sine wave.
+    Sine,
+}
+
+impl ProbeSignal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decorrelated => "decorrelated",
+            Self::Noise => "noise",
+            Self::Sine => "sine",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SendReport {
     schema: &'static str,
     lane: &'static str,
     payload: &'static str,
+    signal: &'static str,
     session_id: u64,
     group_id: u16,
+    group_count: u16,
+    group_channels: u16,
+    group_ids: Vec<u16>,
     sample_rate: u32,
     channels: u16,
     frame_count: u32,
@@ -170,6 +206,7 @@ struct SendReport {
     lossless_payload_bytes: u64,
     pcm_reference_bytes: u64,
     wire_overhead_ratio: f64,
+    wire_to_pcm_ratio: f64,
     elapsed_ms: u64,
 }
 
@@ -276,6 +313,9 @@ async fn main() -> Result<()> {
             duration_seconds,
             session_id,
             payload,
+            channels,
+            group_channels,
+            signal,
             group_id,
             repair_percent,
             min_repair_symbols,
@@ -285,6 +325,9 @@ async fn main() -> Result<()> {
                 duration_seconds,
                 session_id,
                 payload,
+                channels,
+                group_channels,
+                signal,
                 group_id,
                 repair_percent,
                 min_repair_symbols,
@@ -402,6 +445,9 @@ async fn send(
     duration_seconds: u64,
     session_id: Option<u64>,
     payload_kind: ProbePayload,
+    channels: u16,
+    group_channels: u16,
+    signal: ProbeSignal,
     group_id: u16,
     repair_percent: u32,
     min_repair_symbols: u32,
@@ -409,6 +455,7 @@ async fn send(
     if duration_seconds == 0 {
         bail!("--duration-seconds must be positive");
     }
+    let group_plan = source_group_plan(group_id, channels, group_channels)?;
     let session_id = session_id.unwrap_or(now_unix_ns()?.saturating_add(1_000_000_000));
     let now_ns = now_unix_ns()?;
     if session_id + 60_000_000_000 < now_ns {
@@ -423,8 +470,14 @@ async fn send(
     let source_payload_budget = fec
         .max_fragment_payload()
         .context("invalid AEP1 geometry")?;
-    let pcm_bytes_per_epoch = usize::from(CHANNELS) * FRAME_COUNT as usize * 3;
-    let source_symbols = pcm_bytes_per_epoch.div_ceil(source_payload_budget).max(1);
+    let max_pcm_bytes_per_group = group_plan
+        .iter()
+        .map(|group| usize::from(group.channel_count) * FRAME_COUNT as usize * 3)
+        .max()
+        .unwrap_or(0);
+    let source_symbols = max_pcm_bytes_per_group
+        .div_ceil(source_payload_budget)
+        .max(1);
     let proportional = (source_symbols as u64)
         .saturating_mul(u64::from(repair_percent.min(100)))
         .div_ceil(100) as u32;
@@ -439,14 +492,23 @@ async fn send(
         "[::]:0"
     })
     .await?;
-    let flac_config = FlacFrameConfig::new(
-        SAMPLE_RATE,
-        CHANNELS,
-        24,
-        FRAME_COUNT,
-        FlacProfile::Realtime,
-    )?;
-    let mut flac = FlacFrameEncoder::new(flac_config)?;
+    let mut flac_encoders = if matches!(payload_kind, ProbePayload::Flac) {
+        group_plan
+            .iter()
+            .map(|group| {
+                FlacFrameConfig::new(
+                    SAMPLE_RATE,
+                    group.channel_count,
+                    24,
+                    FRAME_COUNT,
+                    FlacProfile::Realtime,
+                )
+                .and_then(FlacFrameEncoder::new)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let epochs = duration_seconds.saturating_mul(1_000) / 5;
     let started = Instant::now();
     let mut ticker = interval_at(TokioInstant::now(), FRAME_DURATION);
@@ -458,24 +520,38 @@ async fn send(
 
     for epoch_id in 0..epochs {
         ticker.tick().await;
-        let pcm = sine_s24le(epoch_id * u64::from(FRAME_COUNT));
-        let payload = match payload_kind {
-            ProbePayload::Flac => Bytes::from(flac.encode_s24le(&pcm)?.payload),
-            ProbePayload::Pcm => Bytes::from(pcm),
-        };
-        lossless_payload_bytes = lossless_payload_bytes.saturating_add(payload.len() as u64);
-        let groups = [MultichannelAudioGroup {
-            group_id,
-            channel_start: 0,
-            channel_count: CHANNELS,
-            payload_kind: match payload_kind {
-                ProbePayload::Flac => AudioPayloadKind::Flac,
-                ProbePayload::Pcm => AudioPayloadKind::Pcm,
-            },
-            sample_format: AudioSampleFormat::S24Le,
-            flags: 0,
-            payload: &payload,
-        }];
+        let first_sample = epoch_id.saturating_mul(u64::from(FRAME_COUNT));
+        let mut payloads = Vec::with_capacity(group_plan.len());
+        for (index, group) in group_plan.iter().enumerate() {
+            let pcm = signal_s24le(
+                first_sample,
+                group.channel_start,
+                group.channel_count,
+                signal,
+            );
+            let payload = match payload_kind {
+                ProbePayload::Flac => flac_encoders[index].encode_s24le(&pcm)?.payload,
+                ProbePayload::Pcm => pcm,
+            };
+            lossless_payload_bytes = lossless_payload_bytes.saturating_add(payload.len() as u64);
+            payloads.push(payload);
+        }
+        let groups = group_plan
+            .iter()
+            .zip(payloads.iter())
+            .map(|(group, payload)| MultichannelAudioGroup {
+                group_id: group.group_id,
+                channel_start: group.channel_start,
+                channel_count: group.channel_count,
+                payload_kind: match payload_kind {
+                    ProbePayload::Flac => AudioPayloadKind::Flac,
+                    ProbePayload::Pcm => AudioPayloadKind::Pcm,
+                },
+                sample_format: AudioSampleFormat::S24Le,
+                flags: 0,
+                payload,
+            })
+            .collect::<Vec<_>>();
         let encoded = sender.encode_epoch(MultichannelAudioEpoch {
             session_id,
             config_generation: 1,
@@ -508,16 +584,20 @@ async fn send(
 
     let pcm_reference_bytes = epochs
         .saturating_mul(u64::from(FRAME_COUNT))
-        .saturating_mul(u64::from(CHANNELS))
+        .saturating_mul(u64::from(channels))
         .saturating_mul(3);
     Ok(SendReport {
-        schema: "needletail.aep1-48k-probe.send.v1",
+        schema: "needletail.aep1-48k-probe.send.v2",
         lane: "source",
         payload: payload_kind.as_str(),
+        signal: signal.as_str(),
         session_id,
         group_id,
+        group_count: group_plan.len() as u16,
+        group_channels: group_channels.min(FLAC_MAX_CHANNELS),
+        group_ids: group_plan.iter().map(|group| group.group_id).collect(),
         sample_rate: SAMPLE_RATE,
-        channels: CHANNELS,
+        channels,
         frame_count: FRAME_COUNT,
         duration_seconds,
         epochs,
@@ -527,8 +607,54 @@ async fn send(
         lossless_payload_bytes,
         pcm_reference_bytes,
         wire_overhead_ratio: wire_bytes as f64 / lossless_payload_bytes.max(1) as f64,
+        wire_to_pcm_ratio: wire_bytes as f64 / pcm_reference_bytes.max(1) as f64,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceGroupPlan {
+    group_id: u16,
+    channel_start: u16,
+    channel_count: u16,
+}
+
+fn source_group_plan(
+    base_group_id: u16,
+    channels: u16,
+    requested_group_channels: u16,
+) -> Result<Vec<SourceGroupPlan>> {
+    if channels == 0 {
+        bail!("--channels must be positive");
+    }
+    if channels > LOGICAL_MAX_CHANNELS {
+        bail!("--channels may not exceed {LOGICAL_MAX_CHANNELS}");
+    }
+    if requested_group_channels == 0 {
+        bail!("--group-channels must be positive");
+    }
+    if requested_group_channels > FLAC_MAX_CHANNELS {
+        bail!("--group-channels may not exceed {FLAC_MAX_CHANNELS}; split wider logical streams across multiple FLAC-safe AEP1 groups");
+    }
+    let group_channels = requested_group_channels;
+    let group_count = channels.div_ceil(group_channels);
+    if u32::from(base_group_id) + u32::from(group_count) > u32::from(u16::MAX) + 1 {
+        bail!("--group-id plus derived group count exceeds u16 range");
+    }
+    let mut groups = Vec::with_capacity(usize::from(group_count));
+    let mut remaining = channels;
+    let mut channel_start = 0_u16;
+    for index in 0..group_count {
+        let channel_count = remaining.min(group_channels);
+        groups.push(SourceGroupPlan {
+            group_id: base_group_id + index,
+            channel_start,
+            channel_count,
+        });
+        channel_start = channel_start.saturating_add(channel_count);
+        remaining -= channel_count;
+    }
+    Ok(groups)
 }
 
 async fn receive_udp(
@@ -1333,19 +1459,63 @@ fn strip_h3_datagram_context(wire: &[u8]) -> Result<&[u8]> {
     Ok(&wire[encoded_len..])
 }
 
-fn sine_s24le(first_sample: u64) -> Vec<u8> {
-    let mut pcm = Vec::with_capacity(FRAME_COUNT as usize * usize::from(CHANNELS) * 3);
+fn signal_s24le(
+    first_sample: u64,
+    channel_start: u16,
+    channels: u16,
+    signal: ProbeSignal,
+) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(FRAME_COUNT as usize * usize::from(channels) * 3);
     for frame in 0..FRAME_COUNT {
         let sample_index = first_sample.saturating_add(u64::from(frame));
-        let phase =
-            sample_index as f64 * 2.0 * std::f64::consts::PI * 997.0 / f64::from(SAMPLE_RATE);
-        let sample = (phase.sin() * 0.5 * 8_388_607.0).round() as i32;
-        let bytes = sample.to_le_bytes();
-        for _ in 0..CHANNELS {
+        for local_channel in 0..channels {
+            let channel = channel_start.saturating_add(local_channel);
+            let sample = match signal {
+                ProbeSignal::Sine => duplicated_sine_sample(sample_index),
+                ProbeSignal::Decorrelated => decorrelated_sample(sample_index, channel),
+                ProbeSignal::Noise => deterministic_noise_sample(sample_index, channel),
+            };
+            let bytes = sample.to_le_bytes();
             pcm.extend_from_slice(&bytes[..3]);
         }
     }
     pcm
+}
+
+#[cfg(test)]
+fn sine_s24le(first_sample: u64) -> Vec<u8> {
+    signal_s24le(first_sample, 0, DEFAULT_CHANNELS, ProbeSignal::Sine)
+}
+
+fn duplicated_sine_sample(sample_index: u64) -> i32 {
+    let phase = sample_index as f64 * 2.0 * std::f64::consts::PI * 997.0 / f64::from(SAMPLE_RATE);
+    s24_from_unit(phase.sin() * 0.5)
+}
+
+fn decorrelated_sample(sample_index: u64, channel: u16) -> i32 {
+    let channel_f = f64::from(channel);
+    let base_hz = 147.0 + f64::from((u32::from(channel) * 37) % 1_400);
+    let overtone_hz = base_hz * 1.5 + f64::from((u32::from(channel) * 17) % 300);
+    let t = sample_index as f64 / f64::from(SAMPLE_RATE);
+    let phase_a = 2.0 * std::f64::consts::PI * base_hz * t + channel_f * 0.173;
+    let phase_b = 2.0 * std::f64::consts::PI * overtone_hz * t + channel_f * 0.071;
+    s24_from_unit(phase_a.sin() * 0.46 + phase_b.sin() * 0.21)
+}
+
+fn deterministic_noise_sample(sample_index: u64, channel: u16) -> i32 {
+    let mut value = sample_index
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(u64::from(channel).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    ((value >> 40) as i32) - 8_388_608
+}
+
+fn s24_from_unit(value: f64) -> i32 {
+    (value.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32
 }
 
 fn percentiles_ms(mut values_ns: Vec<u64>) -> Percentiles {
@@ -1427,8 +1597,36 @@ mod tests {
     fn generated_pcm_is_exact_stereo_s24le_geometry() {
         assert_eq!(
             sine_s24le(0).len(),
-            FRAME_COUNT as usize * usize::from(CHANNELS) * 3
+            FRAME_COUNT as usize * usize::from(DEFAULT_CHANNELS) * 3
         );
+    }
+
+    #[test]
+    fn source_group_plan_splits_16_channels_for_flac_safe_ll_hls() {
+        let groups = source_group_plan(40_000, 16, 8).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_id, 40_000);
+        assert_eq!(groups[0].channel_start, 0);
+        assert_eq!(groups[0].channel_count, 8);
+        assert_eq!(groups[1].group_id, 40_001);
+        assert_eq!(groups[1].channel_start, 8);
+        assert_eq!(groups[1].channel_count, 8);
+    }
+
+    #[test]
+    fn source_group_plan_splits_128_channels_for_sizing() {
+        let groups = source_group_plan(10_000, 128, 8).unwrap();
+        assert_eq!(groups.len(), 16);
+        assert_eq!(groups.first().unwrap().channel_start, 0);
+        assert_eq!(groups.last().unwrap().group_id, 10_015);
+        assert_eq!(groups.last().unwrap().channel_start, 120);
+        assert_eq!(groups.last().unwrap().channel_count, 8);
+    }
+
+    #[test]
+    fn decorrelated_multichannel_signal_has_expected_s24le_geometry() {
+        let pcm = signal_s24le(0, 8, 16, ProbeSignal::Decorrelated);
+        assert_eq!(pcm.len(), FRAME_COUNT as usize * 16 * 3);
     }
 
     #[test]

@@ -96,6 +96,10 @@ static AUDIO_EPOCH_HLS_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 
+fn should_log_audio_epoch_hls_drop(dropped_total: u64) -> bool {
+    dropped_total <= 16 || dropped_total.is_power_of_two() || dropped_total.is_multiple_of(10_000)
+}
+
 fn encode_mesh_fmp4_slot(init: Option<&Bytes>, media: &Bytes) -> Result<Bytes> {
     let init_len = init.map_or(0, Bytes::len);
     if init_len > u32::MAX as usize {
@@ -1521,12 +1525,15 @@ async fn relay_daw_media_datagram(
 ) {
     let now = Instant::now();
     let relay_targets = {
-        let mut targets = targets.write().await;
-        targets.retain(|_, target| target.expires_at > now);
+        let targets = targets.read().await;
+        if targets.is_empty() {
+            return;
+        }
         targets
             .iter()
             .filter_map(|(address, target)| {
                 (*address != source
+                    && target.expires_at > now
                     && target
                         .session_id
                         .is_none_or(|requested| Some(requested) == session_id))
@@ -1544,6 +1551,34 @@ async fn relay_daw_media_datagram(
                 "failed to relay DAW media datagram"
             );
         }
+    }
+}
+
+fn handoff_audio_epoch_hls_datagram(
+    tx: Option<&mpsc::Sender<AudioEpochHlsDatagram>>,
+    peer: SocketAddr,
+    datagram: &[u8],
+) {
+    let Some(tx) = tx else {
+        return;
+    };
+    if let Err(error) = tx.try_send(AudioEpochHlsDatagram {
+        peer,
+        bytes: Bytes::copy_from_slice(datagram),
+    }) {
+        let dropped_total = AUDIO_EPOCH_HLS_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_audio_epoch_hls_drop(dropped_total) {
+            warn!(
+                peer = %peer,
+                error = %error,
+                dropped_total,
+                "AEP1 LL-HLS handoff is full; datagram lanes remain live"
+            );
+        }
+    } else {
+        AUDIO_EPOCH_HLS_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+        AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
     }
 }
 
@@ -1646,46 +1681,32 @@ async fn run_daw_media_udp_ingest(
                 }
 
                 if is_multichannel_audio_transport_datagram(datagram) {
-                    let identity = inspect_multichannel_audio_datagram(
-                        &datagram[MULTICHANNEL_AUDIO_TRANSPORT_MAGIC.len()..],
-                    );
-                    let session_id = identity.ok().and_then(|identity| {
-                        if let Some(session_id) = identity.session_id {
-                            audio_block_sessions.insert(
-                                (peer, identity.block_id),
-                                (session_id, Instant::now() + DAW_RELAY_TARGET_TTL),
-                            );
-                            Some(session_id)
-                        } else {
-                            audio_block_sessions
-                                .get(&(peer, identity.block_id))
-                                .map(|(session_id, _)| *session_id)
-                        }
-                    });
-                    relay_daw_media_datagram(&socket, &targets, peer, datagram, session_id).await;
+                    if !targets.read().await.is_empty() {
+                        let identity = inspect_multichannel_audio_datagram(
+                            &datagram[MULTICHANNEL_AUDIO_TRANSPORT_MAGIC.len()..],
+                        );
+                        let session_id = identity.ok().and_then(|identity| {
+                            if let Some(session_id) = identity.session_id {
+                                audio_block_sessions.insert(
+                                    (peer, identity.block_id),
+                                    (session_id, Instant::now() + DAW_RELAY_TARGET_TTL),
+                                );
+                                Some(session_id)
+                            } else {
+                                audio_block_sessions
+                                    .get(&(peer, identity.block_id))
+                                    .map(|(session_id, _)| *session_id)
+                            }
+                        });
+                        relay_daw_media_datagram(&socket, &targets, peer, datagram, session_id).await;
+                    }
+                    handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
                     if let Err(error) = forwarder.forward_audio_epoch_datagram(datagram).await {
                         warn!(
                             peer = %peer,
                             error = %error,
                             "failed to forward DAW audio epoch datagram to mesh"
                         );
-                    }
-                    if let Some(tx) = &audio_epoch_hls_tx {
-                        if let Err(error) = tx.try_send(AudioEpochHlsDatagram {
-                            peer,
-                            bytes: Bytes::copy_from_slice(datagram),
-                        }) {
-                            AUDIO_EPOCH_HLS_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
-                            warn!(
-                                peer = %peer,
-                                error = %error,
-                                "AEP1 LL-HLS handoff is full; datagram lanes remain live"
-                            );
-                        } else {
-                            AUDIO_EPOCH_HLS_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                            let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
-                            AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
-                        }
                     }
                     continue;
                 }
@@ -6766,6 +6787,15 @@ mod tests {
         assert_eq!(playlist_part_capacity(1_000, 10), 128);
         assert_eq!(playlist_part_capacity(1_000, 5), 208);
         assert_eq!(playlist_part_capacity(u32::MAX, 1), 4_096);
+    }
+
+    #[test]
+    fn audio_epoch_hls_drop_logging_is_sampled_under_overload() {
+        assert!((1..=16).all(should_log_audio_epoch_hls_drop));
+        assert!(should_log_audio_epoch_hls_drop(32));
+        assert!(should_log_audio_epoch_hls_drop(10_000));
+        assert!(!should_log_audio_epoch_hls_drop(17));
+        assert!(!should_log_audio_epoch_hls_drop(9_999));
     }
 
     #[test]
