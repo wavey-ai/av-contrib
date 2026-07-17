@@ -77,7 +77,7 @@ const DAW_RELAY_UNSUBSCRIBE_V2_PREFIX: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/2 ";
 const DAW_RELAY_SUBSCRIBE_ACK_V2_PREFIX: &[u8] = b"WAVEY-DAW-SUBSCRIBED/2 ";
 const DAW_RELAY_TARGET_TTL: Duration = Duration::from_secs(15);
 const DAW_RELAY_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
-const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
 const MEDIA_OBJECT_TENANT: &str = "default";
 const FMP4_MEDIA_TRACK: &str = "muxed-fmp4";
@@ -91,12 +91,24 @@ const DEFAULT_RELAY_DEADLINE_MS: u64 = 1_000;
 const DEFAULT_RELAY_TOPOLOGY_GENERATION: u64 = 1;
 const DEFAULT_RELAY_SUBSCRIPTION_ID: u64 = 1;
 const RELAY_LANE_IMPAIRED_HOLD_MS: u64 = 3_000;
+const AUDIO_EPOCH_MESH_QUEUE_CAPACITY: usize = 32_768;
 static AUDIO_EPOCH_HLS_QUEUE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_HLS_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_FORWARD_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 fn should_log_audio_epoch_hls_drop(dropped_total: u64) -> bool {
+    dropped_total <= 16 || dropped_total.is_power_of_two() || dropped_total.is_multiple_of(10_000)
+}
+
+fn should_log_audio_epoch_mesh_drop(dropped_total: u64) -> bool {
     dropped_total <= 16 || dropped_total.is_power_of_two() || dropped_total.is_multiple_of(10_000)
 }
 
@@ -1562,23 +1574,128 @@ fn handoff_audio_epoch_hls_datagram(
     let Some(tx) = tx else {
         return;
     };
+    let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+    AUDIO_EPOCH_HLS_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+    AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+    if tx.capacity() == 0 {
+        let dropped_total = AUDIO_EPOCH_HLS_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_audio_epoch_hls_drop(dropped_total) {
+            warn!(
+                peer = %peer,
+                dropped_total,
+                queue_depth = depth,
+                "AEP1 LL-HLS handoff is full; datagram lanes remain live"
+            );
+        }
+        return;
+    }
+
     if let Err(error) = tx.try_send(AudioEpochHlsDatagram {
         peer,
         bytes: Bytes::copy_from_slice(datagram),
     }) {
+        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+        AUDIO_EPOCH_HLS_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+        AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
         let dropped_total = AUDIO_EPOCH_HLS_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
         if should_log_audio_epoch_hls_drop(dropped_total) {
             warn!(
                 peer = %peer,
                 error = %error,
                 dropped_total,
+                queue_depth = depth,
                 "AEP1 LL-HLS handoff is full; datagram lanes remain live"
             );
         }
     } else {
         AUDIO_EPOCH_HLS_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
         let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+        AUDIO_EPOCH_HLS_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
         AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+    }
+}
+
+fn handoff_audio_epoch_mesh_datagram(
+    tx: Option<&mpsc::Sender<Bytes>>,
+    peer: SocketAddr,
+    datagram: &[u8],
+) {
+    let Some(tx) = tx else {
+        return;
+    };
+    let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+    AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+    AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+    if tx.capacity() == 0 {
+        let dropped_total = AUDIO_EPOCH_MESH_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_audio_epoch_mesh_drop(dropped_total) {
+            warn!(
+                peer = %peer,
+                dropped_total,
+                queue_depth = depth,
+                "AEP1 mesh forward handoff is full; UDP receive remains live"
+            );
+        }
+        return;
+    }
+
+    if let Err(error) = tx.try_send(Bytes::copy_from_slice(datagram)) {
+        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+        AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+        let dropped_total = AUDIO_EPOCH_MESH_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_audio_epoch_mesh_drop(dropped_total) {
+            warn!(
+                peer = %peer,
+                error = %error,
+                dropped_total,
+                queue_depth = depth,
+                "AEP1 mesh forward handoff is full; UDP receive remains live"
+            );
+        }
+    } else {
+        AUDIO_EPOCH_MESH_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+        AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+    }
+}
+
+async fn run_audio_epoch_mesh_forward_worker(
+    forwarder: Arc<MeshForwarder>,
+    mut input: mpsc::Receiver<Bytes>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            datagram = input.recv() => {
+                let Some(datagram) = datagram else { break; };
+                if let Err(error) = forwarder.forward_audio_epoch_datagram(&datagram).await {
+                    AUDIO_EPOCH_MESH_FORWARD_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %error,
+                        "failed to forward DAW audio epoch datagram to mesh"
+                    );
+                }
+                AUDIO_EPOCH_MESH_QUEUE_DEPTH
+                    .store(input.max_capacity().saturating_sub(input.capacity()) as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    while let Ok(datagram) = input.try_recv() {
+        if let Err(error) = forwarder.forward_audio_epoch_datagram(&datagram).await {
+            AUDIO_EPOCH_MESH_FORWARD_ERRORS.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                error = %error,
+                "failed to drain DAW audio epoch datagram into mesh"
+            );
+        }
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(
+            input.max_capacity().saturating_sub(input.capacity()) as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1587,6 +1704,7 @@ async fn run_daw_media_udp_ingest(
     forwarder: Arc<MeshForwarder>,
     targets: DawRelayTargets,
     audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
+    audio_epoch_mesh_tx: Option<mpsc::Sender<Bytes>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<()> {
     let bind = socket.local_addr()?;
@@ -1701,13 +1819,7 @@ async fn run_daw_media_udp_ingest(
                         relay_daw_media_datagram(&socket, &targets, peer, datagram, session_id).await;
                     }
                     handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
-                    if let Err(error) = forwarder.forward_audio_epoch_datagram(datagram).await {
-                        warn!(
-                            peer = %peer,
-                            error = %error,
-                            "failed to forward DAW audio epoch datagram to mesh"
-                        );
-                    }
+                    handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx.as_ref(), peer, datagram);
                     continue;
                 }
 
@@ -3980,10 +4092,52 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             AUDIO_EPOCH_HLS_QUEUE_DROPPED.load(Ordering::Relaxed),
         ),
         (
+            "av_contrib_audio_epoch_hls_queue_depth",
+            "Current observed AEP1 LL-HLS handoff depth.",
+            "gauge",
+            AUDIO_EPOCH_HLS_QUEUE_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
             "av_contrib_audio_epoch_hls_queue_max_depth",
             "Maximum observed AEP1 LL-HLS handoff depth since process start.",
             "gauge",
             AUDIO_EPOCH_HLS_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_queue_capacity",
+            "Configured capacity of the asynchronous AEP1 mesh forward handoff.",
+            "gauge",
+            AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_queue_enqueued_total",
+            "AEP1 datagrams accepted by the asynchronous mesh forward handoff.",
+            "counter",
+            AUDIO_EPOCH_MESH_QUEUE_ENQUEUED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_queue_dropped_total",
+            "AEP1 datagrams rejected by a full or closed mesh forward handoff.",
+            "counter",
+            AUDIO_EPOCH_MESH_QUEUE_DROPPED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_queue_depth",
+            "Current observed AEP1 mesh forward handoff depth.",
+            "gauge",
+            AUDIO_EPOCH_MESH_QUEUE_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_queue_max_depth",
+            "Maximum observed AEP1 mesh forward handoff depth since process start.",
+            "gauge",
+            AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_forward_errors_total",
+            "AEP1 mesh forward worker errors.",
+            "counter",
+            AUDIO_EPOCH_MESH_FORWARD_ERRORS.load(Ordering::Relaxed),
         ),
         (
             "av_contrib_audio_epoch_hls_worker_datagrams_total",
@@ -6081,44 +6235,57 @@ async fn main() -> Result<()> {
     } else {
         (None, None, None)
     };
-    let (daw_media_task, audio_epoch_hls_task) = if let Some(bind) = args.daw_media_bind {
-        let socket = bind_daw_media_udp_socket(bind).await?;
-        let local_addr = socket.local_addr()?;
-        let targets = Arc::new(RwLock::new(HashMap::new()));
-        let (audio_epoch_hls_tx, audio_epoch_hls_rx) =
-            audio_epoch_hls_channel(args.daw_hls_queue_capacity);
-        AUDIO_EPOCH_HLS_QUEUE_CAPACITY
-            .store(audio_epoch_hls_tx.max_capacity() as u64, Ordering::Relaxed);
-        let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
-            AudioEpochHlsConfig::new(
-                args.stream_id,
-                args.fmp4_part_ms,
-                playlists.clone(),
-                publisher.clone(),
-            ),
-            audio_epoch_hls_rx,
-            shutdown_rx.clone(),
-        ));
-        info!(
-            bind = %local_addr,
-            mesh_media_fec_target = %args.mesh_media_fec_target,
-            hls_base_stream_id = args.stream_id,
-            hls_queue_capacity = args.daw_hls_queue_capacity,
-            "DAW media UDP relay listening"
-        );
-        (
-            Some(tokio::spawn(run_daw_media_udp_ingest(
-                socket,
-                forwarder.clone(),
-                targets,
-                Some(audio_epoch_hls_tx),
+    let (daw_media_task, audio_epoch_hls_task, audio_epoch_mesh_task) =
+        if let Some(bind) = args.daw_media_bind {
+            let socket = bind_daw_media_udp_socket(bind).await?;
+            let local_addr = socket.local_addr()?;
+            let targets = Arc::new(RwLock::new(HashMap::new()));
+            let (audio_epoch_hls_tx, audio_epoch_hls_rx) =
+                audio_epoch_hls_channel(args.daw_hls_queue_capacity);
+            let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) =
+                mpsc::channel(AUDIO_EPOCH_MESH_QUEUE_CAPACITY);
+            AUDIO_EPOCH_HLS_QUEUE_CAPACITY
+                .store(audio_epoch_hls_tx.max_capacity() as u64, Ordering::Relaxed);
+            AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC
+                .store(audio_epoch_mesh_tx.max_capacity() as u64, Ordering::Relaxed);
+            let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
+                AudioEpochHlsConfig::new(
+                    args.stream_id,
+                    args.fmp4_part_ms,
+                    playlists.clone(),
+                    publisher.clone(),
+                ),
+                audio_epoch_hls_rx,
                 shutdown_rx.clone(),
-            ))),
-            Some(audio_epoch_hls_task),
-        )
-    } else {
-        (None, None)
-    };
+            ));
+            let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
+                forwarder.clone(),
+                audio_epoch_mesh_rx,
+                shutdown_rx.clone(),
+            ));
+            info!(
+                bind = %local_addr,
+                mesh_media_fec_target = %args.mesh_media_fec_target,
+                hls_base_stream_id = args.stream_id,
+                hls_queue_capacity = args.daw_hls_queue_capacity,
+                mesh_queue_capacity = AUDIO_EPOCH_MESH_QUEUE_CAPACITY,
+                "DAW media UDP relay listening"
+            );
+            (
+                Some(tokio::spawn(run_daw_media_udp_ingest(
+                    socket,
+                    forwarder.clone(),
+                    targets,
+                    Some(audio_epoch_hls_tx),
+                    Some(audio_epoch_mesh_tx),
+                    shutdown_rx.clone(),
+                ))),
+                Some(audio_epoch_hls_task),
+                Some(audio_epoch_mesh_task),
+            )
+        } else {
+            (None, None, None)
+        };
     let router = Box::new(ContribRouter::new(
         forwarder.clone(),
         args.stream_id,
@@ -6222,6 +6389,9 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     if let Some(task) = audio_epoch_hls_task {
+        let _ = task.await;
+    }
+    if let Some(task) = audio_epoch_mesh_task {
         let _ = task.await;
     }
     Ok(())
@@ -8555,11 +8725,18 @@ mod tests {
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
         let targets = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) = mpsc::channel(256);
+        let mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
+            forwarder.clone(),
+            audio_epoch_mesh_rx,
+            shutdown_rx.clone(),
+        ));
         let task = tokio::spawn(run_daw_media_udp_ingest(
             daw_socket,
             forwarder,
             targets,
             None,
+            Some(audio_epoch_mesh_tx),
             shutdown_rx,
         ));
 
@@ -8625,6 +8802,7 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
+        mesh_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -8688,11 +8866,18 @@ mod tests {
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
         let targets = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) = mpsc::channel(256);
+        let mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
+            forwarder.clone(),
+            audio_epoch_mesh_rx,
+            shutdown_rx.clone(),
+        ));
         let task = tokio::spawn(run_daw_media_udp_ingest(
             daw_socket,
             forwarder,
             targets,
             None,
+            Some(audio_epoch_mesh_tx),
             shutdown_rx,
         ));
 
@@ -8777,5 +8962,6 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
+        mesh_task.await.unwrap();
     }
 }

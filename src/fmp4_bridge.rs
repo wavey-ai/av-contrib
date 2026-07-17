@@ -798,17 +798,6 @@ impl Fmp4Segmenter {
             published_parts = self.published_parts,
             "published fMP4 HLS part details"
         );
-        if self.published_parts <= 3 || self.published_parts.is_multiple_of(25) {
-            info!(
-                output_stream_id = self.output_stream_id,
-                output_stream_idx = self.output_stream_idx,
-                seq = self.seg_seq,
-                duration_ms = duration,
-                key,
-                bytes,
-                "published fMP4 HLS part"
-            );
-        }
         self.seg_seq = self.seg_seq.wrapping_add(1);
     }
 
