@@ -5,8 +5,10 @@
 //! not valid HLS media fragments. This bridge demuxes H.264 access units,
 //! boxes them as fMP4/CMAF parts, and updates the shared playlist cache.
 
+use access_unit::flac::decode_frame_header;
 use access_unit::{
-    AccessUnit, PSI_STREAM_AAC, PSI_STREAM_H264, PSI_STREAM_MPEG4_AAC, PSI_STREAM_PRIVATE_DATA,
+    detect_audio, AccessUnit, AudioType, PSI_STREAM_AAC, PSI_STREAM_H264, PSI_STREAM_MPEG4_AAC,
+    PSI_STREAM_PRIVATE_DATA,
 };
 use boxer::fmp4::{box_fmp4_with_init, AdtsHeader, AvcDecoderConfigurationRecord, Config};
 use bytes::{Bytes, BytesMut};
@@ -81,20 +83,24 @@ pub trait Fmp4PartPublisher: Send + Sync {
 pub enum TimestampInput {
     Ticks90Khz,
     Millis,
+    /// Millisecond PTS already expressed in the publication clock domain.
+    /// Used by AEP1 audio so LL-HLS retains the same sample-derived timeline
+    /// as the datagram lanes instead of rebasing each rendition independently.
+    MillisAbsolute,
 }
 
 impl TimestampInput {
     fn scale_video(self, value: u64) -> u64 {
         match self {
             Self::Ticks90Khz => value,
-            Self::Millis => ms_to_ticks_u64(value),
+            Self::Millis | Self::MillisAbsolute => ms_to_ticks_u64(value),
         }
     }
 
     fn scale_audio(self, value: u64) -> u64 {
         match self {
             Self::Ticks90Khz => ticks_to_ms(value),
-            Self::Millis => value,
+            Self::Millis | Self::MillisAbsolute => value,
         }
     }
 }
@@ -204,11 +210,18 @@ struct H264ConfigSignature {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct AudioConfigSignature {
-    stream_type: u8,
-    profile: u8,
-    sampling_frequency: u32,
-    channel_configuration: u8,
+enum AudioConfigSignature {
+    Aac {
+        stream_type: u8,
+        profile: u8,
+        sampling_frequency: u32,
+        channel_configuration: u8,
+    },
+    Flac {
+        sample_rate: u32,
+        channels: u8,
+        bits_per_sample: u8,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -229,6 +242,9 @@ pub struct Fmp4Segmenter {
     video_timestamps: Vec<u64>,
     audio_buf: Vec<AccessUnit>,
     audio_timestamps: Vec<u64>,
+    /// Known encoded duration of the buffered audio. `None` preserves the
+    /// timestamp-lookahead fallback for an unrecognised audio payload.
+    audio_buffered_duration_ms: Option<u64>,
     config: Config,
     seg_seq: u32,
     sps: Option<Bytes>,
@@ -281,6 +297,7 @@ impl Fmp4Segmenter {
             video_timestamps: Vec::new(),
             audio_buf: Vec::new(),
             audio_timestamps: Vec::new(),
+            audio_buffered_duration_ms: Some(0),
             config: Config {
                 width: 0,
                 height: 0,
@@ -358,6 +375,7 @@ impl Fmp4Segmenter {
         self.video_timestamps.clear();
         self.audio_buf.clear();
         self.audio_timestamps.clear();
+        self.audio_buffered_duration_ms = Some(0);
         self.config = Config {
             width: 0,
             height: 0,
@@ -527,9 +545,11 @@ impl Fmp4Segmenter {
     }
 
     async fn push_audio(&mut self, access_unit: AccessUnit) {
+        let access_unit_duration_ms = audio_access_unit_duration_ms(&access_unit);
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
             self.audio_timestamps.push(access_unit.pts);
             self.audio_buf.push(access_unit);
+            self.extend_audio_buffered_duration(access_unit_duration_ms);
             debug!(
                 output_stream_id = self.output_stream_id,
                 output_stream_idx = self.output_stream_idx,
@@ -560,6 +580,25 @@ impl Fmp4Segmenter {
 
         self.audio_timestamps.push(access_unit.pts);
         self.audio_buf.push(access_unit);
+        self.extend_audio_buffered_duration(access_unit_duration_ms);
+
+        // FLAC and ADTS describe their sample duration in the access unit, so
+        // an audio-only part can be closed as soon as it reaches its target.
+        // Waiting for the next timestamp adds one whole audio frame of latency.
+        if !self.seen_video
+            && self
+                .audio_buffered_duration_ms
+                .is_some_and(|duration_ms| duration_ms >= ticks_to_ms(self.min_part_ticks))
+        {
+            self.flush_with_next_dts(0).await;
+        }
+    }
+
+    fn extend_audio_buffered_duration(&mut self, access_unit_duration_ms: Option<u64>) {
+        self.audio_buffered_duration_ms = self
+            .audio_buffered_duration_ms
+            .zip(access_unit_duration_ms)
+            .map(|(buffered, access_unit)| buffered.saturating_add(access_unit));
     }
 
     fn timestamp_went_backwards(&self, access_unit: &AccessUnit) -> bool {
@@ -571,9 +610,11 @@ impl Fmp4Segmenter {
     }
 
     fn normalize_timestamps(&mut self, access_unit: &mut AccessUnit) {
-        let base_dts = *self.timestamp_base_input.get_or_insert(access_unit.dts);
-        access_unit.pts = access_unit.pts.saturating_sub(base_dts);
-        access_unit.dts = access_unit.dts.saturating_sub(base_dts);
+        if !matches!(self.input_timestamps, TimestampInput::MillisAbsolute) {
+            let base_dts = *self.timestamp_base_input.get_or_insert(access_unit.dts);
+            access_unit.pts = access_unit.pts.saturating_sub(base_dts);
+            access_unit.dts = access_unit.dts.saturating_sub(base_dts);
+        }
 
         if is_h264(access_unit.stream_type) {
             access_unit.pts = self.input_timestamps.scale_video(access_unit.pts);
@@ -643,6 +684,7 @@ impl Fmp4Segmenter {
             self.force_next_init || self.last_init_signature.as_ref() != Some(&init_signature);
         let video_units = self.video_buf.len();
         let audio_units = self.audio_buf.len();
+        let audio_codec = audio_codec_name(&self.audio_buf);
 
         let fmp4 = box_fmp4_with_init(
             self.seg_seq,
@@ -654,6 +696,7 @@ impl Fmp4Segmenter {
         );
         self.video_timestamps.clear();
         self.audio_timestamps.clear();
+        self.audio_buffered_duration_ms = Some(0);
 
         if fmp4.data.is_empty() {
             warn!(
@@ -712,7 +755,7 @@ impl Fmp4Segmenter {
                 video_width: (video_units > 0).then_some(self.config.width),
                 video_height: (video_units > 0).then_some(self.config.height),
                 video_units,
-                audio_codec: (audio_units > 0).then_some("aac"),
+                audio_codec,
                 audio_units,
             };
             if let Err(error) = publisher.publish_fmp4_part(part).await {
@@ -774,6 +817,7 @@ impl Fmp4Segmenter {
         self.video_timestamps.clear();
         self.audio_buf.clear();
         self.audio_timestamps.clear();
+        self.audio_buffered_duration_ms = Some(0);
     }
 
     fn drop_pending_without_config_if_needed(&mut self) {
@@ -1095,17 +1139,61 @@ fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> Result<bool, H264S
 
 fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSignature> {
     for unit in audio_units {
-        let Some(header) = AdtsHeader::read_from(&unit.data) else {
-            continue;
-        };
-        return Some(AudioConfigSignature {
-            stream_type: unit.stream_type,
-            profile: header.profile as u8,
-            sampling_frequency: header.sampling_frequency.as_u32(),
-            channel_configuration: header.channel_configuration as u8,
-        });
+        if let Some(header) = AdtsHeader::read_from(&unit.data) {
+            return Some(AudioConfigSignature::Aac {
+                stream_type: unit.stream_type,
+                profile: header.profile as u8,
+                sampling_frequency: header.sampling_frequency.as_u32(),
+                channel_configuration: header.channel_configuration as u8,
+            });
+        }
+        if let Ok(header) = decode_frame_header(&unit.data) {
+            return Some(AudioConfigSignature::Flac {
+                sample_rate: header.sample_rate,
+                channels: header.channels,
+                bits_per_sample: header.bps,
+            });
+        }
     }
     None
+}
+
+fn audio_access_unit_duration_ms(access_unit: &AccessUnit) -> Option<u64> {
+    for offset in [0, 12, 4] {
+        let Some(data) = access_unit.data.get(offset..) else {
+            continue;
+        };
+        match detect_audio(data) {
+            AudioType::FLAC => {
+                let header = decode_frame_header(data).ok()?;
+                if header.sample_rate == 0 {
+                    return None;
+                }
+                let numerator = u64::from(header.block_size).saturating_mul(1_000);
+                return Some(
+                    numerator.saturating_add(u64::from(header.sample_rate) / 2)
+                        / u64::from(header.sample_rate),
+                );
+            }
+            AudioType::AAC => {
+                let header = AdtsHeader::read_from(data)?;
+                let sample_rate = u64::from(header.sampling_frequency.as_u32());
+                return Some((1_024_000_u64.saturating_add(sample_rate / 2)) / sample_rate);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn audio_codec_name(audio_units: &[AccessUnit]) -> Option<&'static str> {
+    audio_units
+        .first()
+        .map(|unit| match detect_audio(&unit.data) {
+            AudioType::FLAC => "flac",
+            AudioType::AAC => "aac",
+            _ => "unknown",
+        })
 }
 
 #[cfg(test)]

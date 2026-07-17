@@ -1,3 +1,4 @@
+pub mod audio_epoch_hls;
 pub mod fmp4_bridge;
 pub mod ingress_authorization;
 
