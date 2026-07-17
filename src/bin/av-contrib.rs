@@ -2205,12 +2205,12 @@ async fn run_upload_response_ts_bridge(
                                         None,
                                         None,
                                     );
-                                    state.bridge = Some(TsFmp4Bridge::new_with_publisher(
+                                    state.bridge = Some(TsFmp4Bridge::new_publish_only(
                                         public_stream_id,
                                         public_stream_idx,
                                         playlists.clone(),
                                         min_part_ms,
-                                        Some(publisher.clone()),
+                                        publisher.clone(),
                                     ));
                                     debug!(
                                         stream_id,
@@ -2357,13 +2357,13 @@ async fn run_rtmp_hls_bridge(
                         stream.id,
                         RtmpSegmenterState {
                             output_stream_id,
-                            segmenter: Fmp4Segmenter::new_with_publisher(
+                            segmenter: Fmp4Segmenter::new_publish_only(
                                 output_stream_id,
                                 output_stream_idx,
                                 playlists.clone(),
                                 TimestampInput::Millis,
                                 min_part_ms,
-                                Some(publisher.clone()),
+                                publisher.clone(),
                             ),
                         },
                     );
@@ -3846,6 +3846,7 @@ impl ContribStatusConfig {
                 playlist_target_duration_ms: args.hls_target_duration_ms,
                 playlist_count: args.playlist_count,
                 playlist_buffer_kb: args.playlist_buffer_kb,
+                contributor_local_playback_cache_enabled: false,
             },
             fec: FecStatus {
                 repair_symbols: args.repair_symbols,
@@ -4071,6 +4072,36 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "AEP1 recovery or LL-HLS packaging errors in the asynchronous worker.",
             "counter",
             audio_hls_worker.errors,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_active_receivers",
+            "Current AEP1 source/FEC receiver states retained by the contributor.",
+            "gauge",
+            audio_hls_worker.active_receivers,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_active_rendition_workers",
+            "Current lossless LL-HLS rendition workers retained by the contributor.",
+            "gauge",
+            audio_hls_worker.active_rendition_workers,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_retired_receivers_total",
+            "Idle AEP1 source/FEC receiver states retired since process start.",
+            "counter",
+            audio_hls_worker.retired_receivers,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_retired_rendition_workers_total",
+            "Idle lossless LL-HLS rendition workers retired since process start.",
+            "counter",
+            audio_hls_worker.retired_rendition_workers,
+        ),
+        (
+            "av_contrib_local_playback_cache_enabled",
+            "Whether the contributor retains a viewer-facing LL-HLS playback cache.",
+            "gauge",
+            u64::from(snapshot.hls.contributor_local_playback_cache_enabled),
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, metric_type);
@@ -5500,6 +5531,7 @@ struct HlsStatus {
     playlist_target_duration_ms: u32,
     playlist_count: usize,
     playlist_buffer_kb: usize,
+    contributor_local_playback_cache_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

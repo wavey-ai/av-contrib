@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "boxer"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/boxer.git#0a6783a93693d0192bbdfd7c6339797649de448c"
+source = "git+https://github.com/wavey-ai/boxer.git#630df9660e87ec1922a1dd9c59e6ed0eecad1e14"
 dependencies = [
  "access-unit",
  "bytes",

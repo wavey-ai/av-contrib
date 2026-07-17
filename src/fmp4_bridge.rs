@@ -10,7 +10,10 @@ use access_unit::{
     detect_audio, AccessUnit, AudioType, PSI_STREAM_AAC, PSI_STREAM_H264, PSI_STREAM_MPEG4_AAC,
     PSI_STREAM_PRIVATE_DATA,
 };
-use boxer::fmp4::{box_fmp4_with_init, AdtsHeader, AvcDecoderConfigurationRecord, Config};
+use boxer::fmp4::{
+    box_fmp4_with_init_and_pcm, AdtsHeader, AvcDecoderConfigurationRecord, Config, PcmAudioConfig,
+    PcmSampleKind,
+};
 use bytes::{Bytes, BytesMut};
 use h264::{
     Bitstream, Decode, NALUnit, SequenceParameterSet, NAL_UNIT_TYPE_CODED_SLICE_OF_IDR_PICTURE,
@@ -120,6 +123,7 @@ impl TsFmp4Bridge {
             playlists,
             DEFAULT_MIN_PART_MS,
             None,
+            true,
         )
     }
 
@@ -136,6 +140,26 @@ impl TsFmp4Bridge {
             playlists,
             min_part_ms,
             publisher,
+            true,
+        )
+    }
+
+    /// Package and publish immutable fMP4 parts without retaining a second
+    /// contributor-local playback cache.
+    pub fn new_publish_only(
+        output_stream_id: u64,
+        output_stream_idx: usize,
+        playlists: Arc<Playlists>,
+        min_part_ms: u32,
+        publisher: Arc<dyn Fmp4PartPublisher>,
+    ) -> Self {
+        Self::new_with_options(
+            output_stream_id,
+            output_stream_idx,
+            playlists,
+            min_part_ms,
+            Some(publisher),
+            false,
         )
     }
 
@@ -145,16 +169,18 @@ impl TsFmp4Bridge {
         playlists: Arc<Playlists>,
         min_part_ms: u32,
         publisher: Option<Arc<dyn Fmp4PartPublisher>>,
+        retain_local_cache: bool,
     ) -> Self {
         let mut context = TsDemuxContext::new(publisher.clone());
         let demux = demultiplex::Demultiplex::new(&mut context);
-        let segmenter = Fmp4Segmenter::new_with_publisher(
+        let segmenter = Fmp4Segmenter::new_with_options(
             output_stream_id,
             output_stream_idx,
             playlists,
             TimestampInput::Ticks90Khz,
             min_part_ms,
             publisher,
+            retain_local_cache,
         );
 
         Self {
@@ -222,6 +248,7 @@ enum AudioConfigSignature {
         channels: u8,
         bits_per_sample: u8,
     },
+    Pcm(PcmAudioConfig),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -236,6 +263,8 @@ pub struct Fmp4Segmenter {
     playlists: Arc<Playlists>,
     input_timestamps: TimestampInput,
     publisher: Option<Arc<dyn Fmp4PartPublisher>>,
+    retain_local_cache: bool,
+    pcm_config: Option<PcmAudioConfig>,
     min_part_ticks: u64,
     max_part_ticks_without_key: u64,
     video_buf: Vec<AccessUnit>,
@@ -267,13 +296,14 @@ impl Fmp4Segmenter {
         input_timestamps: TimestampInput,
         min_part_ms: u32,
     ) -> Self {
-        Self::new_with_publisher(
+        Self::new_with_options(
             output_stream_id,
             output_stream_idx,
             playlists,
             input_timestamps,
             min_part_ms,
             None,
+            true,
         )
     }
 
@@ -285,12 +315,55 @@ impl Fmp4Segmenter {
         min_part_ms: u32,
         publisher: Option<Arc<dyn Fmp4PartPublisher>>,
     ) -> Self {
+        Self::new_with_options(
+            output_stream_id,
+            output_stream_idx,
+            playlists,
+            input_timestamps,
+            min_part_ms,
+            publisher,
+            true,
+        )
+    }
+
+    /// Package and publish immutable fMP4 parts without retaining them in the
+    /// contributor process. Viewer caches begin at the mesh ingress/edge tier.
+    pub fn new_publish_only(
+        output_stream_id: u64,
+        output_stream_idx: usize,
+        playlists: Arc<Playlists>,
+        input_timestamps: TimestampInput,
+        min_part_ms: u32,
+        publisher: Arc<dyn Fmp4PartPublisher>,
+    ) -> Self {
+        Self::new_with_options(
+            output_stream_id,
+            output_stream_idx,
+            playlists,
+            input_timestamps,
+            min_part_ms,
+            Some(publisher),
+            false,
+        )
+    }
+
+    fn new_with_options(
+        output_stream_id: u64,
+        output_stream_idx: usize,
+        playlists: Arc<Playlists>,
+        input_timestamps: TimestampInput,
+        min_part_ms: u32,
+        publisher: Option<Arc<dyn Fmp4PartPublisher>>,
+        retain_local_cache: bool,
+    ) -> Self {
         Self {
             output_stream_id,
             output_stream_idx,
             playlists,
             input_timestamps,
             publisher,
+            retain_local_cache,
+            pcm_config: None,
             min_part_ticks: ms_to_ticks(min_part_ms),
             max_part_ticks_without_key: ms_to_ticks(MAX_PART_MS_WITHOUT_KEY),
             video_buf: Vec::new(),
@@ -360,6 +433,18 @@ impl Fmp4Segmenter {
 
     pub async fn finish(&mut self) {
         self.flush_current().await;
+    }
+
+    /// Configure an audio-only stream as uncompressed PCM. The caller must
+    /// finish the current continuity segment before changing this value.
+    pub fn set_pcm_audio_config(&mut self, pcm_config: Option<PcmAudioConfig>) {
+        if self.pcm_config == pcm_config {
+            return;
+        }
+        debug_assert!(self.audio_buf.is_empty());
+        self.pcm_config = pcm_config;
+        self.last_init_signature = None;
+        self.force_next_init = true;
     }
 
     pub fn reset(&mut self) {
@@ -545,7 +630,7 @@ impl Fmp4Segmenter {
     }
 
     async fn push_audio(&mut self, access_unit: AccessUnit) {
-        let access_unit_duration_ms = audio_access_unit_duration_ms(&access_unit);
+        let access_unit_duration_ms = audio_access_unit_duration_ms(&access_unit, self.pcm_config);
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
             self.audio_timestamps.push(access_unit.pts);
             self.audio_buf.push(access_unit);
@@ -684,15 +769,16 @@ impl Fmp4Segmenter {
             self.force_next_init || self.last_init_signature.as_ref() != Some(&init_signature);
         let video_units = self.video_buf.len();
         let audio_units = self.audio_buf.len();
-        let audio_codec = audio_codec_name(&self.audio_buf);
+        let audio_codec = audio_codec_name(&self.audio_buf, self.pcm_config);
 
-        let fmp4 = box_fmp4_with_init(
+        let fmp4 = box_fmp4_with_init_and_pcm(
             self.seg_seq,
             self.config.clone(),
             std::mem::take(&mut self.video_buf),
             std::mem::take(&mut self.audio_buf),
             next_dts,
             include_init,
+            self.pcm_config,
         );
         self.video_timestamps.clear();
         self.audio_timestamps.clear();
@@ -715,27 +801,29 @@ impl Fmp4Segmenter {
         let key = fmp4.key;
         let part_bytes = fmp4.data.clone();
         let bytes = part_bytes.len();
-        if let Err(error) = self
-            .playlists
-            .chunk_cache
-            .append(self.output_stream_idx, part_bytes.clone())
-            .await
-        {
-            error!(
-                output_stream_id = self.output_stream_id,
-                output_stream_idx = self.output_stream_idx,
-                "fMP4 chunk_cache append error: {}",
-                error
-            );
-            return;
-        }
+        if self.retain_local_cache {
+            if let Err(error) = self
+                .playlists
+                .chunk_cache
+                .append(self.output_stream_idx, part_bytes.clone())
+                .await
+            {
+                error!(
+                    output_stream_id = self.output_stream_id,
+                    output_stream_idx = self.output_stream_idx,
+                    "fMP4 chunk_cache append error: {}",
+                    error
+                );
+                return;
+            }
 
-        if !self.playlists.add(self.output_stream_id, fmp4) {
-            error!(
-                output_stream_id = self.output_stream_id,
-                "fMP4 playlist add failed"
-            );
-            return;
+            if !self.playlists.add(self.output_stream_id, fmp4) {
+                error!(
+                    output_stream_id = self.output_stream_id,
+                    "fMP4 playlist add failed"
+                );
+                return;
+            }
         }
 
         let mut mesh_publish_succeeded = self.publisher.is_none();
@@ -825,7 +913,10 @@ impl Fmp4Segmenter {
     fn current_init_signature(&self) -> InitSignature {
         InitSignature {
             video: self.config_signature.clone(),
-            audio: audio_config_signature(&self.audio_buf),
+            audio: self
+                .pcm_config
+                .map(AudioConfigSignature::Pcm)
+                .or_else(|| audio_config_signature(&self.audio_buf)),
         }
     }
 
@@ -1147,7 +1238,31 @@ fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSigna
     None
 }
 
-fn audio_access_unit_duration_ms(access_unit: &AccessUnit) -> Option<u64> {
+fn audio_access_unit_duration_ms(
+    access_unit: &AccessUnit,
+    pcm_config: Option<PcmAudioConfig>,
+) -> Option<u64> {
+    if let Some(pcm) = pcm_config {
+        let valid_size = match pcm.sample_kind {
+            PcmSampleKind::Integer => matches!(pcm.sample_size, 16 | 24 | 32),
+            PcmSampleKind::Float => matches!(pcm.sample_size, 32 | 64),
+        };
+        if !valid_size || pcm.sample_rate == 0 || pcm.channel_count == 0 {
+            return None;
+        }
+        let bytes_per_frame =
+            usize::from(pcm.sample_size / 8).checked_mul(usize::from(pcm.channel_count))?;
+        if access_unit.data.is_empty() || !access_unit.data.len().is_multiple_of(bytes_per_frame) {
+            return None;
+        }
+        let frames = u64::try_from(access_unit.data.len() / bytes_per_frame).ok()?;
+        return Some(
+            frames
+                .saturating_mul(1_000)
+                .saturating_add(u64::from(pcm.sample_rate) / 2)
+                / u64::from(pcm.sample_rate),
+        );
+    }
     for offset in [0, 12, 4] {
         let Some(data) = access_unit.data.get(offset..) else {
             continue;
@@ -1175,7 +1290,25 @@ fn audio_access_unit_duration_ms(access_unit: &AccessUnit) -> Option<u64> {
     None
 }
 
-fn audio_codec_name(audio_units: &[AccessUnit]) -> Option<&'static str> {
+fn audio_codec_name(
+    audio_units: &[AccessUnit],
+    pcm_config: Option<PcmAudioConfig>,
+) -> Option<&'static str> {
+    if let Some(pcm) = pcm_config {
+        return Some(
+            match (pcm.sample_kind, pcm.sample_size, pcm.little_endian) {
+                (PcmSampleKind::Integer, 16, true) => "pcm_s16le",
+                (PcmSampleKind::Integer, 24, true) => "pcm_s24le",
+                (PcmSampleKind::Integer, 32, true) => "pcm_s32le",
+                (PcmSampleKind::Float, 32, true) => "pcm_f32le",
+                (PcmSampleKind::Float, 64, true) => "pcm_f64le",
+                (PcmSampleKind::Integer, _, false) => "pcm_integer_be",
+                (PcmSampleKind::Float, _, false) => "pcm_float_be",
+                (PcmSampleKind::Integer, _, true) => "pcm_integer_le",
+                (PcmSampleKind::Float, _, true) => "pcm_float_le",
+            },
+        );
+    }
     audio_units
         .first()
         .map(|unit| match detect_audio(&unit.data) {
@@ -1263,16 +1396,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publisher_receives_packager_duration_and_ordered_wall_clock_stages() {
+    async fn publish_only_skips_local_cache_and_preserves_canonical_part_timing() {
         let (playlists, _, _) = Playlists::new(Options::default());
         let publisher = Arc::new(CapturingPublisher::default());
-        let mut segmenter = Fmp4Segmenter::new_with_publisher(
+        let mut segmenter = Fmp4Segmenter::new_publish_only(
             77,
             0,
-            playlists,
+            Arc::clone(&playlists),
             TimestampInput::Ticks90Khz,
             DEFAULT_MIN_PART_MS,
-            Some(publisher.clone()),
+            publisher.clone(),
         );
         let mut first = h264_access_unit(0, 0);
         first.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
@@ -1285,10 +1418,14 @@ mod tests {
         second.data = second_data.freeze();
         segmenter.push_access_unit(second).await;
 
-        let parts = publisher.parts.lock().unwrap();
-        assert_eq!(parts.len(), 1);
-        assert!(parts[0].duration_ms > 0);
-        assert!(parts[0].published_at_unix_ns >= parts[0].packaged_at_unix_ns);
+        {
+            let parts = publisher.parts.lock().unwrap();
+            assert_eq!(parts.len(), 1);
+            assert!(parts[0].duration_ms > 0);
+            assert!(parts[0].published_at_unix_ns >= parts[0].packaged_at_unix_ns);
+        }
+        assert_eq!(playlists.active(), 0);
+        assert!(playlists.chunk_cache.stream_ids().await.is_empty());
     }
 
     #[test]
