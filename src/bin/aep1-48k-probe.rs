@@ -99,6 +99,9 @@ enum Command {
         tls_ca: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = HlsTransport::H3)]
         transport: HlsTransport,
+        /// Route prefix before the stream id. Edges use /live; contributors use an empty prefix.
+        #[arg(long, default_value = "/live")]
+        path_prefix: String,
         #[arg(long)]
         stream_id: u64,
         #[arg(long)]
@@ -111,6 +114,9 @@ enum Command {
         deadline_ms: u64,
         #[arg(long, default_value_t = 150)]
         render_buffer_ms: u64,
+        /// Ignore media before this offset when qualifying a late join.
+        #[arg(long, default_value_t = 0)]
+        start_offset_ms: u64,
         #[arg(long, default_value_t = 3)]
         tail_seconds: u64,
     },
@@ -199,6 +205,7 @@ struct HlsReceiveReport {
     tls_certificate_verified: bool,
     persistent_connection: bool,
     connection_setup_ms: Option<f64>,
+    path_prefix: String,
     stream_id: u64,
     session_id: u64,
     sample_rate: u32,
@@ -207,12 +214,18 @@ struct HlsReceiveReport {
     expected_parts: u64,
     received_parts: u64,
     missing_parts: u64,
+    first_pts_ms: Option<u64>,
+    last_pts_ms: Option<u64>,
+    non_contiguous_pts: u64,
     deadline_ms: u64,
     deadline_misses: u64,
     render_buffer_ms: u64,
+    start_offset_ms: u64,
     wire_bytes: u64,
     init_has_flac: bool,
     playlist_has_ll_hls_tags: bool,
+    publication_to_cache_latency_ms: Percentiles,
+    cache_to_client_latency_ms: Percentiles,
     availability_latency_ms: Percentiles,
     estimated_render_latency_ms: Percentiles,
 }
@@ -243,12 +256,14 @@ struct HlsReceiveOptions<'a> {
     server_name: &'a str,
     tls_ca: Option<&'a Path>,
     transport: HlsTransport,
+    path_prefix: &'a str,
     stream_id: u64,
     session_id: u64,
     duration_seconds: u64,
     part_ms: u64,
     deadline_ms: u64,
     render_buffer_ms: u64,
+    start_offset_ms: u64,
     tail_seconds: u64,
 }
 
@@ -334,12 +349,14 @@ async fn main() -> Result<()> {
             server_name,
             tls_ca,
             transport,
+            path_prefix,
             stream_id,
             session_id,
             duration_seconds,
             part_ms,
             deadline_ms,
             render_buffer_ms,
+            start_offset_ms,
             tail_seconds,
         } => {
             let report = timeout(
@@ -349,12 +366,14 @@ async fn main() -> Result<()> {
                     server_name: &server_name,
                     tls_ca: tls_ca.as_deref(),
                     transport,
+                    path_prefix: &path_prefix,
                     stream_id,
                     session_id,
                     duration_seconds,
                     part_ms,
                     deadline_ms,
                     render_buffer_ms,
+                    start_offset_ms,
                     tail_seconds,
                 }),
             )
@@ -674,6 +693,7 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
     let stop_ns =
         session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
+    let media_end_ns = session_id.saturating_add(duration_seconds * 1_000_000_000);
     let mut latencies_ns = Vec::new();
     let mut epochs = HashSet::new();
     let mut deadline_misses = 0_u64;
@@ -688,7 +708,16 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
         .await
         {
             Ok(Ok(wire)) => wire,
-            Ok(Err(error)) => return Err(error.into()),
+            Ok(Err(error)) => {
+                // A peer may close an otherwise complete WebTransport session
+                // at its QUIC idle timeout during the bounded receiver tail.
+                // Preserve the completed report so the normal completeness
+                // gates decide whether any media was actually lost.
+                if now_unix_ns()? >= media_end_ns {
+                    break;
+                }
+                return Err(error.into());
+            }
             Err(_) => continue,
         };
         let payload = strip_h3_datagram_context(&wire)?;
@@ -748,28 +777,45 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         server_name,
         tls_ca,
         transport,
+        path_prefix,
         stream_id,
         session_id,
         duration_seconds,
         part_ms,
         deadline_ms,
         render_buffer_ms,
+        start_offset_ms,
         tail_seconds,
     } = options;
     if part_ms == 0 {
         bail!("--part-ms must be positive");
     }
+    if !path_prefix.is_empty() && (!path_prefix.starts_with('/') || path_prefix.ends_with('/')) {
+        bail!("--path-prefix must be empty or start with one slash and have no trailing slash");
+    }
     let stop_ns =
         session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
     let media_duration_ms = duration_seconds.saturating_mul(1_000);
-    let mut after_sequence = None;
+    if start_offset_ms >= media_duration_ms {
+        bail!("--start-offset-ms must be smaller than the media duration");
+    }
+    if !start_offset_ms.is_multiple_of(part_ms) {
+        bail!("--start-offset-ms must align to the configured part duration");
+    }
+    // Edge `from` is inclusive, while direct-origin part IDs start at one.
+    // Begin at the requested PTS without draining the retained prefix.
+    let initial_from_sequence = start_offset_ms.saturating_div(part_ms);
+    let mut after_sequence: Option<u64> = None;
     let mut part_pts = HashSet::new();
     let mut availability_latencies_ns = Vec::new();
+    let mut publication_to_cache_latencies_ns = Vec::new();
+    let mut cache_to_client_latencies_ns = Vec::new();
     let mut render_latencies_ns = Vec::new();
     let mut deadline_misses = 0_u64;
     let mut wire_bytes = 0_u64;
     let mut init_has_flac = false;
     let mut playlist_has_ll_hls_tags = false;
+    let direct_part_route = path_prefix.is_empty();
     let mut h3_client = match transport {
         HlsTransport::H3 => Some(H3HttpsClient::connect(edge, server_name, tls_ca).await?),
         HlsTransport::Http1 => None,
@@ -777,25 +823,49 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     let connection_setup_ms = h3_client.as_ref().map(|client| client.connection_setup_ms);
 
     while now_unix_ns()? < stop_ns {
-        let path = after_sequence.map_or_else(
-            || format!("/live/{stream_id}/tail?from=0"),
-            |sequence| format!("/live/{stream_id}/tail?after={sequence}"),
-        );
+        let requested_sequence = after_sequence
+            .unwrap_or(initial_from_sequence)
+            .saturating_add(1);
+        let path = if direct_part_route {
+            hls_path(
+                path_prefix,
+                stream_id,
+                &format!("p{requested_sequence}.mp4"),
+            )
+        } else {
+            after_sequence.map_or_else(
+                || {
+                    hls_path(
+                        path_prefix,
+                        stream_id,
+                        &format!("tail?from={initial_from_sequence}"),
+                    )
+                },
+                |sequence| hls_path(path_prefix, stream_id, &format!("tail?after={sequence}")),
+            )
+        };
         let response = hls_https_get(&mut h3_client, edge, server_name, tls_ca, &path).await?;
         wire_bytes = wire_bytes.saturating_add(response.wire_bytes as u64);
         match response.status {
             200 => {
-                let sequence = response
-                    .headers
-                    .get("x-sequence")
-                    .context("LL-HLS tail response omitted x-sequence")?
-                    .parse::<u64>()
-                    .context("LL-HLS tail returned an invalid x-sequence")?;
+                let sequence = if direct_part_route {
+                    requested_sequence
+                } else {
+                    response
+                        .headers
+                        .get("x-sequence")
+                        .context("LL-HLS tail response omitted x-sequence")?
+                        .parse::<u64>()
+                        .context("LL-HLS tail returned an invalid x-sequence")?
+                };
                 after_sequence = Some(sequence);
                 let pts_ms = parse_fmp4_tfdt_ms(&response.body)
                     .context("LL-HLS fMP4 part omitted a valid tfdt")?;
                 let arrival_ns = now_unix_ns()?;
-                if arrival_ns >= session_id && pts_ms < media_duration_ms && part_pts.insert(pts_ms)
+                if arrival_ns >= session_id
+                    && pts_ms >= start_offset_ms
+                    && pts_ms < media_duration_ms
+                    && part_pts.insert(pts_ms)
                 {
                     let capture_ns = session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
                     let latency_ns = arrival_ns.saturating_sub(capture_ns);
@@ -803,6 +873,12 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         deadline_misses = deadline_misses.saturating_add(1);
                     }
                     availability_latencies_ns.push(latency_ns);
+                    if let Some((publication_to_cache_ns, cache_to_client_ns)) =
+                        split_cache_latency_ns(&response.headers, capture_ns, arrival_ns)
+                    {
+                        publication_to_cache_latencies_ns.push(publication_to_cache_ns);
+                        cache_to_client_latencies_ns.push(cache_to_client_ns);
+                    }
                     render_latencies_ns.push(
                         latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                     );
@@ -813,7 +889,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         edge,
                         server_name,
                         tls_ca,
-                        &format!("/live/{stream_id}/init.mp4"),
+                        &hls_path(path_prefix, stream_id, "init.mp4"),
                     )
                     .await?;
                     wire_bytes = wire_bytes.saturating_add(init.wire_bytes as u64);
@@ -827,7 +903,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         edge,
                         server_name,
                         tls_ca,
-                        &format!("/live/{stream_id}/stream.m3u8"),
+                        &hls_path(path_prefix, stream_id, "stream.m3u8"),
                     )
                     .await?;
                     wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
@@ -848,20 +924,28 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
     }
 
+    let mut ordered_part_pts = part_pts.iter().copied().collect::<Vec<_>>();
+    ordered_part_pts.sort_unstable();
+    let non_contiguous_pts = ordered_part_pts
+        .windows(2)
+        .filter(|pair| pair[1].saturating_sub(pair[0]) != part_ms)
+        .count() as u64;
+
     // Known-duration audio closes on the access unit that reaches the target,
     // so a duration aligned to the part boundary has no open tail part.
-    let expected_parts = media_duration_ms / part_ms;
+    let expected_parts = media_duration_ms.saturating_sub(start_offset_ms) / part_ms;
     if let Some(client) = h3_client.as_ref() {
         wire_bytes = client.wire_bytes();
     }
     Ok(HlsReceiveReport {
-        schema: "needletail.aep1-48k-probe.hls-receive.v1",
+        schema: "needletail.aep1-48k-probe.hls-receive.v3",
         lane: "ll_hls",
         transport: transport.as_str(),
         tls_protocol: "TLSv1.3",
         tls_certificate_verified: true,
         persistent_connection: matches!(transport, HlsTransport::H3),
         connection_setup_ms,
+        path_prefix: path_prefix.to_owned(),
         stream_id,
         session_id,
         sample_rate: SAMPLE_RATE,
@@ -870,15 +954,41 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         expected_parts,
         received_parts: part_pts.len() as u64,
         missing_parts: expected_parts.saturating_sub(part_pts.len() as u64),
+        first_pts_ms: ordered_part_pts.first().copied(),
+        last_pts_ms: ordered_part_pts.last().copied(),
+        non_contiguous_pts,
         deadline_ms,
         deadline_misses,
         render_buffer_ms,
+        start_offset_ms,
         wire_bytes,
         init_has_flac,
         playlist_has_ll_hls_tags,
+        publication_to_cache_latency_ms: percentiles_ms(publication_to_cache_latencies_ns),
+        cache_to_client_latency_ms: percentiles_ms(cache_to_client_latencies_ns),
         availability_latency_ms: percentiles_ms(availability_latencies_ns),
         estimated_render_latency_ms: percentiles_ms(render_latencies_ns),
     })
+}
+
+fn hls_path(prefix: &str, stream_id: u64, suffix: &str) -> String {
+    format!("{prefix}/{stream_id}/{suffix}")
+}
+
+fn split_cache_latency_ns(
+    headers: &HashMap<String, String>,
+    published_ns: u64,
+    received_ns: u64,
+) -> Option<(u64, u64)> {
+    let available_us = headers
+        .get("x-needletail-cache-available-unix-us")?
+        .parse::<u64>()
+        .ok()?;
+    let available_ns = available_us.checked_mul(1_000)?;
+    if available_ns < published_ns || received_ns < available_ns {
+        return None;
+    }
+    Some((available_ns - published_ns, received_ns - available_ns))
 }
 
 struct SimpleHttpResponse {
@@ -1286,6 +1396,31 @@ mod tests {
         assert_eq!(summary.p95, 4.0);
         assert_eq!(summary.p99, 4.0);
         assert_eq!(summary.max, 4.0);
+    }
+
+    #[test]
+    fn cache_commit_header_splits_publication_and_delivery_latency() {
+        let headers = HashMap::from([(
+            "x-needletail-cache-available-unix-us".to_owned(),
+            "1250000".to_owned(),
+        )]);
+        assert_eq!(
+            split_cache_latency_ns(&headers, 1_000_000_000, 1_275_000_000),
+            Some((250_000_000, 25_000_000))
+        );
+        assert_eq!(
+            split_cache_latency_ns(&headers, 1_300_000_000, 1_400_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn hls_path_supports_edge_and_direct_origin_routes() {
+        assert_eq!(
+            hls_path("/live", 24_001, "tail?from=0"),
+            "/live/24001/tail?from=0"
+        );
+        assert_eq!(hls_path("", 24_001, "stream.m3u8"), "/24001/stream.m3u8");
     }
 
     #[test]
