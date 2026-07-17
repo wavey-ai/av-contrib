@@ -14,7 +14,6 @@ use av_contrib::ingress_authorization::{
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
 use av_contrib::{codec_name, MediaAccessUnitParams};
-use av_hls::{HlsHandler, HlsRouter};
 use av_upload_response::{
     PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
     SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
@@ -36,10 +35,9 @@ use media_object::{
     StageTimestamp,
 };
 use raptorq_datagram_fec::{
-    inspect_multichannel_audio_datagram, source_symbol_count, DatagramFecEncoder,
-    DatagramFecHeader, MediaCodec, MediaFecDecoder, MediaFecEncoder, MediaFrame,
-    MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE, ENCODING_PACKET_HEADER_LEN,
-    HEADER_LEN, MAX_SOURCE_SYMBOLS_PER_BLOCK,
+    source_symbol_count, DatagramFecEncoder, DatagramFecHeader, MediaCodec, MediaFecDecoder,
+    MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE,
+    ENCODING_PACKET_HEADER_LEN, HEADER_LEN, MAX_SOURCE_SYMBOLS_PER_BLOCK,
 };
 use relay_session::{
     encoded_datagram_len as relay_datagram_len, EncodedRaptorQObject, MediaDatagramRole,
@@ -52,14 +50,16 @@ use serde::Serialize;
 use socket2::SockRef;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
-    Arc, Mutex as StdMutex,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, info, trace, warn};
 
@@ -69,14 +69,6 @@ const CONTRIB_STATUS_PATH: &str = "/api/status";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
 const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
-const DAW_RELAY_SUBSCRIBE_MESSAGE: &[u8] = b"WAVEY-DAW-SUBSCRIBE/1";
-const DAW_RELAY_UNSUBSCRIBE_MESSAGE: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/1";
-const DAW_RELAY_SUBSCRIBE_ACK: &[u8] = b"WAVEY-DAW-SUBSCRIBED/1";
-const DAW_RELAY_SUBSCRIBE_V2_PREFIX: &[u8] = b"WAVEY-DAW-SUBSCRIBE/2 ";
-const DAW_RELAY_UNSUBSCRIBE_V2_PREFIX: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/2 ";
-const DAW_RELAY_SUBSCRIBE_ACK_V2_PREFIX: &[u8] = b"WAVEY-DAW-SUBSCRIBED/2 ";
-const DAW_RELAY_TARGET_TTL: Duration = Duration::from_secs(15);
-const DAW_RELAY_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
 const MEDIA_OBJECT_TENANT: &str = "default";
@@ -103,6 +95,62 @@ static AUDIO_EPOCH_MESH_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_MESH_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_MESH_FORWARD_ERRORS: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_INGRESS_TARGETS: AtomicU64 = AtomicU64::new(0);
+static DAW_MEDIA_UDP_SOCKET_INODE: AtomicU64 = AtomicU64::new(0);
+
+fn audio_epoch_ingress_queue_age() -> &'static AtomicDurationHistogram {
+    static HISTOGRAM: OnceLock<AtomicDurationHistogram> = OnceLock::new();
+    HISTOGRAM.get_or_init(AtomicDurationHistogram::default)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_socket_inode(link: &std::path::Path) -> Option<u64> {
+    let link = link.to_str()?;
+    link.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+fn linux_udp_socket_drops_from_table(table: &str, socket_inode: u64) -> Option<u64> {
+    table.lines().skip(1).find_map(|line| {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let inode = fields.get(9)?.parse::<u64>().ok()?;
+        (inode == socket_inode)
+            .then(|| fields.last()?.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn record_daw_media_udp_socket_inode(socket: &UdpSocket) {
+    let fd_link = format!("/proc/self/fd/{}", socket.as_raw_fd());
+    match std::fs::read_link(&fd_link)
+        .ok()
+        .as_deref()
+        .and_then(linux_socket_inode)
+    {
+        Some(inode) => DAW_MEDIA_UDP_SOCKET_INODE.store(inode, Ordering::Relaxed),
+        None => warn!(
+            fd_link,
+            "could not identify DAW media UDP socket for drop metrics"
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn record_daw_media_udp_socket_inode(_socket: &UdpSocket) {}
+
+fn daw_media_udp_socket_drops() -> Option<u64> {
+    let inode = DAW_MEDIA_UDP_SOCKET_INODE.load(Ordering::Relaxed);
+    if inode == 0 {
+        return None;
+    }
+    ["/proc/net/udp", "/proc/net/udp6"]
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .find_map(|table| linux_udp_socket_drops_from_table(&table, inode))
+}
 
 fn should_log_audio_epoch_hls_drop(dropped_total: u64) -> bool {
     dropped_total <= 16 || dropped_total.is_power_of_two() || dropped_total.is_multiple_of(10_000)
@@ -309,7 +357,6 @@ const HLS_BRIDGE_POLL_MS: u64 = 5;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 const CONTRIB_ACTIVITY_LIMIT: usize = 64;
-const CONTRIB_HLS_RESPONSE_LIMIT: usize = 32;
 const CONTRIB_INGEST_SESSION_LIMIT: usize = 48;
 const CONTRIB_MIN_STALE_OUTPUT_MS: u64 = 5_000;
 const MAX_STREAM_FEC_OBJECT_BYTES: usize = 8 * 1024 * 1024;
@@ -480,6 +527,16 @@ struct Args {
 
     #[arg(long)]
     daw_media_bind: Option<SocketAddr>,
+
+    /// Dedicated nearest ingress for exact AEP1 source and repair datagrams.
+    /// Defaults to --mesh-media-fec-target for transition compatibility.
+    #[arg(long, env = "AV_AUDIO_EPOCH_INGRESS_TARGET")]
+    audio_epoch_ingress_target: Option<SocketAddr>,
+
+    /// Optional fixed second AEP1 ingress for origin resilience. Relay and
+    /// edge services own every geographical and viewer fanout beyond it.
+    #[arg(long, env = "AV_AUDIO_EPOCH_REDUNDANT_INGRESS_TARGET")]
+    audio_epoch_redundant_ingress_target: Option<SocketAddr>,
 
     /// Bounded handoff from the live AEP1 datagram path to lossless LL-HLS packaging.
     #[arg(
@@ -1121,7 +1178,7 @@ struct MeshForwarder {
     media_encoder: Arc<Mutex<MediaFecEncoder>>,
     media_socket: Arc<UdpSocket>,
     media_target: SocketAddr,
-    audio_epoch_targets: Arc<Vec<SocketAddr>>,
+    audio_epoch_ingress_targets: Arc<Vec<SocketAddr>>,
     next_media_sequence: Arc<AtomicU64>,
     source_epoch: u64,
     fmp4_initializations: Arc<Mutex<HashMap<u64, (ObjectKey, u64)>>>,
@@ -1130,6 +1187,22 @@ struct MeshForwarder {
     relay: Option<Arc<RelaySessionPublisher>>,
     relay_exclusive: bool,
     telemetry: Arc<IngestTelemetry>,
+}
+
+fn configured_audio_epoch_ingress_targets(args: &Args) -> Result<Vec<SocketAddr>> {
+    let primary = args
+        .audio_epoch_ingress_target
+        .unwrap_or(args.mesh_media_fec_target);
+    let mut targets = vec![primary];
+    if let Some(redundant) = args.audio_epoch_redundant_ingress_target {
+        if redundant == primary {
+            bail!("AEP1 primary and redundant ingress targets must be distinct");
+        }
+        targets.push(redundant);
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    Ok(targets)
 }
 
 #[derive(Debug)]
@@ -1183,15 +1256,9 @@ impl MeshForwarder {
             .media_object_source_epoch
             .store(source_epoch, Ordering::Release);
 
-        let mut audio_epoch_targets = vec![args.mesh_media_fec_target];
-        if let Some(target) = args.relay_primary_target {
-            audio_epoch_targets.push(target);
-        }
-        if let Some(target) = args.relay_secondary_target {
-            audio_epoch_targets.push(target);
-        }
-        audio_epoch_targets.sort_unstable();
-        audio_epoch_targets.dedup();
+        let audio_epoch_ingress_targets = configured_audio_epoch_ingress_targets(args)?;
+        AUDIO_EPOCH_INGRESS_TARGETS
+            .store(audio_epoch_ingress_targets.len() as u64, Ordering::Relaxed);
 
         Ok(Self {
             byte_socket: Arc::new(byte_socket),
@@ -1203,7 +1270,7 @@ impl MeshForwarder {
             media_encoder: Arc::new(Mutex::new(MediaFecEncoder::default())),
             media_socket: Arc::new(media_socket),
             media_target: args.mesh_media_fec_target,
-            audio_epoch_targets: Arc::new(audio_epoch_targets),
+            audio_epoch_ingress_targets: Arc::new(audio_epoch_ingress_targets),
             next_media_sequence: Arc::new(AtomicU64::new(0)),
             source_epoch,
             fmp4_initializations: Arc::new(Mutex::new(HashMap::new())),
@@ -1474,7 +1541,7 @@ impl MeshForwarder {
             return Ok(());
         }
         let mut first_error = None;
-        for target in self.audio_epoch_targets.iter().copied() {
+        for target in self.audio_epoch_ingress_targets.iter().copied() {
             match self.media_socket.send_to(datagram, target).await {
                 Ok(sent) if sent == datagram.len() => {
                     trace!(
@@ -1504,66 +1571,9 @@ impl MeshForwarder {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DawRelayTarget {
-    expires_at: Instant,
-    session_id: Option<u64>,
-}
-
-type DawRelayTargets = Arc<RwLock<HashMap<SocketAddr, DawRelayTarget>>>;
-
-fn parse_daw_relay_session_message(datagram: &[u8], prefix: &[u8]) -> Option<u64> {
-    let value = datagram.strip_prefix(prefix)?;
-    let value = std::str::from_utf8(value).ok()?;
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    value.parse().ok()
-}
-
-fn daw_relay_session_ack(session_id: u64) -> Vec<u8> {
-    let mut ack = Vec::with_capacity(DAW_RELAY_SUBSCRIBE_ACK_V2_PREFIX.len() + 20);
-    ack.extend_from_slice(DAW_RELAY_SUBSCRIBE_ACK_V2_PREFIX);
-    ack.extend_from_slice(session_id.to_string().as_bytes());
-    ack
-}
-
-async fn relay_daw_media_datagram(
-    socket: &UdpSocket,
-    targets: &DawRelayTargets,
-    source: SocketAddr,
-    datagram: &[u8],
-    session_id: Option<u64>,
-) {
-    let now = Instant::now();
-    let relay_targets = {
-        let targets = targets.read().await;
-        if targets.is_empty() {
-            return;
-        }
-        targets
-            .iter()
-            .filter_map(|(address, target)| {
-                (*address != source
-                    && target.expires_at > now
-                    && target
-                        .session_id
-                        .is_none_or(|requested| Some(requested) == session_id))
-                .then_some(*address)
-            })
-            .collect::<Vec<_>>()
-    };
-
-    for target in relay_targets {
-        if let Err(error) = socket.send_to(datagram, target).await {
-            warn!(
-                source = %source,
-                target = %target,
-                error = %error,
-                "failed to relay DAW media datagram"
-            );
-        }
-    }
+struct QueuedAudioEpochIngressDatagram {
+    bytes: Bytes,
+    enqueued_at: Instant,
 }
 
 fn handoff_audio_epoch_hls_datagram(
@@ -1616,7 +1626,7 @@ fn handoff_audio_epoch_hls_datagram(
 }
 
 fn handoff_audio_epoch_mesh_datagram(
-    tx: Option<&mpsc::Sender<Bytes>>,
+    tx: Option<&mpsc::Sender<QueuedAudioEpochIngressDatagram>>,
     peer: SocketAddr,
     datagram: &[u8],
 ) {
@@ -1639,7 +1649,10 @@ fn handoff_audio_epoch_mesh_datagram(
         return;
     }
 
-    if let Err(error) = tx.try_send(Bytes::copy_from_slice(datagram)) {
+    if let Err(error) = tx.try_send(QueuedAudioEpochIngressDatagram {
+        bytes: Bytes::copy_from_slice(datagram),
+        enqueued_at: Instant::now(),
+    }) {
         let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
         AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
         AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
@@ -1663,7 +1676,7 @@ fn handoff_audio_epoch_mesh_datagram(
 
 async fn run_audio_epoch_mesh_forward_worker(
     forwarder: Arc<MeshForwarder>,
-    mut input: mpsc::Receiver<Bytes>,
+    mut input: mpsc::Receiver<QueuedAudioEpochIngressDatagram>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     loop {
@@ -1671,7 +1684,8 @@ async fn run_audio_epoch_mesh_forward_worker(
             _ = shutdown_rx.changed() => break,
             datagram = input.recv() => {
                 let Some(datagram) = datagram else { break; };
-                if let Err(error) = forwarder.forward_audio_epoch_datagram(&datagram).await {
+                audio_epoch_ingress_queue_age().record(datagram.enqueued_at.elapsed());
+                if let Err(error) = forwarder.forward_audio_epoch_datagram(&datagram.bytes).await {
                     AUDIO_EPOCH_MESH_FORWARD_ERRORS.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         error = %error,
@@ -1685,7 +1699,11 @@ async fn run_audio_epoch_mesh_forward_worker(
     }
 
     while let Ok(datagram) = input.try_recv() {
-        if let Err(error) = forwarder.forward_audio_epoch_datagram(&datagram).await {
+        audio_epoch_ingress_queue_age().record(datagram.enqueued_at.elapsed());
+        if let Err(error) = forwarder
+            .forward_audio_epoch_datagram(&datagram.bytes)
+            .await
+        {
             AUDIO_EPOCH_MESH_FORWARD_ERRORS.fetch_add(1, Ordering::Relaxed);
             warn!(
                 error = %error,
@@ -1702,29 +1720,19 @@ async fn run_audio_epoch_mesh_forward_worker(
 async fn run_daw_media_udp_ingest(
     socket: UdpSocket,
     forwarder: Arc<MeshForwarder>,
-    targets: DawRelayTargets,
     audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
-    audio_epoch_mesh_tx: Option<mpsc::Sender<Bytes>>,
+    audio_epoch_mesh_tx: Option<mpsc::Sender<QueuedAudioEpochIngressDatagram>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<()> {
     let bind = socket.local_addr()?;
     let mut decoders = HashMap::<SocketAddr, MediaFecDecoder>::new();
-    let mut audio_block_sessions = HashMap::<(SocketAddr, u32), (u64, Instant)>::new();
     let mut buf = vec![0u8; 65_536];
-    let mut cleanup = interval(DAW_RELAY_CLEANUP_INTERVAL);
-    cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 info!(bind = %bind, "DAW media UDP relay shutting down");
                 return Ok(());
-            }
-            _ = cleanup.tick() => {
-                let now = Instant::now();
-                let mut targets = targets.write().await;
-                targets.retain(|_, target| target.expires_at > now);
-                audio_block_sessions.retain(|_, (_, expires_at)| *expires_at > now);
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
@@ -1733,97 +1741,11 @@ async fn run_daw_media_udp_ingest(
                 }
                 let datagram = &buf[..len];
 
-                if datagram == DAW_RELAY_SUBSCRIBE_MESSAGE {
-                    let expires_at = Instant::now() + DAW_RELAY_TARGET_TTL;
-                    targets.write().await.insert(peer, DawRelayTarget {
-                        expires_at,
-                        session_id: None,
-                    });
-                    if let Err(error) = socket.send_to(DAW_RELAY_SUBSCRIBE_ACK, peer).await {
-                        warn!(peer = %peer, error = %error, "failed to acknowledge DAW relay subscription");
-                    }
-                    trace!(peer = %peer, "registered DAW relay subscriber");
-                    continue;
-                }
-
-                if let Some(session_id) = parse_daw_relay_session_message(
-                    datagram,
-                    DAW_RELAY_SUBSCRIBE_V2_PREFIX,
-                ) {
-                    let expires_at = Instant::now() + DAW_RELAY_TARGET_TTL;
-                    targets.write().await.insert(peer, DawRelayTarget {
-                        expires_at,
-                        session_id: Some(session_id),
-                    });
-                    let ack = daw_relay_session_ack(session_id);
-                    if let Err(error) = socket.send_to(&ack, peer).await {
-                        warn!(peer = %peer, session_id, error = %error, "failed to acknowledge session-scoped DAW relay subscription");
-                    }
-                    trace!(peer = %peer, session_id, "registered session-scoped DAW relay subscriber");
-                    continue;
-                }
-                if datagram.starts_with(DAW_RELAY_SUBSCRIBE_V2_PREFIX) {
-                    warn!(peer = %peer, "ignored malformed session-scoped DAW relay subscription");
-                    continue;
-                }
-
-                if datagram == DAW_RELAY_UNSUBSCRIBE_MESSAGE {
-                    targets.write().await.remove(&peer);
-                    decoders.remove(&peer);
-                    trace!(peer = %peer, "removed DAW relay subscriber");
-                    continue;
-                }
-
-                if let Some(session_id) = parse_daw_relay_session_message(
-                    datagram,
-                    DAW_RELAY_UNSUBSCRIBE_V2_PREFIX,
-                ) {
-                    let mut targets = targets.write().await;
-                    if targets.get(&peer).is_some_and(|target| target.session_id == Some(session_id)) {
-                        targets.remove(&peer);
-                    }
-                    decoders.remove(&peer);
-                    trace!(peer = %peer, session_id, "removed session-scoped DAW relay subscriber");
-                    continue;
-                }
-                if datagram.starts_with(DAW_RELAY_UNSUBSCRIBE_V2_PREFIX) {
-                    warn!(peer = %peer, "ignored malformed session-scoped DAW relay unsubscription");
-                    continue;
-                }
-
-                if datagram == DAW_RELAY_SUBSCRIBE_ACK {
-                    continue;
-                }
-                if datagram.starts_with(DAW_RELAY_SUBSCRIBE_ACK_V2_PREFIX) {
-                    continue;
-                }
-
                 if is_multichannel_audio_transport_datagram(datagram) {
-                    if !targets.read().await.is_empty() {
-                        let identity = inspect_multichannel_audio_datagram(
-                            &datagram[MULTICHANNEL_AUDIO_TRANSPORT_MAGIC.len()..],
-                        );
-                        let session_id = identity.ok().and_then(|identity| {
-                            if let Some(session_id) = identity.session_id {
-                                audio_block_sessions.insert(
-                                    (peer, identity.block_id),
-                                    (session_id, Instant::now() + DAW_RELAY_TARGET_TTL),
-                                );
-                                Some(session_id)
-                            } else {
-                                audio_block_sessions
-                                    .get(&(peer, identity.block_id))
-                                    .map(|(session_id, _)| *session_id)
-                            }
-                        });
-                        relay_daw_media_datagram(&socket, &targets, peer, datagram, session_id).await;
-                    }
                     handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
                     handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx.as_ref(), peer, datagram);
                     continue;
                 }
-
-                relay_daw_media_datagram(&socket, &targets, peer, datagram, None).await;
 
                 let decoded = {
                     let decoder = decoders.entry(peer).or_default();
@@ -1874,6 +1796,7 @@ async fn bind_daw_media_udp_socket(bind: SocketAddr) -> Result<UdpSocket> {
         .await
         .with_context(|| format!("failed to bind DAW media UDP relay on {bind}"))?;
     let socket_ref = SockRef::from(&socket);
+    record_daw_media_udp_socket_inode(&socket);
     socket_ref
         .set_recv_buffer_size(DAW_MEDIA_RECEIVE_BUFFER_BYTES)
         .context("failed to configure DAW media UDP receive buffer")?;
@@ -2686,11 +2609,6 @@ struct IngestTelemetry {
     fmp4_video_access_units: AtomicU64,
     fmp4_audio_parts: AtomicU64,
     fmp4_audio_access_units: AtomicU64,
-    hls_responses_total: AtomicU64,
-    hls_response_errors: AtomicU64,
-    hls_response_not_found: AtomicU64,
-    hls_last_response_unix_ms: AtomicU64,
-    recent_hls_responses: StdMutex<VecDeque<ContribHlsResponse>>,
     ingest_sessions_started: AtomicU64,
     ingest_sessions_ended: AtomicU64,
     stream_runtime: StdMutex<HashMap<u64, ContribStreamRuntimeRecord>>,
@@ -3237,56 +3155,6 @@ impl IngestTelemetry {
         });
     }
 
-    fn record_hls_response(
-        &self,
-        method: &Method,
-        path: &str,
-        query: Option<&str>,
-        response: &HandlerResponse,
-    ) {
-        let unix_ms = now_unix_ms();
-        let status = response.status.as_u16();
-        let bytes = response
-            .body
-            .as_ref()
-            .map(|body| body.len() as u64)
-            .unwrap_or(0);
-        let responses = self.hls_responses_total.fetch_add(1, Ordering::Relaxed) + 1;
-        if response.status.is_client_error() || response.status.is_server_error() {
-            self.hls_response_errors.fetch_add(1, Ordering::Relaxed);
-            self.push_activity(ContribActivity {
-                level: if status >= 500 { "error" } else { "warn" },
-                code: "hls_response_error",
-                message: format!("HLS request {method} {path} returned HTTP {status}."),
-                stream_id_text: None,
-                bytes: Some(bytes),
-                datagrams: None,
-                sequence: Some(responses),
-                seen_unix_ms: unix_ms,
-            });
-        }
-        if response.status == StatusCode::NOT_FOUND {
-            self.hls_response_not_found.fetch_add(1, Ordering::Relaxed);
-        }
-        self.hls_last_response_unix_ms
-            .store(unix_ms, Ordering::Relaxed);
-
-        if let Ok(mut recent) = self.recent_hls_responses.lock() {
-            recent.push_front(ContribHlsResponse {
-                unix_ms,
-                method: method.as_str().into(),
-                path: path.into(),
-                query: query.map(ToOwned::to_owned),
-                status,
-                bytes,
-                content_type: response.content_type.clone(),
-            });
-            while recent.len() > CONTRIB_HLS_RESPONSE_LIMIT {
-                recent.pop_back();
-            }
-        }
-    }
-
     fn ensure_ingest_session(
         &self,
         protocol: &'static str,
@@ -3603,20 +3471,6 @@ impl IngestTelemetry {
                 audio_codec: (self.fmp4_audio_parts.load(Ordering::Relaxed) > 0).then_some("aac"),
                 audio_parts: self.fmp4_audio_parts.load(Ordering::Relaxed),
                 audio_access_units: self.fmp4_audio_access_units.load(Ordering::Relaxed),
-            },
-            hls: HlsRuntimeSnapshot {
-                responses_total: self.hls_responses_total.load(Ordering::Relaxed),
-                response_errors: self.hls_response_errors.load(Ordering::Relaxed),
-                response_not_found: self.hls_response_not_found.load(Ordering::Relaxed),
-                last_response_unix_ms: nonzero_unix_ms(
-                    self.hls_last_response_unix_ms.load(Ordering::Relaxed),
-                ),
-                last_response_age_ms: age_from_atomic_ms(now_ms, &self.hls_last_response_unix_ms),
-                recent_responses: self
-                    .recent_hls_responses
-                    .lock()
-                    .map(|responses| responses.iter().cloned().collect())
-                    .unwrap_or_default(),
             },
             ingest_sessions: IngestSessionsRuntimeSnapshot {
                 active: active_ingest_sessions,
@@ -4071,6 +3925,7 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
     let runtime = &snapshot.runtime;
     let mut output = String::with_capacity(8 * 1024);
     let audio_hls_worker = audio_epoch_hls_worker_stats();
+    let daw_media_socket_drops = daw_media_udp_socket_drops();
 
     for (name, help, metric_type, value) in [
         (
@@ -4140,6 +3995,60 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             AUDIO_EPOCH_MESH_FORWARD_ERRORS.load(Ordering::Relaxed),
         ),
         (
+            "av_contrib_audio_epoch_ingress_targets",
+            "Fixed AEP1 origin publication relationships; one normally, at most two with explicit redundancy.",
+            "gauge",
+            AUDIO_EPOCH_INGRESS_TARGETS.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_ingress_queue_capacity",
+            "Configured capacity of the asynchronous AEP1 origin-to-ingress publication handoff.",
+            "gauge",
+            AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_ingress_queue_enqueued_total",
+            "AEP1 datagrams accepted for origin-to-ingress publication.",
+            "counter",
+            AUDIO_EPOCH_MESH_QUEUE_ENQUEUED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_ingress_queue_dropped_total",
+            "AEP1 datagrams rejected by a full or closed origin-to-ingress publication handoff.",
+            "counter",
+            AUDIO_EPOCH_MESH_QUEUE_DROPPED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_ingress_queue_depth",
+            "Current AEP1 origin-to-ingress publication queue depth.",
+            "gauge",
+            AUDIO_EPOCH_MESH_QUEUE_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_ingress_queue_max_depth",
+            "Maximum AEP1 origin-to-ingress publication queue depth since process start.",
+            "gauge",
+            AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_ingress_errors_total",
+            "AEP1 origin-to-ingress publication errors.",
+            "counter",
+            AUDIO_EPOCH_MESH_FORWARD_ERRORS.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_daw_media_udp_socket_drops_total",
+            "Datagrams dropped at the Linux kernel receive queue for the contributor media socket.",
+            "counter",
+            daw_media_socket_drops.unwrap_or(0),
+        ),
+        (
+            "av_contrib_daw_media_udp_socket_drop_observation_supported",
+            "Whether per-socket Linux kernel receive-drop observation is available.",
+            "gauge",
+            u64::from(daw_media_socket_drops.is_some()),
+        ),
+        (
             "av_contrib_audio_epoch_hls_worker_datagrams_total",
             "AEP1 datagrams processed by the asynchronous lossless LL-HLS worker.",
             "counter",
@@ -4167,6 +4076,35 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
         push_prometheus_metric_header(&mut output, name, help, metric_type);
         output.push_str(&format!("{name} {value}\n"));
     }
+
+    let ingress_queue_age = audio_epoch_ingress_queue_age().snapshot();
+    push_prometheus_metric_header(
+        &mut output,
+        "av_contrib_audio_epoch_ingress_queue_age_seconds",
+        "Time an AEP1 datagram waits before origin-to-ingress publication begins.",
+        "histogram",
+    );
+    for (upper_bound_us, count) in DURATION_HISTOGRAM_BUCKETS_US
+        .iter()
+        .zip(ingress_queue_age.buckets.iter())
+    {
+        output.push_str(&format!(
+            "av_contrib_audio_epoch_ingress_queue_age_seconds_bucket{{le=\"{}\"}} {count}\n",
+            *upper_bound_us as f64 / 1_000_000.0
+        ));
+    }
+    output.push_str(&format!(
+        "av_contrib_audio_epoch_ingress_queue_age_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        ingress_queue_age.count
+    ));
+    output.push_str(&format!(
+        "av_contrib_audio_epoch_ingress_queue_age_seconds_sum {}\n",
+        ingress_queue_age.sum_us as f64 / 1_000_000.0
+    ));
+    output.push_str(&format!(
+        "av_contrib_audio_epoch_ingress_queue_age_seconds_count {}\n",
+        ingress_queue_age.count
+    ));
 
     push_prometheus_metric_header(
         &mut output,
@@ -4493,21 +4431,6 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_fmp4_publish_errors_total",
             "CMAF/fMP4 publish failures.",
             runtime.fmp4.publish_errors,
-        ),
-        (
-            "av_contrib_hls_responses_total",
-            "Contributor LL-HLS responses.",
-            runtime.hls.responses_total,
-        ),
-        (
-            "av_contrib_hls_response_errors_total",
-            "Contributor LL-HLS non-success responses.",
-            runtime.hls.response_errors,
-        ),
-        (
-            "av_contrib_hls_not_found_total",
-            "Contributor LL-HLS not-found responses.",
-            runtime.hls.response_not_found,
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
@@ -5156,35 +5079,6 @@ fn derive_contrib_alerts(
         });
     }
 
-    if runtime.hls.response_errors > 0 {
-        let latest_error = runtime
-            .hls
-            .recent_responses
-            .iter()
-            .find(|response| response.status >= 400);
-        let (status, path, last_seen) = latest_error
-            .map(|response| {
-                (
-                    response.status,
-                    response.path.clone(),
-                    Some(response.unix_ms),
-                )
-            })
-            .unwrap_or((0, "unknown HLS path".to_owned(), Some(now)));
-        alerts.push(ContribAlert {
-            level: if status >= 500 { "error" } else { "warn" },
-            code: "hls_response_errors",
-            message: format!(
-                "Contributor LL-HLS has returned {} non-success response(s); latest was HTTP {status} for {path}.",
-                runtime.hls.response_errors
-            ),
-            count: runtime.hls.response_errors,
-            last_seen_unix_ms: last_seen,
-            stream_id_text: Some(advertised_hls_stream_id.to_owned()),
-            protocol: None,
-        });
-    }
-
     let mpeg_ts_errors = runtime
         .mpeg_ts
         .continuity_errors
@@ -5221,7 +5115,6 @@ struct IngestRuntimeSnapshot {
     mpeg_ts: MpegTsRuntimeSnapshot,
     rtmp: RtmpRuntimeSnapshot,
     fmp4: Fmp4RuntimeSnapshot,
-    hls: HlsRuntimeSnapshot,
     ingest_sessions: IngestSessionsRuntimeSnapshot,
     streams: Vec<ContribStreamRuntimeSnapshot>,
     protocols: Vec<ProtocolRuntimeSnapshot>,
@@ -5369,29 +5262,6 @@ struct Fmp4RuntimeSnapshot {
     audio_codec: Option<&'static str>,
     audio_parts: u64,
     audio_access_units: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct HlsRuntimeSnapshot {
-    responses_total: u64,
-    response_errors: u64,
-    response_not_found: u64,
-    last_response_unix_ms: Option<u64>,
-    last_response_age_ms: Option<u64>,
-    recent_responses: Vec<ContribHlsResponse>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ContribHlsResponse {
-    unix_ms: u64,
-    method: String,
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    query: Option<String>,
-    status: u16,
-    bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -5723,7 +5593,6 @@ struct ContribActivity {
 struct ContribRouter {
     forwarder: Arc<MeshForwarder>,
     default_stream_id: u64,
-    hls_router: Arc<HlsRouter>,
     status: Arc<ContribStatusConfig>,
     publish_ingress_gate: Option<Arc<PublishIngressGate>>,
 }
@@ -5732,29 +5601,15 @@ impl ContribRouter {
     fn new(
         forwarder: Arc<MeshForwarder>,
         default_stream_id: u64,
-        hls_router: Arc<HlsRouter>,
         status: Arc<ContribStatusConfig>,
         publish_ingress_gate: Option<Arc<PublishIngressGate>>,
     ) -> Self {
         Self {
             forwarder,
             default_stream_id,
-            hls_router,
             status,
             publish_ingress_gate,
         }
-    }
-
-    async fn route_hls(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
-        let method = req.method().clone();
-        let path = req.uri().path().to_owned();
-        let query = req.uri().query().map(ToOwned::to_owned);
-        let response = self.hls_router.route(req).await?;
-        log_hls_response(&method, &path, query.as_deref(), response.status);
-        self.status
-            .telemetry
-            .record_hls_response(&method, &path, query.as_deref(), &response);
-        Ok(response)
     }
 }
 
@@ -5795,7 +5650,7 @@ impl Router for ContribRouter {
             "/" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(
-                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /<stream_id>/stream.m3u8 serves local LL-HLS\nGET /api/status returns service status for Needletail Mission Control\nGET /api/status/events streams service status as SSE\nGET /metrics returns Prometheus metrics\nGET /up checks health\n",
+                    b"av-contrib\n\nPOST /ingest?stream_id=... publishes arbitrary stream bytes\nPOST /media/access-unit forwards detected media access units\nGET /api/status returns service status for Needletail Mission Control\nGET /api/status/events streams service status as SSE\nGET /metrics returns Prometheus metrics\nGET /up checks health\n",
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
@@ -5836,7 +5691,13 @@ impl Router for ContribRouter {
                 )),
                 Some("text/plain"),
             )),
-            _ => self.route_hls(req).await,
+            _ => Ok(response(
+                StatusCode::NOT_FOUND,
+                Some(Bytes::from_static(
+                    b"viewer delivery is served by a relay or playback edge\n",
+                )),
+                Some("text/plain; charset=utf-8"),
+            )),
         }
     }
 
@@ -6099,7 +5960,13 @@ impl Router for ContribRouter {
             ));
         }
 
-        self.route_hls(req).await
+        Ok(response(
+            StatusCode::NOT_FOUND,
+            Some(Bytes::from_static(
+                b"viewer delivery is served by a relay or playback edge\n",
+            )),
+            Some("text/plain; charset=utf-8"),
+        ))
     }
 
     fn has_body_handler(&self, path: &str) -> bool {
@@ -6107,7 +5974,7 @@ impl Router for ContribRouter {
     }
 
     fn is_streaming(&self, path: &str) -> bool {
-        path == CONTRIB_STATUS_EVENTS_PATH || self.hls_router.is_streaming(path)
+        path == CONTRIB_STATUS_EVENTS_PATH
     }
 
     async fn route_stream(
@@ -6132,15 +5999,22 @@ impl Router for ContribRouter {
             }
         }
 
-        self.hls_router.route_stream(req, stream_writer).await
+        stream_writer
+            .send_response(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(())
+                    .map_err(ServerError::Http)?,
+            )
+            .await
     }
 
     fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
-        self.hls_router.webtransport_handler()
+        None
     }
 
-    fn websocket_handler(&self, path: &str) -> Option<&dyn WebSocketHandler> {
-        self.hls_router.websocket_handler(path)
+    fn websocket_handler(&self, _path: &str) -> Option<&dyn WebSocketHandler> {
+        None
     }
 }
 
@@ -6165,9 +6039,7 @@ async fn main() -> Result<()> {
         telemetry: telemetry.clone(),
         canonical_sequences: Mutex::new(HashMap::new()),
     });
-    let (playlists, chunk_cache, m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
-    let hls_router =
-        Arc::new(HlsRouter::new().add_handler(Box::new(HlsHandler::new(chunk_cache, m3u8_cache))));
+    let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
     let status = Arc::new(ContribStatusConfig::from_args(&args, telemetry.clone()));
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let rist_shutdown = if let Some(bind) = args.rist_bind {
@@ -6239,7 +6111,6 @@ async fn main() -> Result<()> {
         if let Some(bind) = args.daw_media_bind {
             let socket = bind_daw_media_udp_socket(bind).await?;
             let local_addr = socket.local_addr()?;
-            let targets = Arc::new(RwLock::new(HashMap::new()));
             let (audio_epoch_hls_tx, audio_epoch_hls_rx) =
                 audio_epoch_hls_channel(args.daw_hls_queue_capacity);
             let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) =
@@ -6265,17 +6136,17 @@ async fn main() -> Result<()> {
             ));
             info!(
                 bind = %local_addr,
-                mesh_media_fec_target = %args.mesh_media_fec_target,
+                audio_epoch_ingress_target = %forwarder.audio_epoch_ingress_targets[0],
+                audio_epoch_ingress_targets = AUDIO_EPOCH_INGRESS_TARGETS.load(Ordering::Relaxed),
                 hls_base_stream_id = args.stream_id,
                 hls_queue_capacity = args.daw_hls_queue_capacity,
                 mesh_queue_capacity = AUDIO_EPOCH_MESH_QUEUE_CAPACITY,
-                "DAW media UDP relay listening"
+                "DAW media contributor ingest listening"
             );
             (
                 Some(tokio::spawn(run_daw_media_udp_ingest(
                     socket,
                     forwarder.clone(),
-                    targets,
                     Some(audio_epoch_hls_tx),
                     Some(audio_epoch_mesh_tx),
                     shutdown_rx.clone(),
@@ -6289,7 +6160,6 @@ async fn main() -> Result<()> {
     let router = Box::new(ContribRouter::new(
         forwarder.clone(),
         args.stream_id,
-        hls_router,
         status,
         publish_ingress_gate,
     ));
@@ -6311,11 +6181,7 @@ async fn main() -> Result<()> {
         "av-contrib ready"
     );
     println!("contrib: https://127.0.0.1:{}", args.http_port);
-    let advertised_hls_stream_id = advertised_hls_stream_id(&args);
-    println!(
-        "ll-hls:  https://127.0.0.1:{}/{}/stream.m3u8",
-        args.http_port, advertised_hls_stream_id
-    );
+    println!("ll-hls:  published to the configured mesh ingress");
     println!("bytes:   udp+stream-fec://{}", args.mesh_fec_target);
     println!("media:   udp+media-fec://{}", args.mesh_media_fec_target);
     if let Some(target) = args.relay_primary_target {
@@ -6606,34 +6472,6 @@ fn validate_enforced_ingress_adapters(
         );
     }
     Ok(())
-}
-
-fn log_hls_response(method: &Method, path: &str, query: Option<&str>, status: StatusCode) {
-    if status == StatusCode::NOT_FOUND {
-        debug!(
-            %method,
-            %path,
-            query = query.unwrap_or(""),
-            status = status.as_u16(),
-            "HLS request not found"
-        );
-    } else if status.is_success() {
-        debug!(
-            %method,
-            %path,
-            query = query.unwrap_or(""),
-            status = status.as_u16(),
-            "HLS request completed"
-        );
-    } else {
-        debug!(
-            %method,
-            %path,
-            query = query.unwrap_or(""),
-            status = status.as_u16(),
-            "HLS request completed with non-success status"
-        );
-    }
 }
 
 fn content_length_exceeds(req: &Request<()>, maximum: usize) -> bool {
@@ -6976,25 +6814,6 @@ mod tests {
             9_007_199_254_741_993
         );
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
-    }
-
-    #[test]
-    fn daw_relay_v2_subscription_is_session_scoped() {
-        assert_eq!(
-            parse_daw_relay_session_message(
-                b"WAVEY-DAW-SUBSCRIBE/2 18446744073709551615",
-                DAW_RELAY_SUBSCRIBE_V2_PREFIX,
-            ),
-            Some(u64::MAX)
-        );
-        assert_eq!(
-            parse_daw_relay_session_message(
-                b"WAVEY-DAW-SUBSCRIBE/2 all",
-                DAW_RELAY_SUBSCRIBE_V2_PREFIX,
-            ),
-            None
-        );
-        assert_eq!(daw_relay_session_ack(42), b"WAVEY-DAW-SUBSCRIBED/2 42");
     }
 
     #[test]
@@ -7923,6 +7742,8 @@ mod tests {
             relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: None,
+            audio_epoch_ingress_target: None,
+            audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             stream_id: 1,
             rist_stream_id: 1,
@@ -7978,6 +7799,8 @@ mod tests {
             relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: None,
+            audio_epoch_ingress_target: None,
+            audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             stream_id: 9_007_199_254_741_993,
             rist_stream_id: 9_007_199_254_741_994,
@@ -8203,7 +8026,51 @@ mod tests {
         assert!(metrics.contains("av_contrib_relay_session_datagrams_total{role=\"repair\"} 1\n"));
         assert!(metrics
             .contains("av_contrib_relay_session_datagram_bytes_total{role=\"source\"} 1200\n"));
+        assert!(metrics.contains("# TYPE av_contrib_audio_epoch_ingress_targets gauge\n"));
+        assert!(
+            metrics.contains("# TYPE av_contrib_audio_epoch_ingress_queue_age_seconds histogram\n")
+        );
         assert_eq!(prometheus_label_value("node\\\"\n"), "node\\\\\\\"\\n");
+    }
+
+    #[test]
+    fn audio_epoch_origin_publication_defaults_to_one_ingress() {
+        let mut args = contrib_status_args();
+        args.mesh_media_fec_target = "127.0.0.1:12001".parse().unwrap();
+        args.relay_primary_target = Some("127.0.0.1:12001".parse().unwrap());
+        args.relay_secondary_target = Some("127.0.0.1:12002".parse().unwrap());
+
+        assert_eq!(
+            configured_audio_epoch_ingress_targets(&args).unwrap(),
+            vec!["127.0.0.1:12001".parse().unwrap()]
+        );
+
+        args.audio_epoch_redundant_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
+        assert_eq!(
+            configured_audio_epoch_ingress_targets(&args).unwrap(),
+            vec![
+                "127.0.0.1:12001".parse().unwrap(),
+                "127.0.0.1:12002".parse().unwrap()
+            ]
+        );
+
+        args.audio_epoch_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
+        assert!(configured_audio_epoch_ingress_targets(&args).is_err());
+    }
+
+    #[test]
+    fn parses_linux_udp_socket_drop_counter() {
+        let link = std::path::Path::new("socket:[12345]");
+        assert_eq!(linux_socket_inode(link), Some(12_345));
+        assert_eq!(
+            linux_socket_inode(std::path::Path::new("pipe:[12345]")),
+            None
+        );
+
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+          46: 0100007F:69DC 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 12345 2 0000000000000000 17\n";
+        assert_eq!(linux_udp_socket_drops_from_table(table, 12_345), Some(17));
+        assert_eq!(linux_udp_socket_drops_from_table(table, 54_321), None);
     }
 
     #[tokio::test]
@@ -8219,7 +8086,6 @@ mod tests {
         let router = ContribRouter::new(
             forwarder,
             args.stream_id,
-            Arc::new(HlsRouter::new()),
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
             None,
         );
@@ -8238,6 +8104,34 @@ mod tests {
         );
         let metrics = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
         assert!(metrics.contains("av_contrib_raw_http_bytes_total 1024\n"));
+    }
+
+    #[tokio::test]
+    async fn contributor_http_does_not_serve_viewer_media() {
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(
+            MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap(),
+        );
+        let router = ContribRouter::new(
+            forwarder,
+            args.stream_id,
+            Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            None,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/1/stream.m3u8")
+            .body(())
+            .unwrap();
+
+        let response = router.route(req).await.unwrap();
+
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert!(router.webtransport_handler().is_none());
+        assert!(router.websocket_handler("/live/1").is_none());
     }
 
     #[test]
@@ -8285,41 +8179,6 @@ mod tests {
             .iter()
             .any(|alert| alert.code == "fmp4_output_stale"
                 && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
-    }
-
-    #[test]
-    fn contrib_status_reports_hls_response_errors() {
-        let args = contrib_status_args();
-        let stream_id_text = args.stream_id.to_string();
-        let telemetry = Arc::new(IngestTelemetry::default());
-        let status_config = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry));
-        let hls_response = response(StatusCode::NOT_FOUND, None, None);
-
-        telemetry.record_hls_response(
-            &Method::GET,
-            "/1/stream.m3u8",
-            Some("_HLS_msn=12&_HLS_part=1"),
-            &hls_response,
-        );
-        let snapshot = status_config.snapshot();
-
-        assert_eq!(snapshot.runtime.hls.responses_total, 1);
-        assert_eq!(snapshot.runtime.hls.response_errors, 1);
-        assert_eq!(snapshot.runtime.hls.response_not_found, 1);
-        assert_eq!(
-            snapshot.runtime.hls.recent_responses[0].path,
-            "/1/stream.m3u8"
-        );
-        assert_eq!(snapshot.runtime.hls.recent_responses[0].status, 404);
-        assert!(snapshot
-            .alerts
-            .iter()
-            .any(|alert| alert.code == "hls_response_errors"
-                && alert.stream_id_text.as_deref() == Some(stream_id_text.as_str())));
-        assert!(snapshot
-            .activity
-            .iter()
-            .any(|activity| activity.code == "hls_response_error"));
     }
 
     #[test]
@@ -8510,6 +8369,8 @@ mod tests {
             relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: None,
+            audio_epoch_ingress_target: None,
+            audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             stream_id: 1,
             rist_stream_id: 0,
@@ -8663,7 +8524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daw_media_udp_ingest_relays_and_forwards_decoded_media_to_mesh() {
+    async fn daw_media_udp_ingest_publishes_decoded_media_to_ingress() {
         use raptorq_datagram_fec::{MediaCodec, MediaFecDecoder, MediaFecEncoder, MediaFrame};
 
         let mesh_media_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -8702,6 +8563,8 @@ mod tests {
             relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: Some(daw_bind),
+            audio_epoch_ingress_target: None,
+            audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             stream_id: 1,
             rist_stream_id: 0,
@@ -8723,7 +8586,6 @@ mod tests {
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
-        let targets = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) = mpsc::channel(256);
         let mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
@@ -8734,24 +8596,10 @@ mod tests {
         let task = tokio::spawn(run_daw_media_udp_ingest(
             daw_socket,
             forwarder,
-            targets,
             None,
             Some(audio_epoch_mesh_tx),
             shutdown_rx,
         ));
-
-        let subscriber = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        subscriber
-            .send_to(DAW_RELAY_SUBSCRIBE_MESSAGE, daw_bind)
-            .await
-            .unwrap();
-        let mut relay_buf = vec![0u8; 65_536];
-        let (ack_len, _peer) =
-            timeout(Duration::from_secs(3), subscriber.recv_from(&mut relay_buf))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(&relay_buf[..ack_len], DAW_RELAY_SUBSCRIBE_ACK);
 
         let metadata = MediaFrameMetadata::new(9, 4, 100, MediaCodec::Opus);
         let mut source_encoder = MediaFecEncoder::default();
@@ -8761,26 +8609,10 @@ mod tests {
                 payload: b"opus-soundkit-frame",
             })
             .unwrap();
-        let first_source_datagram = encoded.datagrams[0].clone();
-
         let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for datagram in &encoded.datagrams {
             source.send_to(datagram, daw_bind).await.unwrap();
         }
-
-        let relayed = timeout(Duration::from_secs(3), async {
-            loop {
-                let (len, _peer) = subscriber.recv_from(&mut relay_buf).await.unwrap();
-                if relay_buf[..len] == first_source_datagram {
-                    break;
-                }
-            }
-        })
-        .await;
-        assert!(
-            relayed.is_ok(),
-            "subscriber did not receive exact relayed DAW datagram"
-        );
 
         let mut mesh_decoder = MediaFecDecoder::new();
         let mut mesh_buf = vec![0u8; 65_536];
@@ -8806,7 +8638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daw_media_udp_ingest_forwards_audio_epoch_datagrams_to_mesh() {
+    async fn daw_media_udp_ingest_publishes_audio_epoch_once_and_serves_no_viewers() {
         let mesh_media_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mesh_media_target = mesh_media_socket.local_addr().unwrap();
         let daw_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -8843,6 +8675,8 @@ mod tests {
             relay_secondary_path_observed_at_unix_ms: None,
             wall_clock_estimated_error_ms: DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS,
             daw_media_bind: Some(daw_bind),
+            audio_epoch_ingress_target: None,
+            audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             stream_id: 1,
             rist_stream_id: 0,
@@ -8864,7 +8698,6 @@ mod tests {
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
-        let targets = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) = mpsc::channel(256);
         let mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
@@ -8875,33 +8708,26 @@ mod tests {
         let task = tokio::spawn(run_daw_media_udp_ingest(
             daw_socket,
             forwarder,
-            targets,
             None,
             Some(audio_epoch_mesh_tx),
             shutdown_rx,
         ));
 
-        let matching = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        matching
+        let would_be_viewer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        would_be_viewer
             .send_to(b"WAVEY-DAW-SUBSCRIBE/2 91", daw_bind)
             .await
             .unwrap();
-        other
-            .send_to(b"WAVEY-DAW-SUBSCRIBE/2 92", daw_bind)
+        let mut viewer_buf = vec![0u8; 65_536];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                would_be_viewer.recv_from(&mut viewer_buf)
+            )
             .await
-            .unwrap();
-        let mut relay_buf = vec![0u8; 65_536];
-        let (matching_ack, _) = timeout(Duration::from_secs(3), matching.recv_from(&mut relay_buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&relay_buf[..matching_ack], b"WAVEY-DAW-SUBSCRIBED/2 91");
-        let (other_ack, _) = timeout(Duration::from_secs(3), other.recv_from(&mut relay_buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&relay_buf[..other_ack], b"WAVEY-DAW-SUBSCRIBED/2 92");
+            .is_err(),
+            "contributor acknowledged a viewer subscription"
+        );
 
         let transport = MultichannelAudioTransportAdapter::udp(1_200);
         let fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
@@ -8948,16 +8774,14 @@ mod tests {
         .unwrap();
         assert_eq!(&mesh_buf[..len], epoch_datagram.as_ref());
 
-        let (relayed_len, _) = timeout(Duration::from_secs(3), matching.recv_from(&mut relay_buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&relay_buf[..relayed_len], epoch_datagram.as_ref());
         assert!(
-            timeout(Duration::from_millis(100), other.recv_from(&mut relay_buf))
-                .await
-                .is_err(),
-            "a subscriber for another AEP1 session received a datagram"
+            timeout(
+                Duration::from_millis(100),
+                would_be_viewer.recv_from(&mut viewer_buf)
+            )
+            .await
+            .is_err(),
+            "contributor sent media directly to a viewer"
         );
 
         let _ = shutdown_tx.send(());
