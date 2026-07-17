@@ -1,6 +1,8 @@
 pub mod audio_epoch_hls;
 pub mod fmp4_bridge;
 pub mod ingress_authorization;
+pub mod synchronized_stem_ingress;
+pub mod talkback_publish;
 
 use access_unit::{detect_audio, h264, AudioType};
 #[cfg(test)]

@@ -634,6 +634,12 @@ impl PublishLease {
         &self,
         payload: &[u8],
     ) -> Result<MediaObject, PublishIngressError> {
+        if self.identity().media_class() == MediaClass::Talkback {
+            return Err(PublishIngressError::new(
+                PublishRejectionCode::TalkbackIsolation,
+                "canonical_media_object",
+            ));
+        }
         if payload.len() != self.envelope.payload_bytes() as usize {
             return Err(PublishIngressError::new(
                 PublishRejectionCode::PayloadLengthMismatch,
@@ -701,6 +707,26 @@ impl PublishLease {
                     "canonical_media_object",
                 )
             })
+    }
+
+    #[must_use]
+    pub fn media_authorization_epoch(&self) -> u64 {
+        self.binding.media_authorization_epoch
+    }
+
+    #[must_use]
+    pub fn subject_grant_epoch(&self) -> u64 {
+        self.binding.subject_grant_epoch
+    }
+
+    #[must_use]
+    pub fn media_policy_version(&self) -> u64 {
+        self.binding.media_policy_version
+    }
+
+    #[must_use]
+    pub fn class_authorization_epoch(&self) -> Option<u64> {
+        self.binding.class_authorization_epoch
     }
 }
 

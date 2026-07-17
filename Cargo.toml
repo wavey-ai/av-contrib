@@ -45,8 +45,10 @@ socket2 = "0.6"
 soundkit-flac = { path = "../soundkit/soundkit-flac", default-features = false, features = ["packet-codec"] }
 soundkit = { path = "../soundkit/soundkit" }
 soundkit-opus = { path = "../soundkit/soundkit-opus" }
+synchronized-stems-media = { path = "../av-api/synchronized-stems-media" }
 tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
+talkback-media = { path = "../av-api/talkback-media" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"

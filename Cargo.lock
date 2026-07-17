@@ -214,6 +214,8 @@ dependencies = [
  "soundkit",
  "soundkit-flac",
  "soundkit-opus",
+ "synchronized-stems-media",
+ "talkback-media",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3258,6 +3260,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "synchronized-stems-media"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3306,6 +3316,13 @@ name = "take-until"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bdb6fa0dfa67b38c1e66b7041ba9dcf23b99d8121907cd31c807a332f7a0bbb"
+
+[[package]]
+name = "talkback-media"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+]
 
 [[package]]
 name = "textwrap"

@@ -21,6 +21,7 @@ use av_contrib::ingress_authorization::{
     PublishBindingRegistry, PublishIngressError, PublishIngressGate, PublishIngressRequest,
     PublishRejectionCode,
 };
+use av_contrib::talkback_publish::ephemeral_talkback_frame;
 
 const NOW: i64 = 1_784_131_220;
 const ISSUER: &str = "https://control.infidelity.io";
@@ -151,6 +152,21 @@ fn envelope(configuration_ref: u32, sequence: u64) -> Vec<u8> {
         capture_pts: 48_000,
         duration_ticks: 960,
         payload_bytes: 480,
+    })
+    .unwrap()
+    .to_canonical_json_vec()
+    .unwrap()
+}
+
+fn talkback_envelope(configuration_ref: u32, sequence: u64) -> Vec<u8> {
+    MediaFrameEnvelopeV1::new(MediaFrameEnvelopeV1Params {
+        binding_generation: 8,
+        configuration_ref,
+        configuration_epoch: 11,
+        sequence,
+        capture_pts: 48_000,
+        duration_ticks: 240,
+        payload_bytes: 120,
     })
     .unwrap()
     .to_canonical_json_vec()
@@ -545,13 +561,13 @@ fn talkback_is_an_exact_monitor_only_audience_lane() {
     claims.audience_ids = vec![AudienceId::new("aud_producer_return").unwrap()];
     claims.max_channels = 1;
     let token = sign(&fixture.signing_key, claims);
-    let frame = envelope(3, 1);
+    let frame = talkback_envelope(3, 1);
     let admission = fixture
         .gate
         .authorize(&PublishIngressRequest {
             compact_jws: &token,
             envelope_json: &frame,
-            content_length: 480,
+            content_length: 120,
             legacy_stream_id: 88,
             now_unix_seconds: NOW,
         })
@@ -562,6 +578,22 @@ fn talkback_is_an_exact_monitor_only_audience_lane() {
         lease.configuration().capture_disposition(),
         MediaCaptureDisposition::MonitorOnly
     );
+    assert_eq!(
+        lease
+            .canonical_media_object(&[0x2a; 120])
+            .unwrap_err()
+            .code(),
+        PublishRejectionCode::TalkbackIsolation
+    );
+    let live =
+        ephemeral_talkback_frame(lease, &[0x2a; 120], u64::try_from(NOW).unwrap() * 1_000_000)
+            .unwrap();
+    assert_eq!(live.frame().frame_samples(), 240);
+    assert_eq!(live.frame().audience_id(), "aud_producer_return");
+    assert_eq!(
+        live.deadline_unix_us(),
+        u64::try_from(NOW).unwrap() * 1_000_000 + 100_000
+    );
 
     let mut wrong_audience = claims_params("cap_wrong_audience");
     wrong_audience.media_class = MediaClass::Talkback;
@@ -571,8 +603,8 @@ fn talkback_is_an_exact_monitor_only_audience_lane() {
     let token = sign(&fixture.signing_key, wrong_audience);
     let error = rejected(fixture.gate.authorize(&PublishIngressRequest {
         compact_jws: &token,
-        envelope_json: &envelope(3, 2),
-        content_length: 480,
+        envelope_json: &talkback_envelope(3, 2),
+        content_length: 120,
         legacy_stream_id: 88,
         now_unix_seconds: NOW,
     }));
