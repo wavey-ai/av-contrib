@@ -2,11 +2,11 @@ use anyhow::{bail, Context, Result};
 use av_contrib::audio_epoch_hls::{
     channel as audio_epoch_hls_channel, run_audio_epoch_hls_worker,
     worker_stats as audio_epoch_hls_worker_stats, AudioEpochHlsConfig, AudioEpochHlsDatagram,
-    DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+    AudioEpochHlsPackaging, DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
 };
 use av_contrib::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop, PublishedFmp4Part,
-    TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
+    PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
 use av_contrib::ingress_authorization::{
     decode_envelope_header_bytes, gate_from_bootstrap_path, parse_bearer_header,
@@ -71,9 +71,11 @@ const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
+const DAW_CONTROL_MAGIC: &[u8] = b"WAVEY-DAW-";
 const MEDIA_OBJECT_TENANT: &str = "default";
 const FMP4_MEDIA_TRACK: &str = "muxed-fmp4";
 const FMP4_INITIALIZATION_TRACK: &str = "muxed-fmp4-init";
+const OPAQUE_AUDIO_TRACK: &str = "opaque-audio";
 const MEDIA_OBJECT_VERSION: u32 = 1;
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
@@ -299,6 +301,54 @@ fn build_fmp4_media_object(
     builder
         .build()
         .context("invalid canonical fMP4 media object")
+}
+
+fn build_opaque_media_object(
+    part: &PublishedOpaquePart,
+    source_epoch: u64,
+    delivery_budget_ms: u64,
+    estimated_clock_error_ns: u64,
+) -> Result<MediaObject> {
+    if delivery_budget_ms == 0 {
+        bail!("canonical media delivery budget must be positive");
+    }
+    if part.bytes.is_empty() || part.audio_units == 0 || part.duration_ms == 0 {
+        bail!("opaque audio part must contain timed media units");
+    }
+    let key = ObjectKey::for_payload(
+        MEDIA_OBJECT_TENANT,
+        part.stream_id.to_string(),
+        OPAQUE_AUDIO_TRACK,
+        source_epoch,
+        0,
+        part.sequence,
+        MEDIA_OBJECT_VERSION,
+        &part.bytes,
+    )
+    .context("invalid canonical opaque-media identity")?;
+    let packaged =
+        canonical_contributor_timestamp(part.packaged_at_unix_ns, estimated_clock_error_ns)?;
+    let published =
+        canonical_contributor_timestamp(part.published_at_unix_ns, estimated_clock_error_ns)?;
+    let deadline_ns = i128::from(part.published_at_unix_ns)
+        .checked_add(i128::from(delivery_budget_ms) * 1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .context("canonical media deadline exceeds Unix-nanosecond range")?;
+    let deadline = canonical_contributor_timestamp(deadline_ns, estimated_clock_error_ns)?;
+
+    MediaObject::builder(key, ObjectKind::Media, part.bytes.to_vec())
+        .with_deadline(deadline)
+        .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, packaged))
+        .with_stage_timestamp(StageTimestamp::new(Stage::Published, published))
+        .with_metadata("container", b"opaque".to_vec())
+        .with_metadata("duration-ms", part.duration_ms.to_string().into_bytes())
+        .with_metadata("payload-format", b"opaque-part-v1".to_vec())
+        .with_metadata("scheduler-class", b"audio".to_vec())
+        .with_metadata("track-composition", b"audio".to_vec())
+        .with_metadata("content-type", b"application/octet-stream".to_vec())
+        .with_metadata("file-extension", b"bin".to_vec())
+        .build()
+        .context("invalid canonical opaque-media object")
 }
 
 fn canonical_contributor_timestamp(
@@ -538,13 +588,22 @@ struct Args {
     #[arg(long, env = "AV_AUDIO_EPOCH_REDUNDANT_INGRESS_TARGET")]
     audio_epoch_redundant_ingress_target: Option<SocketAddr>,
 
-    /// Bounded handoff from the live AEP1 datagram path to lossless LL-HLS packaging.
+    /// Bounded handoff from the live AEP1 datagram path to format-preserving LL-HLS packaging.
     #[arg(
         long,
         env = "AV_DAW_HLS_QUEUE_CAPACITY",
         default_value_t = DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY
     )]
     daw_hls_queue_capacity: usize,
+
+    /// Choose whether DAW AEP1 payloads pass through unchanged or are boxed as fMP4.
+    #[arg(
+        long,
+        env = "AV_DAW_HLS_PACKAGING",
+        value_enum,
+        default_value = "opaque"
+    )]
+    daw_hls_packaging: DawHlsPackaging,
 
     #[arg(long, default_value_t = 1)]
     stream_id: u64,
@@ -596,6 +655,21 @@ struct Args {
 
     #[arg(long, default_value_t = 800)]
     playlist_buffer_kb: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DawHlsPackaging {
+    Opaque,
+    Fmp4,
+}
+
+impl From<DawHlsPackaging> for AudioEpochHlsPackaging {
+    fn from(value: DawHlsPackaging) -> Self {
+        match value {
+            DawHlsPackaging::Opaque => Self::Opaque,
+            DawHlsPackaging::Fmp4 => Self::Fmp4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1741,6 +1815,15 @@ async fn run_daw_media_udp_ingest(
                 }
                 let datagram = &buf[..len];
 
+                // A Nexus pointed directly at its contributor can retain the
+                // legacy relay registration loop while publishing AEP1. The
+                // contributor is an ingest endpoint, not a viewer relay: drop
+                // those control messages without acknowledging or fanning out.
+                if datagram.starts_with(DAW_CONTROL_MAGIC) {
+                    trace!(peer = %peer, "ignored DAW relay control at contributor ingress");
+                    continue;
+                }
+
                 if is_multichannel_audio_transport_datagram(datagram) {
                     handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
                     handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx.as_ref(), peer, datagram);
@@ -1917,6 +2000,40 @@ impl Fmp4PartPublisher for MeshForwarder {
         }
         Ok(())
     }
+
+    async fn publish_opaque_part(
+        &self,
+        part: PublishedOpaquePart,
+    ) -> std::result::Result<(), String> {
+        let object = build_opaque_media_object(
+            &part,
+            self.source_epoch,
+            self.delivery_budget_ms,
+            self.estimated_clock_error_ns,
+        )
+        .map_err(|error| error.to_string())?;
+        let encoded = encode_canonical_media_object(&object).map_err(|error| error.to_string())?;
+        if !self.relay_exclusive {
+            self.forward_stream_slot(part.stream_id, &encoded)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(relay) = &self.relay {
+            let outcome = relay
+                .publish_object(&object)
+                .await
+                .map_err(|error| error.to_string())?;
+            trace!(
+                stream_id = part.stream_id,
+                sequence = part.sequence,
+                object_key = ?outcome.announcement.key,
+                source_symbols = outcome.source_symbols,
+                repair_symbols = outcome.repair_symbols,
+                "published canonical opaque audio part through RelaySession"
+            );
+        }
+        Ok(())
+    }
 }
 
 struct TelemetryFmp4Publisher {
@@ -1979,6 +2096,20 @@ impl Fmp4PartPublisher for TelemetryFmp4Publisher {
 
     fn record_mpeg_ts_payload_drop(&self, drop: MpegTsPayloadDrop) {
         self.telemetry.record_mpeg_ts_payload_drop(drop);
+    }
+
+    async fn publish_opaque_part(
+        &self,
+        mut part: PublishedOpaquePart,
+    ) -> std::result::Result<(), String> {
+        part.sequence = {
+            let mut sequences = self.canonical_sequences.lock().await;
+            let next = sequences.entry(part.stream_id).or_insert(0);
+            let sequence = *next;
+            *next = next.saturating_add(1);
+            sequence
+        };
+        self.inner.publish_opaque_part(part).await
     }
 }
 
@@ -3931,7 +4062,7 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
     for (name, help, metric_type, value) in [
         (
             "av_contrib_audio_epoch_hls_queue_capacity",
-            "Configured capacity of the asynchronous lossless AEP1 to LL-HLS handoff.",
+            "Configured capacity of the asynchronous format-preserving AEP1 to LL-HLS handoff.",
             "gauge",
             AUDIO_EPOCH_HLS_QUEUE_CAPACITY.load(Ordering::Relaxed),
         ),
@@ -4051,13 +4182,13 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
         ),
         (
             "av_contrib_audio_epoch_hls_worker_datagrams_total",
-            "AEP1 datagrams processed by the asynchronous lossless LL-HLS worker.",
+            "AEP1 datagrams processed by the asynchronous LL-HLS worker.",
             "counter",
             audio_hls_worker.datagrams,
         ),
         (
             "av_contrib_audio_epoch_hls_groups_completed_total",
-            "Lossless AEP1 groups completed for LL-HLS packaging.",
+            "AEP1 audio groups completed for format-preserving LL-HLS packaging.",
             "counter",
             audio_hls_worker.groups_completed,
         ),
@@ -4081,7 +4212,7 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
         ),
         (
             "av_contrib_audio_epoch_hls_active_rendition_workers",
-            "Current lossless LL-HLS rendition workers retained by the contributor.",
+            "Current AEP1 LL-HLS rendition workers retained by the contributor.",
             "gauge",
             audio_hls_worker.active_rendition_workers,
         ),
@@ -4093,7 +4224,7 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
         ),
         (
             "av_contrib_audio_epoch_hls_retired_rendition_workers_total",
-            "Idle lossless LL-HLS rendition workers retired since process start.",
+            "Idle AEP1 LL-HLS rendition workers retired since process start.",
             "counter",
             audio_hls_worker.retired_rendition_workers,
         ),
@@ -6155,6 +6286,7 @@ async fn main() -> Result<()> {
                 AudioEpochHlsConfig::new(
                     args.stream_id,
                     args.fmp4_part_ms,
+                    args.daw_hls_packaging.into(),
                     playlists.clone(),
                     publisher.clone(),
                 ),
@@ -6969,6 +7101,40 @@ mod tests {
     }
 
     #[test]
+    fn canonical_opaque_object_preserves_arbitrary_bytes_without_format_metadata() {
+        const PACKAGED_NS: i64 = 1_721_000_000_298_000_000;
+        const PUBLISHED_NS: i64 = 1_721_000_000_300_000_000;
+        let payload = Bytes::from_static(b"not-soundkit-not-pcm-not-a-codec");
+        let part = PublishedOpaquePart {
+            stream_id: 91,
+            stream_idx: 91,
+            sequence: 17,
+            duration_ms: 5,
+            packaged_at_unix_ns: PACKAGED_NS,
+            published_at_unix_ns: PUBLISHED_NS,
+            bytes: payload.clone(),
+            audio_units: 1,
+        };
+        let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
+
+        assert_eq!(object.key().track(), OPAQUE_AUDIO_TRACK);
+        assert_eq!(object.kind(), ObjectKind::Media);
+        assert_eq!(object.payload(), payload.as_ref());
+        assert!(object.dependencies().is_empty());
+        assert_eq!(object.metadata().get("container").unwrap(), b"opaque");
+        assert_eq!(
+            object.metadata().get("payload-format").unwrap(),
+            b"opaque-part-v1"
+        );
+        assert_eq!(
+            object.metadata().get("content-type").unwrap(),
+            b"application/octet-stream"
+        );
+        assert_eq!(object.metadata().get("file-extension").unwrap(), b"bin");
+        assert!(!object.metadata().contains_key("audio-codec"));
+    }
+
+    #[test]
     fn canonical_fmp4_retry_and_initialization_identity_are_deterministic() {
         let init = Bytes::from_static(b"stable-init");
         let media = Bytes::from_static(b"stable-media");
@@ -7777,6 +7943,7 @@ mod tests {
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+            daw_hls_packaging: DawHlsPackaging::Opaque,
             stream_id: 1,
             rist_stream_id: 1,
             srt_stream_id: 1,
@@ -7834,6 +8001,7 @@ mod tests {
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+            daw_hls_packaging: DawHlsPackaging::Opaque,
             stream_id: 9_007_199_254_741_993,
             rist_stream_id: 9_007_199_254_741_994,
             srt_stream_id: 9_007_199_254_741_995,
@@ -8404,6 +8572,7 @@ mod tests {
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+            daw_hls_packaging: DawHlsPackaging::Opaque,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -8598,6 +8767,7 @@ mod tests {
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+            daw_hls_packaging: DawHlsPackaging::Opaque,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -8710,6 +8880,7 @@ mod tests {
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+            daw_hls_packaging: DawHlsPackaging::Opaque,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -8747,10 +8918,23 @@ mod tests {
 
         let would_be_viewer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         would_be_viewer
-            .send_to(b"WAVEY-DAW-SUBSCRIBE/2 91", daw_bind)
+            .send_to(b"WAVEY-DAW-SUBSCRIBE/1", daw_bind)
             .await
             .unwrap();
         let mut viewer_buf = vec![0u8; 65_536];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                would_be_viewer.recv_from(&mut viewer_buf)
+            )
+            .await
+            .is_err(),
+            "contributor acknowledged a legacy relay subscription"
+        );
+        would_be_viewer
+            .send_to(b"WAVEY-DAW-SUBSCRIBE/2 91", daw_bind)
+            .await
+            .unwrap();
         assert!(
             timeout(
                 Duration::from_millis(100),

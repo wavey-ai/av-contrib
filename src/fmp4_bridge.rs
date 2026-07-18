@@ -11,8 +11,8 @@ use access_unit::{
     PSI_STREAM_PRIVATE_DATA,
 };
 use boxer::fmp4::{
-    box_fmp4_with_init_and_pcm, AdtsHeader, AvcDecoderConfigurationRecord, Config, PcmAudioConfig,
-    PcmSampleKind,
+    box_fmp4_with_init_and_audio_config, opus_packet_info, AdtsHeader, AudioTrackConfig,
+    AvcDecoderConfigurationRecord, Config, PcmAudioConfig, PcmSampleKind,
 };
 use bytes::{Bytes, BytesMut};
 use h264::{
@@ -61,6 +61,21 @@ pub struct PublishedFmp4Part {
     pub audio_units: usize,
 }
 
+/// One immutable opaque media part. The bytes are recovered from contributor
+/// transport and are not parsed or transformed by the LL-HLS publication
+/// path. Producers and consumers own any framing inside the payload.
+#[derive(Debug, Clone)]
+pub struct PublishedOpaquePart {
+    pub stream_id: u64,
+    pub stream_idx: usize,
+    pub sequence: u64,
+    pub duration_ms: u32,
+    pub packaged_at_unix_ns: i64,
+    pub published_at_unix_ns: i64,
+    pub bytes: Bytes,
+    pub audio_units: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MpegTsContinuityIssue {
     pub stream_type: &'static str,
@@ -76,6 +91,10 @@ pub struct MpegTsPayloadDrop {
 #[async_trait::async_trait]
 pub trait Fmp4PartPublisher: Send + Sync {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> Result<(), String>;
+
+    async fn publish_opaque_part(&self, _part: PublishedOpaquePart) -> Result<(), String> {
+        Err("opaque part publication is not supported by this publisher".to_string())
+    }
 
     fn record_mpeg_ts_continuity_issue(&self, _issue: MpegTsContinuityIssue) {}
 
@@ -248,7 +267,7 @@ enum AudioConfigSignature {
         channels: u8,
         bits_per_sample: u8,
     },
-    Pcm(PcmAudioConfig),
+    Explicit(AudioTrackConfig),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -264,7 +283,7 @@ pub struct Fmp4Segmenter {
     input_timestamps: TimestampInput,
     publisher: Option<Arc<dyn Fmp4PartPublisher>>,
     retain_local_cache: bool,
-    pcm_config: Option<PcmAudioConfig>,
+    audio_config: Option<AudioTrackConfig>,
     min_part_ticks: u64,
     max_part_ticks_without_key: u64,
     video_buf: Vec<AccessUnit>,
@@ -363,7 +382,7 @@ impl Fmp4Segmenter {
             input_timestamps,
             publisher,
             retain_local_cache,
-            pcm_config: None,
+            audio_config: None,
             min_part_ticks: ms_to_ticks(min_part_ms),
             max_part_ticks_without_key: ms_to_ticks(MAX_PART_MS_WITHOUT_KEY),
             video_buf: Vec::new(),
@@ -438,11 +457,18 @@ impl Fmp4Segmenter {
     /// Configure an audio-only stream as uncompressed PCM. The caller must
     /// finish the current continuity segment before changing this value.
     pub fn set_pcm_audio_config(&mut self, pcm_config: Option<PcmAudioConfig>) {
-        if self.pcm_config == pcm_config {
+        self.set_audio_track_config(pcm_config.map(AudioTrackConfig::Pcm));
+    }
+
+    /// Configure an audio-only stream whose elementary packets do not carry a
+    /// complete sample-entry configuration. The caller must finish the current
+    /// continuity segment before changing this value.
+    pub fn set_audio_track_config(&mut self, audio_config: Option<AudioTrackConfig>) {
+        if self.audio_config == audio_config {
             return;
         }
         debug_assert!(self.audio_buf.is_empty());
-        self.pcm_config = pcm_config;
+        self.audio_config = audio_config;
         self.last_init_signature = None;
         self.force_next_init = true;
     }
@@ -630,7 +656,8 @@ impl Fmp4Segmenter {
     }
 
     async fn push_audio(&mut self, access_unit: AccessUnit) {
-        let access_unit_duration_ms = audio_access_unit_duration_ms(&access_unit, self.pcm_config);
+        let access_unit_duration_ms =
+            audio_access_unit_duration_ms(&access_unit, self.audio_config);
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
             self.audio_timestamps.push(access_unit.pts);
             self.audio_buf.push(access_unit);
@@ -667,8 +694,8 @@ impl Fmp4Segmenter {
         self.audio_buf.push(access_unit);
         self.extend_audio_buffered_duration(access_unit_duration_ms);
 
-        // FLAC and ADTS describe their sample duration in the access unit, so
-        // an audio-only part can be closed as soon as it reaches its target.
+        // FLAC, ADTS, Opus, and configured PCM describe their sample duration,
+        // so an audio-only part can close as soon as it reaches its target.
         // Waiting for the next timestamp adds one whole audio frame of latency.
         if !self.seen_video
             && self
@@ -769,16 +796,16 @@ impl Fmp4Segmenter {
             self.force_next_init || self.last_init_signature.as_ref() != Some(&init_signature);
         let video_units = self.video_buf.len();
         let audio_units = self.audio_buf.len();
-        let audio_codec = audio_codec_name(&self.audio_buf, self.pcm_config);
+        let audio_codec = audio_codec_name(&self.audio_buf, self.audio_config);
 
-        let fmp4 = box_fmp4_with_init_and_pcm(
+        let fmp4 = box_fmp4_with_init_and_audio_config(
             self.seg_seq,
             self.config.clone(),
             std::mem::take(&mut self.video_buf),
             std::mem::take(&mut self.audio_buf),
             next_dts,
             include_init,
-            self.pcm_config,
+            self.audio_config,
         );
         self.video_timestamps.clear();
         self.audio_timestamps.clear();
@@ -914,8 +941,8 @@ impl Fmp4Segmenter {
         InitSignature {
             video: self.config_signature.clone(),
             audio: self
-                .pcm_config
-                .map(AudioConfigSignature::Pcm)
+                .audio_config
+                .map(AudioConfigSignature::Explicit)
                 .or_else(|| audio_config_signature(&self.audio_buf)),
         }
     }
@@ -1029,7 +1056,10 @@ fn is_h264(stream_type: u8) -> bool {
 fn is_supported_audio(stream_type: u8) -> bool {
     matches!(
         stream_type,
-        PSI_STREAM_AAC | PSI_STREAM_MPEG4_AAC | PSI_STREAM_PRIVATE_DATA
+        PSI_STREAM_AAC
+            | PSI_STREAM_MPEG4_AAC
+            | PSI_STREAM_PRIVATE_DATA
+            | access_unit::PSI_STREAM_AUDIO_OPUS
     )
 }
 
@@ -1240,28 +1270,41 @@ fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSigna
 
 fn audio_access_unit_duration_ms(
     access_unit: &AccessUnit,
-    pcm_config: Option<PcmAudioConfig>,
+    audio_config: Option<AudioTrackConfig>,
 ) -> Option<u64> {
-    if let Some(pcm) = pcm_config {
-        let valid_size = match pcm.sample_kind {
-            PcmSampleKind::Integer => matches!(pcm.sample_size, 16 | 24 | 32),
-            PcmSampleKind::Float => matches!(pcm.sample_size, 32 | 64),
-        };
-        if !valid_size || pcm.sample_rate == 0 || pcm.channel_count == 0 {
-            return None;
+    match audio_config {
+        Some(AudioTrackConfig::Pcm(pcm)) => {
+            let valid_size = match pcm.sample_kind {
+                PcmSampleKind::Integer => matches!(pcm.sample_size, 16 | 24 | 32),
+                PcmSampleKind::Float => matches!(pcm.sample_size, 32 | 64),
+            };
+            if !valid_size || pcm.sample_rate == 0 || pcm.channel_count == 0 {
+                return None;
+            }
+            let bytes_per_frame =
+                usize::from(pcm.sample_size / 8).checked_mul(usize::from(pcm.channel_count))?;
+            if access_unit.data.is_empty()
+                || !access_unit.data.len().is_multiple_of(bytes_per_frame)
+            {
+                return None;
+            }
+            let frames = u64::try_from(access_unit.data.len() / bytes_per_frame).ok()?;
+            return Some(
+                frames
+                    .saturating_mul(1_000)
+                    .saturating_add(u64::from(pcm.sample_rate) / 2)
+                    / u64::from(pcm.sample_rate),
+            );
         }
-        let bytes_per_frame =
-            usize::from(pcm.sample_size / 8).checked_mul(usize::from(pcm.channel_count))?;
-        if access_unit.data.is_empty() || !access_unit.data.len().is_multiple_of(bytes_per_frame) {
-            return None;
+        Some(AudioTrackConfig::Opus(_)) => {
+            return Some(
+                u64::from(opus_packet_info(&access_unit.data)?.duration_samples)
+                    .saturating_mul(1_000)
+                    .saturating_add(24_000)
+                    / 48_000,
+            );
         }
-        let frames = u64::try_from(access_unit.data.len() / bytes_per_frame).ok()?;
-        return Some(
-            frames
-                .saturating_mul(1_000)
-                .saturating_add(u64::from(pcm.sample_rate) / 2)
-                / u64::from(pcm.sample_rate),
-        );
+        None => {}
     }
     for offset in [0, 12, 4] {
         let Some(data) = access_unit.data.get(offset..) else {
@@ -1292,22 +1335,25 @@ fn audio_access_unit_duration_ms(
 
 fn audio_codec_name(
     audio_units: &[AccessUnit],
-    pcm_config: Option<PcmAudioConfig>,
+    audio_config: Option<AudioTrackConfig>,
 ) -> Option<&'static str> {
-    if let Some(pcm) = pcm_config {
-        return Some(
-            match (pcm.sample_kind, pcm.sample_size, pcm.little_endian) {
-                (PcmSampleKind::Integer, 16, true) => "pcm_s16le",
-                (PcmSampleKind::Integer, 24, true) => "pcm_s24le",
-                (PcmSampleKind::Integer, 32, true) => "pcm_s32le",
-                (PcmSampleKind::Float, 32, true) => "pcm_f32le",
-                (PcmSampleKind::Float, 64, true) => "pcm_f64le",
-                (PcmSampleKind::Integer, _, false) => "pcm_integer_be",
-                (PcmSampleKind::Float, _, false) => "pcm_float_be",
-                (PcmSampleKind::Integer, _, true) => "pcm_integer_le",
-                (PcmSampleKind::Float, _, true) => "pcm_float_le",
-            },
-        );
+    if let Some(config) = audio_config {
+        return Some(match config {
+            AudioTrackConfig::Pcm(pcm) => {
+                match (pcm.sample_kind, pcm.sample_size, pcm.little_endian) {
+                    (PcmSampleKind::Integer, 16, true) => "pcm_s16le",
+                    (PcmSampleKind::Integer, 24, true) => "pcm_s24le",
+                    (PcmSampleKind::Integer, 32, true) => "pcm_s32le",
+                    (PcmSampleKind::Float, 32, true) => "pcm_f32le",
+                    (PcmSampleKind::Float, 64, true) => "pcm_f64le",
+                    (PcmSampleKind::Integer, _, false) => "pcm_integer_be",
+                    (PcmSampleKind::Float, _, false) => "pcm_float_be",
+                    (PcmSampleKind::Integer, _, true) => "pcm_integer_le",
+                    (PcmSampleKind::Float, _, true) => "pcm_float_le",
+                }
+            }
+            AudioTrackConfig::Opus(_) => "opus",
+        });
     }
     audio_units
         .first()

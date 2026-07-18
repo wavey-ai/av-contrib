@@ -189,6 +189,7 @@ dependencies = [
  "clap 4.6.1",
  "ed25519-dalek",
  "form_urlencoded",
+ "frame-header",
  "futures-util",
  "h264",
  "h3",
@@ -414,10 +415,10 @@ dependencies = [
 [[package]]
 name = "boxer"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/boxer.git#630df9660e87ec1922a1dd9c59e6ed0eecad1e14"
 dependencies = [
  "access-unit",
  "bytes",
+ "libopus-rs 0.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -1827,6 +1828,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libopus-rs"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a634b0aceefbc10a498a403c596eba9f716e0bab602439035584e297417684d5"
+dependencies = [
+ "wide",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3147,7 +3157,7 @@ name = "soundkit-opus"
 version = "0.12.3"
 dependencies = [
  "frame-header",
- "libopus-rs",
+ "libopus-rs 0.0.2",
  "soundkit",
  "tracing",
 ]

@@ -5,10 +5,21 @@ Contributor-facing web-service and sender tools for `av-mesh`.
 `av-mesh` should stay focused on cache streams, RaptorQ mesh sync, telemetry,
 replication, and serving. This repo owns edge-facing contributor formats and
 tools. The main `av-contrib` binary accepts arbitrary contributor byte streams,
-terminates OBS-style RIST/SRT MPEG-TS and RTMP inputs, packages them as
-fMP4/CMAF LL-HLS artifacts with `playlists`, and publishes only stream-addressed
-artifact bytes into mesh RaptorQ/FEC ingest sockets. Raw RIST, SRT, RTMP, and
-MPEG-TS payloads do not cross the mesh boundary.
+terminates OBS-style RIST/SRT MPEG-TS and RTMP inputs, accepts AEP1/RaptorQ DAW
+audio, produces format-preserving LL-HLS artifacts with `playlists`, and
+publishes only stream-addressed artifact bytes into mesh ingest. Raw RIST, SRT,
+RTMP, and MPEG-TS payloads do not cross the mesh boundary.
+
+Each AEP1 contribution route chooses its LL-HLS packaging policy. The default
+`opaque` policy uses AEP1 stream identity, timing, continuity, and FEC recovery
+to publish every recovered payload byte-for-byte, without interpreting its
+inner format. The explicit `fmp4` policy keeps boxing in `av-contrib` for raw
+PCM and FLAC sources that need CMAF/fMP4 output. It never silently converts one
+codec into another, and framed or encrypted Opus must use `opaque`. At 5 ms an
+opaque part contains one recovered media unit; a configured larger part may
+concatenate consecutive self-delimiting units. A future producer-authored,
+unencrypted Opus CMAF/fMP4 programme rendition can provide generic-player
+compatibility without changing the private path.
 
 Reliability boundary: RIST and SRT belong here at the contributor edge because
 they are mature WAN ingest protocols with retransmission history. The mesh hot
@@ -59,11 +70,12 @@ source/repair path intent in each RelaySession datagram. Initialization,
 catalog, subscription, and bounded backfill messages belong to the reliable
 RelaySession channel used by the controller-managed rollout.
 
-Canonical fMP4 publication carries the packager-reported `duration-ms`, bounded
+Canonical media publication carries the packager-reported `duration-ms`, bounded
 `track-composition`, codec, and `scheduler-class` metadata. Each media object
-depends on the complete immutable initialization `ObjectKey`; a stable
-SHA-256-derived configuration epoch keeps the initialization identity consistent
-across retries and later parts that use the same configuration. Muxed delta
+that needs an initialization object depends on its complete immutable
+`ObjectKey`; a stable SHA-256-derived configuration epoch keeps that identity
+consistent across retries and later parts using the same configuration.
+Opaque private parts declare no initialization dependency. Muxed delta
 parts containing audio use audio scheduling priority, while keyframes retain
 the strongest media priority.
 

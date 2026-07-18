@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, Bytes};
 use clap::{Parser, Subcommand, ValueEnum};
+use frame_header::{EncodingFlag, FrameHeaderV2};
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use music_audio_session::{
     MultichannelAudioReceiver, MultichannelAudioSender, MultichannelAudioSessionConfig,
@@ -11,9 +12,13 @@ use raptorq_datagram_fec::{
 };
 use raptorq_fec_transport::MultichannelAudioTransportAdapter;
 use serde::Serialize;
+use soundkit::audio_packet::Decoder as _;
+use soundkit::crypto::ChaCha20Poly1305PacketCipher;
+use soundkit::frame_stream::{SoundKitFrameStream, SoundKitFrameStreamOptions};
 use soundkit_flac::{FlacFrameConfig, FlacFrameEncoder, FlacProfile};
-use std::collections::{HashMap, HashSet};
-use std::io;
+use soundkit_opus::OpusDecoder;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
@@ -144,12 +149,24 @@ enum Command {
         window_seconds: Option<u64>,
         #[arg(long, default_value_t = 3)]
         tail_seconds: u64,
-        /// Codec that must be declared by the fMP4 init segment.
+        /// Audio representation that every media part must preserve.
         #[arg(long, value_enum, default_value_t = HlsAudioCodec::Flac)]
         expected_audio_codec: HlsAudioCodec,
         /// PCM channels carried by this LL-HLS rendition; required for ipcm size checks.
         #[arg(long, default_value_t = 0)]
         expected_pcm_channels: u16,
+        /// Decimal SoundKit media key, read from this file, for consumer-side Opus decode.
+        #[arg(long)]
+        soundkit_key_file: Option<PathBuf>,
+        /// Write consumer-decoded interleaved S16LE PCM to this path.
+        #[arg(long, requires = "soundkit_key_file")]
+        decoded_pcm_output: Option<PathBuf>,
+        /// Compare decoded Opus with this interleaved S16LE PCM reference.
+        #[arg(long, requires = "soundkit_key_file")]
+        reference_pcm_s16le: Option<PathBuf>,
+        /// Leading silent source frames inserted before the reference stem.
+        #[arg(long, default_value_t = 512)]
+        reference_leading_silence_frames: usize,
     },
     /// Run many independent persistent LL-HLS clients in one Rust process.
     LoadHls {
@@ -183,7 +200,7 @@ enum Command {
         tail_seconds: u64,
         #[arg(long, default_value_t = 100)]
         readers: usize,
-        /// Codec that every reader must verify in the fMP4 init segment.
+        /// Audio representation that every reader must verify.
         #[arg(long, value_enum, default_value_t = HlsAudioCodec::Flac)]
         expected_audio_codec: HlsAudioCodec,
         /// PCM channels carried by this LL-HLS rendition; required for ipcm size checks.
@@ -207,6 +224,7 @@ enum HlsTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum HlsAudioCodec {
     Flac,
+    SoundkitOpus,
     Ipcm,
     Fpcm,
 }
@@ -215,16 +233,25 @@ impl HlsAudioCodec {
     fn as_str(self) -> &'static str {
         match self {
             Self::Flac => "flac",
+            Self::SoundkitOpus => "soundkit_opus",
             Self::Ipcm => "ipcm_s24le",
             Self::Fpcm => "fpcm_f32le",
         }
     }
 
-    fn init_marker(self) -> &'static [u8; 4] {
+    fn media_extension(self) -> &'static str {
         match self {
-            Self::Flac => b"fLaC",
-            Self::Ipcm => b"ipcm",
-            Self::Fpcm => b"fpcm",
+            Self::SoundkitOpus => "bin",
+            Self::Flac | Self::Ipcm | Self::Fpcm => "mp4",
+        }
+    }
+
+    fn init_marker(self) -> Option<&'static [u8; 4]> {
+        match self {
+            Self::SoundkitOpus => None,
+            Self::Flac => Some(b"fLaC"),
+            Self::Ipcm => Some(b"ipcm"),
+            Self::Fpcm => Some(b"fpcm"),
         }
     }
 }
@@ -350,11 +377,32 @@ struct HlsReceiveReport {
     expected_pcm_channels: u16,
     pcm_media_parts_verified: u64,
     pcm_media_size_mismatches: u64,
+    opus_media_parts_verified: u64,
+    opus_media_packet_mismatches: u64,
+    opus_consumer: Option<OpusConsumerReport>,
     playlist_has_ll_hls_tags: bool,
     publication_to_cache_latency_ms: Percentiles,
     cache_to_client_latency_ms: Percentiles,
     availability_latency_ms: Percentiles,
     estimated_render_latency_ms: Percentiles,
+}
+
+#[derive(Debug, Serialize)]
+struct OpusConsumerReport {
+    soundkit_v2_packets: u64,
+    encrypted_packets: u64,
+    decoded_opus_packets: u64,
+    sample_rate: u32,
+    channels: u8,
+    decoded_pcm_frames: u64,
+    decoded_rms_dbfs: f64,
+    decoded_peak: u16,
+    pending_out_of_order_parts: usize,
+    reference_frames: Option<u64>,
+    aligned_reference_frames: Option<u64>,
+    alignment_frames: Option<i64>,
+    normalized_correlation: Option<f64>,
+    waveform_verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -383,6 +431,7 @@ struct HlsLoadReport {
     deadline_misses_total: u64,
     init_verified_readers: usize,
     pcm_media_size_mismatches_total: u64,
+    opus_media_packet_mismatches_total: u64,
     playlist_verified_readers: usize,
     wire_bytes_total: u64,
     connection_setup_ms: Percentiles,
@@ -555,6 +604,10 @@ struct HlsReceiveOptions<'a> {
     tail_seconds: u64,
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
+    soundkit_key_file: Option<&'a Path>,
+    decoded_pcm_output: Option<&'a Path>,
+    reference_pcm_s16le: Option<&'a Path>,
+    reference_leading_silence_frames: usize,
 }
 
 #[derive(Clone)]
@@ -575,6 +628,383 @@ struct HlsLoadOptions {
     readers: usize,
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
+}
+
+struct SoundKitOpusConsumer {
+    parser: SoundKitFrameStream,
+    decoder: Option<OpusDecoder>,
+    next_sequence: u64,
+    pending_parts: BTreeMap<u64, Vec<u8>>,
+    decoded_pcm: Vec<i16>,
+    capture_pcm: bool,
+    decoded_pcm_output: Option<PathBuf>,
+    reference_pcm_bytes: Option<Vec<u8>>,
+    reference_leading_silence_frames: usize,
+    soundkit_v2_packets: u64,
+    encrypted_packets: u64,
+    decoded_opus_packets: u64,
+    sample_rate: u32,
+    channels: u8,
+    decoded_pcm_frames: u64,
+    sum_squares: f64,
+    sample_count: u64,
+    peak: u16,
+}
+
+impl SoundKitOpusConsumer {
+    fn from_key_file(
+        key_file: &Path,
+        first_sequence: u64,
+        decoded_pcm_output: Option<&Path>,
+        reference_pcm_s16le: Option<&Path>,
+        reference_leading_silence_frames: usize,
+    ) -> Result<Self> {
+        let encoded_key = std::fs::read_to_string(key_file)
+            .with_context(|| format!("read SoundKit key file {}", key_file.display()))?;
+        let cipher = ChaCha20Poly1305PacketCipher::new_from_decimal_key(encoded_key.trim())
+            .context("SoundKit key file did not contain a valid decimal key")?;
+        let reference_pcm_bytes = reference_pcm_s16le
+            .map(|path| {
+                std::fs::read(path)
+                    .with_context(|| format!("read PCM reference {}", path.display()))
+            })
+            .transpose()?;
+        Ok(Self {
+            parser: SoundKitFrameStream::new(SoundKitFrameStreamOptions {
+                cipher: Some(cipher),
+                ..SoundKitFrameStreamOptions::default()
+            }),
+            decoder: None,
+            next_sequence: first_sequence,
+            pending_parts: BTreeMap::new(),
+            decoded_pcm: Vec::new(),
+            capture_pcm: decoded_pcm_output.is_some() || reference_pcm_bytes.is_some(),
+            decoded_pcm_output: decoded_pcm_output.map(Path::to_path_buf),
+            reference_pcm_bytes,
+            reference_leading_silence_frames,
+            soundkit_v2_packets: 0,
+            encrypted_packets: 0,
+            decoded_opus_packets: 0,
+            sample_rate: 0,
+            channels: 0,
+            decoded_pcm_frames: 0,
+            sum_squares: 0.0,
+            sample_count: 0,
+            peak: 0,
+        })
+    }
+
+    fn push_part(&mut self, sequence: u64, bytes: &[u8]) -> Result<()> {
+        if sequence < self.next_sequence {
+            return Ok(());
+        }
+        self.pending_parts
+            .entry(sequence)
+            .or_insert_with(|| bytes.to_vec());
+        while let Some(bytes) = self.pending_parts.remove(&self.next_sequence) {
+            self.decode_part(&bytes)?;
+            self.next_sequence = self.next_sequence.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn decode_part(&mut self, bytes: &[u8]) -> Result<()> {
+        let frames = self
+            .parser
+            .push(bytes)
+            .map_err(anyhow::Error::msg)
+            .context("consumer rejected SoundKit v2 bytes")?;
+        if frames.is_empty() {
+            bail!("opaque LL-HLS part contained no complete SoundKit v2 packet");
+        }
+        for frame in frames {
+            self.soundkit_v2_packets = self.soundkit_v2_packets.saturating_add(1);
+            if frame.header.encoding() != &EncodingFlag::Opus {
+                bail!(
+                    "consumer expected SoundKit v2 Opus but received {:?}",
+                    frame.header.encoding()
+                );
+            }
+            if !frame.encrypted {
+                bail!("private SoundKit v2 Opus packet was not encrypted");
+            }
+            self.encrypted_packets = self.encrypted_packets.saturating_add(1);
+            let sample_rate = frame.header.sample_rate();
+            let channels = frame.header.channels();
+            let frame_count = frame.header.frame_count();
+            if sample_rate == 0 || channels == 0 || frame_count == 0 {
+                bail!("SoundKit v2 Opus packet declared invalid audio dimensions");
+            }
+            if self.sample_rate == 0 {
+                self.sample_rate = sample_rate;
+                self.channels = channels;
+                self.decoder = Some(OpusDecoder::new(sample_rate as usize, channels as usize));
+            } else if self.sample_rate != sample_rate || self.channels != channels {
+                bail!(
+                    "SoundKit v2 Opus format changed from {} Hz/{} ch to {} Hz/{} ch",
+                    self.sample_rate,
+                    self.channels,
+                    sample_rate,
+                    channels
+                );
+            }
+            let sample_capacity = usize::try_from(frame_count)
+                .ok()
+                .and_then(|frames| frames.checked_mul(usize::from(channels)))
+                .context("SoundKit v2 Opus frame size exceeds this platform")?;
+            let mut pcm = vec![0_i16; sample_capacity];
+            let decoded_frames = self
+                .decoder
+                .as_mut()
+                .expect("decoder initialized with first packet")
+                .decode_i16(&frame.payload, &mut pcm, false)
+                .map_err(anyhow::Error::msg)
+                .context("pure-Rust consumer failed to decode Opus")?;
+            if decoded_frames != frame_count as usize {
+                bail!(
+                    "consumer decoded {decoded_frames} frames but SoundKit declared {frame_count}"
+                );
+            }
+            pcm.truncate(decoded_frames.saturating_mul(usize::from(channels)));
+            for sample in &pcm {
+                let normalized = f64::from(*sample) / f64::from(i16::MAX);
+                self.sum_squares += normalized * normalized;
+                self.sample_count = self.sample_count.saturating_add(1);
+                self.peak = self
+                    .peak
+                    .max(i32::from(*sample).unsigned_abs().min(u32::from(u16::MAX)) as u16);
+            }
+            if self.capture_pcm {
+                self.decoded_pcm.extend_from_slice(&pcm);
+            }
+            self.decoded_pcm_frames = self
+                .decoded_pcm_frames
+                .saturating_add(decoded_frames as u64);
+            self.decoded_opus_packets = self.decoded_opus_packets.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<OpusConsumerReport> {
+        self.parser
+            .finish()
+            .map_err(anyhow::Error::msg)
+            .context("consumer ended with a partial SoundKit v2 packet")?;
+        if let Some(path) = &self.decoded_pcm_output {
+            write_s16le_pcm(path, &self.decoded_pcm)?;
+        }
+        let rms = if self.sample_count == 0 {
+            0.0
+        } else {
+            (self.sum_squares / self.sample_count as f64).sqrt()
+        };
+        let decoded_rms_dbfs = if rms > 0.0 {
+            20.0 * rms.log10()
+        } else {
+            f64::NEG_INFINITY
+        };
+        let comparison = self
+            .reference_pcm_bytes
+            .as_deref()
+            .map(|bytes| {
+                compare_reference_pcm(
+                    &self.decoded_pcm,
+                    bytes,
+                    self.channels,
+                    self.reference_leading_silence_frames,
+                )
+            })
+            .transpose()?;
+        let waveform_verified = self.soundkit_v2_packets > 0
+            && self.soundkit_v2_packets == self.encrypted_packets
+            && self.soundkit_v2_packets == self.decoded_opus_packets
+            && self.decoded_pcm_frames > 0
+            && self.pending_parts.is_empty()
+            && decoded_rms_dbfs.is_finite()
+            && decoded_rms_dbfs > -60.0
+            && comparison
+                .as_ref()
+                .is_none_or(|comparison| comparison.normalized_correlation >= 0.70);
+        Ok(OpusConsumerReport {
+            soundkit_v2_packets: self.soundkit_v2_packets,
+            encrypted_packets: self.encrypted_packets,
+            decoded_opus_packets: self.decoded_opus_packets,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            decoded_pcm_frames: self.decoded_pcm_frames,
+            decoded_rms_dbfs,
+            decoded_peak: self.peak,
+            pending_out_of_order_parts: self.pending_parts.len(),
+            reference_frames: comparison.as_ref().map(|value| value.reference_frames),
+            aligned_reference_frames: comparison.as_ref().map(|value| value.aligned_frames),
+            alignment_frames: comparison.as_ref().map(|value| value.alignment_frames),
+            normalized_correlation: comparison
+                .as_ref()
+                .map(|value| value.normalized_correlation),
+            waveform_verified,
+        })
+    }
+}
+
+struct PcmComparison {
+    reference_frames: u64,
+    aligned_frames: u64,
+    alignment_frames: i64,
+    normalized_correlation: f64,
+}
+
+fn write_s16le_pcm(path: &Path, samples: &[i16]) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("create decoded PCM output {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    for sample in samples {
+        writer.write_all(&sample.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn compare_reference_pcm(
+    decoded: &[i16],
+    reference_bytes: &[u8],
+    channels: u8,
+    leading_silence_frames: usize,
+) -> Result<PcmComparison> {
+    let channels = usize::from(channels);
+    if channels == 0 || !reference_bytes.len().is_multiple_of(2 * channels) {
+        bail!("PCM reference is not complete interleaved S16LE audio");
+    }
+    let mut reference = Vec::with_capacity(
+        leading_silence_frames
+            .saturating_mul(channels)
+            .saturating_add(reference_bytes.len() / 2),
+    );
+    reference.resize(leading_silence_frames.saturating_mul(channels), 0_i16);
+    reference.extend(
+        reference_bytes
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])),
+    );
+    let decoded_frames = decoded.len() / channels;
+    let reference_frames = reference.len() / channels;
+    let common_frames = decoded_frames.min(reference_frames);
+    if common_frames < SAMPLE_RATE as usize / 2 {
+        bail!("consumer/reference comparison requires at least 500 ms of PCM");
+    }
+    let window_frames = common_frames.min(SAMPLE_RATE as usize * 2);
+    let reference_start = highest_energy_window(&reference, channels, window_frames);
+    let coarse = best_correlation_in_lag_range(
+        decoded,
+        &reference,
+        channels,
+        reference_start,
+        window_frames,
+        -4_096,
+        4_096,
+        8,
+        8,
+    )
+    .context("PCM reference did not contain enough signal for alignment")?;
+    let refined = best_correlation_in_lag_range(
+        decoded,
+        &reference,
+        channels,
+        reference_start,
+        window_frames,
+        coarse.0.saturating_sub(16),
+        coarse.0.saturating_add(16),
+        1,
+        2,
+    )
+    .unwrap_or(coarse);
+    Ok(PcmComparison {
+        reference_frames: reference_frames as u64,
+        aligned_frames: refined.2 as u64,
+        alignment_frames: refined.0,
+        normalized_correlation: refined.1,
+    })
+}
+
+fn highest_energy_window(reference: &[i16], channels: usize, window_frames: usize) -> usize {
+    let frames = reference.len() / channels;
+    if frames <= window_frames {
+        return 0;
+    }
+    let hop = (SAMPLE_RATE as usize / 4).max(1);
+    let mut best_start = 0;
+    let mut best_energy = -1.0_f64;
+    for start in (0..=frames - window_frames).step_by(hop) {
+        let energy = (start..start + window_frames)
+            .step_by(8)
+            .map(|frame| {
+                let sample = f64::from(reference[frame * channels]);
+                sample * sample
+            })
+            .sum::<f64>();
+        if energy > best_energy {
+            best_energy = energy;
+            best_start = start;
+        }
+    }
+    best_start
+}
+
+#[allow(clippy::too_many_arguments)]
+fn best_correlation_in_lag_range(
+    decoded: &[i16],
+    reference: &[i16],
+    channels: usize,
+    reference_start: usize,
+    window_frames: usize,
+    min_lag: i64,
+    max_lag: i64,
+    lag_step: usize,
+    sample_step: usize,
+) -> Option<(i64, f64, usize)> {
+    let decoded_frames = decoded.len() / channels;
+    let reference_frames = reference.len() / channels;
+    let mut best: Option<(i64, f64, usize)> = None;
+    for lag in (min_lag..=max_lag).step_by(lag_step.max(1)) {
+        let decoded_start = if lag >= 0 {
+            reference_start.checked_add(lag as usize)?
+        } else {
+            reference_start.checked_sub(lag.unsigned_abs() as usize)?
+        };
+        let available = window_frames
+            .min(reference_frames.saturating_sub(reference_start))
+            .min(decoded_frames.saturating_sub(decoded_start));
+        if available < SAMPLE_RATE as usize / 4 {
+            continue;
+        }
+        let mut count = 0_f64;
+        let mut sum_x = 0_f64;
+        let mut sum_y = 0_f64;
+        let mut sum_x2 = 0_f64;
+        let mut sum_y2 = 0_f64;
+        let mut sum_xy = 0_f64;
+        for offset in (0..available).step_by(sample_step.max(1)) {
+            let x = f64::from(reference[(reference_start + offset) * channels]);
+            let y = f64::from(decoded[(decoded_start + offset) * channels]);
+            count += 1.0;
+            sum_x += x;
+            sum_y += y;
+            sum_x2 += x * x;
+            sum_y2 += y * y;
+            sum_xy += x * y;
+        }
+        let covariance = count * sum_xy - sum_x * sum_y;
+        let variance_x = count * sum_x2 - sum_x * sum_x;
+        let variance_y = count * sum_y2 - sum_y * sum_y;
+        let denominator = (variance_x * variance_y).sqrt();
+        if denominator <= f64::EPSILON {
+            continue;
+        }
+        let correlation = covariance / denominator;
+        if best.as_ref().is_none_or(|current| correlation > current.1) {
+            best = Some((lag, correlation, available));
+        }
+    }
+    best
 }
 
 #[tokio::main]
@@ -677,6 +1107,10 @@ async fn main() -> Result<()> {
             tail_seconds,
             expected_audio_codec,
             expected_pcm_channels,
+            soundkit_key_file,
+            decoded_pcm_output,
+            reference_pcm_s16le,
+            reference_leading_silence_frames,
         } => {
             let end_offset_ms =
                 hls_window_end_ms(duration_seconds, start_offset_ms, window_seconds, part_ms)?;
@@ -699,17 +1133,29 @@ async fn main() -> Result<()> {
                     tail_seconds,
                     expected_audio_codec,
                     expected_pcm_channels,
+                    soundkit_key_file: soundkit_key_file.as_deref(),
+                    decoded_pcm_output: decoded_pcm_output.as_deref(),
+                    reference_pcm_s16le: reference_pcm_s16le.as_deref(),
+                    reference_leading_silence_frames,
                 }),
             )
             .await
             .context("LL-HLS probe exceeded its overall deadline")??;
             println!("{}", serde_json::to_string_pretty(&report)?);
-            if !report.init_audio_codec_verified || report.pcm_media_size_mismatches > 0 {
+            if !report.init_audio_codec_verified
+                || report.pcm_media_size_mismatches > 0
+                || report.opus_media_packet_mismatches > 0
+                || report
+                    .opus_consumer
+                    .as_ref()
+                    .is_some_and(|consumer| !consumer.waveform_verified)
+            {
                 bail!(
-                    "LL-HLS codec verification failed: expected {}, received {:?}, {} PCM media size mismatches",
+                    "LL-HLS codec verification failed: expected {}, received {:?}, {} PCM size mismatches, {} invalid Opus packets",
                     report.expected_audio_codec,
                     report.init_audio_codec,
-                    report.pcm_media_size_mismatches
+                    report.pcm_media_size_mismatches,
+                    report.opus_media_packet_mismatches
                 );
             }
         }
@@ -1308,6 +1754,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         tail_seconds,
         expected_audio_codec,
         expected_pcm_channels,
+        soundkit_key_file,
+        decoded_pcm_output,
+        reference_pcm_s16le,
+        reference_leading_silence_frames,
     } = options;
     if part_ms == 0 {
         bail!("--part-ms must be positive");
@@ -1343,6 +1793,28 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     let mut init_audio_codec_verified = false;
     let mut pcm_media_parts_verified = 0_u64;
     let mut pcm_media_size_mismatches = 0_u64;
+    let mut opus_media_parts_verified = 0_u64;
+    let mut opus_media_packet_mismatches = 0_u64;
+    let mut opus_consumer = match soundkit_key_file {
+        Some(key_file) => {
+            if expected_audio_codec != HlsAudioCodec::SoundkitOpus {
+                bail!("--soundkit-key-file requires --expected-audio-codec soundkit-opus");
+            }
+            Some(SoundKitOpusConsumer::from_key_file(
+                key_file,
+                initial_from_sequence,
+                decoded_pcm_output,
+                reference_pcm_s16le,
+                reference_leading_silence_frames,
+            )?)
+        }
+        None => {
+            if decoded_pcm_output.is_some() || reference_pcm_s16le.is_some() {
+                bail!("consumer decode outputs require --soundkit-key-file");
+            }
+            None
+        }
+    };
     let mut playlist_has_ll_hls_tags = false;
     let direct_part_route = path_prefix.is_empty();
     let mut h3_client = match transport {
@@ -1360,7 +1832,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                 hls_path(
                     path_prefix,
                     stream_id,
-                    &format!("p{requested_sequence}.mp4"),
+                    &format!(
+                        "p{requested_sequence}.{}",
+                        expected_audio_codec.media_extension()
+                    ),
                 )
             } else {
                 after_sequence.map_or_else(
@@ -1389,8 +1864,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             .context("LL-HLS tail returned an invalid x-sequence")?
                     };
                     after_sequence = Some(sequence);
-                    let pts_ms = parse_fmp4_tfdt_ms(&response.body)
-                        .context("LL-HLS fMP4 part omitted a valid tfdt")?;
+                    let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
+                        && soundkit_opus_part_is_valid(&response.body, part_ms);
+                    let pts_ms =
+                        media_part_pts_ms(expected_audio_codec, &response.body, sequence, part_ms)?;
                     let arrival_ns = now_unix_ns()?;
                     if arrival_ns >= session_id
                         && pts_ms >= start_offset_ms
@@ -1419,6 +1896,19 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     pcm_media_size_mismatches.saturating_add(1);
                             }
                         }
+                        if expected_audio_codec == HlsAudioCodec::SoundkitOpus {
+                            if soundkit_valid {
+                                opus_media_parts_verified =
+                                    opus_media_parts_verified.saturating_add(1);
+                                init_audio_codec_verified = true;
+                            } else {
+                                opus_media_packet_mismatches =
+                                    opus_media_packet_mismatches.saturating_add(1);
+                            }
+                        }
+                        if let Some(consumer) = opus_consumer.as_mut() {
+                            consumer.push_part(sequence, &response.body)?;
+                        }
                         if let Some((publication_to_cache_ns, cache_to_client_ns)) =
                             split_cache_latency_ns(&response.headers, capture_ns, arrival_ns)
                         {
@@ -1429,7 +1919,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                         );
                     }
-                    if init_audio_codec.is_none() {
+                    if expected_audio_codec != HlsAudioCodec::SoundkitOpus
+                        && init_audio_codec.is_none()
+                    {
                         let init = hls_https_get(
                             &mut h3_client,
                             edge,
@@ -1461,14 +1953,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         .await?;
                         wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
                         if playlist.status == 200 {
-                            playlist_has_ll_hls_tags = playlist
-                                .body
-                                .windows(b"#EXT-X-PART:".len())
-                                .any(|window| window == b"#EXT-X-PART:")
-                                && playlist
-                                    .body
-                                    .windows(b"CAN-BLOCK-RELOAD=YES".len())
-                                    .any(|window| window == b"CAN-BLOCK-RELOAD=YES");
+                            playlist_has_ll_hls_tags =
+                                playlist_matches_format(&playlist.body, expected_audio_codec);
                         }
                     }
                 }
@@ -1497,7 +1983,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             let path = hls_path(
                 path_prefix,
                 stream_id,
-                &format!("part{requested_sequence}.mp4"),
+                &format!(
+                    "part{requested_sequence}.{}",
+                    expected_audio_codec.media_extension()
+                ),
             );
             let sender = h3_client
                 .as_ref()
@@ -1518,8 +2007,14 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             let mut retry_sequence = None;
             match response.status {
                 200 => {
-                    let pts_ms = parse_fmp4_tfdt_ms(&response.body)
-                        .context("LL-HLS fMP4 part omitted a valid tfdt")?;
+                    let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
+                        && soundkit_opus_part_is_valid(&response.body, part_ms);
+                    let pts_ms = media_part_pts_ms(
+                        expected_audio_codec,
+                        &response.body,
+                        requested_sequence,
+                        part_ms,
+                    )?;
                     let expected_pts_ms = requested_sequence.saturating_mul(part_ms);
                     if pts_ms != expected_pts_ms {
                         bail!(
@@ -1554,6 +2049,19 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     pcm_media_size_mismatches.saturating_add(1);
                             }
                         }
+                        if expected_audio_codec == HlsAudioCodec::SoundkitOpus {
+                            if soundkit_valid {
+                                opus_media_parts_verified =
+                                    opus_media_parts_verified.saturating_add(1);
+                                init_audio_codec_verified = true;
+                            } else {
+                                opus_media_packet_mismatches =
+                                    opus_media_packet_mismatches.saturating_add(1);
+                            }
+                        }
+                        if let Some(consumer) = opus_consumer.as_mut() {
+                            consumer.push_part(requested_sequence, &response.body)?;
+                        }
                         if let Some((publication_to_cache_ns, cache_to_client_ns)) =
                             split_cache_latency_ns(&response.headers, capture_ns, arrival_ns)
                         {
@@ -1564,7 +2072,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                         );
                     }
-                    if init_audio_codec.is_none() {
+                    if expected_audio_codec != HlsAudioCodec::SoundkitOpus
+                        && init_audio_codec.is_none()
+                    {
                         let init = hls_https_get(
                             &mut h3_client,
                             edge,
@@ -1596,14 +2106,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         .await?;
                         wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
                         if playlist.status == 200 {
-                            playlist_has_ll_hls_tags = playlist
-                                .body
-                                .windows(b"#EXT-X-PART:".len())
-                                .any(|window| window == b"#EXT-X-PART:")
-                                && playlist
-                                    .body
-                                    .windows(b"CAN-BLOCK-RELOAD=YES".len())
-                                    .any(|window| window == b"CAN-BLOCK-RELOAD=YES");
+                            playlist_has_ll_hls_tags =
+                                playlist_matches_format(&playlist.body, expected_audio_codec);
                         }
                     }
                 }
@@ -1624,7 +2128,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                 let path = hls_path(
                     path_prefix,
                     stream_id,
-                    &format!("part{requested_sequence}.mp4"),
+                    &format!(
+                        "part{requested_sequence}.{}",
+                        expected_audio_codec.media_extension()
+                    ),
                 );
                 let sender = h3_client
                     .as_ref()
@@ -1642,6 +2149,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     if let Some(client) = h3_client.as_ref() {
         wire_bytes = client.wire_bytes();
     }
+    let opus_consumer = opus_consumer
+        .map(SoundKitOpusConsumer::finish)
+        .transpose()?;
     Ok(HlsReceiveReport {
         schema: "needletail.aep1-48k-probe.hls-receive.v4",
         lane: "ll_hls",
@@ -1675,6 +2185,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         expected_pcm_channels,
         pcm_media_parts_verified,
         pcm_media_size_mismatches,
+        opus_media_parts_verified,
+        opus_media_packet_mismatches,
+        opus_consumer,
         playlist_has_ll_hls_tags,
         publication_to_cache_latency_ms: publication_to_cache_latencies_ns.summary(),
         cache_to_client_latency_ms: cache_to_client_latencies_ns.summary(),
@@ -1723,6 +2236,10 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                     tail_seconds: reader.tail_seconds,
                     expected_audio_codec: reader.expected_audio_codec,
                     expected_pcm_channels: reader.expected_pcm_channels,
+                    soundkit_key_file: None,
+                    decoded_pcm_output: None,
+                    reference_pcm_s16le: None,
+                    reference_leading_silence_frames: 0,
                 }),
             )
             .await
@@ -1783,6 +2300,10 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         .iter()
         .map(|report| report.pcm_media_size_mismatches)
         .sum::<u64>();
+    let opus_media_packet_mismatches_total = reports
+        .iter()
+        .map(|report| report.opus_media_packet_mismatches)
+        .sum::<u64>();
     let playlist_verified_readers = reports
         .iter()
         .filter(|report| report.playlist_has_ll_hls_tags)
@@ -1814,6 +2335,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         && deadline_misses_total == 0
         && init_verified_readers == options.readers
         && pcm_media_size_mismatches_total == 0
+        && opus_media_packet_mismatches_total == 0
         && playlist_verified_readers == options.readers;
 
     Ok(HlsLoadReport {
@@ -1841,6 +2363,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         deadline_misses_total,
         init_verified_readers,
         pcm_media_size_mismatches_total,
+        opus_media_packet_mismatches_total,
         playlist_verified_readers,
         wire_bytes_total,
         connection_setup_ms,
@@ -2091,6 +2614,39 @@ fn decode_chunked_body(mut wire: &[u8]) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+fn media_part_pts_ms(
+    codec: HlsAudioCodec,
+    bytes: &[u8],
+    sequence: u64,
+    part_ms: u64,
+) -> Result<u64> {
+    if codec == HlsAudioCodec::SoundkitOpus {
+        return sequence
+            .checked_mul(part_ms)
+            .context("SoundKit LL-HLS part PTS overflow");
+    }
+    parse_fmp4_tfdt_ms(bytes).context("LL-HLS fMP4 part omitted a valid tfdt")
+}
+
+fn playlist_matches_format(bytes: &[u8], codec: HlsAudioCodec) -> bool {
+    let has_part = bytes
+        .windows(b"#EXT-X-PART:".len())
+        .any(|window| window == b"#EXT-X-PART:");
+    let can_block = bytes
+        .windows(b"CAN-BLOCK-RELOAD=YES".len())
+        .any(|window| window == b"CAN-BLOCK-RELOAD=YES");
+    if !has_part || !can_block {
+        return false;
+    }
+    if codec != HlsAudioCodec::SoundkitOpus {
+        return true;
+    }
+    bytes.windows(b".bin".len()).any(|window| window == b".bin")
+        && !bytes
+            .windows(b"#EXT-X-MAP:".len())
+            .any(|window| window == b"#EXT-X-MAP:")
+}
+
 fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
     [
         HlsAudioCodec::Ipcm,
@@ -2099,15 +2655,17 @@ fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
     ]
     .into_iter()
     .find(|codec| {
-        bytes
-            .windows(codec.init_marker().len())
-            .any(|window| window == codec.init_marker())
+        let marker = codec
+            .init_marker()
+            .expect("fMP4 codec has an initialization marker");
+        bytes.windows(marker.len()).any(|window| window == marker)
     })
 }
 
 fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channels: u16) -> bool {
     let (sample_size, marker) = match codec {
         HlsAudioCodec::Flac => return true,
+        HlsAudioCodec::SoundkitOpus => return false,
         HlsAudioCodec::Ipcm => (24, b"ipcm"),
         HlsAudioCodec::Fpcm => (32, b"fpcm"),
     };
@@ -2128,7 +2686,7 @@ fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channe
 
 fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) -> Option<u64> {
     let bytes_per_sample = match codec {
-        HlsAudioCodec::Flac => return None,
+        HlsAudioCodec::Flac | HlsAudioCodec::SoundkitOpus => return None,
         HlsAudioCodec::Ipcm => 3_u64,
         HlsAudioCodec::Fpcm => 4_u64,
     };
@@ -2137,6 +2695,51 @@ fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) ->
         .checked_div(1_000)?
         .checked_mul(u64::from(channels))?
         .checked_mul(bytes_per_sample)
+}
+
+fn soundkit_opus_part_is_valid(mut bytes: &[u8], part_ms: u64) -> bool {
+    if bytes.is_empty() || part_ms == 0 {
+        return false;
+    }
+    let mut total_frames = 0_u64;
+    let mut packets = 0_u64;
+    while !bytes.is_empty() {
+        let Ok(header_size) = FrameHeaderV2::header_size(bytes) else {
+            return false;
+        };
+        let Ok(header) = FrameHeaderV2::decode(&mut &bytes[..header_size]) else {
+            return false;
+        };
+        let Ok(payload_size) = usize::try_from(header.payload_size()) else {
+            return false;
+        };
+        let Some(packet_size) = header_size.checked_add(payload_size) else {
+            return false;
+        };
+        if packet_size > bytes.len()
+            || header.encoding() != &EncodingFlag::Opus
+            || header.sample_rate() != SAMPLE_RATE
+            || !(1..=2).contains(&header.channels())
+            || header.frame_count() == 0
+            || payload_size == 0
+            || !header.is_encrypted()
+        {
+            return false;
+        }
+        if header.packet_crc32_value().is_some()
+            && !matches!(
+                header.verify_packet_crc32(&bytes[..header_size], &bytes[header_size..packet_size]),
+                Ok(true)
+            )
+        {
+            return false;
+        }
+        total_frames = total_frames.saturating_add(u64::from(header.frame_count()));
+        packets = packets.saturating_add(1);
+        bytes = &bytes[packet_size..];
+    }
+    packets > 0
+        && total_frames.saturating_mul(1_000) == u64::from(SAMPLE_RATE).saturating_mul(part_ms)
 }
 
 fn fmp4_mdat_payload(bytes: &[u8]) -> Option<&[u8]> {
