@@ -827,6 +827,12 @@ fn hls_window_end_ms(
     Ok(end_offset_ms)
 }
 
+fn h3_preload_at_ns(session_id: u64, start_offset_ms: u64) -> u64 {
+    let start_ns = session_id.saturating_add(start_offset_ms.saturating_mul(1_000_000));
+    let preload_lead_ns = H3_PART_PRELOAD_LEAD.as_nanos().min(u128::from(u64::MAX)) as u64;
+    start_ns.saturating_sub(preload_lead_ns)
+}
+
 async fn send(
     target: SocketAddr,
     duration_seconds: u64,
@@ -1471,8 +1477,11 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             }
         }
     } else {
-        let preload_at_ns = session_id
-            .saturating_sub(H3_PART_PRELOAD_LEAD.as_nanos().min(u128::from(u64::MAX)) as u64);
+        // A late-join reader must not request its first retained part from
+        // session start. Gate preloading on the requested media window instead,
+        // or early readers occupy and retry blocked part requests for the whole
+        // interval before their window.
+        let preload_at_ns = h3_preload_at_ns(session_id, start_offset_ms);
         let now_ns = now_unix_ns()?;
         if now_ns < preload_at_ns {
             sleep_until(TokioInstant::now() + Duration::from_nanos(preload_at_ns - now_ns)).await;
@@ -2468,6 +2477,16 @@ mod tests {
         assert!(hls_window_end_ms(10, 8_000, Some(3), 5).is_err());
         assert!(hls_window_end_ms(10, 2_001, Some(1), 5).is_err());
         assert!(hls_window_end_ms(u64::MAX, 0, Some(1), 5).is_err());
+    }
+
+    #[test]
+    fn h3_late_join_preload_tracks_the_requested_window() {
+        let session_id = 1_000_000_000_000;
+        assert_eq!(h3_preload_at_ns(session_id, 0), session_id - 100_000_000);
+        assert_eq!(
+            h3_preload_at_ns(session_id, 36_000),
+            session_id + 35_900_000_000
+        );
     }
 
     #[test]
