@@ -35,6 +35,10 @@ const MAX_DATAGRAM_BYTES: usize = 1_200;
 // latency and is not a substitute for selecting the local mesh edge.
 const H3_PART_PIPELINE_DEPTH: usize = 8;
 const H3_PART_PRELOAD_LEAD: Duration = Duration::from_millis(100);
+// Keep four-hour load qualifications bounded while retaining a deterministic,
+// uniform reservoir for latency percentiles. Exact continuity uses a bitset and
+// is never sampled.
+const MAX_LATENCY_SAMPLES: usize = 65_536;
 
 #[derive(Debug, Parser)]
 #[command(name = "aep1-48k-probe")]
@@ -383,11 +387,135 @@ struct HlsLoadReport {
 #[derive(Debug, Clone, Serialize)]
 struct Percentiles {
     count: usize,
+    sample_count: usize,
     min: f64,
     p50: f64,
     p95: f64,
     p99: f64,
     max: f64,
+}
+
+struct PartCoverage {
+    start_sequence: u64,
+    part_ms: u64,
+    expected_parts: u64,
+    words: Vec<u64>,
+    received_parts: u64,
+}
+
+impl PartCoverage {
+    fn new(start_sequence: u64, expected_parts: u64, part_ms: u64) -> Result<Self> {
+        let word_count = expected_parts.saturating_add(63) / 64;
+        let word_count = usize::try_from(word_count)
+            .context("LL-HLS qualification duration exceeds addressable memory")?;
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(word_count)
+            .context("could not allocate LL-HLS continuity bitset")?;
+        words.resize(word_count, 0);
+        Ok(Self {
+            start_sequence,
+            part_ms,
+            expected_parts,
+            words,
+            received_parts: 0,
+        })
+    }
+
+    fn insert_pts(&mut self, pts_ms: u64) -> bool {
+        if !pts_ms.is_multiple_of(self.part_ms) {
+            return false;
+        }
+        let sequence = pts_ms / self.part_ms;
+        let Some(relative) = sequence.checked_sub(self.start_sequence) else {
+            return false;
+        };
+        if relative >= self.expected_parts {
+            return false;
+        }
+        let word = usize::try_from(relative / 64).expect("bitset index fits allocated memory");
+        let mask = 1_u64 << (relative % 64);
+        if self.words[word] & mask != 0 {
+            return false;
+        }
+        self.words[word] |= mask;
+        self.received_parts = self.received_parts.saturating_add(1);
+        true
+    }
+
+    fn contains_relative(&self, relative: u64) -> bool {
+        let word = usize::try_from(relative / 64).expect("bitset index fits allocated memory");
+        self.words
+            .get(word)
+            .is_some_and(|value| value & (1_u64 << (relative % 64)) != 0)
+    }
+
+    fn first_pts_ms(&self) -> Option<u64> {
+        (0..self.expected_parts)
+            .find(|relative| self.contains_relative(*relative))
+            .map(|relative| {
+                self.start_sequence
+                    .saturating_add(relative)
+                    .saturating_mul(self.part_ms)
+            })
+    }
+
+    fn last_pts_ms(&self) -> Option<u64> {
+        (0..self.expected_parts)
+            .rev()
+            .find(|relative| self.contains_relative(*relative))
+            .map(|relative| {
+                self.start_sequence
+                    .saturating_add(relative)
+                    .saturating_mul(self.part_ms)
+            })
+    }
+
+    fn non_contiguous_pts(&self) -> u64 {
+        let mut previous = None;
+        let mut gaps = 0_u64;
+        for relative in 0..self.expected_parts {
+            if !self.contains_relative(relative) {
+                continue;
+            }
+            if previous.is_some_and(|value| relative != value + 1) {
+                gaps = gaps.saturating_add(1);
+            }
+            previous = Some(relative);
+        }
+        gaps
+    }
+}
+
+struct BoundedLatencySamples {
+    observations: usize,
+    values_ns: Vec<u64>,
+}
+
+impl BoundedLatencySamples {
+    fn new() -> Self {
+        Self {
+            observations: 0,
+            values_ns: Vec::with_capacity(MAX_LATENCY_SAMPLES),
+        }
+    }
+
+    fn record(&mut self, value_ns: u64) {
+        self.observations = self.observations.saturating_add(1);
+        if self.values_ns.len() < MAX_LATENCY_SAMPLES {
+            self.values_ns.push(value_ns);
+            return;
+        }
+        let candidate = deterministic_sample_index(self.observations as u64);
+        let slot = candidate % self.observations as u64;
+        if slot < MAX_LATENCY_SAMPLES as u64 {
+            self.values_ns[slot as usize] = value_ns;
+        }
+    }
+
+    fn summary(self) -> Percentiles {
+        percentiles_ms_with_count(self.values_ns, self.observations)
+    }
 }
 
 struct WebTransportReceiveOptions<'a> {
@@ -1131,12 +1259,13 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     // Edge `from` is inclusive, while direct-origin part IDs start at one.
     // Begin at the requested PTS without draining the retained prefix.
     let initial_from_sequence = start_offset_ms.saturating_div(part_ms);
+    let expected_parts = media_duration_ms.saturating_sub(start_offset_ms) / part_ms;
     let mut after_sequence: Option<u64> = None;
-    let mut part_pts = HashSet::new();
-    let mut availability_latencies_ns = Vec::new();
-    let mut publication_to_cache_latencies_ns = Vec::new();
-    let mut cache_to_client_latencies_ns = Vec::new();
-    let mut render_latencies_ns = Vec::new();
+    let mut part_coverage = PartCoverage::new(initial_from_sequence, expected_parts, part_ms)?;
+    let mut availability_latencies_ns = BoundedLatencySamples::new();
+    let mut publication_to_cache_latencies_ns = BoundedLatencySamples::new();
+    let mut cache_to_client_latencies_ns = BoundedLatencySamples::new();
+    let mut render_latencies_ns = BoundedLatencySamples::new();
     let mut deadline_misses = 0_u64;
     let mut wire_bytes = 0_u64;
     let mut init_audio_codec = None;
@@ -1195,7 +1324,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     if arrival_ns >= session_id
                         && pts_ms >= start_offset_ms
                         && pts_ms < media_duration_ms
-                        && part_pts.insert(pts_ms)
+                        && part_coverage.insert_pts(pts_ms)
                     {
                         let capture_ns =
                             session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
@@ -1203,7 +1332,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         if latency_ns > deadline_ms.saturating_mul(1_000_000) {
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
-                        availability_latencies_ns.push(latency_ns);
+                        availability_latencies_ns.record(latency_ns);
                         if let Some(expected_bytes) = expected_pcm_part_bytes(
                             expected_audio_codec,
                             expected_pcm_channels,
@@ -1222,10 +1351,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         if let Some((publication_to_cache_ns, cache_to_client_ns)) =
                             split_cache_latency_ns(&response.headers, capture_ns, arrival_ns)
                         {
-                            publication_to_cache_latencies_ns.push(publication_to_cache_ns);
-                            cache_to_client_latencies_ns.push(cache_to_client_ns);
+                            publication_to_cache_latencies_ns.record(publication_to_cache_ns);
+                            cache_to_client_latencies_ns.record(cache_to_client_ns);
                         }
-                        render_latencies_ns.push(
+                        render_latencies_ns.record(
                             latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                         );
                     }
@@ -1327,7 +1456,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     if arrival_ns >= session_id
                         && pts_ms >= start_offset_ms
                         && pts_ms < media_duration_ms
-                        && part_pts.insert(pts_ms)
+                        && part_coverage.insert_pts(pts_ms)
                     {
                         let capture_ns =
                             session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
@@ -1335,7 +1464,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         if latency_ns > deadline_ms.saturating_mul(1_000_000) {
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
-                        availability_latencies_ns.push(latency_ns);
+                        availability_latencies_ns.record(latency_ns);
                         if let Some(expected_bytes) = expected_pcm_part_bytes(
                             expected_audio_codec,
                             expected_pcm_channels,
@@ -1354,10 +1483,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         if let Some((publication_to_cache_ns, cache_to_client_ns)) =
                             split_cache_latency_ns(&response.headers, capture_ns, arrival_ns)
                         {
-                            publication_to_cache_latencies_ns.push(publication_to_cache_ns);
-                            cache_to_client_latencies_ns.push(cache_to_client_ns);
+                            publication_to_cache_latencies_ns.record(publication_to_cache_ns);
+                            cache_to_client_latencies_ns.record(cache_to_client_ns);
                         }
-                        render_latencies_ns.push(
+                        render_latencies_ns.record(
                             latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                         );
                     }
@@ -1432,16 +1561,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
     }
 
-    let mut ordered_part_pts = part_pts.iter().copied().collect::<Vec<_>>();
-    ordered_part_pts.sort_unstable();
-    let non_contiguous_pts = ordered_part_pts
-        .windows(2)
-        .filter(|pair| pair[1].saturating_sub(pair[0]) != part_ms)
-        .count() as u64;
+    let non_contiguous_pts = part_coverage.non_contiguous_pts();
 
     // Known-duration audio closes on the access unit that reaches the target,
     // so a duration aligned to the part boundary has no open tail part.
-    let expected_parts = media_duration_ms.saturating_sub(start_offset_ms) / part_ms;
     if let Some(client) = h3_client.as_ref() {
         wire_bytes = client.wire_bytes();
     }
@@ -1460,10 +1583,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         duration_seconds,
         part_ms,
         expected_parts,
-        received_parts: part_pts.len() as u64,
-        missing_parts: expected_parts.saturating_sub(part_pts.len() as u64),
-        first_pts_ms: ordered_part_pts.first().copied(),
-        last_pts_ms: ordered_part_pts.last().copied(),
+        received_parts: part_coverage.received_parts,
+        missing_parts: expected_parts.saturating_sub(part_coverage.received_parts),
+        first_pts_ms: part_coverage.first_pts_ms(),
+        last_pts_ms: part_coverage.last_pts_ms(),
         non_contiguous_pts,
         deadline_ms,
         deadline_misses,
@@ -1478,10 +1601,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         pcm_media_parts_verified,
         pcm_media_size_mismatches,
         playlist_has_ll_hls_tags,
-        publication_to_cache_latency_ms: percentiles_ms(publication_to_cache_latencies_ns),
-        cache_to_client_latency_ms: percentiles_ms(cache_to_client_latencies_ns),
-        availability_latency_ms: percentiles_ms(availability_latencies_ns),
-        estimated_render_latency_ms: percentiles_ms(render_latencies_ns),
+        publication_to_cache_latency_ms: publication_to_cache_latencies_ns.summary(),
+        cache_to_client_latency_ms: cache_to_client_latencies_ns.summary(),
+        availability_latency_ms: availability_latencies_ns.summary(),
+        estimated_render_latency_ms: render_latencies_ns.summary(),
     })
 }
 
@@ -2165,10 +2288,23 @@ fn ms_f64_to_ns(value_ms: f64) -> u64 {
     (value_ms * 1_000_000.0).round().min(u64::MAX as f64) as u64
 }
 
-fn percentiles_ms(mut values_ns: Vec<u64>) -> Percentiles {
+fn deterministic_sample_index(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn percentiles_ms(values_ns: Vec<u64>) -> Percentiles {
+    let count = values_ns.len();
+    percentiles_ms_with_count(values_ns, count)
+}
+
+fn percentiles_ms_with_count(mut values_ns: Vec<u64>, count: usize) -> Percentiles {
     if values_ns.is_empty() {
         return Percentiles {
-            count: 0,
+            count,
+            sample_count: 0,
             min: 0.0,
             p50: 0.0,
             p95: 0.0,
@@ -2183,7 +2319,8 @@ fn percentiles_ms(mut values_ns: Vec<u64>) -> Percentiles {
         values_ns[index] as f64 / 1_000_000.0
     };
     Percentiles {
-        count: values_ns.len(),
+        count,
+        sample_count: values_ns.len(),
         min: values_ns[0] as f64 / 1_000_000.0,
         p50: at(0.50),
         p95: at(0.95),
@@ -2208,11 +2345,42 @@ mod tests {
     fn percentile_summary_is_deterministic() {
         let summary = percentiles_ms(vec![1_000_000, 2_000_000, 3_000_000, 4_000_000]);
         assert_eq!(summary.count, 4);
+        assert_eq!(summary.sample_count, 4);
         assert_eq!(summary.min, 1.0);
         assert_eq!(summary.p50, 2.0);
         assert_eq!(summary.p95, 4.0);
         assert_eq!(summary.p99, 4.0);
         assert_eq!(summary.max, 4.0);
+    }
+
+    #[test]
+    fn long_hls_continuity_uses_compact_exact_coverage() {
+        let expected_parts = 4 * 60 * 60 * 200;
+        let mut coverage = PartCoverage::new(0, expected_parts, 5).unwrap();
+        assert!(coverage.words.len() * std::mem::size_of::<u64>() < 400_000);
+        assert!(coverage.insert_pts(0));
+        assert!(coverage.insert_pts(5));
+        assert!(coverage.insert_pts((expected_parts - 1) * 5));
+        assert!(!coverage.insert_pts(5));
+        assert_eq!(coverage.received_parts, 3);
+        assert_eq!(coverage.first_pts_ms(), Some(0));
+        assert_eq!(coverage.last_pts_ms(), Some((expected_parts - 1) * 5));
+        assert_eq!(coverage.non_contiguous_pts(), 1);
+    }
+
+    #[test]
+    fn long_latency_summary_has_bounded_uniform_reservoir() {
+        let observations = MAX_LATENCY_SAMPLES * 3;
+        let mut samples = BoundedLatencySamples::new();
+        for value in 0..observations {
+            samples.record(value as u64 * 1_000_000);
+        }
+        let summary = samples.summary();
+        assert_eq!(summary.count, observations);
+        assert_eq!(summary.sample_count, MAX_LATENCY_SAMPLES);
+        assert!(summary.p50 > observations as f64 * 0.45);
+        assert!(summary.p50 < observations as f64 * 0.55);
+        assert!(summary.p99 > observations as f64 * 0.95);
     }
 
     #[test]
