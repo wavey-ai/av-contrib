@@ -6298,12 +6298,12 @@ async fn main() -> Result<()> {
 fn response(
     status: StatusCode,
     body: Option<Bytes>,
-    content_type: Option<&str>,
+    content_type: Option<&'static str>,
 ) -> HandlerResponse {
     HandlerResponse {
         status,
         body,
-        content_type: content_type.map(ToOwned::to_owned),
+        content_type: content_type.map(Into::into),
         ..Default::default()
     }
 }

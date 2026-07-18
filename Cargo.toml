@@ -53,7 +53,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
 av-upload-response = { path = "../av-service/av-upload-response", default-features = false, features = ["srt", "rist-pure"] }
-av-web-service = { path = "../av-service/av-web-service" }
+av-web-service = { package = "web-service", git = "https://github.com/wavey-ai/web-services.git", rev = "d80c578d298701f60773a63acf0c933842a3475e" }
 
 [dev-dependencies]
 ed25519-dalek = "2.2"
