@@ -139,6 +139,9 @@ enum Command {
         /// Ignore media before this offset when qualifying a late join.
         #[arg(long, default_value_t = 0)]
         start_offset_ms: u64,
+        /// Qualify only this many seconds after the start offset.
+        #[arg(long)]
+        window_seconds: Option<u64>,
         #[arg(long, default_value_t = 3)]
         tail_seconds: u64,
         /// Codec that must be declared by the fMP4 init segment.
@@ -173,6 +176,9 @@ enum Command {
         deadline_ms: u64,
         #[arg(long, default_value_t = 0)]
         start_offset_ms: u64,
+        /// Run each late-joining reader for only this many seconds.
+        #[arg(long)]
+        window_seconds: Option<u64>,
         #[arg(long, default_value_t = 3)]
         tail_seconds: u64,
         #[arg(long, default_value_t = 100)]
@@ -335,6 +341,7 @@ struct HlsReceiveReport {
     deadline_misses: u64,
     render_buffer_ms: u64,
     start_offset_ms: u64,
+    end_offset_ms: u64,
     wire_bytes: u64,
     init_has_flac: bool,
     expected_audio_codec: &'static str,
@@ -361,6 +368,8 @@ struct HlsLoadReport {
     session_id: u64,
     duration_seconds: u64,
     part_ms: u64,
+    start_offset_ms: u64,
+    end_offset_ms: u64,
     expected_audio_codec: &'static str,
     expected_pcm_channels: u16,
     readers_requested: usize,
@@ -542,6 +551,7 @@ struct HlsReceiveOptions<'a> {
     deadline_ms: u64,
     render_buffer_ms: u64,
     start_offset_ms: u64,
+    window_seconds: Option<u64>,
     tail_seconds: u64,
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
@@ -560,6 +570,7 @@ struct HlsLoadOptions {
     part_ms: u64,
     deadline_ms: u64,
     start_offset_ms: u64,
+    window_seconds: Option<u64>,
     tail_seconds: u64,
     readers: usize,
     expected_audio_codec: HlsAudioCodec,
@@ -662,12 +673,15 @@ async fn main() -> Result<()> {
             deadline_ms,
             render_buffer_ms,
             start_offset_ms,
+            window_seconds,
             tail_seconds,
             expected_audio_codec,
             expected_pcm_channels,
         } => {
+            let end_offset_ms =
+                hls_window_end_ms(duration_seconds, start_offset_ms, window_seconds, part_ms)?;
             let report = timeout(
-                receive_command_timeout(session_id, duration_seconds, tail_seconds)?,
+                receive_command_timeout_ms(session_id, end_offset_ms, tail_seconds)?,
                 receive_hls(HlsReceiveOptions {
                     edge,
                     server_name: &server_name,
@@ -681,6 +695,7 @@ async fn main() -> Result<()> {
                     deadline_ms,
                     render_buffer_ms,
                     start_offset_ms,
+                    window_seconds,
                     tail_seconds,
                     expected_audio_codec,
                     expected_pcm_channels,
@@ -710,6 +725,7 @@ async fn main() -> Result<()> {
             part_ms,
             deadline_ms,
             start_offset_ms,
+            window_seconds,
             tail_seconds,
             readers,
             expected_audio_codec,
@@ -727,6 +743,7 @@ async fn main() -> Result<()> {
                 part_ms,
                 deadline_ms,
                 start_offset_ms,
+                window_seconds,
                 tail_seconds,
                 readers,
                 expected_audio_codec,
@@ -752,11 +769,62 @@ fn receive_command_timeout(
     duration_seconds: u64,
     tail_seconds: u64,
 ) -> Result<Duration> {
-    let stop_ns =
-        session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
+    receive_command_timeout_ms(
+        session_id,
+        duration_seconds.saturating_mul(1_000),
+        tail_seconds,
+    )
+}
+
+fn receive_command_timeout_ms(
+    session_id: u64,
+    end_offset_ms: u64,
+    tail_seconds: u64,
+) -> Result<Duration> {
+    let stop_ns = session_id
+        .saturating_add(end_offset_ms.saturating_mul(1_000_000))
+        .saturating_add(tail_seconds.saturating_mul(1_000_000_000));
     let remaining_ns = stop_ns.saturating_sub(now_unix_ns()?);
     // Leave a bounded allowance for subscription setup, clock skew, and orderly QUIC close.
     Ok(Duration::from_nanos(remaining_ns).saturating_add(Duration::from_secs(5)))
+}
+
+fn hls_window_end_ms(
+    duration_seconds: u64,
+    start_offset_ms: u64,
+    window_seconds: Option<u64>,
+    part_ms: u64,
+) -> Result<u64> {
+    if part_ms == 0 {
+        bail!("--part-ms must be positive");
+    }
+    let media_duration_ms = duration_seconds
+        .checked_mul(1_000)
+        .context("media duration exceeds the supported range")?;
+    if start_offset_ms >= media_duration_ms {
+        bail!("--start-offset-ms must be smaller than the media duration");
+    }
+    if !start_offset_ms.is_multiple_of(part_ms) {
+        bail!("--start-offset-ms must align to the configured part duration");
+    }
+    let end_offset_ms = match window_seconds {
+        None => media_duration_ms,
+        Some(0) => bail!("--window-seconds must be positive"),
+        Some(window_seconds) => start_offset_ms
+            .checked_add(
+                window_seconds
+                    .checked_mul(1_000)
+                    .context("reader window exceeds the supported range")?,
+            )
+            .context("reader window exceeds the supported range")?,
+    };
+    if end_offset_ms > media_duration_ms {
+        bail!("reader window must end within the media duration");
+    }
+    if !end_offset_ms.is_multiple_of(part_ms) {
+        bail!("reader window end must align to the configured part duration");
+    }
+    Ok(end_offset_ms)
 }
 
 async fn send(
@@ -1230,6 +1298,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         deadline_ms,
         render_buffer_ms,
         start_offset_ms,
+        window_seconds,
         tail_seconds,
         expected_audio_codec,
         expected_pcm_channels,
@@ -1240,15 +1309,11 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     if !path_prefix.is_empty() && (!path_prefix.starts_with('/') || path_prefix.ends_with('/')) {
         bail!("--path-prefix must be empty or start with one slash and have no trailing slash");
     }
-    let stop_ns =
-        session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
-    let media_duration_ms = duration_seconds.saturating_mul(1_000);
-    if start_offset_ms >= media_duration_ms {
-        bail!("--start-offset-ms must be smaller than the media duration");
-    }
-    if !start_offset_ms.is_multiple_of(part_ms) {
-        bail!("--start-offset-ms must align to the configured part duration");
-    }
+    let end_offset_ms =
+        hls_window_end_ms(duration_seconds, start_offset_ms, window_seconds, part_ms)?;
+    let stop_ns = session_id
+        .saturating_add(end_offset_ms.saturating_mul(1_000_000))
+        .saturating_add(tail_seconds.saturating_mul(1_000_000_000));
     if matches!(
         expected_audio_codec,
         HlsAudioCodec::Ipcm | HlsAudioCodec::Fpcm
@@ -1259,7 +1324,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     // Edge `from` is inclusive, while direct-origin part IDs start at one.
     // Begin at the requested PTS without draining the retained prefix.
     let initial_from_sequence = start_offset_ms.saturating_div(part_ms);
-    let expected_parts = media_duration_ms.saturating_sub(start_offset_ms) / part_ms;
+    let expected_parts = end_offset_ms.saturating_sub(start_offset_ms) / part_ms;
     let mut after_sequence: Option<u64> = None;
     let mut part_coverage = PartCoverage::new(initial_from_sequence, expected_parts, part_ms)?;
     let mut availability_latencies_ns = BoundedLatencySamples::new();
@@ -1323,7 +1388,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     let arrival_ns = now_unix_ns()?;
                     if arrival_ns >= session_id
                         && pts_ms >= start_offset_ms
-                        && pts_ms < media_duration_ms
+                        && pts_ms < end_offset_ms
                         && part_coverage.insert_pts(pts_ms)
                     {
                         let capture_ns =
@@ -1414,7 +1479,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
 
         type PartRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
-        let final_sequence = media_duration_ms.saturating_div(part_ms);
+        let final_sequence = end_offset_ms.saturating_div(part_ms);
         let mut next_sequence = initial_from_sequence;
         let mut in_flight = FuturesUnordered::<PartRequest>::new();
         while in_flight.len() < H3_PART_PIPELINE_DEPTH && next_sequence < final_sequence {
@@ -1455,7 +1520,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     let arrival_ns = now_unix_ns()?;
                     if arrival_ns >= session_id
                         && pts_ms >= start_offset_ms
-                        && pts_ms < media_duration_ms
+                        && pts_ms < end_offset_ms
                         && part_coverage.insert_pts(pts_ms)
                     {
                         let capture_ns =
@@ -1592,6 +1657,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         deadline_misses,
         render_buffer_ms,
         start_offset_ms,
+        end_offset_ms,
         wire_bytes,
         init_has_flac: init_audio_codec == Some(HlsAudioCodec::Flac),
         expected_audio_codec: expected_audio_codec.as_str(),
@@ -1615,20 +1681,16 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     if options.part_ms == 0 {
         bail!("--part-ms must be positive");
     }
-    let media_duration_ms = options.duration_seconds.saturating_mul(1_000);
-    if options.start_offset_ms >= media_duration_ms {
-        bail!("--start-offset-ms must be smaller than the media duration");
-    }
-    if !options.start_offset_ms.is_multiple_of(options.part_ms) {
-        bail!("--start-offset-ms must align to the configured part duration");
-    }
+    let end_offset_ms = hls_window_end_ms(
+        options.duration_seconds,
+        options.start_offset_ms,
+        options.window_seconds,
+        options.part_ms,
+    )?;
 
     let started = Instant::now();
-    let per_reader_timeout = receive_command_timeout(
-        options.session_id,
-        options.duration_seconds,
-        options.tail_seconds,
-    )?;
+    let per_reader_timeout =
+        receive_command_timeout_ms(options.session_id, end_offset_ms, options.tail_seconds)?;
     let mut tasks = tokio::task::JoinSet::new();
     for reader_id in 0..options.readers {
         let reader = options.clone();
@@ -1648,6 +1710,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                     deadline_ms: reader.deadline_ms,
                     render_buffer_ms: 0,
                     start_offset_ms: reader.start_offset_ms,
+                    window_seconds: reader.window_seconds,
                     tail_seconds: reader.tail_seconds,
                     expected_audio_codec: reader.expected_audio_codec,
                     expected_pcm_channels: reader.expected_pcm_channels,
@@ -1685,7 +1748,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         .filter(|report| report.missing_parts > 0 || report.non_contiguous_pts > 0)
         .count();
     let expected_parts_per_reader =
-        media_duration_ms.saturating_sub(options.start_offset_ms) / options.part_ms;
+        end_offset_ms.saturating_sub(options.start_offset_ms) / options.part_ms;
     let received_parts_total = reports
         .iter()
         .map(|report| report.received_parts)
@@ -1754,6 +1817,8 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         session_id: options.session_id,
         duration_seconds: options.duration_seconds,
         part_ms: options.part_ms,
+        start_offset_ms: options.start_offset_ms,
+        end_offset_ms,
         expected_audio_codec: options.expected_audio_codec.as_str(),
         expected_pcm_channels: options.expected_pcm_channels,
         readers_requested: options.readers,
@@ -2381,6 +2446,28 @@ mod tests {
         assert!(summary.p50 > observations as f64 * 0.45);
         assert!(summary.p50 < observations as f64 * 0.55);
         assert!(summary.p99 > observations as f64 * 0.95);
+    }
+
+    #[test]
+    fn late_join_window_bounds_a_long_publication() {
+        assert_eq!(
+            hls_window_end_ms(4 * 60 * 60, 300_000, Some(4), 5).unwrap(),
+            304_000
+        );
+        assert_eq!(
+            (304_000_u64 - 300_000) / 5,
+            800,
+            "a four-second 5 ms window has 800 parts"
+        );
+        assert_eq!(hls_window_end_ms(10, 2_000, None, 5).unwrap(), 10_000);
+    }
+
+    #[test]
+    fn late_join_window_rejects_invalid_bounds() {
+        assert!(hls_window_end_ms(10, 2_000, Some(0), 5).is_err());
+        assert!(hls_window_end_ms(10, 8_000, Some(3), 5).is_err());
+        assert!(hls_window_end_ms(10, 2_001, Some(1), 5).is_err());
+        assert!(hls_window_end_ms(u64::MAX, 0, Some(1), 5).is_err());
     }
 
     #[test]
