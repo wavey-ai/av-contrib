@@ -966,9 +966,15 @@ fn best_correlation_in_lag_range(
     let mut best: Option<(i64, f64, usize)> = None;
     for lag in (min_lag..=max_lag).step_by(lag_step.max(1)) {
         let decoded_start = if lag >= 0 {
-            reference_start.checked_add(lag as usize)?
+            let Some(start) = reference_start.checked_add(lag as usize) else {
+                continue;
+            };
+            start
         } else {
-            reference_start.checked_sub(lag.unsigned_abs() as usize)?
+            let Some(start) = reference_start.checked_sub(lag.unsigned_abs() as usize) else {
+                continue;
+            };
+            start
         };
         let available = window_frames
             .min(reference_frames.saturating_sub(reference_start))
@@ -3150,6 +3156,18 @@ mod tests {
             sine_s24le(0).len(),
             FRAME_COUNT as usize * usize::from(DEFAULT_CHANNELS) * 3
         );
+    }
+
+    #[test]
+    fn reference_alignment_skips_out_of_range_negative_lags() {
+        let reference = (0..24_000)
+            .map(|index| ((index as f64 * 0.013).sin() * 12_000.0) as i16)
+            .collect::<Vec<_>>();
+        let best = best_correlation_in_lag_range(&reference, &reference, 1, 0, 24_000, -16, 16, 1, 1)
+            .expect("zero-lag reference should align even when early negative lags underflow");
+
+        assert_eq!(best.0, 0);
+        assert!(best.1 > 0.99);
     }
 
     #[test]
