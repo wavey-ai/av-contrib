@@ -203,6 +203,13 @@ enum Command {
         tail_seconds: u64,
         #[arg(long, default_value_t = 100)]
         readers: usize,
+        /// Randomize each reader's late-join offset within this window.
+        /// Offsets are aligned to media-part boundaries; use the same seed
+        /// across stream-specific load processes to model one multitrack customer.
+        #[arg(long, default_value_t = 0)]
+        arrival_window_ms: u64,
+        #[arg(long, default_value_t = 0x4e45_4544_4c45_5441)]
+        arrival_seed: u64,
         /// Audio representation that every reader must verify.
         #[arg(long, value_enum, default_value_t = HlsAudioCodec::Flac)]
         expected_audio_codec: HlsAudioCodec,
@@ -421,6 +428,8 @@ struct HlsLoadReport {
     part_ms: u64,
     start_offset_ms: u64,
     end_offset_ms: u64,
+    arrival_window_ms: u64,
+    arrival_seed: u64,
     expected_audio_codec: &'static str,
     expected_pcm_channels: u16,
     readers_requested: usize,
@@ -630,6 +639,8 @@ struct HlsLoadOptions {
     window_seconds: Option<u64>,
     tail_seconds: u64,
     readers: usize,
+    arrival_window_ms: u64,
+    arrival_seed: u64,
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
 }
@@ -1228,6 +1239,8 @@ async fn main() -> Result<()> {
             window_seconds,
             tail_seconds,
             readers,
+            arrival_window_ms,
+            arrival_seed,
             expected_audio_codec,
             expected_pcm_channels,
         } => {
@@ -1246,6 +1259,8 @@ async fn main() -> Result<()> {
                 window_seconds,
                 tail_seconds,
                 readers,
+                arrival_window_ms,
+                arrival_seed,
                 expected_audio_codec,
                 expected_pcm_channels,
             })
@@ -1878,6 +1893,16 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     }
     let mut playlist_has_ll_hls_tags = false;
     let direct_part_route = path_prefix.is_empty();
+    // Do not create an H3 connection and then leave it idle while waiting for
+    // a scheduled late-join window. Connect at the preload boundary so the
+    // first media request cannot inherit a Quinn idle timeout.
+    if matches!(transport, HlsTransport::H3) && !direct_part_route {
+        let preload_at_ns = h3_preload_at_ns(session_id, start_offset_ms);
+        let now_ns = now_unix_ns()?;
+        if now_ns < preload_at_ns {
+            sleep_until(TokioInstant::now() + Duration::from_nanos(preload_at_ns - now_ns)).await;
+        }
+    }
     let mut h3_client = match transport {
         HlsTransport::H3 => Some(H3HttpsClient::connect(edge, server_name, tls_ca).await?),
         HlsTransport::Http1 => None,
@@ -2025,16 +2050,6 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             }
         }
     } else {
-        // A late-join reader must not request its first retained part from
-        // session start. Gate preloading on the requested media window instead,
-        // or early readers occupy and retry blocked part requests for the whole
-        // interval before their window.
-        let preload_at_ns = h3_preload_at_ns(session_id, start_offset_ms);
-        let now_ns = now_unix_ns()?;
-        if now_ns < preload_at_ns {
-            sleep_until(TokioInstant::now() + Duration::from_nanos(preload_at_ns - now_ns)).await;
-        }
-
         type PartRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
         let final_sequence = end_offset_ms.saturating_div(part_ms);
         let mut next_sequence = initial_from_sequence;
@@ -2271,9 +2286,18 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     if options.part_ms == 0 {
         bail!("--part-ms must be positive");
     }
+    if options.arrival_window_ms > 0 && options.window_seconds.is_none() {
+        bail!("--arrival-window-ms requires --window-seconds so every reader requests the same amount of media");
+    }
+    let maximum_start_offset_ms = options.start_offset_ms.saturating_add(
+        options
+            .arrival_window_ms
+            .saturating_div(options.part_ms)
+            .saturating_mul(options.part_ms),
+    );
     let end_offset_ms = hls_window_end_ms(
         options.duration_seconds,
-        options.start_offset_ms,
+        maximum_start_offset_ms,
         options.window_seconds,
         options.part_ms,
     )?;
@@ -2285,6 +2309,13 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     for reader_id in 0..options.readers {
         let reader = options.clone();
         tasks.spawn(async move {
+            let reader_start_offset_ms = randomized_reader_start_offset_ms(
+                reader.start_offset_ms,
+                reader.part_ms,
+                reader.arrival_window_ms,
+                reader_id,
+                reader.arrival_seed,
+            );
             let result = timeout(
                 per_reader_timeout,
                 receive_hls(HlsReceiveOptions {
@@ -2299,7 +2330,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                     part_ms: reader.part_ms,
                     deadline_ms: reader.deadline_ms,
                     render_buffer_ms: 0,
-                    start_offset_ms: reader.start_offset_ms,
+                    start_offset_ms: reader_start_offset_ms,
                     window_seconds: reader.window_seconds,
                     tail_seconds: reader.tail_seconds,
                     expected_audio_codec: reader.expected_audio_codec,
@@ -2342,8 +2373,10 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         .iter()
         .filter(|report| report.missing_parts > 0 || report.non_contiguous_pts > 0)
         .count();
-    let expected_parts_per_reader =
-        end_offset_ms.saturating_sub(options.start_offset_ms) / options.part_ms;
+    let expected_parts_per_reader = options.window_seconds.map_or_else(
+        || end_offset_ms.saturating_sub(options.start_offset_ms) / options.part_ms,
+        |window_seconds| window_seconds.saturating_mul(1_000) / options.part_ms,
+    );
     let received_parts_total = reports
         .iter()
         .map(|report| report.received_parts)
@@ -2419,6 +2452,8 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         part_ms: options.part_ms,
         start_offset_ms: options.start_offset_ms,
         end_offset_ms,
+        arrival_window_ms: options.arrival_window_ms,
+        arrival_seed: options.arrival_seed,
         expected_audio_codec: options.expected_audio_codec.as_str(),
         expected_pcm_channels: options.expected_pcm_channels,
         readers_requested: options.readers,
@@ -2525,9 +2560,12 @@ impl H3HttpsClient {
     async fn connect(edge: SocketAddr, server_name: &str, tls_ca: Option<&Path>) -> Result<Self> {
         let setup_started = Instant::now();
         let crypto = tls_client_config(tls_ca, b"h3")?;
-        let client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
+        let mut client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
             h3_quinn::quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
         ));
+        let mut transport_config = h3_quinn::quinn::TransportConfig::default();
+        transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+        client_config.transport_config(Arc::new(transport_config));
         let bind: SocketAddr = if edge.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
@@ -3041,6 +3079,21 @@ fn deterministic_sample_index(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+fn randomized_reader_start_offset_ms(
+    base_offset_ms: u64,
+    part_ms: u64,
+    arrival_window_ms: u64,
+    reader_id: usize,
+    seed: u64,
+) -> u64 {
+    if part_ms == 0 || arrival_window_ms < part_ms {
+        return base_offset_ms;
+    }
+    let slots = arrival_window_ms / part_ms;
+    let slot = deterministic_sample_index(seed ^ reader_id as u64) % slots.saturating_add(1);
+    base_offset_ms.saturating_add(slot.saturating_mul(part_ms))
+}
+
 fn percentiles_ms(values_ns: Vec<u64>) -> Percentiles {
     let count = values_ns.len();
     percentiles_ms_with_count(values_ns, count)
@@ -3158,6 +3211,25 @@ mod tests {
         assert_eq!(
             h3_preload_at_ns(session_id, 36_000),
             session_id + 35_900_000_000
+        );
+    }
+
+    #[test]
+    fn randomized_reader_arrivals_are_part_aligned_and_reproducible() {
+        let offsets = (0..64)
+            .map(|reader_id| randomized_reader_start_offset_ms(1_000, 5, 250, reader_id, 91))
+            .collect::<Vec<_>>();
+        assert!(offsets
+            .iter()
+            .all(|offset| { (1_000..=1_250).contains(offset) && (offset - 1_000) % 5 == 0 }));
+        assert!(offsets.windows(2).any(|pair| pair[0] != pair[1]));
+        assert_eq!(
+            offsets,
+            (0..64)
+                .map(|reader_id| {
+                    randomized_reader_start_offset_ms(1_000, 5, 250, reader_id, 91)
+                })
+                .collect::<Vec<_>>()
         );
     }
 
