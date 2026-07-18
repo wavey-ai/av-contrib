@@ -161,6 +161,9 @@ enum Command {
         /// Write consumer-decoded interleaved S16LE PCM to this path.
         #[arg(long, requires = "soundkit_key_file")]
         decoded_pcm_output: Option<PathBuf>,
+        /// Save each accepted opaque/media LL-HLS part body for offline inspection.
+        #[arg(long)]
+        raw_part_output_dir: Option<PathBuf>,
         /// Compare decoded Opus with this interleaved S16LE PCM reference.
         #[arg(long, requires = "soundkit_key_file")]
         reference_pcm_s16le: Option<PathBuf>,
@@ -606,6 +609,7 @@ struct HlsReceiveOptions<'a> {
     expected_pcm_channels: u16,
     soundkit_key_file: Option<&'a Path>,
     decoded_pcm_output: Option<&'a Path>,
+    raw_part_output_dir: Option<&'a Path>,
     reference_pcm_s16le: Option<&'a Path>,
     reference_leading_silence_frames: usize,
 }
@@ -640,6 +644,8 @@ struct SoundKitOpusConsumer {
     decoded_pcm_output: Option<PathBuf>,
     reference_pcm_bytes: Option<Vec<u8>>,
     reference_leading_silence_frames: usize,
+    reference_start_offset_frames: usize,
+    reference_window_frames: Option<usize>,
     soundkit_v2_packets: u64,
     encrypted_packets: u64,
     decoded_opus_packets: u64,
@@ -658,6 +664,8 @@ impl SoundKitOpusConsumer {
         decoded_pcm_output: Option<&Path>,
         reference_pcm_s16le: Option<&Path>,
         reference_leading_silence_frames: usize,
+        reference_start_offset_ms: u64,
+        reference_window_ms: u64,
     ) -> Result<Self> {
         let encoded_key = std::fs::read_to_string(key_file)
             .with_context(|| format!("read SoundKit key file {}", key_file.display()))?;
@@ -682,6 +690,9 @@ impl SoundKitOpusConsumer {
             decoded_pcm_output: decoded_pcm_output.map(Path::to_path_buf),
             reference_pcm_bytes,
             reference_leading_silence_frames,
+            reference_start_offset_frames: millis_to_frames(reference_start_offset_ms),
+            reference_window_frames: (reference_window_ms > 0)
+                .then(|| millis_to_frames(reference_window_ms)),
             soundkit_v2_packets: 0,
             encrypted_packets: 0,
             decoded_opus_packets: 0,
@@ -812,6 +823,8 @@ impl SoundKitOpusConsumer {
                     bytes,
                     self.channels,
                     self.reference_leading_silence_frames,
+                    self.reference_start_offset_frames,
+                    self.reference_window_frames,
                 )
             })
             .transpose()?;
@@ -864,11 +877,27 @@ fn write_s16le_pcm(path: &Path, samples: &[i16]) -> Result<()> {
     Ok(())
 }
 
+fn write_raw_hls_part(
+    output_dir: Option<&Path>,
+    sequence: u64,
+    pts_ms: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let Some(output_dir) = output_dir else {
+        return Ok(());
+    };
+    let path = output_dir.join(format!("part-{sequence:012}-pts-{pts_ms:012}.bin"));
+    std::fs::write(&path, bytes)
+        .with_context(|| format!("write raw LL-HLS part {}", path.display()))
+}
+
 fn compare_reference_pcm(
     decoded: &[i16],
     reference_bytes: &[u8],
     channels: u8,
     leading_silence_frames: usize,
+    start_offset_frames: usize,
+    window_frames: Option<usize>,
 ) -> Result<PcmComparison> {
     let channels = usize::from(channels);
     if channels == 0 || !reference_bytes.len().is_multiple_of(2 * channels) {
@@ -885,6 +914,19 @@ fn compare_reference_pcm(
             .chunks_exact(2)
             .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])),
     );
+    let total_reference_frames = reference.len() / channels;
+    if start_offset_frames >= total_reference_frames {
+        bail!(
+            "PCM reference starts after the requested verification window: start={} frames, reference={} frames",
+            start_offset_frames,
+            total_reference_frames
+        );
+    }
+    let end_offset_frames = window_frames
+        .and_then(|frames| start_offset_frames.checked_add(frames))
+        .unwrap_or(total_reference_frames)
+        .min(total_reference_frames);
+    reference = reference[start_offset_frames * channels..end_offset_frames * channels].to_vec();
     let decoded_frames = decoded.len() / channels;
     let reference_frames = reference.len() / channels;
     let common_frames = decoded_frames.min(reference_frames);
@@ -923,6 +965,10 @@ fn compare_reference_pcm(
         alignment_frames: refined.0,
         normalized_correlation: refined.1,
     })
+}
+
+fn millis_to_frames(ms: u64) -> usize {
+    ((u128::from(ms) * u128::from(SAMPLE_RATE)) / 1_000).min(usize::MAX as u128) as usize
 }
 
 fn highest_energy_window(reference: &[i16], channels: usize, window_frames: usize) -> usize {
@@ -1115,6 +1161,7 @@ async fn main() -> Result<()> {
             expected_pcm_channels,
             soundkit_key_file,
             decoded_pcm_output,
+            raw_part_output_dir,
             reference_pcm_s16le,
             reference_leading_silence_frames,
         } => {
@@ -1141,6 +1188,7 @@ async fn main() -> Result<()> {
                     expected_pcm_channels,
                     soundkit_key_file: soundkit_key_file.as_deref(),
                     decoded_pcm_output: decoded_pcm_output.as_deref(),
+                    raw_part_output_dir: raw_part_output_dir.as_deref(),
                     reference_pcm_s16le: reference_pcm_s16le.as_deref(),
                     reference_leading_silence_frames,
                 }),
@@ -1762,6 +1810,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         expected_pcm_channels,
         soundkit_key_file,
         decoded_pcm_output,
+        raw_part_output_dir,
         reference_pcm_s16le,
         reference_leading_silence_frames,
     } = options;
@@ -1812,6 +1861,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                 decoded_pcm_output,
                 reference_pcm_s16le,
                 reference_leading_silence_frames,
+                start_offset_ms,
+                end_offset_ms.saturating_sub(start_offset_ms),
             )?)
         }
         None => {
@@ -1821,6 +1872,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             None
         }
     };
+    if let Some(dir) = raw_part_output_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create raw LL-HLS part output dir {}", dir.display()))?;
+    }
     let mut playlist_has_ll_hls_tags = false;
     let direct_part_route = path_prefix.is_empty();
     let mut h3_client = match transport {
@@ -1912,6 +1967,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     opus_media_packet_mismatches.saturating_add(1);
                             }
                         }
+                        write_raw_hls_part(raw_part_output_dir, sequence, pts_ms, &response.body)?;
                         if let Some(consumer) = opus_consumer.as_mut() {
                             consumer.push_part(sequence, &response.body)?;
                         }
@@ -2065,6 +2121,12 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     opus_media_packet_mismatches.saturating_add(1);
                             }
                         }
+                        write_raw_hls_part(
+                            raw_part_output_dir,
+                            requested_sequence,
+                            pts_ms,
+                            &response.body,
+                        )?;
                         if let Some(consumer) = opus_consumer.as_mut() {
                             consumer.push_part(requested_sequence, &response.body)?;
                         }
@@ -2244,6 +2306,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                     expected_pcm_channels: reader.expected_pcm_channels,
                     soundkit_key_file: None,
                     decoded_pcm_output: None,
+                    raw_part_output_dir: None,
                     reference_pcm_s16le: None,
                     reference_leading_silence_frames: 0,
                 }),
@@ -3163,8 +3226,9 @@ mod tests {
         let reference = (0..24_000)
             .map(|index| ((index as f64 * 0.013).sin() * 12_000.0) as i16)
             .collect::<Vec<_>>();
-        let best = best_correlation_in_lag_range(&reference, &reference, 1, 0, 24_000, -16, 16, 1, 1)
-            .expect("zero-lag reference should align even when early negative lags underflow");
+        let best =
+            best_correlation_in_lag_range(&reference, &reference, 1, 0, 24_000, -16, 16, 1, 1)
+                .expect("zero-lag reference should align even when early negative lags underflow");
 
         assert_eq!(best.0, 0);
         assert!(best.1 > 0.99);
