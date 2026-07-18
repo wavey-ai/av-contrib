@@ -137,6 +137,10 @@ enum Command {
         duration_seconds: u64,
         #[arg(long, default_value_t = 50)]
         part_ms: u64,
+        /// HTTP response duration. A value larger than part-ms requests a
+        /// blocking tail response containing consecutive cached media units.
+        #[arg(long)]
+        response_ms: Option<u64>,
         #[arg(long, default_value_t = 1000)]
         deadline_ms: u64,
         #[arg(long, default_value_t = 150)]
@@ -186,12 +190,20 @@ enum Command {
         path_prefix: String,
         #[arg(long)]
         stream_id: u64,
+        /// Consecutive track streams multiplexed over each reader's H3
+        /// connection. A browser normally reuses one connection per origin.
+        #[arg(long, default_value_t = 1)]
+        stream_count: usize,
         #[arg(long)]
         session_id: u64,
         #[arg(long, default_value_t = 10)]
         duration_seconds: u64,
         #[arg(long, default_value_t = 50)]
         part_ms: u64,
+        /// HTTP response duration. A value larger than part-ms requests a
+        /// blocking tail response containing consecutive cached media units.
+        #[arg(long)]
+        response_ms: Option<u64>,
         #[arg(long, default_value_t = 1000)]
         deadline_ms: u64,
         #[arg(long, default_value_t = 0)]
@@ -368,6 +380,9 @@ struct HlsReceiveReport {
     sample_rate: u32,
     duration_seconds: u64,
     part_ms: u64,
+    response_ms: u64,
+    parts_per_response: u64,
+    media_responses: u64,
     expected_parts: u64,
     received_parts: u64,
     missing_parts: u64,
@@ -394,6 +409,8 @@ struct HlsReceiveReport {
     publication_to_cache_latency_ms: Percentiles,
     cache_to_client_latency_ms: Percentiles,
     availability_latency_ms: Percentiles,
+    first_part_to_response_latency_ms: Percentiles,
+    final_part_to_response_latency_ms: Percentiles,
     estimated_render_latency_ms: Percentiles,
 }
 
@@ -423,15 +440,21 @@ struct HlsLoadReport {
     persistent_connections: bool,
     edge: SocketAddr,
     stream_id: u64,
+    stream_count: usize,
     session_id: u64,
     duration_seconds: u64,
     part_ms: u64,
+    response_ms: u64,
+    parts_per_response: u64,
+    media_responses_total: u64,
     start_offset_ms: u64,
     end_offset_ms: u64,
     arrival_window_ms: u64,
     arrival_seed: u64,
     expected_audio_codec: &'static str,
     expected_pcm_channels: u16,
+    customers_requested: usize,
+    h3_connections: usize,
     readers_requested: usize,
     readers_completed: usize,
     readers_failed: usize,
@@ -448,6 +471,8 @@ struct HlsLoadReport {
     wire_bytes_total: u64,
     connection_setup_ms: Percentiles,
     availability_p99_ms_across_readers: Percentiles,
+    first_part_to_response_p99_ms_across_readers: Percentiles,
+    final_part_to_response_p99_ms_across_readers: Percentiles,
     cache_to_client_p99_ms_across_readers: Percentiles,
     elapsed_ms: u64,
     passed: bool,
@@ -609,6 +634,7 @@ struct HlsReceiveOptions<'a> {
     session_id: u64,
     duration_seconds: u64,
     part_ms: u64,
+    response_ms: u64,
     deadline_ms: u64,
     render_buffer_ms: u64,
     start_offset_ms: u64,
@@ -621,6 +647,7 @@ struct HlsReceiveOptions<'a> {
     raw_part_output_dir: Option<&'a Path>,
     reference_pcm_s16le: Option<&'a Path>,
     reference_leading_silence_frames: usize,
+    shared_h3: Option<SharedH3Client>,
 }
 
 #[derive(Clone)]
@@ -631,9 +658,11 @@ struct HlsLoadOptions {
     transport: HlsTransport,
     path_prefix: String,
     stream_id: u64,
+    stream_count: usize,
     session_id: u64,
     duration_seconds: u64,
     part_ms: u64,
+    response_ms: u64,
     deadline_ms: u64,
     start_offset_ms: u64,
     window_seconds: Option<u64>,
@@ -1163,6 +1192,7 @@ async fn main() -> Result<()> {
             session_id,
             duration_seconds,
             part_ms,
+            response_ms,
             deadline_ms,
             render_buffer_ms,
             start_offset_ms,
@@ -1190,6 +1220,7 @@ async fn main() -> Result<()> {
                     session_id,
                     duration_seconds,
                     part_ms,
+                    response_ms: response_ms.unwrap_or(part_ms),
                     deadline_ms,
                     render_buffer_ms,
                     start_offset_ms,
@@ -1202,6 +1233,7 @@ async fn main() -> Result<()> {
                     raw_part_output_dir: raw_part_output_dir.as_deref(),
                     reference_pcm_s16le: reference_pcm_s16le.as_deref(),
                     reference_leading_silence_frames,
+                    shared_h3: None,
                 }),
             )
             .await
@@ -1231,9 +1263,11 @@ async fn main() -> Result<()> {
             transport,
             path_prefix,
             stream_id,
+            stream_count,
             session_id,
             duration_seconds,
             part_ms,
+            response_ms,
             deadline_ms,
             start_offset_ms,
             window_seconds,
@@ -1251,9 +1285,11 @@ async fn main() -> Result<()> {
                 transport,
                 path_prefix,
                 stream_id,
+                stream_count,
                 session_id,
                 duration_seconds,
                 part_ms,
+                response_ms: response_ms.unwrap_or(part_ms),
                 deadline_ms,
                 start_offset_ms,
                 window_seconds,
@@ -1816,6 +1852,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         session_id,
         duration_seconds,
         part_ms,
+        response_ms,
         deadline_ms,
         render_buffer_ms,
         start_offset_ms,
@@ -1828,12 +1865,26 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         raw_part_output_dir,
         reference_pcm_s16le,
         reference_leading_silence_frames,
+        shared_h3,
     } = options;
     if part_ms == 0 {
         bail!("--part-ms must be positive");
     }
+    if response_ms < part_ms || !response_ms.is_multiple_of(part_ms) {
+        bail!("--response-ms must be a positive multiple of --part-ms");
+    }
+    let parts_per_response = response_ms / part_ms;
+    if parts_per_response > 200 {
+        bail!("--response-ms may contain at most 200 media parts");
+    }
+    if parts_per_response > 1 && expected_audio_codec != HlsAudioCodec::SoundkitOpus {
+        bail!("aggregated response qualification currently requires SoundKit Opus");
+    }
     if !path_prefix.is_empty() && (!path_prefix.starts_with('/') || path_prefix.ends_with('/')) {
         bail!("--path-prefix must be empty or start with one slash and have no trailing slash");
+    }
+    if parts_per_response > 1 && path_prefix.is_empty() {
+        bail!("aggregated responses require the edge tail route");
     }
     let end_offset_ms =
         hls_window_end_ms(duration_seconds, start_offset_ms, window_seconds, part_ms)?;
@@ -1857,6 +1908,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     let mut publication_to_cache_latencies_ns = BoundedLatencySamples::new();
     let mut cache_to_client_latencies_ns = BoundedLatencySamples::new();
     let mut render_latencies_ns = BoundedLatencySamples::new();
+    let mut first_part_to_response_latencies_ns = BoundedLatencySamples::new();
+    let mut final_part_to_response_latencies_ns = BoundedLatencySamples::new();
+    let mut media_responses = 0_u64;
     let mut deadline_misses = 0_u64;
     let mut wire_bytes = 0_u64;
     let mut init_audio_codec = None;
@@ -1896,7 +1950,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     // Do not create an H3 connection and then leave it idle while waiting for
     // a scheduled late-join window. Connect at the preload boundary so the
     // first media request cannot inherit a Quinn idle timeout.
-    if matches!(transport, HlsTransport::H3) && !direct_part_route {
+    if shared_h3.is_none() && matches!(transport, HlsTransport::H3) && !direct_part_route {
         let preload_at_ns = h3_preload_at_ns(session_id, start_offset_ms);
         let now_ns = now_unix_ns()?;
         if now_ns < preload_at_ns {
@@ -1904,12 +1958,150 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
     }
     let mut h3_client = match transport {
-        HlsTransport::H3 => Some(H3HttpsClient::connect(edge, server_name, tls_ca).await?),
+        HlsTransport::H3 => Some(match shared_h3 {
+            Some(client) => ActiveH3Client::Shared(client),
+            None => ActiveH3Client::Owned(H3HttpsClient::connect(edge, server_name, tls_ca).await?),
+        }),
         HlsTransport::Http1 => None,
     };
-    let connection_setup_ms = h3_client.as_ref().map(|client| client.connection_setup_ms);
+    let connection_setup_ms = h3_client.as_ref().map(ActiveH3Client::connection_setup_ms);
 
-    if !matches!(transport, HlsTransport::H3) || direct_part_route {
+    if parts_per_response > 1 {
+        if expected_parts % parts_per_response != 0 {
+            bail!("qualification window must contain a whole number of aggregated responses");
+        }
+        while now_unix_ns()? < stop_ns && part_coverage.received_parts < expected_parts {
+            let path = after_sequence.map_or_else(
+                || {
+                    hls_path(
+                        path_prefix,
+                        stream_id,
+                        &format!("tail?from={initial_from_sequence}"),
+                    )
+                },
+                |sequence| hls_path(path_prefix, stream_id, &format!("tail?after={sequence}")),
+            );
+            let response = hls_https_get(&mut h3_client, edge, server_name, tls_ca, &path).await?;
+            wire_bytes = wire_bytes.saturating_add(response.wire_bytes as u64);
+            match response.status {
+                200 => {
+                    media_responses = media_responses.saturating_add(1);
+                    let header_u64 = |name: &str| -> Result<u64> {
+                        response
+                            .headers
+                            .get(name)
+                            .with_context(|| format!("aggregated LL-HLS response omitted {name}"))?
+                            .parse::<u64>()
+                            .with_context(|| {
+                                format!("aggregated LL-HLS response returned an invalid {name}")
+                            })
+                    };
+                    let start_sequence = header_u64("x-sequence-start")?;
+                    let end_sequence = header_u64("x-sequence-end")?;
+                    let response_part_count = header_u64("x-part-count")?;
+                    let continuation_sequence = header_u64("x-sequence")?;
+                    let expected_start = after_sequence
+                        .and_then(|sequence| sequence.checked_add(1))
+                        .unwrap_or(initial_from_sequence);
+                    let expected_end = start_sequence
+                        .checked_add(parts_per_response.saturating_sub(1))
+                        .context("aggregated LL-HLS sequence range overflow")?;
+                    if start_sequence != expected_start
+                        || end_sequence != expected_end
+                        || continuation_sequence != end_sequence
+                        || response_part_count != parts_per_response
+                    {
+                        bail!(
+                            "aggregated LL-HLS range {start_sequence}..={end_sequence} ({response_part_count} parts, cursor {continuation_sequence}) did not match expected {expected_start}..={expected_end}"
+                        );
+                    }
+                    let parts = split_soundkit_opus_parts(&response.body, part_ms)?;
+                    if parts.len() as u64 != parts_per_response {
+                        bail!(
+                            "aggregated LL-HLS body contained {} media units, expected {parts_per_response}",
+                            parts.len()
+                        );
+                    }
+                    let arrival_ns = now_unix_ns()?;
+                    let first_capture_ns = session_id.saturating_add(
+                        start_sequence
+                            .saturating_mul(part_ms)
+                            .saturating_mul(1_000_000),
+                    );
+                    let final_capture_ns = session_id.saturating_add(
+                        end_sequence
+                            .saturating_mul(part_ms)
+                            .saturating_mul(1_000_000),
+                    );
+                    if arrival_ns >= first_capture_ns {
+                        first_part_to_response_latencies_ns.record(arrival_ns - first_capture_ns);
+                    }
+                    if arrival_ns >= final_capture_ns {
+                        final_part_to_response_latencies_ns.record(arrival_ns - final_capture_ns);
+                    }
+
+                    for (offset, part) in parts.into_iter().enumerate() {
+                        let sequence = start_sequence.saturating_add(offset as u64);
+                        let pts_ms = sequence.saturating_mul(part_ms);
+                        if pts_ms < start_offset_ms || pts_ms >= end_offset_ms {
+                            continue;
+                        }
+                        if !part_coverage.insert_pts(pts_ms) {
+                            bail!(
+                                "aggregated LL-HLS returned duplicate or invalid PTS {pts_ms} ms"
+                            );
+                        }
+                        let capture_ns =
+                            session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
+                        let latency_ns = arrival_ns.saturating_sub(capture_ns);
+                        if latency_ns > deadline_ms.saturating_mul(1_000_000) {
+                            deadline_misses = deadline_misses.saturating_add(1);
+                        }
+                        availability_latencies_ns.record(latency_ns);
+                        if soundkit_opus_part_is_valid(part, part_ms) {
+                            opus_media_parts_verified = opus_media_parts_verified.saturating_add(1);
+                            init_audio_codec_verified = true;
+                        } else {
+                            opus_media_packet_mismatches =
+                                opus_media_packet_mismatches.saturating_add(1);
+                        }
+                        write_raw_hls_part(raw_part_output_dir, sequence, pts_ms, part)?;
+                        if let Some(consumer) = opus_consumer.as_mut() {
+                            consumer.push_part(sequence, part)?;
+                        }
+                        render_latencies_ns.record(
+                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
+                        );
+                    }
+                    if let Some((publication_to_cache_ns, cache_to_client_ns)) =
+                        split_cache_latency_ns(&response.headers, final_capture_ns, arrival_ns)
+                    {
+                        publication_to_cache_latencies_ns.record(publication_to_cache_ns);
+                        cache_to_client_latencies_ns.record(cache_to_client_ns);
+                    }
+                    after_sequence = Some(end_sequence);
+
+                    if !playlist_has_ll_hls_tags {
+                        let playlist = hls_https_get(
+                            &mut h3_client,
+                            edge,
+                            server_name,
+                            tls_ca,
+                            &hls_path(path_prefix, stream_id, "stream.m3u8"),
+                        )
+                        .await?;
+                        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
+                        if playlist.status == 200 {
+                            playlist_has_ll_hls_tags =
+                                playlist_matches_format(&playlist.body, expected_audio_codec);
+                        }
+                    }
+                }
+                204 | 404 => tokio::task::yield_now().await,
+                status => bail!("aggregated LL-HLS tail returned HTTP {status}"),
+            }
+        }
+    } else if !matches!(transport, HlsTransport::H3) || direct_part_route {
         while now_unix_ns()? < stop_ns {
             let requested_sequence = after_sequence
                 .unwrap_or(initial_from_sequence)
@@ -1939,6 +2131,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             wire_bytes = wire_bytes.saturating_add(response.wire_bytes as u64);
             match response.status {
                 200 => {
+                    media_responses = media_responses.saturating_add(1);
                     let sequence = if direct_part_route {
                         requested_sequence
                     } else {
@@ -1967,6 +2160,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
                         availability_latencies_ns.record(latency_ns);
+                        first_part_to_response_latencies_ns.record(latency_ns);
+                        final_part_to_response_latencies_ns.record(latency_ns);
                         if let Some(expected_bytes) = expected_pcm_part_bytes(
                             expected_audio_codec,
                             expected_pcm_channels,
@@ -2084,6 +2279,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             let mut retry_sequence = None;
             match response.status {
                 200 => {
+                    media_responses = media_responses.saturating_add(1);
                     let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
                         && soundkit_opus_part_is_valid(&response.body, part_ms);
                     let pts_ms = media_part_pts_ms(
@@ -2111,6 +2307,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
                         availability_latencies_ns.record(latency_ns);
+                        first_part_to_response_latencies_ns.record(latency_ns);
+                        final_part_to_response_latencies_ns.record(latency_ns);
                         if let Some(expected_bytes) = expected_pcm_part_bytes(
                             expected_audio_codec,
                             expected_pcm_channels,
@@ -2249,6 +2447,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         sample_rate: SAMPLE_RATE,
         duration_seconds,
         part_ms,
+        response_ms,
+        parts_per_response,
+        media_responses,
         expected_parts,
         received_parts: part_coverage.received_parts,
         missing_parts: expected_parts.saturating_sub(part_coverage.received_parts),
@@ -2275,16 +2476,183 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         publication_to_cache_latency_ms: publication_to_cache_latencies_ns.summary(),
         cache_to_client_latency_ms: cache_to_client_latencies_ns.summary(),
         availability_latency_ms: availability_latencies_ns.summary(),
+        first_part_to_response_latency_ms: first_part_to_response_latencies_ns.summary(),
+        final_part_to_response_latency_ms: final_part_to_response_latencies_ns.summary(),
         estimated_render_latency_ms: render_latencies_ns.summary(),
     })
+}
+
+struct HlsCustomerLoadResult {
+    customer_id: usize,
+    streams: Vec<(u64, Result<HlsReceiveReport>)>,
+    shared_connection_setup_ms: Option<f64>,
+    shared_wire_bytes: u64,
+}
+
+async fn receive_hls_load_customer(
+    customer_id: usize,
+    reader: HlsLoadOptions,
+    per_reader_timeout: Duration,
+) -> HlsCustomerLoadResult {
+    let reader_start_offset_ms = randomized_reader_start_offset_ms(
+        reader.start_offset_ms,
+        reader.part_ms,
+        reader.arrival_window_ms,
+        customer_id,
+        reader.arrival_seed,
+    );
+    if reader.stream_count == 1 {
+        let result = timeout(
+            per_reader_timeout,
+            receive_hls(HlsReceiveOptions {
+                edge: reader.edge,
+                server_name: &reader.server_name,
+                tls_ca: reader.tls_ca.as_deref(),
+                transport: reader.transport,
+                path_prefix: &reader.path_prefix,
+                stream_id: reader.stream_id,
+                session_id: reader.session_id,
+                duration_seconds: reader.duration_seconds,
+                part_ms: reader.part_ms,
+                response_ms: reader.response_ms,
+                deadline_ms: reader.deadline_ms,
+                render_buffer_ms: 0,
+                start_offset_ms: reader_start_offset_ms,
+                window_seconds: reader.window_seconds,
+                tail_seconds: reader.tail_seconds,
+                expected_audio_codec: reader.expected_audio_codec,
+                expected_pcm_channels: reader.expected_pcm_channels,
+                soundkit_key_file: None,
+                decoded_pcm_output: None,
+                raw_part_output_dir: None,
+                reference_pcm_s16le: None,
+                reference_leading_silence_frames: 0,
+                shared_h3: None,
+            }),
+        )
+        .await
+        .context("reader exceeded its overall deadline")
+        .and_then(|result| result);
+        return HlsCustomerLoadResult {
+            customer_id,
+            streams: vec![(reader.stream_id, result)],
+            shared_connection_setup_ms: None,
+            shared_wire_bytes: 0,
+        };
+    }
+
+    let preload_at_ns = h3_preload_at_ns(reader.session_id, reader_start_offset_ms);
+    if let Ok(now_ns) = now_unix_ns() {
+        if now_ns < preload_at_ns {
+            sleep_until(TokioInstant::now() + Duration::from_nanos(preload_at_ns - now_ns)).await;
+        }
+    }
+    let owner =
+        match H3HttpsClient::connect(reader.edge, &reader.server_name, reader.tls_ca.as_deref())
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                let message = format!("shared H3 connection failed: {error:#}");
+                let streams = (0..reader.stream_count)
+                    .map(|offset| {
+                        (
+                            reader.stream_id.saturating_add(offset as u64),
+                            Err(anyhow::anyhow!(message.clone())),
+                        )
+                    })
+                    .collect();
+                return HlsCustomerLoadResult {
+                    customer_id,
+                    streams,
+                    shared_connection_setup_ms: None,
+                    shared_wire_bytes: 0,
+                };
+            }
+        };
+    let connection_setup_ms = owner.connection_setup_ms;
+    let shared = owner.shared();
+    let mut stream_tasks = tokio::task::JoinSet::new();
+    for offset in 0..reader.stream_count {
+        let stream_reader = reader.clone();
+        let stream_h3 = shared.clone();
+        let stream_id = reader.stream_id.saturating_add(offset as u64);
+        stream_tasks.spawn(async move {
+            let result = timeout(
+                per_reader_timeout,
+                receive_hls(HlsReceiveOptions {
+                    edge: stream_reader.edge,
+                    server_name: &stream_reader.server_name,
+                    tls_ca: stream_reader.tls_ca.as_deref(),
+                    transport: stream_reader.transport,
+                    path_prefix: &stream_reader.path_prefix,
+                    stream_id,
+                    session_id: stream_reader.session_id,
+                    duration_seconds: stream_reader.duration_seconds,
+                    part_ms: stream_reader.part_ms,
+                    response_ms: stream_reader.response_ms,
+                    deadline_ms: stream_reader.deadline_ms,
+                    render_buffer_ms: 0,
+                    start_offset_ms: reader_start_offset_ms,
+                    window_seconds: stream_reader.window_seconds,
+                    tail_seconds: stream_reader.tail_seconds,
+                    expected_audio_codec: stream_reader.expected_audio_codec,
+                    expected_pcm_channels: stream_reader.expected_pcm_channels,
+                    soundkit_key_file: None,
+                    decoded_pcm_output: None,
+                    raw_part_output_dir: None,
+                    reference_pcm_s16le: None,
+                    reference_leading_silence_frames: 0,
+                    shared_h3: Some(stream_h3),
+                }),
+            )
+            .await
+            .context("reader stream exceeded its overall deadline")
+            .and_then(|result| result);
+            (stream_id, result)
+        });
+    }
+    let mut streams = Vec::with_capacity(reader.stream_count);
+    while let Some(outcome) = stream_tasks.join_next().await {
+        match outcome {
+            Ok(stream) => streams.push(stream),
+            Err(error) => streams.push((
+                0,
+                Err(anyhow::anyhow!("reader stream task failed: {error}")),
+            )),
+        }
+    }
+    let shared_wire_bytes = owner.wire_bytes();
+    HlsCustomerLoadResult {
+        customer_id,
+        streams,
+        shared_connection_setup_ms: Some(connection_setup_ms),
+        shared_wire_bytes,
+    }
 }
 
 async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     if options.readers == 0 || options.readers > 4_096 {
         bail!("--readers must be between 1 and 4096");
     }
+    if options.stream_count == 0 || options.stream_count > 128 {
+        bail!("--stream-count must be between 1 and 128");
+    }
+    if options.stream_count > 1 && !matches!(options.transport, HlsTransport::H3) {
+        bail!("--stream-count greater than one requires HTTP/3 connection multiplexing");
+    }
+    let final_stream_offset =
+        u64::try_from(options.stream_count - 1).context("--stream-count exceeds this platform")?;
+    options
+        .stream_id
+        .checked_add(final_stream_offset)
+        .context("stream id range overflow")?;
     if options.part_ms == 0 {
         bail!("--part-ms must be positive");
+    }
+    if options.response_ms < options.part_ms || !options.response_ms.is_multiple_of(options.part_ms)
+    {
+        bail!("--response-ms must be a positive multiple of --part-ms");
     }
     if options.arrival_window_ms > 0 && options.window_seconds.is_none() {
         bail!("--arrival-window-ms requires --window-seconds so every reader requests the same amount of media");
@@ -2308,55 +2676,57 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     let mut tasks = tokio::task::JoinSet::new();
     for reader_id in 0..options.readers {
         let reader = options.clone();
-        tasks.spawn(async move {
-            let reader_start_offset_ms = randomized_reader_start_offset_ms(
-                reader.start_offset_ms,
-                reader.part_ms,
-                reader.arrival_window_ms,
-                reader_id,
-                reader.arrival_seed,
-            );
-            let result = timeout(
-                per_reader_timeout,
-                receive_hls(HlsReceiveOptions {
-                    edge: reader.edge,
-                    server_name: &reader.server_name,
-                    tls_ca: reader.tls_ca.as_deref(),
-                    transport: reader.transport,
-                    path_prefix: &reader.path_prefix,
-                    stream_id: reader.stream_id,
-                    session_id: reader.session_id,
-                    duration_seconds: reader.duration_seconds,
-                    part_ms: reader.part_ms,
-                    deadline_ms: reader.deadline_ms,
-                    render_buffer_ms: 0,
-                    start_offset_ms: reader_start_offset_ms,
-                    window_seconds: reader.window_seconds,
-                    tail_seconds: reader.tail_seconds,
-                    expected_audio_codec: reader.expected_audio_codec,
-                    expected_pcm_channels: reader.expected_pcm_channels,
-                    soundkit_key_file: None,
-                    decoded_pcm_output: None,
-                    raw_part_output_dir: None,
-                    reference_pcm_s16le: None,
-                    reference_leading_silence_frames: 0,
-                }),
-            )
-            .await
-            .context("reader exceeded its overall deadline")
-            .and_then(|result| result);
-            (reader_id, result)
-        });
+        tasks.spawn(receive_hls_load_customer(
+            reader_id,
+            reader,
+            per_reader_timeout,
+        ));
     }
 
-    let mut reports = Vec::with_capacity(options.readers);
+    let requested_track_readers = options
+        .readers
+        .checked_mul(options.stream_count)
+        .context("requested customer/stream product exceeds this platform")?;
+    let mut reports = Vec::with_capacity(requested_track_readers);
     let mut errors = Vec::new();
+    let mut shared_connection_setup_ms = Vec::new();
+    let mut shared_wire_bytes_total = 0_u64;
     while let Some(outcome) = tasks.join_next().await {
         match outcome {
-            Ok((_reader_id, Ok(report))) => reports.push(report),
-            Ok((reader_id, Err(error))) => {
-                if errors.len() < 20 {
-                    errors.push(format!("reader {reader_id}: {error}"));
+            Ok(customer) => {
+                if let Some(setup_ms) = customer.shared_connection_setup_ms {
+                    shared_connection_setup_ms.push(setup_ms);
+                }
+                shared_wire_bytes_total =
+                    shared_wire_bytes_total.saturating_add(customer.shared_wire_bytes);
+                for (stream_id, result) in customer.streams {
+                    match result {
+                        Ok(report) => {
+                            if (report.missing_parts > 0
+                                || report.non_contiguous_pts > 0
+                                || report.deadline_misses > 0)
+                                && errors.len() < 20
+                            {
+                                errors.push(format!(
+                                    "customer {} stream {stream_id}: {} missing parts, {} non-contiguous PTS, {} deadline misses, {} media responses",
+                                    customer.customer_id,
+                                    report.missing_parts,
+                                    report.non_contiguous_pts,
+                                    report.deadline_misses,
+                                    report.media_responses
+                                ));
+                            }
+                            reports.push(report);
+                        }
+                        Err(error) => {
+                            if errors.len() < 20 {
+                                errors.push(format!(
+                                    "customer {} stream {stream_id}: {error}",
+                                    customer.customer_id
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -2368,7 +2738,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     }
 
     let readers_completed = reports.len();
-    let readers_failed = options.readers.saturating_sub(readers_completed);
+    let readers_failed = requested_track_readers.saturating_sub(readers_completed);
     let readers_with_incomplete_media = reports
         .iter()
         .filter(|report| report.missing_parts > 0 || report.non_contiguous_pts > 0)
@@ -2380,6 +2750,10 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     let received_parts_total = reports
         .iter()
         .map(|report| report.received_parts)
+        .sum::<u64>();
+    let media_responses_total = reports
+        .iter()
+        .map(|report| report.media_responses)
         .sum::<u64>();
     let missing_parts_total = reports
         .iter()
@@ -2410,14 +2784,24 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         .iter()
         .filter(|report| report.playlist_has_ll_hls_tags)
         .count();
-    let wire_bytes_total = reports.iter().map(|report| report.wire_bytes).sum::<u64>();
-    let connection_setup_ms = percentiles_ms(
+    let wire_bytes_total = reports
+        .iter()
+        .map(|report| report.wire_bytes)
+        .sum::<u64>()
+        .saturating_add(shared_wire_bytes_total);
+    let connection_setup_samples = if shared_connection_setup_ms.is_empty() {
         reports
             .iter()
             .filter_map(|report| report.connection_setup_ms)
             .map(ms_f64_to_ns)
-            .collect(),
-    );
+            .collect()
+    } else {
+        shared_connection_setup_ms
+            .into_iter()
+            .map(ms_f64_to_ns)
+            .collect()
+    };
+    let connection_setup_ms = percentiles_ms(connection_setup_samples);
     let availability_p99_ms_across_readers = percentiles_ms(
         reports
             .iter()
@@ -2432,31 +2816,53 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
             .map(|report| ms_f64_to_ns(report.cache_to_client_latency_ms.p99))
             .collect(),
     );
+    let first_part_to_response_p99_ms_across_readers = percentiles_ms(
+        reports
+            .iter()
+            .filter(|report| report.first_part_to_response_latency_ms.count > 0)
+            .map(|report| ms_f64_to_ns(report.first_part_to_response_latency_ms.p99))
+            .collect(),
+    );
+    let final_part_to_response_p99_ms_across_readers = percentiles_ms(
+        reports
+            .iter()
+            .filter(|report| report.final_part_to_response_latency_ms.count > 0)
+            .map(|report| ms_f64_to_ns(report.final_part_to_response_latency_ms.p99))
+            .collect(),
+    );
     let passed = readers_failed == 0
         && readers_with_incomplete_media == 0
         && deadline_misses_total == 0
-        && init_verified_readers == options.readers
+        && init_verified_readers == requested_track_readers
         && pcm_media_size_mismatches_total == 0
         && opus_media_packet_mismatches_total == 0
-        && playlist_verified_readers == options.readers;
+        && playlist_verified_readers == requested_track_readers;
 
     Ok(HlsLoadReport {
-        schema: "needletail.aep1-48k-probe.hls-load.v2",
+        schema: "needletail.aep1-48k-probe.hls-load.v3",
         transport: options.transport.as_str(),
         tls_protocol: "TLSv1.3",
         persistent_connections: matches!(options.transport, HlsTransport::H3),
         edge: options.edge,
         stream_id: options.stream_id,
+        stream_count: options.stream_count,
         session_id: options.session_id,
         duration_seconds: options.duration_seconds,
         part_ms: options.part_ms,
+        response_ms: options.response_ms,
+        parts_per_response: options.response_ms / options.part_ms,
+        media_responses_total,
         start_offset_ms: options.start_offset_ms,
         end_offset_ms,
         arrival_window_ms: options.arrival_window_ms,
         arrival_seed: options.arrival_seed,
         expected_audio_codec: options.expected_audio_codec.as_str(),
         expected_pcm_channels: options.expected_pcm_channels,
-        readers_requested: options.readers,
+        customers_requested: options.readers,
+        h3_connections: matches!(options.transport, HlsTransport::H3)
+            .then_some(options.readers)
+            .unwrap_or(0),
+        readers_requested: requested_track_readers,
         readers_completed,
         readers_failed,
         readers_with_incomplete_media,
@@ -2472,6 +2878,8 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         wire_bytes_total,
         connection_setup_ms,
         availability_p99_ms_across_readers,
+        first_part_to_response_p99_ms_across_readers,
+        final_part_to_response_p99_ms_across_readers,
         cache_to_client_p99_ms_across_readers,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         passed,
@@ -2519,6 +2927,48 @@ struct H3HttpsClient {
 struct H3RequestSender {
     send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     authority: String,
+}
+
+#[derive(Clone)]
+struct SharedH3Client {
+    request_sender: H3RequestSender,
+    connection_setup_ms: f64,
+}
+
+enum ActiveH3Client {
+    Owned(H3HttpsClient),
+    Shared(SharedH3Client),
+}
+
+impl ActiveH3Client {
+    async fn get(&self, path: &str) -> Result<SimpleHttpResponse> {
+        match self {
+            Self::Owned(client) => client.get(path).await,
+            Self::Shared(client) => client.request_sender.clone().get(path.to_owned()).await,
+        }
+    }
+
+    fn request_sender(&self) -> H3RequestSender {
+        match self {
+            Self::Owned(client) => client.request_sender(),
+            Self::Shared(client) => client.request_sender.clone(),
+        }
+    }
+
+    fn connection_setup_ms(&self) -> f64 {
+        match self {
+            Self::Owned(client) => client.connection_setup_ms,
+            Self::Shared(client) => client.connection_setup_ms,
+        }
+    }
+
+    fn wire_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(client) => client.wire_bytes(),
+            // The load caller records a shared connection exactly once.
+            Self::Shared(_) => 0,
+        }
+    }
 }
 
 impl H3RequestSender {
@@ -2607,6 +3057,13 @@ impl H3HttpsClient {
         }
     }
 
+    fn shared(&self) -> SharedH3Client {
+        SharedH3Client {
+            request_sender: self.request_sender(),
+            connection_setup_ms: self.connection_setup_ms,
+        }
+    }
+
     async fn get(&self, path: &str) -> Result<SimpleHttpResponse> {
         self.request_sender().get(path.to_owned()).await
     }
@@ -2625,7 +3082,7 @@ impl Drop for H3HttpsClient {
 }
 
 async fn hls_https_get(
-    h3_client: &mut Option<H3HttpsClient>,
+    h3_client: &mut Option<ActiveH3Client>,
     edge: SocketAddr,
     server_name: &str,
     tls_ca: Option<&Path>,
@@ -2802,6 +3259,56 @@ fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) ->
         .checked_div(1_000)?
         .checked_mul(u64::from(channels))?
         .checked_mul(bytes_per_sample)
+}
+
+fn split_soundkit_opus_parts(bytes: &[u8], part_ms: u64) -> Result<Vec<&[u8]>> {
+    let scaled_frames = u64::from(SAMPLE_RATE)
+        .checked_mul(part_ms)
+        .context("SoundKit response duration overflow")?;
+    if part_ms == 0 || !scaled_frames.is_multiple_of(1_000) {
+        bail!("SoundKit part duration does not contain a whole number of audio frames");
+    }
+    let expected_frames = scaled_frames / 1_000;
+    let mut parts = Vec::new();
+    let mut part_start = 0_usize;
+    let mut offset = 0_usize;
+    let mut part_frames = 0_u64;
+    while offset < bytes.len() {
+        let header_size = FrameHeaderV2::header_size(&bytes[offset..])
+            .map_err(anyhow::Error::msg)
+            .context("aggregated SoundKit body contained an invalid header")?;
+        let header_end = offset
+            .checked_add(header_size)
+            .context("aggregated SoundKit header offset overflow")?;
+        let header_bytes = bytes
+            .get(offset..header_end)
+            .context("aggregated SoundKit body truncated a header")?;
+        let header = FrameHeaderV2::decode(&mut &header_bytes[..])
+            .map_err(anyhow::Error::msg)
+            .context("aggregated SoundKit body contained an invalid frame")?;
+        let payload_size = usize::try_from(header.payload_size())
+            .context("aggregated SoundKit payload exceeds this platform")?;
+        let packet_end = header_end
+            .checked_add(payload_size)
+            .context("aggregated SoundKit packet offset overflow")?;
+        if packet_end > bytes.len() {
+            bail!("aggregated SoundKit body truncated a payload");
+        }
+        part_frames = part_frames.saturating_add(u64::from(header.frame_count()));
+        if part_frames > expected_frames {
+            bail!("aggregated SoundKit packet crossed a cached-part boundary");
+        }
+        offset = packet_end;
+        if part_frames == expected_frames {
+            parts.push(&bytes[part_start..offset]);
+            part_start = offset;
+            part_frames = 0;
+        }
+    }
+    if part_frames != 0 || part_start != bytes.len() {
+        bail!("aggregated SoundKit body ended with a partial cached media unit");
+    }
+    Ok(parts)
 }
 
 fn soundkit_opus_part_is_valid(mut bytes: &[u8], part_ms: u64) -> bool {
@@ -3139,6 +3646,41 @@ fn now_unix_ns() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_soundkit_opus_part(id: u8) -> Vec<u8> {
+        let payload = [id; 12];
+        let header = FrameHeaderV2::new(
+            EncodingFlag::Opus,
+            payload.len() as u32,
+            FRAME_COUNT,
+            SAMPLE_RATE,
+            2,
+            16,
+            frame_header::Endianness::LittleEndian,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_packet_flags(FrameHeaderV2::FLAG_ENCRYPTED)
+        .unwrap();
+        let mut bytes = Vec::with_capacity(header.size() + payload.len());
+        header.encode(&mut bytes).unwrap();
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[test]
+    fn splits_aggregated_soundkit_body_on_exact_cached_part_boundaries() {
+        let expected: Vec<Vec<u8>> = (0..40).map(test_soundkit_opus_part).collect();
+        let body: Vec<u8> = expected.iter().flatten().copied().collect();
+        let parts = split_soundkit_opus_parts(&body, 5).unwrap();
+        assert_eq!(parts.len(), 40);
+        for (actual, expected) in parts.into_iter().zip(&expected) {
+            assert_eq!(actual, expected);
+            assert!(soundkit_opus_part_is_valid(actual, 5));
+        }
+    }
 
     #[test]
     fn percentile_summary_is_deterministic() {
