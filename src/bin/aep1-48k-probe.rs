@@ -2653,22 +2653,36 @@ async fn receive_hls_bundle_customer(
         H3HttpsClient::connect(reader.edge, &reader.server_name, reader.tls_ca.as_deref()).await?;
     let connection_setup_ms = owner.connection_setup_ms;
 
-    let mut after_sequence = None;
+    type BundleRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
+    let final_sequence = end_offset_ms.saturating_div(reader.part_ms);
+    let mut next_sequence = initial_from_sequence;
+    let mut in_flight = FuturesUnordered::<BundleRequest>::new();
+    while in_flight.len() < H3_PART_PIPELINE_DEPTH && next_sequence < final_sequence {
+        let requested_sequence = next_sequence;
+        next_sequence = next_sequence.saturating_add(parts_per_response);
+        let path = format!(
+            "{}/tail-bundle?streams={stream_query}&from={requested_sequence}&parts={parts_per_response}",
+            reader.path_prefix
+        );
+        let sender = owner.request_sender();
+        in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
+    }
+
     let mut media_responses = 0_u64;
     while now_unix_ns()? < stop_ns
         && states
             .first()
             .is_some_and(|state| state.coverage.received_parts < expected_parts)
+        && !in_flight.is_empty()
     {
-        let cursor = after_sequence.map_or_else(
-            || format!("from={initial_from_sequence}"),
-            |sequence| format!("after={sequence}"),
-        );
-        let path = format!(
-            "{}/tail-bundle?streams={stream_query}&{cursor}&parts={parts_per_response}",
-            reader.path_prefix
-        );
-        let response = owner.get(&path).await?;
+        let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
+        let Some((requested_sequence, response)) =
+            timeout(remaining, in_flight.next()).await.ok().flatten()
+        else {
+            break;
+        };
+        let response = response?;
+        let mut retry_sequence = None;
         match response.status {
             200 => {
                 if response
@@ -2678,16 +2692,18 @@ async fn receive_hls_bundle_customer(
                 {
                     bail!("LL-HLS tail bundle returned an invalid content type");
                 }
+                let arrival_ns = response.received_unix_ns;
                 let entries = decode_tail_bundle(Bytes::from(response.body))?;
+                let expected_after = (requested_sequence != initial_from_sequence)
+                    .then(|| requested_sequence.saturating_sub(1));
                 validate_tail_bundle_entries(
                     &stream_ids,
                     &entries,
-                    after_sequence,
+                    expected_after,
                     initial_from_sequence,
                     parts_per_response,
                 )?;
                 media_responses = media_responses.saturating_add(1);
-                let arrival_ns = now_unix_ns()?;
                 for (state, entry) in states.iter_mut().zip(&entries) {
                     state.media_responses = state.media_responses.saturating_add(1);
                     let parts = if parts_per_response == 1 {
@@ -2764,37 +2780,60 @@ async fn receive_hls_bundle_customer(
                         }
                     }
                 }
-                for state in states
-                    .iter_mut()
-                    .filter(|state| !state.playlist_has_ll_hls_tags)
-                {
-                    let playlist = owner
-                        .get(&hls_path(
-                            &reader.path_prefix,
-                            state.stream_id,
-                            "stream.m3u8",
-                        ))
-                        .await?;
-                    if playlist.status != 200 {
-                        bail!(
-                            "LL-HLS playlist for stream {} returned HTTP {}",
-                            state.stream_id,
-                            playlist.status
-                        );
-                    }
-                    if !playlist_matches_format(&playlist.body, reader.expected_audio_codec) {
-                        bail!(
-                            "LL-HLS playlist for stream {} did not advertise the expected format",
-                            state.stream_id
-                        );
-                    }
-                    state.playlist_has_ll_hls_tags = true;
-                }
-                after_sequence = entries.first().map(|entry| entry.end_sequence);
             }
-            204 | 404 => tokio::task::yield_now().await,
+            204 | 404 => retry_sequence = Some(requested_sequence),
             status => bail!("LL-HLS tail bundle returned HTTP {status}"),
         }
+
+        if states
+            .first()
+            .is_some_and(|state| state.coverage.received_parts < expected_parts)
+        {
+            let sequence_to_schedule = retry_sequence.or_else(|| {
+                if next_sequence < final_sequence {
+                    let sequence = next_sequence;
+                    next_sequence = next_sequence.saturating_add(parts_per_response);
+                    Some(sequence)
+                } else {
+                    None
+                }
+            });
+            if let Some(requested_sequence) = sequence_to_schedule {
+                let path = format!(
+                    "{}/tail-bundle?streams={stream_query}&from={requested_sequence}&parts={parts_per_response}",
+                    reader.path_prefix
+                );
+                let sender = owner.request_sender();
+                in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
+            }
+        }
+    }
+
+    // Playlist qualification is deliberately outside the timed media loop.
+    // Pausing a live tail to make serial metadata requests creates client-side
+    // deadline misses and is not how a persistent multiplexed H3 consumer runs.
+    for state in &mut states {
+        let playlist = owner
+            .get(&hls_path(
+                &reader.path_prefix,
+                state.stream_id,
+                "stream.m3u8",
+            ))
+            .await?;
+        if playlist.status != 200 {
+            bail!(
+                "LL-HLS playlist for stream {} returned HTTP {}",
+                state.stream_id,
+                playlist.status
+            );
+        }
+        if !playlist_matches_format(&playlist.body, reader.expected_audio_codec) {
+            bail!(
+                "LL-HLS playlist for stream {} did not advertise the expected format",
+                state.stream_id
+            );
+        }
+        state.playlist_has_ll_hls_tags = true;
     }
 
     let wire_bytes = owner.wire_bytes();
@@ -3359,6 +3398,7 @@ struct SimpleHttpResponse {
     headers: HashMap<String, String>,
     body: Vec<u8>,
     wire_bytes: usize,
+    received_unix_ns: u64,
 }
 
 struct H3HttpsClient {
@@ -3443,12 +3483,17 @@ impl H3RequestSender {
             let remaining = chunk.remaining();
             body.extend_from_slice(&chunk.copy_to_bytes(remaining));
         }
+        // Timestamp the completed body before the caller parses or validates
+        // it. Otherwise client scheduling and multitrack bundle decoding are
+        // incorrectly reported as network/server latency.
+        let received_unix_ns = now_unix_ns()?;
         Ok(SimpleHttpResponse {
             status,
             headers,
             body,
             // The report uses Quinn's connection-level UDP counters for H3.
             wire_bytes: 0,
+            received_unix_ns,
         })
     }
 }
@@ -3564,6 +3609,7 @@ async fn https_get_http1(
 }
 
 fn parse_http_response(wire: Vec<u8>) -> Result<SimpleHttpResponse> {
+    let received_unix_ns = now_unix_ns()?;
     let header_end = wire
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -3596,6 +3642,7 @@ fn parse_http_response(wire: Vec<u8>) -> Result<SimpleHttpResponse> {
         headers,
         body,
         wire_bytes: wire.len(),
+        received_unix_ns,
     })
 }
 
