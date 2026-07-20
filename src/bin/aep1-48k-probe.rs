@@ -2,7 +2,11 @@ use anyhow::{bail, Context, Result};
 use bytes::{Buf, Bytes};
 use clap::{Parser, Subcommand, ValueEnum};
 use frame_header::{EncodingFlag, FrameHeaderV2};
-use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures_util::{
+    future::{join_all, BoxFuture},
+    stream::FuturesUnordered,
+    FutureExt, StreamExt,
+};
 use music_audio_session::{
     MultichannelAudioReceiver, MultichannelAudioSender, MultichannelAudioSessionConfig,
 };
@@ -47,6 +51,7 @@ const H3_PART_PRELOAD_LEAD: Duration = Duration::from_millis(100);
 // uniform reservoir for latency percentiles. Exact continuity uses a bitset and
 // is never sampled.
 const MAX_LATENCY_SAMPLES: usize = 65_536;
+const MAX_LATE_BUNDLE_OBSERVATIONS: usize = 512;
 
 #[derive(Debug, Parser)]
 #[command(name = "aep1-48k-probe")]
@@ -211,7 +216,10 @@ enum Command {
         /// blocking tail response containing consecutive cached media units.
         #[arg(long)]
         response_ms: Option<u64>,
-        #[arg(long, default_value_t = 1000)]
+        /// Maximum permitted capture-to-response latency. Qualification must
+        /// declare this explicitly so a permissive generic default cannot be
+        /// mistaken for a strict latency gate.
+        #[arg(long)]
         deadline_ms: u64,
         #[arg(long, default_value_t = 0)]
         start_offset_ms: u64,
@@ -458,6 +466,7 @@ struct HlsLoadReport {
     media_responses_total: u64,
     start_offset_ms: u64,
     end_offset_ms: u64,
+    deadline_ms: u64,
     arrival_window_ms: u64,
     arrival_seed: u64,
     expected_audio_codec: &'static str,
@@ -473,6 +482,7 @@ struct HlsLoadReport {
     missing_parts_total: u64,
     non_contiguous_pts_total: u64,
     deadline_misses_total: u64,
+    late_bundle_observations: Vec<HlsLateBundleObservation>,
     init_verified_readers: usize,
     pcm_media_size_mismatches_total: u64,
     opus_media_packet_mismatches_total: u64,
@@ -486,6 +496,19 @@ struct HlsLoadReport {
     elapsed_ms: u64,
     passed: bool,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HlsLateBundleObservation {
+    customer_id: usize,
+    start_sequence: u64,
+    end_sequence: u64,
+    capture_unix_ns: u64,
+    arrival_unix_ns: u64,
+    availability_latency_ms: f64,
+    lateness_ms: f64,
+    publication_to_cache_ms: Option<f64>,
+    cache_to_client_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2592,13 +2615,16 @@ impl HlsBundleStreamState {
 }
 
 struct HlsBundleCustomerResult {
-    streams: Vec<HlsReceiveReport>,
+    states: Vec<HlsBundleStreamState>,
+    end_offset_ms: u64,
     connection_setup_ms: f64,
     wire_bytes: u64,
     media_responses: u64,
+    late_bundle_observations: Vec<HlsLateBundleObservation>,
 }
 
 async fn receive_hls_bundle_customer(
+    customer_id: usize,
     reader: &HlsLoadOptions,
     start_offset_ms: u64,
 ) -> Result<HlsBundleCustomerResult> {
@@ -2611,7 +2637,7 @@ async fn receive_hls_bundle_customer(
     )?;
     let initial_from_sequence = start_offset_ms / reader.part_ms;
     let expected_parts = end_offset_ms.saturating_sub(start_offset_ms) / reader.part_ms;
-    if expected_parts % parts_per_response != 0 {
+    if !expected_parts.is_multiple_of(parts_per_response) {
         bail!("qualification window must contain a whole number of bundled responses");
     }
     let stop_ns = reader
@@ -2653,6 +2679,32 @@ async fn receive_hls_bundle_customer(
         H3HttpsClient::connect(reader.edge, &reader.server_name, reader.tls_ca.as_deref()).await?;
     let connection_setup_ms = owner.connection_setup_ms;
 
+    // Verify metadata before this customer's timed media window. Running these
+    // requests after one customer finishes overlaps report work with later
+    // customers and can create false delivery-tail measurements.
+    let playlist_requests = states.iter().map(|state| {
+        let path = hls_path(&reader.path_prefix, state.stream_id, "stream.m3u8");
+        owner.request_sender().get(path)
+    });
+    let playlists = join_all(playlist_requests).await;
+    for (state, playlist) in states.iter_mut().zip(playlists) {
+        let playlist = playlist?;
+        if playlist.status != 200 {
+            bail!(
+                "LL-HLS playlist for stream {} returned HTTP {}",
+                state.stream_id,
+                playlist.status
+            );
+        }
+        if !playlist_matches_format(&playlist.body, reader.expected_audio_codec) {
+            bail!(
+                "LL-HLS playlist for stream {} did not advertise the expected format",
+                state.stream_id
+            );
+        }
+        state.playlist_has_ll_hls_tags = true;
+    }
+
     type BundleRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
     let final_sequence = end_offset_ms.saturating_div(reader.part_ms);
     let mut next_sequence = initial_from_sequence;
@@ -2669,6 +2721,7 @@ async fn receive_hls_bundle_customer(
     }
 
     let mut media_responses = 0_u64;
+    let mut late_bundle_observations = Vec::new();
     while now_unix_ns()? < stop_ns
         && states
             .first()
@@ -2704,6 +2757,51 @@ async fn receive_hls_bundle_customer(
                     parts_per_response,
                 )?;
                 media_responses = media_responses.saturating_add(1);
+                let final_capture_ns = entries.first().map(|entry| {
+                    reader.session_id.saturating_add(
+                        entry
+                            .end_sequence
+                            .saturating_mul(reader.part_ms)
+                            .saturating_mul(1_000_000),
+                    )
+                });
+                if let Some(final_capture_ns) = final_capture_ns {
+                    let availability_latency_ns = arrival_ns.saturating_sub(final_capture_ns);
+                    let deadline_ns = reader.deadline_ms.saturating_mul(1_000_000);
+                    if availability_latency_ns > deadline_ns
+                        && late_bundle_observations.len() < MAX_LATE_BUNDLE_OBSERVATIONS
+                    {
+                        let available_ns = entries
+                            .iter()
+                            .filter_map(|entry| entry.available_unix_us)
+                            .max()
+                            .and_then(|available_us| available_us.checked_mul(1_000));
+                        late_bundle_observations.push(HlsLateBundleObservation {
+                            customer_id,
+                            start_sequence: entries
+                                .first()
+                                .map_or(requested_sequence, |entry| entry.start_sequence),
+                            end_sequence: entries
+                                .first()
+                                .map_or(requested_sequence, |entry| entry.end_sequence),
+                            capture_unix_ns: final_capture_ns,
+                            arrival_unix_ns: arrival_ns,
+                            availability_latency_ms: availability_latency_ns as f64 / 1_000_000.0,
+                            lateness_ms: availability_latency_ns.saturating_sub(deadline_ns) as f64
+                                / 1_000_000.0,
+                            publication_to_cache_ms: available_ns
+                                .filter(|&available_ns| available_ns >= final_capture_ns)
+                                .map(|available_ns| {
+                                    (available_ns - final_capture_ns) as f64 / 1_000_000.0
+                                }),
+                            cache_to_client_ms: available_ns
+                                .filter(|&available_ns| arrival_ns >= available_ns)
+                                .map(|available_ns| {
+                                    (arrival_ns - available_ns) as f64 / 1_000_000.0
+                                }),
+                        });
+                    }
+                }
                 for (state, entry) in states.iter_mut().zip(&entries) {
                     state.media_responses = state.media_responses.saturating_add(1);
                     let parts = if parts_per_response == 1 {
@@ -2809,43 +2907,14 @@ async fn receive_hls_bundle_customer(
         }
     }
 
-    // Playlist qualification is deliberately outside the timed media loop.
-    // Pausing a live tail to make serial metadata requests creates client-side
-    // deadline misses and is not how a persistent multiplexed H3 consumer runs.
-    for state in &mut states {
-        let playlist = owner
-            .get(&hls_path(
-                &reader.path_prefix,
-                state.stream_id,
-                "stream.m3u8",
-            ))
-            .await?;
-        if playlist.status != 200 {
-            bail!(
-                "LL-HLS playlist for stream {} returned HTTP {}",
-                state.stream_id,
-                playlist.status
-            );
-        }
-        if !playlist_matches_format(&playlist.body, reader.expected_audio_codec) {
-            bail!(
-                "LL-HLS playlist for stream {} did not advertise the expected format",
-                state.stream_id
-            );
-        }
-        state.playlist_has_ll_hls_tags = true;
-    }
-
     let wire_bytes = owner.wire_bytes();
-    let streams = states
-        .into_iter()
-        .map(|state| state.finish(reader, start_offset_ms, end_offset_ms))
-        .collect();
     Ok(HlsBundleCustomerResult {
-        streams,
+        states,
+        end_offset_ms,
         connection_setup_ms,
         wire_bytes,
         media_responses,
+        late_bundle_observations,
     })
 }
 
@@ -2889,12 +2958,21 @@ fn validate_tail_bundle_entries(
     Ok(())
 }
 
+struct HlsDeferredBundleReports {
+    states: Vec<HlsBundleStreamState>,
+    reader: HlsLoadOptions,
+    start_offset_ms: u64,
+    end_offset_ms: u64,
+}
+
 struct HlsCustomerLoadResult {
     customer_id: usize,
     streams: Vec<(u64, Result<HlsReceiveReport>)>,
+    deferred_bundle_reports: Option<HlsDeferredBundleReports>,
     shared_connection_setup_ms: Option<f64>,
     shared_wire_bytes: u64,
     media_responses: u64,
+    late_bundle_observations: Vec<HlsLateBundleObservation>,
 }
 
 async fn receive_hls_load_customer(
@@ -2912,23 +2990,36 @@ async fn receive_hls_load_customer(
     if reader.bundle_streams {
         let result = timeout(
             per_reader_timeout,
-            receive_hls_bundle_customer(&reader, reader_start_offset_ms),
+            receive_hls_bundle_customer(customer_id, &reader, reader_start_offset_ms),
         )
         .await
         .context("bundled reader exceeded its overall deadline")
         .and_then(|result| result);
         return match result {
-            Ok(bundle) => HlsCustomerLoadResult {
-                customer_id,
-                streams: bundle
-                    .streams
-                    .into_iter()
-                    .map(|report| (report.stream_id, Ok(report)))
-                    .collect(),
-                shared_connection_setup_ms: Some(bundle.connection_setup_ms),
-                shared_wire_bytes: bundle.wire_bytes,
-                media_responses: bundle.media_responses,
-            },
+            Ok(bundle) => {
+                let HlsBundleCustomerResult {
+                    states,
+                    end_offset_ms,
+                    connection_setup_ms,
+                    wire_bytes,
+                    media_responses,
+                    late_bundle_observations,
+                } = bundle;
+                HlsCustomerLoadResult {
+                    customer_id,
+                    streams: Vec::new(),
+                    deferred_bundle_reports: Some(HlsDeferredBundleReports {
+                        states,
+                        reader,
+                        start_offset_ms: reader_start_offset_ms,
+                        end_offset_ms,
+                    }),
+                    shared_connection_setup_ms: Some(connection_setup_ms),
+                    shared_wire_bytes: wire_bytes,
+                    media_responses,
+                    late_bundle_observations,
+                }
+            }
             Err(error) => {
                 let message = format!("bundled H3 reader failed: {error:#}");
                 HlsCustomerLoadResult {
@@ -2941,9 +3032,11 @@ async fn receive_hls_load_customer(
                             )
                         })
                         .collect(),
+                    deferred_bundle_reports: None,
                     shared_connection_setup_ms: None,
                     shared_wire_bytes: 0,
                     media_responses: 0,
+                    late_bundle_observations: Vec::new(),
                 }
             }
         };
@@ -2987,9 +3080,11 @@ async fn receive_hls_load_customer(
         return HlsCustomerLoadResult {
             customer_id,
             streams: vec![(reader.stream_id, result)],
+            deferred_bundle_reports: None,
             shared_connection_setup_ms: None,
             shared_wire_bytes: 0,
             media_responses,
+            late_bundle_observations: Vec::new(),
         };
     }
 
@@ -3017,9 +3112,11 @@ async fn receive_hls_load_customer(
                 return HlsCustomerLoadResult {
                     customer_id,
                     streams,
+                    deferred_bundle_reports: None,
                     shared_connection_setup_ms: None,
                     shared_wire_bytes: 0,
                     media_responses: 0,
+                    late_bundle_observations: Vec::new(),
                 };
             }
         };
@@ -3084,9 +3181,11 @@ async fn receive_hls_load_customer(
     HlsCustomerLoadResult {
         customer_id,
         streams,
+        deferred_bundle_reports: None,
         shared_connection_setup_ms: Some(connection_setup_ms),
         shared_wire_bytes,
         media_responses,
+        late_bundle_observations: Vec::new(),
     }
 }
 
@@ -3173,9 +3272,12 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
     let mut shared_connection_setup_ms = Vec::new();
     let mut shared_wire_bytes_total = 0_u64;
     let mut media_responses_total = 0_u64;
+    let mut late_bundle_observations = Vec::new();
+    let mut deferred_bundle_reports = Vec::new();
     while let Some(outcome) = tasks.join_next().await {
         match outcome {
             Ok(customer) => {
+                let customer_id = customer.customer_id;
                 if let Some(setup_ms) = customer.shared_connection_setup_ms {
                     shared_connection_setup_ms.push(setup_ms);
                 }
@@ -3183,6 +3285,17 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                     shared_wire_bytes_total.saturating_add(customer.shared_wire_bytes);
                 media_responses_total =
                     media_responses_total.saturating_add(customer.media_responses);
+                let remaining_observations =
+                    MAX_LATE_BUNDLE_OBSERVATIONS.saturating_sub(late_bundle_observations.len());
+                late_bundle_observations.extend(
+                    customer
+                        .late_bundle_observations
+                        .into_iter()
+                        .take(remaining_observations),
+                );
+                if let Some(deferred) = customer.deferred_bundle_reports {
+                    deferred_bundle_reports.push((customer_id, deferred));
+                }
                 for (stream_id, result) in customer.streams {
                     match result {
                         Ok(report) => {
@@ -3193,7 +3306,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                             {
                                 errors.push(format!(
                                     "customer {} stream {stream_id}: {} missing parts, {} non-contiguous PTS, {} deadline misses, {} media responses",
-                                    customer.customer_id,
+                                    customer_id,
                                     report.missing_parts,
                                     report.non_contiguous_pts,
                                     report.deadline_misses,
@@ -3206,7 +3319,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
                             if errors.len() < 20 {
                                 errors.push(format!(
                                     "customer {} stream {stream_id}: {error}",
-                                    customer.customer_id
+                                    customer_id
                                 ));
                             }
                         }
@@ -3220,6 +3333,34 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
             }
         }
     }
+    // Finalize bounded percentile reservoirs only after every timed receive
+    // task has stopped. Sorting them in each finishing customer task can starve
+    // later H3 clients during a staggered completion window.
+    for (customer_id, deferred) in deferred_bundle_reports {
+        for state in deferred.states {
+            let stream_id = state.stream_id;
+            let report = state.finish(
+                &deferred.reader,
+                deferred.start_offset_ms,
+                deferred.end_offset_ms,
+            );
+            if (report.missing_parts > 0
+                || report.non_contiguous_pts > 0
+                || report.deadline_misses > 0)
+                && errors.len() < 20
+            {
+                errors.push(format!(
+                    "customer {customer_id} stream {stream_id}: {} missing parts, {} non-contiguous PTS, {} deadline misses, {} media responses",
+                    report.missing_parts,
+                    report.non_contiguous_pts,
+                    report.deadline_misses,
+                    report.media_responses
+                ));
+            }
+            reports.push(report);
+        }
+    }
+    late_bundle_observations.sort_unstable_by_key(|observation| observation.arrival_unix_ns);
 
     let readers_completed = reports.len();
     let readers_failed = requested_track_readers.saturating_sub(readers_completed);
@@ -3319,7 +3460,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         && playlist_verified_readers == requested_track_readers;
 
     Ok(HlsLoadReport {
-        schema: "needletail.aep1-48k-probe.hls-load.v4",
+        schema: "needletail.aep1-48k-probe.hls-load.v6",
         transport: options.transport.as_str(),
         tls_protocol: "TLSv1.3",
         persistent_connections: matches!(options.transport, HlsTransport::H3),
@@ -3340,6 +3481,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         media_responses_total,
         start_offset_ms: options.start_offset_ms,
         end_offset_ms,
+        deadline_ms: options.deadline_ms,
         arrival_window_ms: options.arrival_window_ms,
         arrival_seed: options.arrival_seed,
         expected_audio_codec: options.expected_audio_codec.as_str(),
@@ -3357,6 +3499,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         missing_parts_total,
         non_contiguous_pts_total,
         deadline_misses_total,
+        late_bundle_observations,
         init_verified_readers,
         pcm_media_size_mismatches_total,
         opus_media_packet_mismatches_total,
@@ -4215,6 +4358,25 @@ mod tests {
         assert_eq!(summary.p95, 4.0);
         assert_eq!(summary.p99, 4.0);
         assert_eq!(summary.max, 4.0);
+    }
+
+    #[test]
+    fn load_hls_requires_an_explicit_deadline() {
+        let required = [
+            "aep1-48k-probe",
+            "load-hls",
+            "--edge",
+            "127.0.0.1:19444",
+            "--stream-id",
+            "1",
+            "--session-id",
+            "1",
+        ];
+        assert!(Args::try_parse_from(required).is_err());
+
+        let mut declared = required.to_vec();
+        declared.extend(["--deadline-ms", "20"]);
+        assert!(Args::try_parse_from(declared).is_ok());
     }
 
     #[test]

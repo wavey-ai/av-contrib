@@ -2510,6 +2510,7 @@ name = "raptorq-datagram-fec"
 version = "0.1.4"
 dependencies = [
  "bytes",
+ "crc32fast",
  "raptorq",
  "tokio",
 ]
