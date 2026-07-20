@@ -298,6 +298,7 @@ pub struct Fmp4Segmenter {
     sps: Option<Bytes>,
     pps: Option<Bytes>,
     config_signature: Option<H264ConfigSignature>,
+    known_audio_signature: Option<AudioConfigSignature>,
     last_init_signature: Option<InitSignature>,
     force_next_init: bool,
     seen_video: bool,
@@ -399,6 +400,7 @@ impl Fmp4Segmenter {
             sps: None,
             pps: None,
             config_signature: None,
+            known_audio_signature: None,
             last_init_signature: None,
             force_next_init: true,
             seen_video: false,
@@ -496,6 +498,7 @@ impl Fmp4Segmenter {
         self.sps = None;
         self.pps = None;
         self.config_signature = None;
+        self.known_audio_signature = None;
         self.last_init_signature = None;
         self.force_next_init = true;
         self.seen_video = false;
@@ -656,6 +659,16 @@ impl Fmp4Segmenter {
     }
 
     async fn push_audio(&mut self, access_unit: AccessUnit) {
+        if let Some(signature) = self
+            .audio_config
+            .map(AudioConfigSignature::Explicit)
+            .or_else(|| audio_config_signature(std::slice::from_ref(&access_unit)))
+        {
+            if self.known_audio_signature != Some(signature) {
+                self.known_audio_signature = Some(signature);
+                self.force_next_init = true;
+            }
+        }
         let access_unit_duration_ms =
             audio_access_unit_duration_ms(&access_unit, self.audio_config);
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
@@ -940,10 +953,7 @@ impl Fmp4Segmenter {
     fn current_init_signature(&self) -> InitSignature {
         InitSignature {
             video: self.config_signature.clone(),
-            audio: self
-                .audio_config
-                .map(AudioConfigSignature::Explicit)
-                .or_else(|| audio_config_signature(&self.audio_buf)),
+            audio: self.known_audio_signature,
         }
     }
 
@@ -1472,6 +1482,71 @@ mod tests {
         }
         assert_eq!(playlists.active(), 0);
         assert!(playlists.chunk_cache.stream_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn muxed_stream_does_not_replace_combined_init_with_video_only_init() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let publisher = Arc::new(CapturingPublisher::default());
+        let mut segmenter = Fmp4Segmenter::new_publish_only(
+            77,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            DEFAULT_MIN_PART_MS,
+            publisher.clone(),
+        );
+
+        let mut first = h264_access_unit(0, 0);
+        first.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
+        segmenter.push_access_unit(first).await;
+
+        let mut second = h264_access_unit(6_000, 6_000);
+        second.key = false;
+        let mut second_data = BytesMut::new();
+        push_len_prefixed_nalu(&mut second_data, H264_NON_IDR);
+        second.data = second_data.freeze();
+        segmenter.push_access_unit(second).await;
+
+        let payload = [0x11, 0x22, 0x33, 0x44];
+        let mut aac = access_unit::aac::create_adts_header(0x66, 2, 48_000, payload.len(), false);
+        aac.extend_from_slice(&payload);
+        segmenter
+            .push_access_unit(AccessUnit {
+                key: false,
+                pts: 6_000,
+                dts: 6_000,
+                data: Bytes::from(aac),
+                stream_type: PSI_STREAM_AAC,
+                id: 1,
+            })
+            .await;
+
+        for timestamp in [12_000, 18_000] {
+            let mut video = h264_access_unit(timestamp, timestamp);
+            video.key = false;
+            let mut data = BytesMut::new();
+            push_len_prefixed_nalu(&mut data, H264_NON_IDR);
+            video.data = data.freeze();
+            segmenter.push_access_unit(video).await;
+        }
+
+        let parts = publisher.parts.lock().unwrap();
+        assert_eq!(parts.len(), 3);
+        let video_init = parts[0].init.as_ref().expect("video init");
+        let combined_init = parts[1].init.as_ref().expect("combined init");
+        assert!(video_init.windows(4).any(|window| window == b"avc1"));
+        assert!(!video_init.windows(4).any(|window| window == b"mp4a"));
+        assert!(combined_init.windows(4).any(|window| window == b"avc1"));
+        assert!(combined_init.windows(4).any(|window| window == b"mp4a"));
+        assert_eq!(
+            combined_init
+                .windows(4)
+                .filter(|window| *window == b"trex")
+                .count(),
+            2
+        );
+        assert!(parts[2].init.is_none());
     }
 
     #[test]

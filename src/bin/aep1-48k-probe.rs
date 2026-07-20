@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use clap::{Parser, Subcommand, ValueEnum};
 use frame_header::{EncodingFlag, FrameHeaderV2};
 use futures_util::{
@@ -11,7 +11,8 @@ use music_audio_session::{
     MultichannelAudioReceiver, MultichannelAudioSender, MultichannelAudioSessionConfig,
 };
 use playlists::tail_bundle::{
-    decode_tail_bundle, TailBundleEntry, MAX_TAIL_BUNDLE_ENTRIES, TAIL_BUNDLE_CONTENT_TYPE,
+    decode_tail_bundle, decode_tail_bundle_stream_frame, TailBundleEntry, MAX_TAIL_BUNDLE_ENTRIES,
+    TAIL_BUNDLE_STREAM_CONTENT_TYPE,
 };
 use raptorq_datagram_fec::{
     AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch, MultichannelAudioFecConfig,
@@ -453,6 +454,7 @@ struct HlsLoadReport {
     transport: &'static str,
     tls_protocol: &'static str,
     persistent_connections: bool,
+    persistent_bundle_response: bool,
     edge: SocketAddr,
     stream_id: u64,
     stream_count: usize,
@@ -2705,206 +2707,171 @@ async fn receive_hls_bundle_customer(
         state.playlist_has_ll_hls_tags = true;
     }
 
-    type BundleRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
     let final_sequence = end_offset_ms.saturating_div(reader.part_ms);
-    let mut next_sequence = initial_from_sequence;
-    let mut in_flight = FuturesUnordered::<BundleRequest>::new();
-    while in_flight.len() < H3_PART_PIPELINE_DEPTH && next_sequence < final_sequence {
-        let requested_sequence = next_sequence;
-        next_sequence = next_sequence.saturating_add(parts_per_response);
-        let path = format!(
-            "{}/tail-bundle?streams={stream_query}&from={requested_sequence}&parts={parts_per_response}",
-            reader.path_prefix
+    let path = format!(
+        "{}/tail-bundle-stream?streams={stream_query}&from={initial_from_sequence}&parts={parts_per_response}",
+        reader.path_prefix
+    );
+    let mut response_stream = owner.request_sender().open_stream(path).await?;
+    if response_stream.status != 200 {
+        bail!(
+            "LL-HLS persistent tail bundle returned HTTP {}",
+            response_stream.status
         );
-        let sender = owner.request_sender();
-        in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
+    }
+    if response_stream
+        .headers
+        .get("content-type")
+        .is_none_or(|content_type| content_type != TAIL_BUNDLE_STREAM_CONTENT_TYPE)
+    {
+        bail!("LL-HLS persistent tail bundle returned an invalid content type");
     }
 
     let mut media_responses = 0_u64;
     let mut late_bundle_observations = Vec::new();
+    let mut requested_sequence = initial_from_sequence;
     while now_unix_ns()? < stop_ns
         && states
             .first()
             .is_some_and(|state| state.coverage.received_parts < expected_parts)
-        && !in_flight.is_empty()
+        && requested_sequence < final_sequence
     {
         let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
-        let Some((requested_sequence, response)) =
-            timeout(remaining, in_flight.next()).await.ok().flatten()
+        let Some((encoded_bundle, arrival_ns)) = timeout(remaining, response_stream.next_frame())
+            .await
+            .context("persistent tail bundle exceeded its media deadline")??
         else {
             break;
         };
-        let response = response?;
-        let mut retry_sequence = None;
-        match response.status {
-            200 => {
-                if response
-                    .headers
-                    .get("content-type")
-                    .is_none_or(|content_type| content_type != TAIL_BUNDLE_CONTENT_TYPE)
-                {
-                    bail!("LL-HLS tail bundle returned an invalid content type");
-                }
-                let arrival_ns = response.received_unix_ns;
-                let entries = decode_tail_bundle(Bytes::from(response.body))?;
-                let expected_after = (requested_sequence != initial_from_sequence)
-                    .then(|| requested_sequence.saturating_sub(1));
-                validate_tail_bundle_entries(
-                    &stream_ids,
-                    &entries,
-                    expected_after,
-                    initial_from_sequence,
-                    parts_per_response,
-                )?;
-                media_responses = media_responses.saturating_add(1);
-                let final_capture_ns = entries.first().map(|entry| {
-                    reader.session_id.saturating_add(
-                        entry
-                            .end_sequence
-                            .saturating_mul(reader.part_ms)
-                            .saturating_mul(1_000_000),
-                    )
+        let entries = decode_tail_bundle(encoded_bundle)?;
+        let expected_after = (requested_sequence != initial_from_sequence)
+            .then(|| requested_sequence.saturating_sub(1));
+        validate_tail_bundle_entries(
+            &stream_ids,
+            &entries,
+            expected_after,
+            initial_from_sequence,
+            parts_per_response,
+        )?;
+        media_responses = media_responses.saturating_add(1);
+        let final_capture_ns = entries.first().map(|entry| {
+            reader.session_id.saturating_add(
+                entry
+                    .end_sequence
+                    .saturating_mul(reader.part_ms)
+                    .saturating_mul(1_000_000),
+            )
+        });
+        if let Some(final_capture_ns) = final_capture_ns {
+            let availability_latency_ns = arrival_ns.saturating_sub(final_capture_ns);
+            let deadline_ns = reader.deadline_ms.saturating_mul(1_000_000);
+            if availability_latency_ns > deadline_ns
+                && late_bundle_observations.len() < MAX_LATE_BUNDLE_OBSERVATIONS
+            {
+                let available_ns = entries
+                    .iter()
+                    .filter_map(|entry| entry.available_unix_us)
+                    .max()
+                    .and_then(|available_us| available_us.checked_mul(1_000));
+                late_bundle_observations.push(HlsLateBundleObservation {
+                    customer_id,
+                    start_sequence: entries
+                        .first()
+                        .map_or(requested_sequence, |entry| entry.start_sequence),
+                    end_sequence: entries
+                        .first()
+                        .map_or(requested_sequence, |entry| entry.end_sequence),
+                    capture_unix_ns: final_capture_ns,
+                    arrival_unix_ns: arrival_ns,
+                    availability_latency_ms: availability_latency_ns as f64 / 1_000_000.0,
+                    lateness_ms: availability_latency_ns.saturating_sub(deadline_ns) as f64
+                        / 1_000_000.0,
+                    publication_to_cache_ms: available_ns
+                        .filter(|&available_ns| available_ns >= final_capture_ns)
+                        .map(|available_ns| (available_ns - final_capture_ns) as f64 / 1_000_000.0),
+                    cache_to_client_ms: available_ns
+                        .filter(|&available_ns| arrival_ns >= available_ns)
+                        .map(|available_ns| (arrival_ns - available_ns) as f64 / 1_000_000.0),
                 });
-                if let Some(final_capture_ns) = final_capture_ns {
-                    let availability_latency_ns = arrival_ns.saturating_sub(final_capture_ns);
-                    let deadline_ns = reader.deadline_ms.saturating_mul(1_000_000);
-                    if availability_latency_ns > deadline_ns
-                        && late_bundle_observations.len() < MAX_LATE_BUNDLE_OBSERVATIONS
-                    {
-                        let available_ns = entries
-                            .iter()
-                            .filter_map(|entry| entry.available_unix_us)
-                            .max()
-                            .and_then(|available_us| available_us.checked_mul(1_000));
-                        late_bundle_observations.push(HlsLateBundleObservation {
-                            customer_id,
-                            start_sequence: entries
-                                .first()
-                                .map_or(requested_sequence, |entry| entry.start_sequence),
-                            end_sequence: entries
-                                .first()
-                                .map_or(requested_sequence, |entry| entry.end_sequence),
-                            capture_unix_ns: final_capture_ns,
-                            arrival_unix_ns: arrival_ns,
-                            availability_latency_ms: availability_latency_ns as f64 / 1_000_000.0,
-                            lateness_ms: availability_latency_ns.saturating_sub(deadline_ns) as f64
-                                / 1_000_000.0,
-                            publication_to_cache_ms: available_ns
-                                .filter(|&available_ns| available_ns >= final_capture_ns)
-                                .map(|available_ns| {
-                                    (available_ns - final_capture_ns) as f64 / 1_000_000.0
-                                }),
-                            cache_to_client_ms: available_ns
-                                .filter(|&available_ns| arrival_ns >= available_ns)
-                                .map(|available_ns| {
-                                    (arrival_ns - available_ns) as f64 / 1_000_000.0
-                                }),
-                        });
-                    }
-                }
-                for (state, entry) in states.iter_mut().zip(&entries) {
-                    state.media_responses = state.media_responses.saturating_add(1);
-                    let parts = if parts_per_response == 1 {
-                        vec![entry.payload.as_ref()]
-                    } else {
-                        split_soundkit_opus_parts(&entry.payload, reader.part_ms)?
-                    };
-                    if parts.len() as u64 != parts_per_response {
-                        bail!(
+            }
+        }
+        for (state, entry) in states.iter_mut().zip(&entries) {
+            state.media_responses = state.media_responses.saturating_add(1);
+            let parts = if parts_per_response == 1 {
+                vec![entry.payload.as_ref()]
+            } else {
+                split_soundkit_opus_parts(&entry.payload, reader.part_ms)?
+            };
+            if parts.len() as u64 != parts_per_response {
+                bail!(
                             "stream {} bundle entry contained {} media units, expected {parts_per_response}",
                             state.stream_id,
                             parts.len()
                         );
-                    }
-                    let first_capture_ns = reader.session_id.saturating_add(
-                        entry
-                            .start_sequence
-                            .saturating_mul(reader.part_ms)
-                            .saturating_mul(1_000_000),
-                    );
-                    let final_capture_ns = reader.session_id.saturating_add(
-                        entry
-                            .end_sequence
-                            .saturating_mul(reader.part_ms)
-                            .saturating_mul(1_000_000),
-                    );
-                    if arrival_ns >= first_capture_ns {
-                        state
-                            .first_part_to_response_latencies_ns
-                            .record(arrival_ns - first_capture_ns);
-                    }
-                    if arrival_ns >= final_capture_ns {
-                        state
-                            .final_part_to_response_latencies_ns
-                            .record(arrival_ns - final_capture_ns);
-                    }
-                    for (offset, part) in parts.into_iter().enumerate() {
-                        let sequence = entry.start_sequence.saturating_add(offset as u64);
-                        let pts_ms = sequence.saturating_mul(reader.part_ms);
-                        if !state.coverage.insert_pts(pts_ms) {
-                            bail!(
-                                "stream {} returned duplicate or invalid PTS {pts_ms} ms",
-                                state.stream_id
-                            );
-                        }
-                        let capture_ns = reader
-                            .session_id
-                            .saturating_add(pts_ms.saturating_mul(1_000_000));
-                        let latency_ns = arrival_ns.saturating_sub(capture_ns);
-                        if latency_ns > reader.deadline_ms.saturating_mul(1_000_000) {
-                            state.deadline_misses = state.deadline_misses.saturating_add(1);
-                        }
-                        state.availability_latencies_ns.record(latency_ns);
-                        state.render_latencies_ns.record(latency_ns);
-                        if soundkit_opus_part_is_valid(part, reader.part_ms) {
-                            state.opus_media_parts_verified =
-                                state.opus_media_parts_verified.saturating_add(1);
-                        } else {
-                            state.opus_media_packet_mismatches =
-                                state.opus_media_packet_mismatches.saturating_add(1);
-                        }
-                    }
-                    if let Some(available_ns) = entry
-                        .available_unix_us
-                        .and_then(|available_us| available_us.checked_mul(1_000))
-                    {
-                        if available_ns >= final_capture_ns && arrival_ns >= available_ns {
-                            state
-                                .publication_to_cache_latencies_ns
-                                .record(available_ns - final_capture_ns);
-                            state
-                                .cache_to_client_latencies_ns
-                                .record(arrival_ns - available_ns);
-                        }
-                    }
-                }
             }
-            204 | 404 => retry_sequence = Some(requested_sequence),
-            status => bail!("LL-HLS tail bundle returned HTTP {status}"),
-        }
-
-        if states
-            .first()
-            .is_some_and(|state| state.coverage.received_parts < expected_parts)
-        {
-            let sequence_to_schedule = retry_sequence.or_else(|| {
-                if next_sequence < final_sequence {
-                    let sequence = next_sequence;
-                    next_sequence = next_sequence.saturating_add(parts_per_response);
-                    Some(sequence)
+            let first_capture_ns = reader.session_id.saturating_add(
+                entry
+                    .start_sequence
+                    .saturating_mul(reader.part_ms)
+                    .saturating_mul(1_000_000),
+            );
+            let final_capture_ns = reader.session_id.saturating_add(
+                entry
+                    .end_sequence
+                    .saturating_mul(reader.part_ms)
+                    .saturating_mul(1_000_000),
+            );
+            if arrival_ns >= first_capture_ns {
+                state
+                    .first_part_to_response_latencies_ns
+                    .record(arrival_ns - first_capture_ns);
+            }
+            if arrival_ns >= final_capture_ns {
+                state
+                    .final_part_to_response_latencies_ns
+                    .record(arrival_ns - final_capture_ns);
+            }
+            for (offset, part) in parts.into_iter().enumerate() {
+                let sequence = entry.start_sequence.saturating_add(offset as u64);
+                let pts_ms = sequence.saturating_mul(reader.part_ms);
+                if !state.coverage.insert_pts(pts_ms) {
+                    bail!(
+                        "stream {} returned duplicate or invalid PTS {pts_ms} ms",
+                        state.stream_id
+                    );
+                }
+                let capture_ns = reader
+                    .session_id
+                    .saturating_add(pts_ms.saturating_mul(1_000_000));
+                let latency_ns = arrival_ns.saturating_sub(capture_ns);
+                if latency_ns > reader.deadline_ms.saturating_mul(1_000_000) {
+                    state.deadline_misses = state.deadline_misses.saturating_add(1);
+                }
+                state.availability_latencies_ns.record(latency_ns);
+                state.render_latencies_ns.record(latency_ns);
+                if soundkit_opus_part_is_valid(part, reader.part_ms) {
+                    state.opus_media_parts_verified =
+                        state.opus_media_parts_verified.saturating_add(1);
                 } else {
-                    None
+                    state.opus_media_packet_mismatches =
+                        state.opus_media_packet_mismatches.saturating_add(1);
                 }
-            });
-            if let Some(requested_sequence) = sequence_to_schedule {
-                let path = format!(
-                    "{}/tail-bundle?streams={stream_query}&from={requested_sequence}&parts={parts_per_response}",
-                    reader.path_prefix
-                );
-                let sender = owner.request_sender();
-                in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
+            }
+            if let Some(available_ns) = entry
+                .available_unix_us
+                .and_then(|available_us| available_us.checked_mul(1_000))
+            {
+                if available_ns >= final_capture_ns && arrival_ns >= available_ns {
+                    state
+                        .publication_to_cache_latencies_ns
+                        .record(available_ns - final_capture_ns);
+                    state
+                        .cache_to_client_latencies_ns
+                        .record(arrival_ns - available_ns);
+                }
             }
         }
+        requested_sequence = requested_sequence.saturating_add(parts_per_response);
     }
 
     let wire_bytes = owner.wire_bytes();
@@ -3460,10 +3427,11 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         && playlist_verified_readers == requested_track_readers;
 
     Ok(HlsLoadReport {
-        schema: "needletail.aep1-48k-probe.hls-load.v6",
+        schema: "needletail.aep1-48k-probe.hls-load.v7",
         transport: options.transport.as_str(),
         tls_protocol: "TLSv1.3",
         persistent_connections: matches!(options.transport, HlsTransport::H3),
+        persistent_bundle_response: options.bundle_streams,
         edge: options.edge,
         stream_id: options.stream_id,
         stream_count: options.stream_count,
@@ -3541,7 +3509,32 @@ struct SimpleHttpResponse {
     headers: HashMap<String, String>,
     body: Vec<u8>,
     wire_bytes: usize,
-    received_unix_ns: u64,
+}
+
+struct H3ResponseStream {
+    status: u16,
+    headers: HashMap<String, String>,
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    buffered: BytesMut,
+}
+
+impl H3ResponseStream {
+    async fn next_frame(&mut self) -> Result<Option<(Bytes, u64)>> {
+        loop {
+            if let Some(bundle) = decode_tail_bundle_stream_frame(&mut self.buffered)? {
+                return Ok(Some((bundle, now_unix_ns()?)));
+            }
+            let Some(mut chunk) = self.stream.recv_data().await? else {
+                if self.buffered.is_empty() {
+                    return Ok(None);
+                }
+                bail!("persistent tail bundle ended with a truncated frame");
+            };
+            let remaining = chunk.remaining();
+            self.buffered
+                .extend_from_slice(&chunk.copy_to_bytes(remaining));
+        }
+    }
 }
 
 struct H3HttpsClient {
@@ -3602,6 +3595,33 @@ impl ActiveH3Client {
 }
 
 impl H3RequestSender {
+    async fn open_stream(mut self, path: String) -> Result<H3ResponseStream> {
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("https://{}{path}", self.authority))
+            .header(http::header::ACCEPT, TAIL_BUNDLE_STREAM_CONTENT_TYPE)
+            .body(())?;
+        let mut stream = self.send_request.send_request(request).await?;
+        stream.finish().await?;
+        let response = stream.recv_response().await?;
+        if response.version() != http::Version::HTTP_3 {
+            bail!("LL-HLS response was not HTTP/3");
+        }
+        let status = response.status().as_u16();
+        let mut headers = HashMap::new();
+        for (name, value) in response.headers() {
+            if let Ok(value) = value.to_str() {
+                headers.insert(name.as_str().to_ascii_lowercase(), value.to_owned());
+            }
+        }
+        Ok(H3ResponseStream {
+            status,
+            headers,
+            stream,
+            buffered: BytesMut::new(),
+        })
+    }
+
     async fn get(mut self, path: String) -> Result<SimpleHttpResponse> {
         let request = http::Request::builder()
             .method(http::Method::GET)
@@ -3626,17 +3646,12 @@ impl H3RequestSender {
             let remaining = chunk.remaining();
             body.extend_from_slice(&chunk.copy_to_bytes(remaining));
         }
-        // Timestamp the completed body before the caller parses or validates
-        // it. Otherwise client scheduling and multitrack bundle decoding are
-        // incorrectly reported as network/server latency.
-        let received_unix_ns = now_unix_ns()?;
         Ok(SimpleHttpResponse {
             status,
             headers,
             body,
             // The report uses Quinn's connection-level UDP counters for H3.
             wire_bytes: 0,
-            received_unix_ns,
         })
     }
 }
@@ -3752,7 +3767,6 @@ async fn https_get_http1(
 }
 
 fn parse_http_response(wire: Vec<u8>) -> Result<SimpleHttpResponse> {
-    let received_unix_ns = now_unix_ns()?;
     let header_end = wire
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -3785,7 +3799,6 @@ fn parse_http_response(wire: Vec<u8>) -> Result<SimpleHttpResponse> {
         headers,
         body,
         wire_bytes: wire.len(),
-        received_unix_ns,
     })
 }
 

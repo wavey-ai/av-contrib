@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="${AV_CONTRIB_TEST_WORK_DIR:-"$ROOT/test/work"}"
 MEDIA_DIR="$WORK_DIR/media"
 LOG_DIR="$WORK_DIR/logs"
-SOURCE="${LORI_SOURCE:-"$HOME/Documents/LORI 4k no grain hum.m4v"}"
+SOURCE="${LORI_SOURCE:-"$HOME/Movies/TV/Media.localized/Home Videos/LORI 4k no grain hum.m4v"}"
 
 STREAM_ID="${AV_CONTRIB_TEST_STREAM_ID:-1}"
 HTTP_PORT="${AV_CONTRIB_TEST_HTTP_PORT:-19443}"
@@ -39,9 +39,9 @@ HLS_OK_FILE=""
 usage() {
   cat <<USAGE
 Usage:
-  test/local-video-pipeline.sh prepare [360p|720p|1080p|2160p|all...]
-  test/local-video-pipeline.sh run <mode> [360p|720p|1080p|2160p]
-  test/local-video-pipeline.sh matrix [360p|720p|1080p|2160p...]
+  test/local-video-pipeline.sh prepare [360p|720p|1080p|2160p|4320p|all...]
+  test/local-video-pipeline.sh run <mode> [360p|720p|1080p|2160p|4320p]
+  test/local-video-pipeline.sh matrix [360p|720p|1080p|2160p|4320p...]
 
 Modes:
   srt
@@ -59,9 +59,11 @@ Useful environment:
   LORI_SOURCE=/path/to/LORI.m4v
   AV_CONTRIB_TEST_LIMIT_SECONDS=30       # optional smoke limit; unset means full video
   AV_LL_HLS_PART_MS=50
+  AV_CONTRIB_TEST_EDGE_HLS_URL=https://local.bitneedle.com:19444/live/stream.m3u8
 
-The run modes start av-contrib locally, send a prepared MPEG-TS fixture in
-real time, and poll the generated LL-HLS playlist plus latest media URI.
+The run modes start av-contrib locally and send a prepared MPEG-TS fixture in
+real time. They require a Needletail mesh edge URL because av-contrib publishes
+canonical media to the mesh and does not own the product LL-HLS endpoint.
 USAGE
 }
 
@@ -79,7 +81,7 @@ require_cmd() {
 }
 
 all_variants() {
-  printf '%s\n' 360p 720p 1080p 2160p
+  printf '%s\n' 360p 720p 1080p 2160p 4320p
 }
 
 variant_height() {
@@ -88,6 +90,7 @@ variant_height() {
     720p) printf '720\n' ;;
     1080p) printf '1080\n' ;;
     2160p) printf '2160\n' ;;
+    4320p) printf '4320\n' ;;
     *) die "unknown variant: $1" ;;
   esac
 }
@@ -97,7 +100,8 @@ variant_bitrate() {
     360p) printf '900k\n' ;;
     720p) printf '2500k\n' ;;
     1080p) printf '5500k\n' ;;
-    2160p) printf '12000k\n' ;;
+    2160p) printf '40000k\n' ;;
+    4320p) printf '120000k\n' ;;
     *) die "unknown variant: $1" ;;
   esac
 }
@@ -107,7 +111,8 @@ variant_bufsize() {
     360p) printf '1800k\n' ;;
     720p) printf '5000k\n' ;;
     1080p) printf '11000k\n' ;;
-    2160p) printf '24000k\n' ;;
+    2160p) printf '80000k\n' ;;
+    4320p) printf '240000k\n' ;;
     *) die "unknown variant: $1" ;;
   esac
 }
@@ -135,10 +140,14 @@ expand_variants() {
 prepare_variant() {
   local variant="$1"
   local height bitrate bufsize out
+  local level_args=()
   height="$(variant_height "$variant")"
   bitrate="$(variant_bitrate "$variant")"
   bufsize="$(variant_bufsize "$variant")"
   out="$(variant_file "$variant")"
+  if [[ "$variant" == "4320p" ]]; then
+    level_args=(-level:v 6.2)
+  fi
 
   mkdir -p "$MEDIA_DIR"
   [[ -f "$SOURCE" ]] || die "source video not found: $SOURCE"
@@ -154,7 +163,7 @@ prepare_variant() {
     -map 0:v:0 -map 0:a:0 -sn -dn \
     -vf "scale=-2:${height}:flags=bicubic" \
     -c:v libx264 -preset "$X264_PRESET" -tune zerolatency \
-    -profile:v high -pix_fmt yuv420p -bf 0 \
+    -profile:v high ${level_args[@]+"${level_args[@]}"} -pix_fmt yuv420p -bf 0 \
     -b:v "$bitrate" -maxrate "$bitrate" -bufsize "$bufsize" \
     -g "$GOP_FRAMES" -keyint_min "$GOP_FRAMES" -sc_threshold 0 \
     -c:a aac -b:a "$AUDIO_BITRATE" -ar 48000 -ac 2 \
@@ -194,7 +203,9 @@ tls_args() {
 }
 
 hls_url() {
-  printf 'https://%s:%s/%s/stream.m3u8\n' "$(base_url_host)" "$HTTP_PORT" "$STREAM_ID"
+  [[ -n "${AV_CONTRIB_TEST_EDGE_HLS_URL:-}" ]] || die \
+    "set AV_CONTRIB_TEST_EDGE_HLS_URL to the running Needletail edge playlist"
+  printf '%s\n' "$AV_CONTRIB_TEST_EDGE_HLS_URL"
 }
 
 cleanup() {
