@@ -7,7 +7,8 @@ replication, and serving. This repo owns edge-facing contributor formats and
 tools.
 
 The main `av-contrib` binary accepts arbitrary contributor byte streams.
-It terminates OBS-style RIST/SRT MPEG-TS and RTMP inputs. It also accepts
+It terminates RIST/SRT MPEG-TS and RTMP/FLV inputs from any compatible sender.
+It also accepts
 AEP1/RaptorQ DAW audio and produces format-preserving LL-HLS artifacts with
 `playlists`. It publishes only stream-addressed artifact bytes into mesh ingest.
 Raw RIST, SRT, RTMP, and MPEG-TS payloads do not cross the mesh boundary.
@@ -131,12 +132,12 @@ Useful endpoints:
   error, object metadata, and dependency/timing fields feed the same view.
   `/api/status` carries the configured targets/carrier state and latest deadline
   headroom.
-- `rist://<rist-bind>`: accepts OBS-style RIST MPEG-TS and demuxes H.264/AAC. It
+- `rist://<rist-bind>`: accepts RIST MPEG-TS and demuxes H.264/AAC. It
   boxes fMP4/CMAF parts and serves LL-HLS locally. It publishes fMP4 part bytes
   to mesh under `--rist-stream-id` (default `0`).
-- `srt://<srt-bind>`: accepts OBS-style SRT MPEG-TS and follows the same fMP4
+- `srt://<srt-bind>`: accepts SRT MPEG-TS and follows the same fMP4
   path under `--srt-stream-id` (default `6`).
-- `rtmp://<rtmp-bind>`: accepts OBS-style RTMP/FLV access units and boxes them
+- `rtmp://<rtmp-bind>`: accepts RTMP/FLV access units and boxes them
   as fMP4 under `--rtmp-stream-id` (default `7`).
 
 The stdin senders are kept for local smoke tests and protocol debugging:
@@ -159,7 +160,8 @@ test/local-video-pipeline.sh run rist-rust-pure 720p
 test/local-video-pipeline.sh run rist-rust-librist 720p
 ```
 
-For local OBS testing with both mesh nodes and the contributor ingress under one
+For local live-ingest testing with both mesh nodes and the contributor ingress
+under one
 Rust supervisor, run from this repo:
 
 ```sh
@@ -168,20 +170,22 @@ make stack
 
 The supervisor builds release `av-contrib`, release `../av-mesh`, and
 Needletail Mission Control. It passes those product assets to each playback edge
-with `NEEDLETAIL_MISSION_CONTROL_DIST`. It uses local bitneedle TLS material
-from `../tls/local.bitneedle.com`. It starts UK and US mesh nodes plus one
+with `NEEDLETAIL_MISSION_CONTROL_DIST`. It uses the Infidelity wildcard TLS material
+from `../tls/local.infidelity.io`. It starts UK and US mesh nodes plus one
 `av-contrib` ingress. It prefixes each child process output line with its source.
 
 By default, it uses stream ID `1`, UK egress
-`https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
-`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and Mission Control at
+`https://local.infidelity.io:19444/live/1/stream.m3u8`, US egress
+`https://local.infidelity.io:19445/live/1/stream.m3u8`, and Mission Control at
 `/mesh` on both ports. The contributor status endpoints are available at
-`https://local.bitneedle.com:19443/api/status` and
-`https://local.bitneedle.com:19443/api/status/events`.
+`https://local.infidelity.io:19443/api/status` and
+`https://local.infidelity.io:19443/api/status/events`.
 
-OBS can publish RTMP to `rtmp://local.bitneedle.com:19350/live` with stream key
-`obs-local`, or SRT to `srt://local.bitneedle.com:27001?mode=caller`. RIST is
-bound on `local.bitneedle.com:27000` with main profile and flow id `0x11223344`.
+Any compatible sender can publish SRT to
+`srt://local.infidelity.io:27001?mode=caller` or RIST to
+`local.infidelity.io:27000` with main profile and flow id `0x11223344`. RTMP
+compatibility remains available at `rtmp://local.infidelity.io:19350/live` with
+stream key `live-local`.
 The supervisor defaults the LL-HLS part target to 50 ms. Override it with
 `AV_LL_HLS_PART_MS` or `--part-ms`.
 
@@ -191,10 +195,14 @@ Useful overrides:
 PART_MS=67 \
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
   STACK_ARGS="--rtmp-bind 127.0.0.1:19351 --srt-bind 127.0.0.1:27011" \
-  make stack STREAM_ID=4294967351 HOST=local.bitneedle.com
+  make stack STREAM_ID=4294967351 HOST=local.infidelity.io
 ```
 
 Use `--mission-control-dist /path/to/dist` to reuse a specific asset build. Use
 `--no-mission-control-build` to reuse existing assets. `--no-build` skips the
 component release builds. The same flags can be passed through `STACK_ARGS`.
 Run `make help` for service and Mission Control tasks.
+
+## License
+
+av-contrib is available under the [MIT License](LICENSE).

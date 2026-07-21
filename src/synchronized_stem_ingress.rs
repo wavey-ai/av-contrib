@@ -254,9 +254,7 @@ mod tests {
         AeadOpenError, StemDatagramHeader, SST1_AEAD_TAG_BYTES, SST1_HEADER_BYTES,
     };
 
-    const CONFIG_JSON: &[u8] = include_bytes!(
-        "../../av-api/synchronized-stems-media/tests/fixtures/stem-stream-config.json"
-    );
+    const CONFIG_JSON: &[u8] = include_bytes!("../tests/fixtures/stem-stream-config.json");
 
     #[derive(Clone, Copy)]
     struct TestAead {

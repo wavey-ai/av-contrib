@@ -14,11 +14,11 @@ use av_contrib::ingress_authorization::{
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
 use av_contrib::{codec_name, MediaAccessUnitParams};
-use av_upload_response::{
+use upload_response::{
     PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
     SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
 };
-use av_web_service::{
+use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
     HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
     WebTransportHandler,
@@ -404,6 +404,7 @@ fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
 }
 const UPLOAD_RESPONSE_HLS_WORKER_ID: &str = "av-contrib-upload-response-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
+const LOW_LATENCY_RIST_BODY_FLUSH_BYTES: usize = 2 * 1_316;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 const CONTRIB_ACTIVITY_LIMIT: usize = 64;
@@ -1256,6 +1257,7 @@ struct MeshForwarder {
     next_media_sequence: Arc<AtomicU64>,
     source_epoch: u64,
     fmp4_initializations: Arc<Mutex<HashMap<u64, (ObjectKey, u64)>>>,
+    fmp4_initialization_payloads: Arc<Mutex<HashMap<u64, Bytes>>>,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
     relay: Option<Arc<RelaySessionPublisher>>,
@@ -1348,6 +1350,7 @@ impl MeshForwarder {
             next_media_sequence: Arc::new(AtomicU64::new(0)),
             source_epoch,
             fmp4_initializations: Arc::new(Mutex::new(HashMap::new())),
+            fmp4_initialization_payloads: Arc::new(Mutex::new(HashMap::new())),
             delivery_budget_ms: args.relay_deadline_ms,
             estimated_clock_error_ns,
             relay,
@@ -1922,7 +1925,7 @@ impl Fmp4PartPublisher for MeshForwarder {
             })
             .transpose()
             .map_err(|error| error.to_string())?;
-        let (initialization_key, configuration_epoch) =
+        let (initialization_key, configuration_epoch, slot_init) =
             if let Some((object, epoch)) = initialization {
                 let initialization_envelope =
                     encode_canonical_media_object(&object).map_err(|error| error.to_string())?;
@@ -1949,9 +1952,17 @@ impl Fmp4PartPublisher for MeshForwarder {
                     .lock()
                     .await
                     .insert(part.stream_id, (key.clone(), epoch));
-                (key, epoch)
+                let init = part.init.clone().ok_or_else(|| {
+                    "fMP4 initialization object was built without bytes".to_string()
+                })?;
+                self.fmp4_initialization_payloads
+                    .lock()
+                    .await
+                    .insert(part.stream_id, init.clone());
+                (key, epoch, init)
             } else {
-                self.fmp4_initializations
+                let (key, epoch) = self
+                    .fmp4_initializations
                     .lock()
                     .await
                     .get(&part.stream_id)
@@ -1961,10 +1972,23 @@ impl Fmp4PartPublisher for MeshForwarder {
                             "fMP4 media part {} for stream {} has no initialization dependency",
                             part.sequence, part.stream_id
                         )
-                    })?
+                    })?;
+                let init = self
+                    .fmp4_initialization_payloads
+                    .lock()
+                    .await
+                    .get(&part.stream_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "fMP4 media part {} for stream {} has no cached initialization payload",
+                            part.sequence, part.stream_id
+                        )
+                    })?;
+                (key, epoch, init)
             };
 
-        let bundled_media = encode_mesh_fmp4_slot(part.init.as_ref(), &part.bytes)
+        let bundled_media = encode_mesh_fmp4_slot(Some(&slot_init), &part.bytes)
             .map_err(|error| error.to_string())?;
         let media_object = build_fmp4_media_object(
             &part,
@@ -2124,6 +2148,7 @@ async fn start_rist_ingest(
     let rist_shutdown = UploadPureRistIngest::new(service.clone())
         .with_profile(config.profile.into())
         .with_flow_id(config.flow_id)
+        .with_body_flush_bytes(LOW_LATENCY_RIST_BODY_FLUSH_BYTES)
         .start(config.bind)
         .await
         .map_err(|error| {
@@ -2217,6 +2242,7 @@ async fn run_upload_response_ts_bridge(
     let mut tick = interval(Duration::from_millis(HLS_BRIDGE_POLL_MS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut bridges: HashMap<u64, UploadTsBridgeState> = HashMap::new();
+    let mut last_poll_at = Instant::now();
 
     loop {
         tokio::select! {
@@ -2230,6 +2256,17 @@ async fn run_upload_response_ts_bridge(
                 return;
             }
             _ = tick.tick() => {
+                let poll_at = Instant::now();
+                let poll_gap = poll_at.duration_since(last_poll_at);
+                last_poll_at = poll_at;
+                if poll_gap >= Duration::from_millis(100) {
+                    warn!(
+                        protocol,
+                        elapsed_ms = poll_gap.as_secs_f64() * 1_000.0,
+                        tracked_streams = bridges.len(),
+                        "delayed upload-response fMP4 bridge poll"
+                    );
+                }
                 let streams = service.active_streams().await;
                 let active: HashSet<u64> = streams.iter().map(|stream| stream.stream_id).collect();
                 let stale: Vec<u64> = bridges
@@ -2374,7 +2411,18 @@ async fn run_upload_response_ts_bridge(
                                     "upload-response fMP4 bridge consuming MPEG-TS body slot"
                                 );
                                 if let Some(bridge) = state.bridge.as_mut() {
+                                    let push_started = Instant::now();
                                     bridge.push_ts(data).await;
+                                    let push_elapsed = push_started.elapsed();
+                                    if push_elapsed >= Duration::from_millis(100) {
+                                        warn!(
+                                            protocol,
+                                            stream_id,
+                                            slot,
+                                            elapsed_ms = push_elapsed.as_secs_f64() * 1_000.0,
+                                            "slow MPEG-TS to fMP4 bridge push"
+                                        );
+                                    }
                                 }
                             }
                             Some(TailSlot::End) => {
@@ -6186,7 +6234,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "av_contrib=info,av_web_service=info".into()),
+                .unwrap_or_else(|_| "av_contrib=info,web_service=info".into()),
         )
         .init();
 

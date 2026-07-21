@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "kind": "stem_stream_config",
+  "delivery": "reliable_authenticated_control_stream",
+  "mediaClass": "program",
+  "talkbackIncluded": false,
+  "identity": {
+    "tenantId": "ten_demo",
+    "sessionId": "ses_demo",
+    "sessionEpoch": 9,
+    "contributorId": "con_demo"
+  },
+  "topologyGeneration": 11,
+  "bindingGeneration": 13,
+  "configRef": 41,
+  "configGeneration": 7,
+  "effectiveEpoch": 100,
+  "sourceMap": {
+    "schemaVersion": 1,
+    "kind": "synchronized_stem_source_map",
+    "mediaClass": "program",
+    "talkbackIncluded": false,
+    "identity": {
+      "tenantId": "ten_demo",
+      "sessionId": "ses_demo",
+      "sessionEpoch": 9,
+      "contributorId": "con_demo"
+    },
+    "sourceMapVersion": 4,
+    "configGeneration": 7,
+    "effectiveEpoch": 100,
+    "sourceClockId": "clk_contributor_audio",
+    "sampleRate": 48000,
+    "frameSamples": 240,
+    "sources": [
+      {
+        "sourceId": "src_vocal",
+        "sourceRef": 1,
+        "label": "Lead vocal",
+        "order": 0,
+        "required": true,
+        "priority": 100,
+        "mediaClass": "program",
+        "channelLayout": {
+          "schemaVersion": 1,
+          "kind": "stem_channel_layout",
+          "layout": "mono",
+          "channelCount": 1,
+          "channels": [
+            {
+              "channelId": "ch_vocal_mono",
+              "order": 0,
+              "role": "mono",
+              "label": "Vocal"
+            }
+          ]
+        }
+      },
+      {
+        "sourceId": "src_guitar",
+        "sourceRef": 2,
+        "label": "Guitar",
+        "order": 1,
+        "required": false,
+        "priority": 50,
+        "mediaClass": "program",
+        "channelLayout": {
+          "schemaVersion": 1,
+          "kind": "stem_channel_layout",
+          "layout": "mono",
+          "channelCount": 1,
+          "channels": [
+            {
+              "channelId": "ch_guitar_mono",
+              "order": 0,
+              "role": "mono",
+              "label": "Guitar"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "representation": {
+    "mode": "pcm_s24le",
+    "sampleRate": 48000,
+    "frameSamples": 240,
+    "independentlyDecodablePerSource": true,
+    "codecStateScope": "per_source_per_config_generation",
+    "pcmFormat": "s24le_interleaved_v1"
+  },
+  "latencyPolicy": {
+    "aggregationDeadlineMicroseconds": 1000,
+    "receiverAllowanceMilliseconds": 25,
+    "missingSourcePolicy": "explicit_erasure_at_same_pts",
+    "lateArrivalPolicy": "discard_after_release",
+    "releasedEpochMutable": false
+  },
+  "fecPolicy": {
+    "strategy": "reed_solomon",
+    "sameDeadlineEpochOnly": true,
+    "maxRepairOverheadPercent": 25,
+    "sourceSymbols": 8,
+    "repairSymbols": 2
+  },
+  "carrier": {
+    "transportProfile": "native_datagram",
+    "maxDatagramBytes": 1200,
+    "fragmentationRequired": false
+  },
+  "keyEpoch": 3,
+  "admissionDecisionId": "adm_demo"
+}

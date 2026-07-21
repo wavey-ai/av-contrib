@@ -109,7 +109,7 @@ enum Command {
     ReceiveWebtransport {
         #[arg(long)]
         edge: SocketAddr,
-        #[arg(long, default_value = "local.bitneedle.com")]
+        #[arg(long, default_value = "local.infidelity.io")]
         server_name: String,
         /// Additional PEM certificate authority for private/local qualification endpoints.
         #[arg(long)]
@@ -128,7 +128,7 @@ enum Command {
     ReceiveHls {
         #[arg(long)]
         edge: SocketAddr,
-        #[arg(long, default_value = "local.bitneedle.com")]
+        #[arg(long, default_value = "local.infidelity.io")]
         server_name: String,
         /// Additional PEM certificate authority for private/local qualification endpoints.
         #[arg(long)]
@@ -188,7 +188,7 @@ enum Command {
     LoadHls {
         #[arg(long)]
         edge: SocketAddr,
-        #[arg(long, default_value = "local.bitneedle.com")]
+        #[arg(long, default_value = "local.infidelity.io")]
         server_name: String,
         /// Additional PEM certificate authority for private/local qualification endpoints.
         #[arg(long)]
@@ -2013,10 +2013,18 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     hls_path(
                         path_prefix,
                         stream_id,
-                        &format!("tail?from={initial_from_sequence}"),
+                        &format!(
+                            "tail?from={initial_from_sequence}&parts={parts_per_response}"
+                        ),
                     )
                 },
-                |sequence| hls_path(path_prefix, stream_id, &format!("tail?after={sequence}")),
+                |sequence| {
+                    hls_path(
+                        path_prefix,
+                        stream_id,
+                        &format!("tail?after={sequence}&parts={parts_per_response}"),
+                    )
+                },
             );
             let response = hls_https_get(&mut h3_client, edge, server_name, tls_ca, &path).await?;
             wire_bytes = wire_bytes.saturating_add(response.wire_bytes as u64);

@@ -59,7 +59,7 @@ Useful environment:
   LORI_SOURCE=/path/to/LORI.m4v
   AV_CONTRIB_TEST_LIMIT_SECONDS=30       # optional smoke limit; unset means full video
   AV_LL_HLS_PART_MS=50
-  AV_CONTRIB_TEST_EDGE_HLS_URL=https://local.bitneedle.com:19444/live/stream.m3u8
+  AV_CONTRIB_TEST_EDGE_HLS_URL=https://local.infidelity.io:19444/live/stream.m3u8
 
 The run modes start av-contrib locally and send a prepared MPEG-TS fixture in
 real time. They require a Needletail mesh edge URL because av-contrib publishes
@@ -185,18 +185,18 @@ prepare() {
 }
 
 base_url_host() {
-  local cert="$ROOT/../tls/local.bitneedle.com/fullchain.pem"
-  local key="$ROOT/../tls/local.bitneedle.com/privkey.pem"
+  local cert="$ROOT/../tls/local.infidelity.io/fullchain.pem"
+  local key="$ROOT/../tls/local.infidelity.io/privkey.pem"
   if [[ -f "$cert" && -f "$key" ]]; then
-    printf 'local.bitneedle.com\n'
+    printf 'local.infidelity.io\n'
   else
     printf '127.0.0.1\n'
   fi
 }
 
 tls_args() {
-  local cert="$ROOT/../tls/local.bitneedle.com/fullchain.pem"
-  local key="$ROOT/../tls/local.bitneedle.com/privkey.pem"
+  local cert="$ROOT/../tls/local.infidelity.io/fullchain.pem"
+  local key="$ROOT/../tls/local.infidelity.io/privkey.pem"
   if [[ -f "$cert" && -f "$key" ]]; then
     printf '%s\n' --cert "$cert" --key "$key"
   fi

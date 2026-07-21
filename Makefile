@@ -5,7 +5,7 @@ MAKE ?= make
 NEEDLETAIL_ROOT ?= ../needletail
 
 RUST_LOG ?= info
-HOST ?= local.bitneedle.com
+HOST ?= local.infidelity.io
 STREAM_ID ?= 1
 PART_MS ?= 50
 
@@ -41,7 +41,7 @@ help:
 	@printf '%s\n' '  make build-release     Build av-contrib release binaries'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
-	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.bitneedle.com'
+	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.infidelity.io'
 
 stack:
 	$(MAKE) -C $(NEEDLETAIL_ROOT) local HOST=$(HOST) STREAM_ID=$(STREAM_ID) \

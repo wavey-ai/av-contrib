@@ -35,6 +35,10 @@ struct Args {
 
     #[arg(long, default_value_t = 8192)]
     history_packets: usize,
+
+    /// Keep the sender alive after EOF so the receiver can request final repairs.
+    #[arg(long, default_value_t = 250)]
+    final_repair_ms: u64,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -137,6 +141,13 @@ async fn main() -> Result<()> {
         sender.drain_feedback(&mut feedback_buf)?;
         sent_bytes += read;
     }
+
+    let repair_deadline = Instant::now() + Duration::from_millis(args.final_repair_ms);
+    while Instant::now() < repair_deadline {
+        sender.drain_feedback(&mut feedback_buf)?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    sender.drain_feedback(&mut feedback_buf)?;
 
     println!(
         "sent {} bytes to {} using RIST chunks of {} bytes",

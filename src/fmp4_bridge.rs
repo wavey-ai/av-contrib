@@ -5,7 +5,9 @@
 //! not valid HLS media fragments. This bridge demuxes H.264 access units,
 //! boxes them as fMP4/CMAF parts, and updates the shared playlist cache.
 
+use access_unit::aac::{parse_adts_frame, split_adts_frames};
 use access_unit::flac::decode_frame_header;
+use access_unit::h264::{detect_framing as detect_h264_framing, Framing as H264Framing};
 use access_unit::{
     detect_audio, AccessUnit, AudioType, PSI_STREAM_AAC, PSI_STREAM_H264, PSI_STREAM_MPEG4_AAC,
     PSI_STREAM_PRIVATE_DATA,
@@ -27,7 +29,7 @@ use mpeg2ts_reader::psi;
 use mpeg2ts_reader::StreamType;
 use playlists::Playlists;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 const TICKS_PER_SECOND: u64 = 90_000;
@@ -237,6 +239,12 @@ impl TsFmp4Bridge {
     }
 
     pub async fn finish(&mut self) {
+        self.demux.flush(&mut self.context);
+        self.context
+            .drain_access_units_into(&mut self.drained_access_units);
+        for access_unit in self.drained_access_units.drain(..) {
+            self.segmenter.push_access_unit(access_unit).await;
+        }
         self.segmenter.finish().await;
     }
 
@@ -270,6 +278,12 @@ enum AudioConfigSignature {
     Explicit(AudioTrackConfig),
 }
 
+#[derive(Clone, Copy)]
+struct AacTimeline {
+    sample_rate: u32,
+    next_decode_time: u64,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct InitSignature {
     video: Option<H264ConfigSignature>,
@@ -293,6 +307,7 @@ pub struct Fmp4Segmenter {
     /// Known encoded duration of the buffered audio. `None` preserves the
     /// timestamp-lookahead fallback for an unrecognised audio payload.
     audio_buffered_duration_ms: Option<u64>,
+    aac_timeline: Option<AacTimeline>,
     config: Config,
     seg_seq: u32,
     sps: Option<Bytes>,
@@ -304,6 +319,7 @@ pub struct Fmp4Segmenter {
     seen_video: bool,
     started_video: bool,
     published_parts: u64,
+    last_packaged_at_unix_ns: Option<i64>,
     warned_no_config: bool,
     timestamp_base_input: Option<u64>,
 }
@@ -391,6 +407,7 @@ impl Fmp4Segmenter {
             audio_buf: Vec::new(),
             audio_timestamps: Vec::new(),
             audio_buffered_duration_ms: Some(0),
+            aac_timeline: None,
             config: Config {
                 width: 0,
                 height: 0,
@@ -406,6 +423,7 @@ impl Fmp4Segmenter {
             seen_video: false,
             started_video: false,
             published_parts: 0,
+            last_packaged_at_unix_ns: None,
             warned_no_config: false,
             timestamp_base_input: None,
         }
@@ -489,6 +507,7 @@ impl Fmp4Segmenter {
         self.audio_buf.clear();
         self.audio_timestamps.clear();
         self.audio_buffered_duration_ms = Some(0);
+        self.aac_timeline = None;
         self.config = Config {
             width: 0,
             height: 0,
@@ -504,6 +523,7 @@ impl Fmp4Segmenter {
         self.seen_video = false;
         self.started_video = false;
         self.published_parts = 0;
+        self.last_packaged_at_unix_ns = None;
         self.warned_no_config = false;
         self.timestamp_base_input = None;
     }
@@ -658,7 +678,8 @@ impl Fmp4Segmenter {
         self.warned_no_config = false;
     }
 
-    async fn push_audio(&mut self, access_unit: AccessUnit) {
+    async fn push_audio(&mut self, mut access_unit: AccessUnit) {
+        self.apply_aac_timeline(&mut access_unit);
         if let Some(signature) = self
             .audio_config
             .map(AudioConfigSignature::Explicit)
@@ -686,7 +707,10 @@ impl Fmp4Segmenter {
             return;
         }
 
-        if self.video_buf.is_empty() && self.should_flush_audio_only_before(&access_unit) {
+        if self.video_buf.is_empty()
+            && self.audio_buffered_duration_ms.is_none()
+            && self.should_flush_audio_only_before(&access_unit)
+        {
             let first_pts = self
                 .audio_timestamps
                 .first()
@@ -724,6 +748,39 @@ impl Fmp4Segmenter {
             .audio_buffered_duration_ms
             .zip(access_unit_duration_ms)
             .map(|(buffered, access_unit)| buffered.saturating_add(access_unit));
+    }
+
+    fn apply_aac_timeline(&mut self, access_unit: &mut AccessUnit) {
+        if self.audio_config.is_some() {
+            return;
+        }
+        let Some(header) = AdtsHeader::read_from(&access_unit.data) else {
+            return;
+        };
+        let sample_rate = header.sampling_frequency.as_u32();
+        let input_decode_time = access_unit
+            .pts
+            .saturating_mul(u64::from(sample_rate))
+            .saturating_add(500)
+            / 1_000;
+        let decode_time = self
+            .aac_timeline
+            .filter(|timeline| timeline.sample_rate == sample_rate)
+            .map(|timeline| {
+                if timeline.next_decode_time.abs_diff(input_decode_time) > 1_024 {
+                    input_decode_time
+                } else {
+                    timeline.next_decode_time
+                }
+            })
+            .unwrap_or(input_decode_time);
+
+        access_unit.pts = decode_time;
+        access_unit.dts = decode_time;
+        self.aac_timeline = Some(AacTimeline {
+            sample_rate,
+            next_decode_time: decode_time.saturating_add(1_024),
+        });
     }
 
     fn timestamp_went_backwards(&self, access_unit: &AccessUnit) -> bool {
@@ -811,6 +868,13 @@ impl Fmp4Segmenter {
         let audio_units = self.audio_buf.len();
         let audio_codec = audio_codec_name(&self.audio_buf, self.audio_config);
 
+        let boxing_audio_config = match self.known_audio_signature {
+            Some(AudioConfigSignature::Aac { .. }) if self.audio_config.is_none() => {
+                Some(AudioTrackConfig::Aac)
+            }
+            _ => self.audio_config,
+        };
+        let boxing_started = Instant::now();
         let fmp4 = box_fmp4_with_init_and_audio_config(
             self.seg_seq,
             self.config.clone(),
@@ -818,8 +882,9 @@ impl Fmp4Segmenter {
             std::mem::take(&mut self.audio_buf),
             next_dts,
             include_init,
-            self.audio_config,
+            boxing_audio_config,
         );
+        let boxing_elapsed = boxing_started.elapsed();
         self.video_timestamps.clear();
         self.audio_timestamps.clear();
         self.audio_buffered_duration_ms = Some(0);
@@ -841,6 +906,36 @@ impl Fmp4Segmenter {
         let key = fmp4.key;
         let part_bytes = fmp4.data.clone();
         let bytes = part_bytes.len();
+        if boxing_elapsed >= std::time::Duration::from_millis(100) {
+            warn!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                seq = self.seg_seq,
+                elapsed_ms = boxing_elapsed.as_secs_f64() * 1_000.0,
+                bytes,
+                video_units,
+                audio_units,
+                "slow fMP4 part boxing"
+            );
+        }
+        if let Some(previous) = self.last_packaged_at_unix_ns {
+            let cadence_ms = packaged_at_unix_ns.saturating_sub(previous) as f64 / 1_000_000.0;
+            if cadence_ms >= 350.0 {
+                warn!(
+                    output_stream_id = self.output_stream_id,
+                    output_stream_idx = self.output_stream_idx,
+                    seq = self.seg_seq,
+                    cadence_ms,
+                    duration_ms = duration,
+                    boxing_ms = boxing_elapsed.as_secs_f64() * 1_000.0,
+                    bytes,
+                    video_units,
+                    audio_units,
+                    "delayed fMP4 part packaging cadence"
+                );
+            }
+        }
+        self.last_packaged_at_unix_ns = Some(packaged_at_unix_ns);
         if self.retain_local_cache {
             if let Err(error) = self
                 .playlists
@@ -886,7 +981,20 @@ impl Fmp4Segmenter {
                 audio_codec,
                 audio_units,
             };
-            if let Err(error) = publisher.publish_fmp4_part(part).await {
+            let publish_started = Instant::now();
+            let publish_result = publisher.publish_fmp4_part(part).await;
+            let publish_elapsed = publish_started.elapsed();
+            if publish_elapsed >= std::time::Duration::from_millis(100) {
+                warn!(
+                    output_stream_id = self.output_stream_id,
+                    output_stream_idx = self.output_stream_idx,
+                    sequence = self.published_parts,
+                    elapsed_ms = publish_elapsed.as_secs_f64() * 1_000.0,
+                    bytes,
+                    "slow fMP4 part publication"
+                );
+            }
+            if let Err(error) = publish_result {
                 warn!(
                     output_stream_id = self.output_stream_id,
                     output_stream_idx = self.output_stream_idx,
@@ -1017,13 +1125,19 @@ impl Fmp4Segmenter {
                 return None;
             }
         };
+        // AVCDecoderConfigurationRecord stores the complete
+        // profile_compatibility byte from the SPS, not the decoded value of
+        // constraint_set0_flag alone. Reducing 0xc0 to 0x01 advertises a
+        // different codec string (for example avc1.42011F instead of
+        // avc1.42C01F), which conforming Media Source implementations reject.
+        let profile_compatibility = *sps.get(2)?;
         Some((
             Config {
                 width,
                 height,
                 avcc: Some(AvcDecoderConfigurationRecord {
                     profile_idc: decoded_sps.profile_idc.0,
-                    constraint_set_flag: decoded_sps.constraint_set0_flag.0,
+                    constraint_set_flag: profile_compatibility,
                     level_idc: decoded_sps.level_idc.0,
                     sequence_parameter_set: sps.clone(),
                     picture_parameter_set: pps.clone(),
@@ -1194,8 +1308,10 @@ fn append_h264_nalu_to_avcc_sample(sample: &mut BytesMut, nalu: &[u8]) -> H264Na
 }
 
 fn ensure_h264_length_prefixed(access_unit: &mut AccessUnit) -> bool {
-    if !looks_like_annex_b(&access_unit.data) {
-        return true;
+    match detect_h264_framing(&access_unit.data, 4) {
+        Some(H264Framing::Avcc) => return true,
+        Some(H264Framing::AnnexB) => {}
+        None => return false,
     }
 
     let mut sample = BytesMut::with_capacity(access_unit.data.len());
@@ -1226,10 +1342,6 @@ fn ensure_h264_length_prefixed(access_unit: &mut AccessUnit) -> bool {
     access_unit.data = sample.freeze();
     access_unit.key = key;
     true
-}
-
-fn looks_like_annex_b(data: &[u8]) -> bool {
-    data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
 }
 
 fn strip_h264_parameter_sets(access_unit: &mut AccessUnit) -> Result<bool, H264SampleError> {
@@ -1283,6 +1395,11 @@ fn audio_access_unit_duration_ms(
     audio_config: Option<AudioTrackConfig>,
 ) -> Option<u64> {
     match audio_config {
+        Some(AudioTrackConfig::Aac) => {
+            let header = AdtsHeader::read_from(&access_unit.data)?;
+            let sample_rate = u64::from(header.sampling_frequency.as_u32());
+            return Some((1_024_000_u64.saturating_add(sample_rate / 2)) / sample_rate);
+        }
         Some(AudioTrackConfig::Pcm(pcm)) => {
             let valid_size = match pcm.sample_kind {
                 PcmSampleKind::Integer => matches!(pcm.sample_size, 16 | 24 | 32),
@@ -1349,6 +1466,7 @@ fn audio_codec_name(
 ) -> Option<&'static str> {
     if let Some(config) = audio_config {
         return Some(match config {
+            AudioTrackConfig::Aac => "aac",
             AudioTrackConfig::Pcm(pcm) => {
                 match (pcm.sample_kind, pcm.sample_size, pcm.little_endian) {
                     (PcmSampleKind::Integer, 16, true) => "pcm_s16le",
@@ -1413,6 +1531,59 @@ mod tests {
             stream_type: PSI_STREAM_AAC,
             id: 0,
         }
+    }
+
+    fn aac_access_unit_ticks(index: u64) -> AccessUnit {
+        let payload = [index as u8, 0x22, 0x33, 0x44];
+        let mut data = access_unit::aac::create_adts_header(0x66, 2, 48_000, payload.len(), false);
+        data.extend_from_slice(&payload);
+        let timestamp = index * 1_920;
+        AccessUnit {
+            key: false,
+            pts: timestamp,
+            dts: timestamp,
+            data: Bytes::from(data),
+            stream_type: PSI_STREAM_AAC,
+            id: index,
+        }
+    }
+
+    fn read_u32(bytes: &[u8]) -> u32 {
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    fn read_u64(bytes: &[u8]) -> u64 {
+        u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    }
+
+    fn box_type_offsets(data: &[u8], box_type: &[u8; 4]) -> Vec<usize> {
+        data.windows(4)
+            .enumerate()
+            .filter_map(|(offset, window)| (window == box_type).then_some(offset))
+            .collect()
+    }
+
+    fn tfdt_decode_time(data: &[u8]) -> u64 {
+        let tfdt = box_type_offsets(data, b"tfdt")[0];
+        match data[tfdt + 4] {
+            0 => u64::from(read_u32(&data[tfdt + 8..tfdt + 12])),
+            1 => read_u64(&data[tfdt + 8..tfdt + 16]),
+            version => panic!("unexpected tfdt version {version}"),
+        }
+    }
+
+    fn trun_sample_durations(data: &[u8]) -> Vec<u32> {
+        let trun = box_type_offsets(data, b"trun")[0];
+        let sample_count = read_u32(&data[trun + 8..trun + 12]) as usize;
+        let mut durations = Vec::with_capacity(sample_count);
+        let mut offset = trun + 16;
+        for _ in 0..sample_count {
+            durations.push(read_u32(&data[offset..offset + 4]));
+            offset += 8;
+        }
+        durations
     }
 
     fn push_len_prefixed_nalu(out: &mut BytesMut, nalu: &[u8]) {
@@ -1549,6 +1720,50 @@ mod tests {
         assert!(parts[2].init.is_none());
     }
 
+    #[tokio::test]
+    async fn aac_decode_timeline_is_contiguous_across_audio_parts() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let publisher = Arc::new(CapturingPublisher::default());
+        let mut segmenter = Fmp4Segmenter::new_publish_only(
+            77,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            200,
+            publisher.clone(),
+        );
+
+        for index in 0..20 {
+            segmenter
+                .push_access_unit(aac_access_unit_ticks(index))
+                .await;
+        }
+        segmenter.finish().await;
+
+        let parts = publisher.parts.lock().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0]
+            .init
+            .as_ref()
+            .expect("AAC init segment")
+            .windows(4)
+            .any(|window| window == b"mp4a"));
+
+        let mut expected_decode_time = 0;
+        for part in parts.iter() {
+            assert_eq!(part.audio_codec, Some("aac"));
+            assert_eq!(tfdt_decode_time(&part.bytes), expected_decode_time);
+            let durations = trun_sample_durations(&part.bytes);
+            assert_eq!(durations.len(), 10);
+            assert!(durations.iter().all(|duration| *duration == 1_024));
+            expected_decode_time += durations
+                .iter()
+                .map(|duration| u64::from(*duration))
+                .sum::<u64>();
+        }
+        assert_eq!(expected_decode_time, 20 * 1_024);
+    }
+
     #[test]
     fn fmp4_segmenter_rebases_large_mpeg_ts_timestamps() {
         let (playlists, _, _) = Playlists::new(Options::default());
@@ -1649,6 +1864,30 @@ mod tests {
     }
 
     #[test]
+    fn avcc_nalu_length_that_looks_like_annex_b_is_not_repacketized() {
+        let mut nalu = vec![0x55; 0x110];
+        nalu[0] = 0x41;
+        let mut sample = BytesMut::new();
+        push_len_prefixed_nalu(&mut sample, &nalu);
+        let expected = sample.freeze();
+        assert!(expected.starts_with(&[0, 0, 1]));
+        assert_eq!(detect_h264_framing(&expected, 4), Some(H264Framing::Avcc));
+
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.key = false;
+        access_unit.data = expected.clone();
+        assert!(ensure_h264_length_prefixed(&mut access_unit));
+        assert_eq!(access_unit.data, expected);
+    }
+
+    #[test]
+    fn malformed_h264_sample_is_not_assumed_to_be_avcc() {
+        let mut access_unit = h264_access_unit(0, 0);
+        access_unit.data = Bytes::from_static(&[0, 0, 0, 8, 0x41, 1, 2]);
+        assert!(!ensure_h264_length_prefixed(&mut access_unit));
+    }
+
+    #[test]
     fn parses_h264_sps_display_dimensions_with_spec_crop_units() {
         let (playlists, _, _) = Playlists::new(Options::default());
         let mut segmenter = Fmp4Segmenter::new(
@@ -1663,6 +1902,11 @@ mod tests {
 
         let (config, _) = segmenter.parse_h264_config(&access_unit).unwrap();
         assert_eq!((config.width, config.height), (1280, 720));
+        let avcc = config.avcc.as_ref().unwrap();
+        assert_eq!(
+            (avcc.profile_idc, avcc.constraint_set_flag, avcc.level_idc),
+            (0x42, 0xc0, 0x1f)
+        );
 
         access_unit.data = h264_sample(H264_SPS_360P, H264_PPS, H264_IDR);
         let (config, _) = segmenter.parse_h264_config(&access_unit).unwrap();
@@ -1756,6 +2000,172 @@ mod tests {
         assert_eq!(segmenter.video_buf.len(), 1);
         let nalus: Vec<&[u8]> = h264::iterate_avcc(&segmenter.video_buf[0].data, 4).collect();
         assert_eq!(nalus, vec![&media[..]]);
+    }
+
+    #[test]
+    #[ignore = "requires AV_CONTRIB_MPEG_TS_FIXTURE"]
+    fn mpeg_ts_fixture_emits_only_its_declared_h264_dimensions() {
+        let fixture = std::env::var("AV_CONTRIB_MPEG_TS_FIXTURE")
+            .expect("set AV_CONTRIB_MPEG_TS_FIXTURE to an H.264 MPEG-TS file");
+        let expected_width: u16 = std::env::var("AV_CONTRIB_EXPECTED_WIDTH")
+            .expect("set AV_CONTRIB_EXPECTED_WIDTH")
+            .parse()
+            .expect("valid expected width");
+        let expected_height: u16 = std::env::var("AV_CONTRIB_EXPECTED_HEIGHT")
+            .expect("set AV_CONTRIB_EXPECTED_HEIGHT")
+            .parse()
+            .expect("valid expected height");
+        let bytes = std::fs::read(&fixture).expect("read MPEG-TS fixture");
+        let mut context = TsDemuxContext::new(None);
+        let mut demux = demultiplex::Demultiplex::new(&mut context);
+
+        for chunk in bytes.chunks(47 * 1024) {
+            demux.push(&mut context, chunk);
+        }
+        demux.flush(&mut context);
+
+        let mut access_units = Vec::new();
+        context.drain_access_units_into(&mut access_units);
+        let video_timestamps: Vec<(u64, u64)> = access_units
+            .iter()
+            .filter(|access_unit| is_h264(access_unit.stream_type))
+            .map(|access_unit| (access_unit.pts, access_unit.dts))
+            .collect();
+        if let Some((index, timestamps)) = video_timestamps
+            .windows(2)
+            .enumerate()
+            .find(|(_, timestamps)| timestamps[1].1 < timestamps[0].1)
+        {
+            panic!(
+                "H.264 DTS moved backwards between access units {index} and {}: {:?}",
+                index + 1,
+                timestamps
+            );
+        }
+        let mut video_units = 0usize;
+        let mut video_units_with_vcl = 0usize;
+        let mut sequence_parameter_sets = 0usize;
+        for access_unit in access_units
+            .iter()
+            .filter(|access_unit| is_h264(access_unit.stream_type))
+        {
+            video_units += 1;
+            assert_eq!(
+                detect_h264_framing(&access_unit.data, 4),
+                Some(H264Framing::Avcc),
+                "MPEG-TS access unit {video_units} was not valid AVCC"
+            );
+            let mut has_vcl = false;
+            for nalu in h264::iterate_avcc(&access_unit.data, 4) {
+                has_vcl |= nalu
+                    .first()
+                    .is_some_and(|byte| matches!(byte & NAL_UNIT_TYPE_MASK, 1..=5));
+                if nalu.first().map(|byte| byte & NAL_UNIT_TYPE_MASK)
+                    == Some(NAL_UNIT_TYPE_SEQUENCE_PARAMETER_SET)
+                {
+                    sequence_parameter_sets += 1;
+                    let (_, width, height) = decode_h264_sps(nalu).unwrap_or_else(|error| {
+                        panic!("invalid SPS in access unit {video_units}: {error:?}")
+                    });
+                    assert_eq!(
+                        (width, height),
+                        (expected_width, expected_height),
+                        "unexpected SPS dimensions in access unit {video_units}"
+                    );
+                }
+            }
+            video_units_with_vcl += usize::from(has_vcl);
+        }
+
+        assert!(video_units > 0, "fixture emitted no H.264 access units");
+        assert_eq!(
+            video_units_with_vcl, video_units,
+            "fixture emitted an H.264 access unit without a coded picture"
+        );
+        if let Ok(expected_video_frames) = std::env::var("AV_CONTRIB_EXPECTED_VIDEO_FRAMES") {
+            assert_eq!(
+                video_units,
+                expected_video_frames
+                    .parse::<usize>()
+                    .expect("valid expected video-frame count"),
+                "MPEG-TS demux did not emit one access unit per H.264 frame"
+            );
+        }
+        assert!(
+            sequence_parameter_sets > 0,
+            "fixture emitted no H.264 sequence parameter sets"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AV_CONTRIB_MPEG_TS_FIXTURE"]
+    async fn mpeg_ts_fixture_packages_every_h264_frame_into_fmp4() {
+        let fixture = std::env::var("AV_CONTRIB_MPEG_TS_FIXTURE")
+            .expect("set AV_CONTRIB_MPEG_TS_FIXTURE to an H.264 MPEG-TS file");
+        let expected_width: u16 = std::env::var("AV_CONTRIB_EXPECTED_WIDTH")
+            .expect("set AV_CONTRIB_EXPECTED_WIDTH")
+            .parse()
+            .expect("valid expected width");
+        let expected_height: u16 = std::env::var("AV_CONTRIB_EXPECTED_HEIGHT")
+            .expect("set AV_CONTRIB_EXPECTED_HEIGHT")
+            .parse()
+            .expect("valid expected height");
+        let expected_video_frames: usize = std::env::var("AV_CONTRIB_EXPECTED_VIDEO_FRAMES")
+            .expect("set AV_CONTRIB_EXPECTED_VIDEO_FRAMES")
+            .parse()
+            .expect("valid expected video-frame count");
+        let expected_audio_frames: usize = std::env::var("AV_CONTRIB_EXPECTED_AUDIO_FRAMES")
+            .expect("set AV_CONTRIB_EXPECTED_AUDIO_FRAMES")
+            .parse()
+            .expect("valid expected audio-frame count");
+        let bytes = std::fs::read(&fixture).expect("read MPEG-TS fixture");
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let publisher = Arc::new(CapturingPublisher::default());
+        let mut bridge =
+            TsFmp4Bridge::new_publish_only(1, 0, playlists, DEFAULT_MIN_PART_MS, publisher.clone());
+
+        for chunk in bytes.chunks(47 * 1024) {
+            bridge.push_ts(Bytes::copy_from_slice(chunk)).await;
+        }
+        bridge.finish().await;
+
+        let parts = publisher.parts.lock().unwrap();
+        assert!(!parts.is_empty(), "fixture emitted no fMP4 parts");
+        assert!(
+            parts.iter().all(|part| {
+                part.video_units == 0
+                    || (part.video_width, part.video_height)
+                        == (Some(expected_width), Some(expected_height))
+            }),
+            "fixture emitted an fMP4 part with unexpected video dimensions"
+        );
+        assert_eq!(
+            parts.iter().map(|part| part.video_units).sum::<usize>(),
+            expected_video_frames,
+            "not every demuxed H.264 frame reached an fMP4 part"
+        );
+        assert_eq!(
+            parts.iter().map(|part| part.audio_units).sum::<usize>(),
+            expected_audio_frames,
+            "not every demuxed AAC frame reached an fMP4 part"
+        );
+
+        if let Ok(output) = std::env::var("AV_CONTRIB_FMP4_OUTPUT") {
+            // The first initialization can be video-only. Use the newest
+            // initialization after the AAC configuration becomes available.
+            let init = parts
+                .iter()
+                .filter_map(|part| part.init.as_ref())
+                .last()
+                .expect("fixture emitted no fMP4 initialization");
+            let media_bytes = parts.iter().map(|part| part.bytes.len()).sum::<usize>();
+            let mut fragmented_mp4 = Vec::with_capacity(init.len() + media_bytes);
+            fragmented_mp4.extend_from_slice(init);
+            for part in parts.iter() {
+                fragmented_mp4.extend_from_slice(&part.bytes);
+            }
+            std::fs::write(output, fragmented_mp4).expect("write diagnostic fragmented MP4");
+        }
     }
 }
 
@@ -1967,9 +2377,43 @@ impl pes::ElementaryStreamConsumer<TsDemuxContext> for ElementaryStreamConsumer 
                     });
                 }
             }
-            StreamType::ADTS
-            | StreamType::H222_0_PES_PRIVATE_DATA
-            | StreamType::AUDIO_WITHOUT_TRANSPORT_SYNTAX
+            StreamType::ADTS if !self.accumulated_payload.is_empty() => {
+                let encoded = Bytes::from(std::mem::take(&mut self.accumulated_payload));
+                let encoded_bytes = encoded.len();
+                let Some(frames) = split_adts_frames(encoded) else {
+                    warn!(
+                        stream_type = ?self.stream_type,
+                        bytes = encoded_bytes,
+                        "dropping malformed or partial ADTS PES payload"
+                    );
+                    if let Some(observer) = &self.observer {
+                        observer.record_mpeg_ts_payload_drop(MpegTsPayloadDrop {
+                            stream_type: self.stream_type_label,
+                            bytes: encoded_bytes,
+                        });
+                    }
+                    return;
+                };
+                let mut pts = self.pts;
+                let mut dts = self.dts;
+                for frame in frames {
+                    let info = parse_adts_frame(&frame).expect("split ADTS frame must parse");
+                    ctx.access_units.push(AccessUnit {
+                        key: false,
+                        pts,
+                        dts,
+                        data: frame,
+                        stream_type: self.stream_type.into(),
+                        id: 0,
+                    });
+                    let duration_ticks = u64::from(info.samples)
+                        .saturating_mul(TICKS_PER_SECOND)
+                        .div_ceil(u64::from(info.sample_rate));
+                    pts = pts.saturating_add(duration_ticks);
+                    dts = dts.saturating_add(duration_ticks);
+                }
+            }
+            StreamType::H222_0_PES_PRIVATE_DATA | StreamType::AUDIO_WITHOUT_TRANSPORT_SYNTAX
                 if !self.accumulated_payload.is_empty() =>
             {
                 ctx.access_units.push(AccessUnit {
