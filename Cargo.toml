@@ -40,6 +40,7 @@ rist-mio-pure = { package = "rist-mio", version = "0.1.0" }
 rtmp-ingress = "0.1.1"
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std"] }
 rustls-pemfile = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 socket2 = "0.6"

@@ -14,15 +14,6 @@ use av_contrib::ingress_authorization::{
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
 use av_contrib::{codec_name, MediaAccessUnitParams};
-use upload_response::{
-    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
-    SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
-};
-use web_service::{
-    load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
-    HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
-    WebTransportHandler,
-};
 use bytes::{Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
@@ -46,7 +37,7 @@ use relay_session::{
 };
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use socket2::SockRef;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -54,7 +45,7 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::Duration;
@@ -62,15 +53,29 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, info, trace, warn};
+use upload_response::{
+    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
+    SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
+};
+use web_service::{
+    load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
+    HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
+    WebTransportHandler,
+};
 
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
+const NEEDLETAIL_AEP1_INGEST_PATH: &str = "/v1/ingest/aep1";
+const NEEDLETAIL_AEP1_CONTENT_TYPE: &str = "application/x-needletail-aep1-stream";
+const NEEDLETAIL_AEP1_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
+const NEEDLETAIL_AEP1_MAX_BUFFER_BYTES: usize = 256 * 1024;
 const CONTRIB_STATUS_PATH: &str = "/api/status";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
 const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
+const ENCRYPTED_AUDIO_TRANSPORT_MAGIC: &[u8] = b"ACE1";
 const DAW_CONTROL_MAGIC: &[u8] = b"WAVEY-DAW-";
 const MEDIA_OBJECT_TENANT: &str = "default";
 const FMP4_MEDIA_TRACK: &str = "muxed-fmp4";
@@ -399,8 +404,9 @@ fn encode_canonical_media_object(object: &MediaObject) -> Result<Bytes> {
     ))
 }
 
-fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
+fn is_audio_transport_datagram(datagram: &[u8]) -> bool {
     datagram.starts_with(MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
+        || datagram.starts_with(ENCRYPTED_AUDIO_TRANSPORT_MAGIC)
 }
 const UPLOAD_RESPONSE_HLS_WORKER_ID: &str = "av-contrib-upload-response-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
@@ -1827,7 +1833,7 @@ async fn run_daw_media_udp_ingest(
                     continue;
                 }
 
-                if is_multichannel_audio_transport_datagram(datagram) {
+                if is_audio_transport_datagram(datagram) {
                     handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
                     handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx.as_ref(), peer, datagram);
                     continue;
@@ -5806,6 +5812,10 @@ struct ContribRouter {
     default_stream_id: u64,
     status: Arc<ContribStatusConfig>,
     publish_ingress_gate: Option<Arc<PublishIngressGate>>,
+    needletail_authorizer: Option<NeedletailSessionAuthorizer>,
+    audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
+    audio_epoch_mesh_tx: Option<mpsc::Sender<QueuedAudioEpochIngressDatagram>>,
+    needletail_ingest_active: Arc<AtomicBool>,
 }
 
 impl ContribRouter {
@@ -5814,14 +5824,188 @@ impl ContribRouter {
         default_stream_id: u64,
         status: Arc<ContribStatusConfig>,
         publish_ingress_gate: Option<Arc<PublishIngressGate>>,
+        needletail_authorizer: Option<NeedletailSessionAuthorizer>,
+        audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
+        audio_epoch_mesh_tx: Option<mpsc::Sender<QueuedAudioEpochIngressDatagram>>,
     ) -> Self {
         Self {
             forwarder,
             default_stream_id,
             status,
             publish_ingress_gate,
+            needletail_authorizer,
+            audio_epoch_hls_tx,
+            audio_epoch_mesh_tx,
+            needletail_ingest_active: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+#[derive(Clone)]
+struct NeedletailSessionAuthorizer {
+    http: reqwest::Client,
+    sessions_api_base: reqwest::Url,
+    expected_stream_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeedletailBootstrapResponse {
+    session_id: String,
+    endpoint_id: String,
+    route: NeedletailBootstrapRoute,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeedletailBootstrapRoute {
+    kind: String,
+    stream_id: String,
+}
+
+impl NeedletailSessionAuthorizer {
+    fn from_environment(expected_stream_id: u64) -> Result<Option<Self>> {
+        let Some(value) = std::env::var_os("AV_NEEDLETAIL_SESSION_API_BASE") else {
+            return Ok(None);
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("AV_NEEDLETAIL_SESSION_API_BASE is invalid"))?;
+        let sessions_api_base =
+            reqwest::Url::parse(&value).context("AV_NEEDLETAIL_SESSION_API_BASE is not a URL")?;
+        let local_development = matches!(
+            sessions_api_base.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1")
+        );
+        if sessions_api_base.host_str().is_none()
+            || (sessions_api_base.scheme() != "https"
+                && !(sessions_api_base.scheme() == "http" && local_development))
+            || !sessions_api_base.username().is_empty()
+            || sessions_api_base.password().is_some()
+            || sessions_api_base.query().is_some()
+            || sessions_api_base.fragment().is_some()
+        {
+            bail!("AV_NEEDLETAIL_SESSION_API_BASE must be an HTTPS origin");
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("failed to initialize Needletail session authorizer")?;
+        Ok(Some(Self {
+            http,
+            sessions_api_base,
+            expected_stream_id,
+        }))
+    }
+
+    async fn authorize(
+        &self,
+        bearer: &str,
+        session_id: &str,
+        endpoint_id: &str,
+    ) -> std::result::Result<(), StatusCode> {
+        if !ingest_identifier(session_id) || !ingest_identifier(endpoint_id) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let route = format!(
+            "v1/sessions/{}/media/publication-bootstrap",
+            url_encode_path_segment(session_id)
+        );
+        let url = self
+            .sessions_api_base
+            .join(&route)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(bearer)
+            .json(&serde_json::json!({
+                "version": 1,
+                "endpointId": endpoint_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if !response.status().is_success() {
+            return Err(match response.status().as_u16() {
+                401 => StatusCode::UNAUTHORIZED,
+                403 | 404 => StatusCode::FORBIDDEN,
+                409 => StatusCode::CONFLICT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > 32 * 1024)
+        {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if bytes.len() > 32 * 1024 {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        let bootstrap: NeedletailBootstrapResponse =
+            serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if bootstrap.session_id != session_id
+            || bootstrap.endpoint_id != endpoint_id
+            || bootstrap.route.kind != "needletail_london"
+            || bootstrap.route.stream_id != self.expected_stream_id.to_string()
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Ok(())
+    }
+}
+
+fn ingest_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn url_encode_path_segment(value: &str) -> String {
+    form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+struct NeedletailIngestGuard(Arc<AtomicBool>);
+
+impl Drop for NeedletailIngestGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn needletail_ingest_query(
+    query: Option<&str>,
+) -> std::result::Result<(String, String), StatusCode> {
+    let mut session_id = None;
+    let mut endpoint_id = None;
+    for (name, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        match name.as_ref() {
+            "sessionId" if session_id.is_none() => session_id = Some(value.into_owned()),
+            "endpointId" if endpoint_id.is_none() => endpoint_id = Some(value.into_owned()),
+            _ => return Err(StatusCode::BAD_REQUEST),
+        }
+    }
+    let session_id = session_id.filter(|value| ingest_identifier(value));
+    let endpoint_id = endpoint_id.filter(|value| ingest_identifier(value));
+    match (session_id, endpoint_id) {
+        (Some(session_id), Some(endpoint_id)) => Ok((session_id, endpoint_id)),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+fn needletail_ingest_response(status: StatusCode) -> HandlerResponse {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": "needletail_ingest_rejected",
+    }))
+    .unwrap_or_else(|_| b"{\"error\":\"needletail_ingest_rejected\"}".to_vec());
+    response(status, Some(Bytes::from(body)), Some("application/json"))
 }
 
 #[derive(Debug, Serialize)]
@@ -5918,6 +6102,115 @@ impl Router for ContribRouter {
         mut body: BodyStream,
     ) -> HandlerResult<HandlerResponse> {
         let path = req.uri().path().to_string();
+        if path == NEEDLETAIL_AEP1_INGEST_PATH {
+            if req.method() != Method::POST {
+                return Ok(response(StatusCode::METHOD_NOT_ALLOWED, None, None));
+            }
+            let Some(authorizer) = self.needletail_authorizer.as_ref() else {
+                return Ok(needletail_ingest_response(StatusCode::SERVICE_UNAVAILABLE));
+            };
+            let Some(audio_epoch_hls_tx) = self.audio_epoch_hls_tx.as_ref() else {
+                return Ok(needletail_ingest_response(StatusCode::SERVICE_UNAVAILABLE));
+            };
+            let Some(audio_epoch_mesh_tx) = self.audio_epoch_mesh_tx.as_ref() else {
+                return Ok(needletail_ingest_response(StatusCode::SERVICE_UNAVAILABLE));
+            };
+            if req.headers().get_all(AUTHORIZATION).iter().count() != 1 {
+                return Ok(needletail_ingest_response(StatusCode::UNAUTHORIZED));
+            }
+            let bearer = match parse_bearer_header(
+                req.headers()
+                    .get(AUTHORIZATION)
+                    .map(|value| value.as_bytes()),
+            ) {
+                Ok(value) => value,
+                Err(_) => return Ok(needletail_ingest_response(StatusCode::UNAUTHORIZED)),
+            };
+            let (session_id, endpoint_id) = match needletail_ingest_query(req.uri().query()) {
+                Ok(value) => value,
+                Err(status) => return Ok(needletail_ingest_response(status)),
+            };
+            if let Err(status) = authorizer
+                .authorize(bearer, &session_id, &endpoint_id)
+                .await
+            {
+                return Ok(needletail_ingest_response(status));
+            }
+            if req
+                .headers()
+                .get("x-needletail-ingest-preflight")
+                .is_some_and(|value| value.as_bytes() == b"1")
+            {
+                return Ok(response(StatusCode::NO_CONTENT, None, None));
+            }
+            if req
+                .headers()
+                .get("content-type")
+                .is_none_or(|value| value.as_bytes() != NEEDLETAIL_AEP1_CONTENT_TYPE.as_bytes())
+            {
+                return Ok(needletail_ingest_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ));
+            }
+            if self
+                .needletail_ingest_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(needletail_ingest_response(StatusCode::CONFLICT));
+            }
+            let _active = NeedletailIngestGuard(self.needletail_ingest_active.clone());
+            let peer = SocketAddr::from(([127, 0, 0, 1], 0));
+            let mut pending = BytesMut::new();
+            let mut datagrams = 0_u64;
+            let mut payload_bytes = 0_u64;
+            while let Some(next) = body.next().await {
+                let chunk = next?;
+                if pending.len().saturating_add(chunk.len()) > NEEDLETAIL_AEP1_MAX_BUFFER_BYTES {
+                    return Ok(needletail_ingest_response(StatusCode::PAYLOAD_TOO_LARGE));
+                }
+                pending.extend_from_slice(&chunk);
+                loop {
+                    if pending.len() < 4 {
+                        break;
+                    }
+                    let length =
+                        u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]])
+                            as usize;
+                    if length == 0 || length > NEEDLETAIL_AEP1_MAX_DATAGRAM_BYTES {
+                        return Ok(needletail_ingest_response(StatusCode::PAYLOAD_TOO_LARGE));
+                    }
+                    let framed_length = 4 + length;
+                    if pending.len() < framed_length {
+                        break;
+                    }
+                    let frame = pending.split_to(framed_length);
+                    let datagram = &frame[4..];
+                    if !is_audio_transport_datagram(datagram) {
+                        return Ok(needletail_ingest_response(StatusCode::BAD_REQUEST));
+                    }
+                    handoff_audio_epoch_hls_datagram(Some(audio_epoch_hls_tx), peer, datagram);
+                    handoff_audio_epoch_mesh_datagram(Some(audio_epoch_mesh_tx), peer, datagram);
+                    datagrams = datagrams.saturating_add(1);
+                    payload_bytes = payload_bytes.saturating_add(length as u64);
+                }
+            }
+            if !pending.is_empty() {
+                return Ok(needletail_ingest_response(StatusCode::BAD_REQUEST));
+            }
+            let body = serde_json::to_vec(&serde_json::json!({
+                "accepted": true,
+                "streamId": authorizer.expected_stream_id.to_string(),
+                "datagrams": datagrams,
+                "bytes": payload_bytes,
+            }))
+            .map_err(|error| ServerError::Handler(Box::new(error)))?;
+            return Ok(response(
+                StatusCode::ACCEPTED,
+                Some(Bytes::from(body)),
+                Some("application/json"),
+            ));
+        }
         if path == "/ingest" {
             if req.method() != Method::POST && req.method() != Method::PUT {
                 return Ok(response(
@@ -6181,7 +6474,7 @@ impl Router for ContribRouter {
     }
 
     fn has_body_handler(&self, path: &str) -> bool {
-        path == "/ingest" || path == MEDIA_ACCESS_UNIT_PATH
+        path == "/ingest" || path == MEDIA_ACCESS_UNIT_PATH || path == NEEDLETAIL_AEP1_INGEST_PATH
     }
 
     fn is_streaming(&self, path: &str) -> bool {
@@ -6318,62 +6611,73 @@ async fn main() -> Result<()> {
     } else {
         (None, None, None)
     };
-    let (daw_media_task, audio_epoch_hls_task, audio_epoch_mesh_task) =
-        if let Some(bind) = args.daw_media_bind {
-            let socket = bind_daw_media_udp_socket(bind).await?;
-            let local_addr = socket.local_addr()?;
-            let (audio_epoch_hls_tx, audio_epoch_hls_rx) =
-                audio_epoch_hls_channel(args.daw_hls_queue_capacity);
-            let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) =
-                mpsc::channel(AUDIO_EPOCH_MESH_QUEUE_CAPACITY);
-            AUDIO_EPOCH_HLS_QUEUE_CAPACITY
-                .store(audio_epoch_hls_tx.max_capacity() as u64, Ordering::Relaxed);
-            AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC
-                .store(audio_epoch_mesh_tx.max_capacity() as u64, Ordering::Relaxed);
-            let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
-                AudioEpochHlsConfig::new(
-                    args.stream_id,
-                    args.fmp4_part_ms,
-                    args.daw_hls_packaging.into(),
-                    playlists.clone(),
-                    publisher.clone(),
-                ),
-                audio_epoch_hls_rx,
-                shutdown_rx.clone(),
-            ));
-            let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
+    let (
+        daw_media_task,
+        audio_epoch_hls_task,
+        audio_epoch_mesh_task,
+        router_audio_epoch_hls_tx,
+        router_audio_epoch_mesh_tx,
+    ) = if let Some(bind) = args.daw_media_bind {
+        let socket = bind_daw_media_udp_socket(bind).await?;
+        let local_addr = socket.local_addr()?;
+        let (audio_epoch_hls_tx, audio_epoch_hls_rx) =
+            audio_epoch_hls_channel(args.daw_hls_queue_capacity);
+        let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) =
+            mpsc::channel(AUDIO_EPOCH_MESH_QUEUE_CAPACITY);
+        AUDIO_EPOCH_HLS_QUEUE_CAPACITY
+            .store(audio_epoch_hls_tx.max_capacity() as u64, Ordering::Relaxed);
+        AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC
+            .store(audio_epoch_mesh_tx.max_capacity() as u64, Ordering::Relaxed);
+        let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
+            AudioEpochHlsConfig::new(
+                args.stream_id,
+                args.fmp4_part_ms,
+                args.daw_hls_packaging.into(),
+                playlists.clone(),
+                publisher.clone(),
+            ),
+            audio_epoch_hls_rx,
+            shutdown_rx.clone(),
+        ));
+        let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
+            forwarder.clone(),
+            audio_epoch_mesh_rx,
+            shutdown_rx.clone(),
+        ));
+        info!(
+            bind = %local_addr,
+            audio_epoch_ingress_target = %forwarder.audio_epoch_ingress_targets[0],
+            audio_epoch_ingress_targets = AUDIO_EPOCH_INGRESS_TARGETS.load(Ordering::Relaxed),
+            hls_base_stream_id = args.stream_id,
+            hls_queue_capacity = args.daw_hls_queue_capacity,
+            mesh_queue_capacity = AUDIO_EPOCH_MESH_QUEUE_CAPACITY,
+            "DAW media contributor ingest listening"
+        );
+        (
+            Some(tokio::spawn(run_daw_media_udp_ingest(
+                socket,
                 forwarder.clone(),
-                audio_epoch_mesh_rx,
+                Some(audio_epoch_hls_tx.clone()),
+                Some(audio_epoch_mesh_tx.clone()),
                 shutdown_rx.clone(),
-            ));
-            info!(
-                bind = %local_addr,
-                audio_epoch_ingress_target = %forwarder.audio_epoch_ingress_targets[0],
-                audio_epoch_ingress_targets = AUDIO_EPOCH_INGRESS_TARGETS.load(Ordering::Relaxed),
-                hls_base_stream_id = args.stream_id,
-                hls_queue_capacity = args.daw_hls_queue_capacity,
-                mesh_queue_capacity = AUDIO_EPOCH_MESH_QUEUE_CAPACITY,
-                "DAW media contributor ingest listening"
-            );
-            (
-                Some(tokio::spawn(run_daw_media_udp_ingest(
-                    socket,
-                    forwarder.clone(),
-                    Some(audio_epoch_hls_tx),
-                    Some(audio_epoch_mesh_tx),
-                    shutdown_rx.clone(),
-                ))),
-                Some(audio_epoch_hls_task),
-                Some(audio_epoch_mesh_task),
-            )
-        } else {
-            (None, None, None)
-        };
+            ))),
+            Some(audio_epoch_hls_task),
+            Some(audio_epoch_mesh_task),
+            Some(audio_epoch_hls_tx),
+            Some(audio_epoch_mesh_tx),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
+    let needletail_authorizer = NeedletailSessionAuthorizer::from_environment(args.stream_id)?;
     let router = Box::new(ContribRouter::new(
         forwarder.clone(),
         args.stream_id,
         status,
         publish_ingress_gate,
+        needletail_authorizer,
+        router_audio_epoch_hls_tx,
+        router_audio_epoch_mesh_tx,
     ));
     let server = H2H3Server::builder()
         .with_tls(cert, key)
@@ -7026,6 +7330,24 @@ mod tests {
             9_007_199_254_741_993
         );
         assert_eq!(parse_stream_id_query(None, 7).unwrap(), 7);
+    }
+
+    #[test]
+    fn needletail_ingest_query_is_exact_and_scoped() {
+        assert_eq!(
+            needletail_ingest_query(Some("sessionId=ses_1&endpointId=end_nexus")).unwrap(),
+            ("ses_1".to_owned(), "end_nexus".to_owned())
+        );
+        assert!(needletail_ingest_query(None).is_err());
+        assert!(needletail_ingest_query(Some("sessionId=ses_1")).is_err());
+        assert!(
+            needletail_ingest_query(Some("sessionId=ses_1&endpointId=end_nexus&extra=1")).is_err()
+        );
+        assert!(needletail_ingest_query(Some(
+            "sessionId=ses_1&sessionId=ses_2&endpointId=end_nexus"
+        ))
+        .is_err());
+        assert!(needletail_ingest_query(Some("sessionId=../ses&endpointId=end_nexus")).is_err());
     }
 
     #[test]
@@ -8336,6 +8658,9 @@ mod tests {
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
             None,
+            None,
+            None,
+            None,
         );
         let req = Request::builder()
             .method(Method::GET)
@@ -8367,6 +8692,9 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            None,
+            None,
+            None,
             None,
         );
         let req = Request::builder()
@@ -9022,7 +9350,10 @@ mod tests {
             .unwrap();
         let wrapped = transport.wrap_epoch(encoded).unwrap();
         let epoch_datagram = wrapped.datagrams[0].payload.clone();
-        assert!(is_multichannel_audio_transport_datagram(&epoch_datagram));
+        assert!(is_audio_transport_datagram(&epoch_datagram));
+        assert!(is_audio_transport_datagram(
+            b"ACE1\x01\x00\x00\x00opaque-authenticated-audio"
+        ));
         let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for datagram in wrapped.datagrams {
             source.send_to(&datagram.payload, daw_bind).await.unwrap();
