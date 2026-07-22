@@ -48,6 +48,7 @@ const MAX_DATAGRAM_BYTES: usize = 1_200;
 // latency and is not a substitute for selecting the local mesh edge.
 const H3_PART_PIPELINE_DEPTH: usize = 8;
 const H3_PART_PRELOAD_LEAD: Duration = Duration::from_millis(100);
+const HLS_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 // Keep four-hour load qualifications bounded while retaining a deterministic,
 // uniform reservoir for latency percentiles. Exact continuity uses a bitset and
 // is never sampled.
@@ -262,6 +263,7 @@ enum HlsTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum HlsAudioCodec {
     Flac,
+    OpaqueFlac,
     SoundkitOpus,
     Ipcm,
     Fpcm,
@@ -271,6 +273,7 @@ impl HlsAudioCodec {
     fn as_str(self) -> &'static str {
         match self {
             Self::Flac => "flac",
+            Self::OpaqueFlac => "opaque_flac",
             Self::SoundkitOpus => "soundkit_opus",
             Self::Ipcm => "ipcm_s24le",
             Self::Fpcm => "fpcm_f32le",
@@ -279,14 +282,14 @@ impl HlsAudioCodec {
 
     fn media_extension(self) -> &'static str {
         match self {
-            Self::SoundkitOpus => "bin",
+            Self::OpaqueFlac | Self::SoundkitOpus => "bin",
             Self::Flac | Self::Ipcm | Self::Fpcm => "mp4",
         }
     }
 
     fn init_marker(self) -> Option<&'static [u8; 4]> {
         match self {
-            Self::SoundkitOpus => None,
+            Self::OpaqueFlac | Self::SoundkitOpus => None,
             Self::Flac => Some(b"fLaC"),
             Self::Ipcm => Some(b"ipcm"),
             Self::Fpcm => Some(b"fpcm"),
@@ -418,6 +421,8 @@ struct HlsReceiveReport {
     expected_pcm_channels: u16,
     pcm_media_parts_verified: u64,
     pcm_media_size_mismatches: u64,
+    opaque_flac_media_parts_verified: u64,
+    opaque_flac_frame_mismatches: u64,
     opus_media_parts_verified: u64,
     opus_media_packet_mismatches: u64,
     opus_consumer: Option<OpusConsumerReport>,
@@ -487,6 +492,7 @@ struct HlsLoadReport {
     late_bundle_observations: Vec<HlsLateBundleObservation>,
     init_verified_readers: usize,
     pcm_media_size_mismatches_total: u64,
+    opaque_flac_frame_mismatches_total: u64,
     opus_media_packet_mismatches_total: u64,
     playlist_verified_readers: usize,
     wire_bytes_total: u64,
@@ -1276,6 +1282,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.init_audio_codec_verified
                 || report.pcm_media_size_mismatches > 0
+                || report.opaque_flac_frame_mismatches > 0
                 || report.opus_media_packet_mismatches > 0
                 || report
                     .opus_consumer
@@ -1283,10 +1290,11 @@ async fn main() -> Result<()> {
                     .is_some_and(|consumer| !consumer.waveform_verified)
             {
                 bail!(
-                    "LL-HLS codec verification failed: expected {}, received {:?}, {} PCM size mismatches, {} invalid Opus packets",
+                    "LL-HLS codec verification failed: expected {}, received {:?}, {} PCM size mismatches, {} invalid opaque FLAC parts, {} invalid Opus packets",
                     report.expected_audio_codec,
                     report.init_audio_codec,
                     report.pcm_media_size_mismatches,
+                    report.opaque_flac_frame_mismatches,
                     report.opus_media_packet_mismatches
                 );
             }
@@ -1954,6 +1962,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     let mut init_audio_codec_verified = false;
     let mut pcm_media_parts_verified = 0_u64;
     let mut pcm_media_size_mismatches = 0_u64;
+    let mut opaque_flac_media_parts_verified = 0_u64;
+    let mut opaque_flac_frame_mismatches = 0_u64;
     let mut opus_media_parts_verified = 0_u64;
     let mut opus_media_packet_mismatches = 0_u64;
     let mut opus_consumer = match soundkit_key_file {
@@ -2013,9 +2023,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     hls_path(
                         path_prefix,
                         stream_id,
-                        &format!(
-                            "tail?from={initial_from_sequence}&parts={parts_per_response}"
-                        ),
+                        &format!("tail?from={initial_from_sequence}&parts={parts_per_response}"),
                     )
                 },
                 |sequence| {
@@ -2125,22 +2133,6 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         cache_to_client_latencies_ns.record(cache_to_client_ns);
                     }
                     after_sequence = Some(end_sequence);
-
-                    if !playlist_has_ll_hls_tags {
-                        let playlist = hls_https_get(
-                            &mut h3_client,
-                            edge,
-                            server_name,
-                            tls_ca,
-                            &hls_path(path_prefix, stream_id, "stream.m3u8"),
-                        )
-                        .await?;
-                        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
-                        if playlist.status == 200 {
-                            playlist_has_ll_hls_tags =
-                                playlist_matches_format(&playlist.body, expected_audio_codec);
-                        }
-                    }
                 }
                 204 | 404 => tokio::task::yield_now().await,
                 status => bail!("aggregated LL-HLS tail returned HTTP {status}"),
@@ -2190,6 +2182,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     after_sequence = Some(sequence);
                     let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
                         && soundkit_opus_part_is_valid(&response.body, part_ms);
+                    let opaque_flac_valid = expected_audio_codec == HlsAudioCodec::OpaqueFlac
+                        && opaque_flac_part_is_valid(&response.body);
                     let pts_ms =
                         media_part_pts_ms(expected_audio_codec, &response.body, sequence, part_ms)?;
                     let arrival_ns = now_unix_ns()?;
@@ -2232,6 +2226,16 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     opus_media_packet_mismatches.saturating_add(1);
                             }
                         }
+                        if expected_audio_codec == HlsAudioCodec::OpaqueFlac {
+                            if opaque_flac_valid {
+                                opaque_flac_media_parts_verified =
+                                    opaque_flac_media_parts_verified.saturating_add(1);
+                                init_audio_codec_verified = true;
+                            } else {
+                                opaque_flac_frame_mismatches =
+                                    opaque_flac_frame_mismatches.saturating_add(1);
+                            }
+                        }
                         write_raw_hls_part(raw_part_output_dir, sequence, pts_ms, &response.body)?;
                         if let Some(consumer) = opus_consumer.as_mut() {
                             consumer.push_part(sequence, &response.body)?;
@@ -2246,9 +2250,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                         );
                     }
-                    if expected_audio_codec != HlsAudioCodec::SoundkitOpus
-                        && init_audio_codec.is_none()
-                    {
+                    if expected_audio_codec.init_marker().is_some() && init_audio_codec.is_none() {
                         let init = hls_https_get(
                             &mut h3_client,
                             edge,
@@ -2327,6 +2329,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     media_responses = media_responses.saturating_add(1);
                     let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
                         && soundkit_opus_part_is_valid(&response.body, part_ms);
+                    let opaque_flac_valid = expected_audio_codec == HlsAudioCodec::OpaqueFlac
+                        && opaque_flac_part_is_valid(&response.body);
                     let pts_ms = media_part_pts_ms(
                         expected_audio_codec,
                         &response.body,
@@ -2379,6 +2383,16 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     opus_media_packet_mismatches.saturating_add(1);
                             }
                         }
+                        if expected_audio_codec == HlsAudioCodec::OpaqueFlac {
+                            if opaque_flac_valid {
+                                opaque_flac_media_parts_verified =
+                                    opaque_flac_media_parts_verified.saturating_add(1);
+                                init_audio_codec_verified = true;
+                            } else {
+                                opaque_flac_frame_mismatches =
+                                    opaque_flac_frame_mismatches.saturating_add(1);
+                            }
+                        }
                         write_raw_hls_part(
                             raw_part_output_dir,
                             requested_sequence,
@@ -2398,9 +2412,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
                         );
                     }
-                    if expected_audio_codec != HlsAudioCodec::SoundkitOpus
-                        && init_audio_codec.is_none()
-                    {
+                    if expected_audio_codec.init_marker().is_some() && init_audio_codec.is_none() {
                         let init = hls_https_get(
                             &mut h3_client,
                             edge,
@@ -2419,21 +2431,6 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     expected_audio_codec,
                                     expected_pcm_channels,
                                 );
-                        }
-                    }
-                    if !playlist_has_ll_hls_tags {
-                        let playlist = hls_https_get(
-                            &mut h3_client,
-                            edge,
-                            server_name,
-                            tls_ca,
-                            &hls_path(path_prefix, stream_id, "stream.m3u8"),
-                        )
-                        .await?;
-                        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
-                        if playlist.status == 200 {
-                            playlist_has_ll_hls_tags =
-                                playlist_matches_format(&playlist.body, expected_audio_codec);
                         }
                     }
                 }
@@ -2468,6 +2465,26 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
     }
 
+    if !playlist_has_ll_hls_tags {
+        let playlist = timeout(
+            HLS_CONTROL_REQUEST_TIMEOUT,
+            hls_https_get(
+                &mut h3_client,
+                edge,
+                server_name,
+                tls_ca,
+                &hls_path(path_prefix, stream_id, "stream.m3u8"),
+            ),
+        )
+        .await
+        .context("LL-HLS playlist verification exceeded two seconds")??;
+        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
+        if playlist.status == 200 {
+            playlist_has_ll_hls_tags =
+                playlist_matches_format(&playlist.body, expected_audio_codec);
+        }
+    }
+
     let non_contiguous_pts = part_coverage.non_contiguous_pts();
 
     // Known-duration audio closes on the access unit that reaches the target,
@@ -2479,7 +2496,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         .map(SoundKitOpusConsumer::finish)
         .transpose()?;
     Ok(HlsReceiveReport {
-        schema: "needletail.aep1-48k-probe.hls-receive.v4",
+        schema: "needletail.aep1-48k-probe.hls-receive.v5",
         lane: "ll_hls",
         transport: transport.as_str(),
         tls_protocol: "TLSv1.3",
@@ -2514,6 +2531,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         expected_pcm_channels,
         pcm_media_parts_verified,
         pcm_media_size_mismatches,
+        opaque_flac_media_parts_verified,
+        opaque_flac_frame_mismatches,
         opus_media_parts_verified,
         opus_media_packet_mismatches,
         opus_consumer,
@@ -2610,6 +2629,8 @@ impl HlsBundleStreamState {
             expected_pcm_channels: reader.expected_pcm_channels,
             pcm_media_parts_verified: 0,
             pcm_media_size_mismatches: 0,
+            opaque_flac_media_parts_verified: 0,
+            opaque_flac_frame_mismatches: 0,
             opus_media_parts_verified: self.opus_media_parts_verified,
             opus_media_packet_mismatches: self.opus_media_packet_mismatches,
             opus_consumer: None,
@@ -3372,6 +3393,10 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         .iter()
         .map(|report| report.pcm_media_size_mismatches)
         .sum::<u64>();
+    let opaque_flac_frame_mismatches_total = reports
+        .iter()
+        .map(|report| report.opaque_flac_frame_mismatches)
+        .sum::<u64>();
     let opus_media_packet_mismatches_total = reports
         .iter()
         .map(|report| report.opus_media_packet_mismatches)
@@ -3431,11 +3456,12 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         && deadline_misses_total == 0
         && init_verified_readers == requested_track_readers
         && pcm_media_size_mismatches_total == 0
+        && opaque_flac_frame_mismatches_total == 0
         && opus_media_packet_mismatches_total == 0
         && playlist_verified_readers == requested_track_readers;
 
     Ok(HlsLoadReport {
-        schema: "needletail.aep1-48k-probe.hls-load.v7",
+        schema: "needletail.aep1-48k-probe.hls-load.v8",
         transport: options.transport.as_str(),
         tls_protocol: "TLSv1.3",
         persistent_connections: matches!(options.transport, HlsTransport::H3),
@@ -3478,6 +3504,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         late_bundle_observations,
         init_verified_readers,
         pcm_media_size_mismatches_total,
+        opaque_flac_frame_mismatches_total,
         opus_media_packet_mismatches_total,
         playlist_verified_readers,
         wire_bytes_total,
@@ -3842,10 +3869,13 @@ fn media_part_pts_ms(
     sequence: u64,
     part_ms: u64,
 ) -> Result<u64> {
-    if codec == HlsAudioCodec::SoundkitOpus {
+    if matches!(
+        codec,
+        HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus
+    ) {
         return sequence
             .checked_mul(part_ms)
-            .context("SoundKit LL-HLS part PTS overflow");
+            .context("opaque LL-HLS part PTS overflow");
     }
     parse_fmp4_tfdt_ms(bytes).context("LL-HLS fMP4 part omitted a valid tfdt")
 }
@@ -3860,7 +3890,10 @@ fn playlist_matches_format(bytes: &[u8], codec: HlsAudioCodec) -> bool {
     if !has_part || !can_block {
         return false;
     }
-    if codec != HlsAudioCodec::SoundkitOpus {
+    if !matches!(
+        codec,
+        HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus
+    ) {
         return true;
     }
     bytes.windows(b".bin".len()).any(|window| window == b".bin")
@@ -3887,7 +3920,7 @@ fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
 fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channels: u16) -> bool {
     let (sample_size, marker) = match codec {
         HlsAudioCodec::Flac => return true,
-        HlsAudioCodec::SoundkitOpus => return false,
+        HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus => return false,
         HlsAudioCodec::Ipcm => (24, b"ipcm"),
         HlsAudioCodec::Fpcm => (32, b"fpcm"),
     };
@@ -3908,7 +3941,9 @@ fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channe
 
 fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) -> Option<u64> {
     let bytes_per_sample = match codec {
-        HlsAudioCodec::Flac | HlsAudioCodec::SoundkitOpus => return None,
+        HlsAudioCodec::Flac | HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus => {
+            return None;
+        }
         HlsAudioCodec::Ipcm => 3_u64,
         HlsAudioCodec::Fpcm => 4_u64,
     };
@@ -3917,6 +3952,10 @@ fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) ->
         .checked_div(1_000)?
         .checked_mul(u64::from(channels))?
         .checked_mul(bytes_per_sample)
+}
+
+fn opaque_flac_part_is_valid(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xfe == 0xf8
 }
 
 fn split_soundkit_opus_parts(bytes: &[u8], part_ms: u64) -> Result<Vec<&[u8]>> {
@@ -4531,6 +4570,23 @@ mod tests {
         media.extend_from_slice(b"mdat");
         media.extend_from_slice(&[1, 2, 3, 4]);
         assert_eq!(fmp4_mdat_payload(&media), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn opaque_flac_uses_binary_parts_without_fmp4_metadata() {
+        assert_eq!(HlsAudioCodec::OpaqueFlac.media_extension(), "bin");
+        assert_eq!(HlsAudioCodec::OpaqueFlac.init_marker(), None);
+        assert_eq!(
+            media_part_pts_ms(HlsAudioCodec::OpaqueFlac, &[0xff, 0xf8], 7, 50).unwrap(),
+            350
+        );
+        assert!(opaque_flac_part_is_valid(&[0xff, 0xf8, 0x01]));
+        assert!(opaque_flac_part_is_valid(&[0xff, 0xf9, 0x01]));
+        assert!(!opaque_flac_part_is_valid(b"fLaC"));
+
+        let playlist = b"#EXTM3U\n#EXT-X-PART:DURATION=0.05,URI=\"part7.bin\"\n\
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES\n";
+        assert!(playlist_matches_format(playlist, HlsAudioCodec::OpaqueFlac));
     }
 
     #[test]
