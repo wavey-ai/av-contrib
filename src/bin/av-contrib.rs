@@ -5,16 +5,23 @@ use av_contrib::audio_epoch_hls::{
     AudioEpochHlsPackaging, DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
 };
 use av_contrib::fmp4_bridge::{
-    Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop, PublishedFmp4Part,
-    PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
+    AccessUnitSink, Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop,
+    PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
 use av_contrib::ingress_authorization::{
     decode_envelope_header_bytes, gate_from_bootstrap_path, parse_bearer_header,
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
+#[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+use av_contrib::quadra_renditions::{
+    start_quadra_rendition_pipeline, QuadraRenditionConfig, QuadraRenditionSpec,
+    QuadraRenditionTarget,
+};
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use bytes::{Bytes, BytesMut};
+#[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+use clap::Args as ClapArgs;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use http::{
@@ -301,6 +308,12 @@ fn build_fmp4_media_object(
         );
     if let Some(codec) = part.video_codec {
         builder = builder.with_metadata("video-codec", codec.as_bytes().to_vec());
+    }
+    if let Some(width) = part.video_width {
+        builder = builder.with_metadata("video-width", width.to_string().into_bytes());
+    }
+    if let Some(height) = part.video_height {
+        builder = builder.with_metadata("video-height", height.to_string().into_bytes());
     }
     if let Some(codec) = part.audio_codec {
         builder = builder.with_metadata("audio-codec", codec.as_bytes().to_vec());
@@ -673,6 +686,41 @@ struct Args {
 
     #[arg(long, default_value_t = 800)]
     playlist_buffer_kb: usize,
+
+    #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+    #[command(flatten)]
+    quadra: QuadraCliArgs,
+}
+
+#[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+#[derive(Debug, Clone, ClapArgs)]
+struct QuadraCliArgs {
+    /// Hardware rendition as STREAM_ID:WIDTHxHEIGHT:AVERAGE_BANDWIDTH:PEAK_BANDWIDTH.
+    #[arg(
+        long = "quadra-rendition",
+        env = "AV_QUADRA_RENDITIONS",
+        value_delimiter = ','
+    )]
+    renditions: Vec<QuadraRenditionSpec>,
+
+    #[arg(long, env = "AV_QUADRA_SOURCE_WIDTH", default_value_t = 3_840)]
+    source_width: u16,
+
+    #[arg(long, env = "AV_QUADRA_SOURCE_HEIGHT", default_value_t = 2_160)]
+    source_height: u16,
+
+    #[arg(
+        long,
+        env = "AV_QUADRA_FRAME_RATE_MILLIHERTZ",
+        default_value_t = 25_000
+    )]
+    frame_rate_millihertz: u32,
+
+    #[arg(long, env = "AV_QUADRA_HARDWARE_ID")]
+    hardware_id: Option<i32>,
+
+    #[arg(long, env = "AV_QUADRA_QUEUE_CAPACITY", default_value_t = 256)]
+    queue_capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2186,6 +2234,7 @@ async fn start_rist_ingest(
     config: RistIngestConfig,
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
+    access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
     telemetry: Arc<IngestTelemetry>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
@@ -2207,12 +2256,13 @@ async fn start_rist_ingest(
         config.output_stream_id,
         config.output_stream_idx,
         config.min_part_ms,
+        access_unit_sink,
         shutdown_rx,
     ));
     info!(
         bind = %config.bind,
         profile = config.profile.as_str(),
-        backend = "pure",
+        backend = "pure-rust",
         output_stream_id = config.output_stream_id,
         output_stream_idx = config.output_stream_idx,
         "RIST contributor frontend listening via upload-response"
@@ -2323,6 +2373,7 @@ async fn start_srt_ingest(
         config.output_stream_id,
         output_stream_idx,
         config.min_part_ms,
+        None,
         shutdown_rx,
     ));
     info!(
@@ -2345,6 +2396,7 @@ async fn run_upload_response_ts_bridge(
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
+    access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let mut tick = interval(Duration::from_millis(HLS_BRIDGE_POLL_MS));
@@ -2511,13 +2563,36 @@ async fn run_upload_response_ts_bridge(
                                         None,
                                         None,
                                     );
-                                    state.bridge = Some(TsFmp4Bridge::new_publish_only(
-                                        public_stream_id,
-                                        public_stream_idx,
-                                        playlists.clone(),
-                                        min_part_ms,
-                                        publisher.clone(),
-                                    ));
+                                    state.bridge = Some(
+                                        if public_stream_id == output_stream_id {
+                                            if let Some(sink) = &access_unit_sink {
+                                                TsFmp4Bridge::new_publish_only_with_access_unit_sink(
+                                                    public_stream_id,
+                                                    public_stream_idx,
+                                                    playlists.clone(),
+                                                    min_part_ms,
+                                                    publisher.clone(),
+                                                    sink.clone(),
+                                                )
+                                            } else {
+                                                TsFmp4Bridge::new_publish_only(
+                                                    public_stream_id,
+                                                    public_stream_idx,
+                                                    playlists.clone(),
+                                                    min_part_ms,
+                                                    publisher.clone(),
+                                                )
+                                            }
+                                        } else {
+                                            TsFmp4Bridge::new_publish_only(
+                                                public_stream_id,
+                                                public_stream_idx,
+                                                playlists.clone(),
+                                                min_part_ms,
+                                                publisher.clone(),
+                                            )
+                                        },
+                                    );
                                     debug!(
                                         stream_id,
                                         output_stream_id = public_stream_id,
@@ -5882,7 +5957,7 @@ impl ListenerStatus {
             bind: args.rist_bind.map(|bind| bind.to_string()),
             output_stream_id: args.rist_stream_id.to_string(),
             output_hls_path: format!("/{}/stream.m3u8", args.rist_stream_id),
-            backend: Some("librist"),
+            backend: Some("pure-rust"),
             profile: Some(args.rist_profile.as_str()),
             flow_id: None,
         }
@@ -6682,6 +6757,49 @@ async fn main() -> Result<()> {
         canonical_sequences: Mutex::new(HashMap::new()),
     });
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
+    #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+    let rist_access_unit_sink: Option<Arc<dyn AccessUnitSink>> =
+        if args.quadra.renditions.is_empty() {
+            None
+        } else {
+            if args.rist_bind.is_none() {
+                bail!("--quadra-rendition requires --rist-bind");
+            }
+            let config = QuadraRenditionConfig {
+                source_stream_id: args.rist_stream_id,
+                source_width: args.quadra.source_width,
+                source_height: args.quadra.source_height,
+                frame_rate_millihertz: args.quadra.frame_rate_millihertz,
+                hardware_id: args.quadra.hardware_id,
+                queue_capacity: args.quadra.queue_capacity,
+                renditions: args.quadra.renditions.clone(),
+            };
+            config.validate().map_err(|error| {
+                anyhow::anyhow!("invalid Quadra rendition configuration: {error}")
+            })?;
+            let mut targets = Vec::with_capacity(config.renditions.len());
+            for spec in &config.renditions {
+                targets.push(QuadraRenditionTarget {
+                    spec: *spec,
+                    stream_idx: resolve_output_stream_idx(&playlists, spec.stream_id).await,
+                });
+            }
+            Some(
+                start_quadra_rendition_pipeline(
+                    config,
+                    targets,
+                    playlists.clone(),
+                    publisher.clone(),
+                    args.fmp4_part_ms,
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to start Quadra rendition pipeline: {error}")
+                })?,
+            )
+        };
+    #[cfg(not(all(feature = "quadra-renditions", target_os = "linux")))]
+    let rist_access_unit_sink: Option<Arc<dyn AccessUnitSink>> = None;
     let status = Arc::new(ContribStatusConfig::from_args(&args, telemetry.clone()));
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let rist_shutdown = if let Some(bind) = args.rist_bind {
@@ -6697,6 +6815,7 @@ async fn main() -> Result<()> {
                 },
                 playlists.clone(),
                 publisher.clone(),
+                rist_access_unit_sink,
                 telemetry.clone(),
                 shutdown_rx.clone(),
             )
@@ -6859,7 +6978,7 @@ async fn main() -> Result<()> {
     }
     if let Some(bind) = args.rist_bind {
         println!(
-            "rist:    rist://127.0.0.1:{} backend=pure profile={} stream_id={}",
+            "rist:    rist://127.0.0.1:{} backend=pure-rust profile={} stream_id={}",
             bind.port(),
             args.rist_profile.as_str(),
             args.rist_stream_id
@@ -8827,7 +8946,7 @@ mod tests {
             .expect("missing RIST listener status");
         assert!(rist.enabled);
         assert_eq!(rist.output_stream_id, "9007199254741994");
-        assert_eq!(rist.backend, Some("librist"));
+        assert_eq!(rist.backend, Some("pure-rust"));
         assert!(rist.flow_id.is_none());
     }
 

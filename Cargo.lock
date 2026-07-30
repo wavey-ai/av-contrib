@@ -206,6 +206,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "av-hls",
+ "av-traits",
  "av-upload-response",
  "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=066bf4b3296ea8403e1c310b86f189dde20e990e)",
  "base64",
@@ -247,6 +248,7 @@ dependencies = [
  "wavey-h264",
  "wavey-mpeg2ts-reader",
  "webpki-roots 1.0.9",
+ "xcoder-quadra",
 ]
 
 [[package]]
@@ -277,6 +279,11 @@ dependencies = [
  "tracing-subscriber",
  "xmpegts",
 ]
+
+[[package]]
+name = "av-traits"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=fe1342454a6aad796066fd18268b2a06edec2d4d#fe1342454a6aad796066fd18268b2a06edec2d4d"
 
 [[package]]
 name = "av-upload-response"
@@ -1016,6 +1023,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "enum-repr"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bad30c9c0fa1aaf1ae5010dab11f1117b15d35faf62cda4bbbc53b9987950f18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3377,6 +3395,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "snafu"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
+dependencies = [
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4531,6 +4570,29 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xcoder-quadra"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=fe1342454a6aad796066fd18268b2a06edec2d4d#fe1342454a6aad796066fd18268b2a06edec2d4d"
+dependencies = [
+ "av-traits",
+ "enum-repr",
+ "libc",
+ "scopeguard",
+ "snafu",
+ "xcoder-quadra-sys",
+]
+
+[[package]]
+name = "xcoder-quadra-sys"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=fe1342454a6aad796066fd18268b2a06edec2d4d#fe1342454a6aad796066fd18268b2a06edec2d4d"
+dependencies = [
+ "bindgen",
+ "cc",
+ "log",
+]
 
 [[package]]
 name = "xmpegts"

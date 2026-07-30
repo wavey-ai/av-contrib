@@ -10,6 +10,7 @@ readme = "README.md"
 [features]
 default = ["srt-ingest"]
 media_capability_enforce_publish_v1 = []
+quadra-renditions = ["dep:av-traits", "dep:xcoder-quadra"]
 rist-rs-tools = ["dep:rist-core-pure", "dep:rist-mio-pure"]
 srt-ingest = ["av-upload-response/srt"]
 
@@ -63,6 +64,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
 av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "066bf4b3296ea8403e1c310b86f189dde20e990e", default-features = false, features = ["rist-pure"] }
 av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "066bf4b3296ea8403e1c310b86f189dde20e990e" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+av-traits = { git = "https://github.com/wavey-ai/av-rs.git", rev = "fe1342454a6aad796066fd18268b2a06edec2d4d", optional = true }
+xcoder-quadra = { git = "https://github.com/wavey-ai/av-rs.git", rev = "fe1342454a6aad796066fd18268b2a06edec2d4d", optional = true }
 
 [dev-dependencies]
 ed25519-dalek = "2.2"

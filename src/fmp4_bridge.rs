@@ -111,6 +111,15 @@ pub trait Fmp4PartPublisher: Send + Sync {
     fn record_mpeg_ts_payload_drop(&self, _drop: MpegTsPayloadDrop) {}
 }
 
+#[async_trait::async_trait]
+pub trait AccessUnitSink: Send + Sync {
+    async fn push_access_unit(&self, access_unit: AccessUnit) -> Result<(), String>;
+
+    async fn finish(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TimestampInput {
     Ticks90Khz,
@@ -142,6 +151,7 @@ pub struct TsFmp4Bridge {
     demux: demultiplex::Demultiplex<TsDemuxContext>,
     segmenter: Fmp4Segmenter,
     drained_access_units: Vec<AccessUnit>,
+    access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
 }
 
 impl TsFmp4Bridge {
@@ -153,6 +163,7 @@ impl TsFmp4Bridge {
             DEFAULT_MIN_PART_MS,
             None,
             true,
+            None,
         )
     }
 
@@ -170,6 +181,7 @@ impl TsFmp4Bridge {
             min_part_ms,
             publisher,
             true,
+            None,
         )
     }
 
@@ -189,6 +201,30 @@ impl TsFmp4Bridge {
             min_part_ms,
             Some(publisher),
             false,
+            None,
+        )
+    }
+
+    /// Publish the source rendition and mirror each demuxed access unit into a
+    /// bounded external processing pipeline, such as the Quadra rendition
+    /// worker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_publish_only_with_access_unit_sink(
+        output_stream_id: u64,
+        output_stream_idx: usize,
+        playlists: Arc<Playlists>,
+        min_part_ms: u32,
+        publisher: Arc<dyn Fmp4PartPublisher>,
+        access_unit_sink: Arc<dyn AccessUnitSink>,
+    ) -> Self {
+        Self::new_with_options(
+            output_stream_id,
+            output_stream_idx,
+            playlists,
+            min_part_ms,
+            Some(publisher),
+            false,
+            Some(access_unit_sink),
         )
     }
 
@@ -199,6 +235,7 @@ impl TsFmp4Bridge {
         min_part_ms: u32,
         publisher: Option<Arc<dyn Fmp4PartPublisher>>,
         retain_local_cache: bool,
+        access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
     ) -> Self {
         let mut context = TsDemuxContext::new(publisher.clone());
         let demux = demultiplex::Demultiplex::new(&mut context);
@@ -217,6 +254,7 @@ impl TsFmp4Bridge {
             demux,
             segmenter,
             drained_access_units: Vec::new(),
+            access_unit_sink,
         }
     }
 
@@ -242,6 +280,11 @@ impl TsFmp4Bridge {
             );
         }
         for access_unit in self.drained_access_units.drain(..) {
+            if let Some(sink) = &self.access_unit_sink {
+                if let Err(error) = sink.push_access_unit(access_unit.clone()).await {
+                    error!(error, "access-unit processing sink rejected live media");
+                }
+            }
             self.segmenter.push_access_unit(access_unit).await;
         }
     }
@@ -251,9 +294,22 @@ impl TsFmp4Bridge {
         self.context
             .drain_access_units_into(&mut self.drained_access_units);
         for access_unit in self.drained_access_units.drain(..) {
+            if let Some(sink) = &self.access_unit_sink {
+                if let Err(error) = sink.push_access_unit(access_unit.clone()).await {
+                    error!(
+                        error,
+                        "access-unit processing sink rejected final live media"
+                    );
+                }
+            }
             self.segmenter.push_access_unit(access_unit).await;
         }
         self.segmenter.finish().await;
+        if let Some(sink) = &self.access_unit_sink {
+            if let Err(error) = sink.finish().await {
+                error!(error, "access-unit processing sink failed to finish");
+            }
+        }
     }
 
     pub fn reset(&mut self) {
