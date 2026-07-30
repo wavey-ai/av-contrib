@@ -42,8 +42,8 @@ playlists = "0.1.6"
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 relay-session = "0.1.1"
-rist-core-pure = { package = "rist-core", version = "0.1.0", optional = true }
-rist-mio-pure = { package = "rist-mio", version = "0.1.0", optional = true }
+rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4", optional = true }
+rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", rev = "95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4", optional = true }
 rtmp-ingress = "0.1.1"
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std"] }
 rustls-pemfile = "2"
@@ -61,8 +61,8 @@ talkback-media = "0.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
-av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "6517df971b15bd2b2193aa7d1837852b80909dfd", default-features = false, features = ["rist"] }
-av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "6517df971b15bd2b2193aa7d1837852b80909dfd" }
+av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "2570a8247eb7eea5653ff6f3cb055e5137997949", default-features = false, features = ["rist-pure"] }
+av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "2570a8247eb7eea5653ff6f3cb055e5137997949" }
 
 [dev-dependencies]
 ed25519-dalek = "2.2"

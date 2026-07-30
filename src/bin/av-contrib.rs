@@ -57,8 +57,8 @@ use tracing::{debug, info, trace, warn};
 #[cfg(feature = "srt-ingest")]
 use upload_response::SrtIngest as UploadSrtIngest;
 use upload_response::{
-    CachedResponse, RistIngest as UploadRistIngest, RistProfile as UploadRistProfile, TailSlot,
-    UploadResponseConfig, UploadResponseService,
+    CachedResponse, PureRistIngest as UploadRistIngest, PureRistProfile as UploadRistProfile,
+    TailSlot, UploadResponseConfig, UploadResponseService,
 };
 use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
@@ -2212,7 +2212,7 @@ async fn start_rist_ingest(
     info!(
         bind = %config.bind,
         profile = config.profile.as_str(),
-        backend = "librist",
+        backend = "pure",
         output_stream_id = config.output_stream_id,
         output_stream_idx = config.output_stream_idx,
         "RIST contributor frontend listening via upload-response"
@@ -6859,7 +6859,7 @@ async fn main() -> Result<()> {
     }
     if let Some(bind) = args.rist_bind {
         println!(
-            "rist:    rist://127.0.0.1:{} backend=librist profile={} stream_id={}",
+            "rist:    rist://127.0.0.1:{} backend=pure profile={} stream_id={}",
             bind.port(),
             args.rist_profile.as_str(),
             args.rist_stream_id

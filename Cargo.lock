@@ -56,6 +56,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -193,7 +207,7 @@ dependencies = [
  "async-trait",
  "av-hls",
  "av-upload-response",
- "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=2570a8247eb7eea5653ff6f3cb055e5137997949)",
  "base64",
  "bytes",
  "clap 4.6.3",
@@ -267,11 +281,11 @@ dependencies = [
 [[package]]
 name = "av-upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd#6517df971b15bd2b2193aa7d1837852b80909dfd"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=2570a8247eb7eea5653ff6f3cb055e5137997949#2570a8247eb7eea5653ff6f3cb055e5137997949"
 dependencies = [
  "anyhow",
  "async-trait",
- "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=2570a8247eb7eea5653ff6f3cb055e5137997949)",
  "bytes",
  "futures-util",
  "http",
@@ -280,6 +294,8 @@ dependencies = [
  "hyper-util",
  "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "reqwest 0.13.4",
+ "rist-core",
+ "rist-mio",
  "rustls 0.23.42",
  "rustls-pemfile",
  "serde",
@@ -288,7 +304,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
- "wavey-rist",
  "wavey-srt",
 ]
 
@@ -340,7 +355,7 @@ dependencies = [
 [[package]]
 name = "av-web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd#6517df971b15bd2b2193aa7d1837852b80909dfd"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=2570a8247eb7eea5653ff6f3cb055e5137997949#2570a8247eb7eea5653ff6f3cb055e5137997949"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -433,26 +448,6 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bindgen"
-version = "0.70.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
-dependencies = [
- "bitflags 2.13.1",
- "cexpr",
- "clang-sys",
- "itertools",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 1.1.0",
- "shlex 1.3.0",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
@@ -466,7 +461,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash 2.1.3",
+ "rustc-hash",
  "shlex 1.3.0",
  "syn 2.0.119",
 ]
@@ -831,6 +826,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1322,6 +1318,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+dependencies = [
+ "opaque-debug",
+ "polyval",
+]
+
+[[package]]
 name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1473,6 +1479,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac 0.12.1",
+]
 
 [[package]]
 name = "hmac"
@@ -2030,6 +2045,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "message-packetizer"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2098,6 +2122,19 @@ checksum = "56fa4f8445b41cfc54adc54860992c5561489f1e07ede7c4cb1591d60dcd232c"
 dependencies = [
  "bytes",
  "raptorq-datagram-fec",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -2337,6 +2374,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyval"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2444,7 +2493,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash 2.1.3",
+ "rustc-hash",
  "rustls 0.23.42",
  "socket2 0.5.10",
  "thiserror 2.0.19",
@@ -2466,7 +2515,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "ring",
- "rustc-hash 2.1.3",
+ "rustc-hash",
  "rustls 0.23.42",
  "rustls-pki-types",
  "slab",
@@ -2825,38 +2874,32 @@ dependencies = [
 [[package]]
 name = "rist-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65e1b7277722bbf4ef842f34b34016af16ba4b26e4548eed9bca12e76098d448"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4#95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4"
 dependencies = [
  "aes",
+ "aes-gcm",
  "ctr",
  "getrandom 0.2.17",
+ "hkdf",
  "num-bigint",
  "num-traits",
  "pbkdf2",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.19",
+ "zeroize",
 ]
 
 [[package]]
 name = "rist-mio"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e39d03348adb25c7593a8aa1e0ffeb3078cf2b501fa73e02d19c0e69488653b0"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4#95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4"
 dependencies = [
+ "libc",
  "mio",
+ "nix",
  "rist-core",
  "socket2 0.6.5",
-]
-
-[[package]]
-name = "rist-sys"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0de2fb48dc6d7996ddbb31dabebdce0729894c48a31608f3d31cfbf3805c8fb"
-dependencies = [
- "bindgen 0.70.1",
- "pkg-config",
 ]
 
 [[package]]
@@ -2921,12 +2964,6 @@ name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
-
-[[package]]
-name = "rustc-hash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -3444,7 +3481,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f206e7becfb887690a7fc7037147bfbff1708021a38ef7a054e5beea8e2744f8"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen",
  "cmake",
  "libc",
 ]
@@ -4226,18 +4263,6 @@ dependencies = [
  "fixedbitset",
  "log",
  "smptera-format-identifiers-rust",
-]
-
-[[package]]
-name = "wavey-rist"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afc60f7f003c30c3f505a63fa6229fd574500e19f3076267fa1a9eeb95755519"
-dependencies = [
- "libc",
- "rist-sys",
- "thiserror 2.0.19",
- "tokio",
 ]
 
 [[package]]
