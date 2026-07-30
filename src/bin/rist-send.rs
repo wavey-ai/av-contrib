@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use rist_core_pure::packet::gre::{BufferNegotiation, GreKeepalive};
 use rist_core_pure::time::ntp_now;
+use rist_core_pure::{MainOutboundPacket, OutboundPacket};
 use rist_mio_pure::{MainMioSender, SimpleMioSender};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -9,6 +10,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{self as tokio_io, AsyncReadExt};
 
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
+const INITIAL_UDP_RETRY_DELAY: Duration = Duration::from_millis(1);
+const MAX_UDP_RETRY_DELAY: Duration = Duration::from_millis(32);
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RistProfile {
@@ -47,6 +50,12 @@ enum Sender {
     Main(MainMioSender),
 }
 
+#[allow(clippy::large_enum_variant)]
+enum PayloadPacket {
+    Simple(OutboundPacket),
+    Main(MainOutboundPacket),
+}
+
 impl Sender {
     fn connect(args: &Args) -> io::Result<Self> {
         let local = local_sender_addr(args.target);
@@ -78,14 +87,26 @@ impl Sender {
         Ok(())
     }
 
-    fn send_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+    fn build_payload(&mut self, payload: &[u8]) -> PayloadPacket {
         match self {
             Self::Simple(sender) => sender
-                .send_payload(payload, ntp_now(), Instant::now())
-                .map(|_| ()),
+                .build_payload(payload, ntp_now(), Instant::now())
+                .into(),
             Self::Main(sender) => sender
-                .send_payload(payload, ntp_now(), Instant::now())
-                .map(|_| ()),
+                .build_payload(payload, ntp_now(), Instant::now())
+                .into(),
+        }
+    }
+
+    fn send_outbound(&mut self, packet: &PayloadPacket) -> io::Result<()> {
+        match (self, packet) {
+            (Self::Simple(sender), PayloadPacket::Simple(packet)) => {
+                sender.send_outbound(packet).map(|_| ())
+            }
+            (Self::Main(sender), PayloadPacket::Main(packet)) => {
+                sender.send_outbound(packet).map(|_| ())
+            }
+            _ => unreachable!("payload packet profile must match sender profile"),
         }
     }
 
@@ -110,6 +131,18 @@ impl Sender {
     }
 }
 
+impl From<OutboundPacket> for PayloadPacket {
+    fn from(packet: OutboundPacket) -> Self {
+        Self::Simple(packet)
+    }
+}
+
+impl From<MainOutboundPacket> for PayloadPacket {
+    fn from(packet: MainOutboundPacket) -> Self {
+        Self::Main(packet)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -128,32 +161,88 @@ async fn main() -> Result<()> {
             break;
         }
         let payload = &chunk[..read];
-        loop {
-            match sender.send_payload(payload) {
-                Ok(()) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    sender.drain_feedback(&mut feedback_buf)?;
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(error).context("failed to send RIST payload"),
-            }
-        }
-        sender.drain_feedback(&mut feedback_buf)?;
+        let packet = sender.build_payload(payload);
+        retry_transient_udp(|| sender.send_outbound(&packet))
+            .await
+            .context("failed to send RIST payload")?;
+        retry_transient_udp(|| sender.drain_feedback(&mut feedback_buf))
+            .await
+            .context("failed to process RIST feedback")?;
         sent_bytes += read;
     }
 
     let repair_deadline = Instant::now() + Duration::from_millis(args.final_repair_ms);
     while Instant::now() < repair_deadline {
-        sender.drain_feedback(&mut feedback_buf)?;
+        retry_transient_udp(|| sender.drain_feedback(&mut feedback_buf))
+            .await
+            .context("failed to process final RIST feedback")?;
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    sender.drain_feedback(&mut feedback_buf)?;
+    retry_transient_udp(|| sender.drain_feedback(&mut feedback_buf))
+        .await
+        .context("failed to process final RIST feedback")?;
 
     println!(
         "sent {} bytes to {} using RIST chunks of {} bytes",
         sent_bytes, args.target, chunk_bytes
     );
     Ok(())
+}
+
+async fn retry_transient_udp<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut delay = INITIAL_UDP_RETRY_DELAY;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_udp_error(&error) => {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(MAX_UDP_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_udp_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) || is_enobufs(error.raw_os_error())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn is_enobufs(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(55)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn is_enobufs(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(105)
+}
+
+#[cfg(windows)]
+fn is_enobufs(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(10_055)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    windows
+)))]
+fn is_enobufs(_raw_os_error: Option<i32>) -> bool {
+    false
 }
 
 async fn read_chunk<R>(input: &mut R, chunk: &mut [u8]) -> Result<usize>
@@ -204,5 +293,67 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
         u32::from_str_radix(hex, 16).map_err(|err| err.to_string())
     } else {
         trimmed.parse::<u32>().map_err(|err| err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn retries_transient_errors_until_success() {
+        let attempts = Cell::new(0);
+        let result = retry_transient_udp(|| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt < 3 {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Ok(42)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn returns_fatal_errors_without_retry() {
+        let attempts = Cell::new(0);
+        let error = retry_transient_udp(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(io::Error::from(io::ErrorKind::NetworkUnreachable))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NetworkUnreachable);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn recognizes_platform_enobufs() {
+        let raw_os_error = if cfg!(target_vendor = "apple")
+            || cfg!(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )) {
+            55
+        } else if cfg!(any(target_os = "android", target_os = "linux")) {
+            105
+        } else if cfg!(windows) {
+            10_055
+        } else {
+            return;
+        };
+
+        assert!(is_transient_udp_error(&io::Error::from_raw_os_error(
+            raw_os_error
+        )));
     }
 }

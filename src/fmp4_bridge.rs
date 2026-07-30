@@ -45,6 +45,10 @@ const MAX_H264_DIMENSION: u16 = 8_192;
 pub struct PublishedFmp4Part {
     pub stream_id: u64,
     pub stream_idx: usize,
+    /// Canonical source epoch for this media session.
+    ///
+    /// A value of `None` uses the publisher process epoch.
+    pub source_epoch: Option<u64>,
     pub sequence: u64,
     /// Actual duration reported by the fMP4 packager.
     pub duration_ms: u32,
@@ -70,6 +74,10 @@ pub struct PublishedFmp4Part {
 pub struct PublishedOpaquePart {
     pub stream_id: u64,
     pub stream_idx: usize,
+    /// Canonical source epoch for this media session.
+    ///
+    /// A value of `None` uses the publisher process epoch.
+    pub source_epoch: Option<u64>,
     pub sequence: u64,
     pub duration_ms: u32,
     pub packaged_at_unix_ns: i64,
@@ -293,6 +301,7 @@ struct InitSignature {
 pub struct Fmp4Segmenter {
     output_stream_id: u64,
     output_stream_idx: usize,
+    source_epoch: Option<u64>,
     playlists: Arc<Playlists>,
     input_timestamps: TimestampInput,
     publisher: Option<Arc<dyn Fmp4PartPublisher>>,
@@ -395,6 +404,7 @@ impl Fmp4Segmenter {
         Self {
             output_stream_id,
             output_stream_idx,
+            source_epoch: None,
             playlists,
             input_timestamps,
             publisher,
@@ -427,6 +437,11 @@ impl Fmp4Segmenter {
             warned_no_config: false,
             timestamp_base_input: None,
         }
+    }
+
+    /// Set the canonical source epoch for all parts from this segmenter.
+    pub fn set_source_epoch(&mut self, source_epoch: u64) {
+        self.source_epoch = Some(source_epoch.max(1));
     }
 
     pub async fn push_access_unit(&mut self, mut access_unit: AccessUnit) {
@@ -513,7 +528,6 @@ impl Fmp4Segmenter {
             height: 0,
             avcc: None,
         };
-        self.seg_seq = 1;
         self.sps = None;
         self.pps = None;
         self.config_signature = None;
@@ -522,7 +536,6 @@ impl Fmp4Segmenter {
         self.force_next_init = true;
         self.seen_video = false;
         self.started_video = false;
-        self.published_parts = 0;
         self.last_packaged_at_unix_ns = None;
         self.warned_no_config = false;
         self.timestamp_base_input = None;
@@ -967,13 +980,17 @@ impl Fmp4Segmenter {
             let part = PublishedFmp4Part {
                 stream_id: self.output_stream_id,
                 stream_idx: self.output_stream_idx,
+                source_epoch: self.source_epoch,
                 sequence: self.published_parts,
                 duration_ms: duration,
                 packaged_at_unix_ns,
                 published_at_unix_ns,
                 init: init_for_mesh,
                 bytes: part_bytes,
-                keyframe: key,
+                // Audio access units are independently decodable, but they do not
+                // define parent-segment boundaries. Edges group audio-only parts
+                // with their configured parts-per-segment value.
+                keyframe: key && video_units > 0,
                 video_codec: (video_units > 0).then_some("h264"),
                 video_width: (video_units > 0).then_some(self.config.width),
                 video_height: (video_units > 0).then_some(self.config.height),
@@ -1511,6 +1528,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn continuity_reset_preserves_stream_sequence_numbers() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let mut segmenter = Fmp4Segmenter::new(
+            77,
+            0,
+            playlists,
+            TimestampInput::MillisAbsolute,
+            DEFAULT_MIN_PART_MS,
+        );
+        segmenter.seg_seq = 43;
+        segmenter.published_parts = 2_401;
+        segmenter.reset();
+
+        assert_eq!(segmenter.seg_seq, 43);
+        assert_eq!(segmenter.published_parts, 2_401);
+        assert!(segmenter.force_next_init);
+    }
+
     fn h264_access_unit(pts: u64, dts: u64) -> AccessUnit {
         AccessUnit {
             key: true,
@@ -1752,6 +1788,7 @@ mod tests {
         let mut expected_decode_time = 0;
         for part in parts.iter() {
             assert_eq!(part.audio_codec, Some("aac"));
+            assert!(!part.keyframe);
             assert_eq!(tfdt_decode_time(&part.bytes), expected_decode_time);
             let durations = trun_sample_durations(&part.bytes);
             assert_eq!(durations.len(), 10);

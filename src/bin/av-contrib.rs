@@ -26,14 +26,15 @@ use media_object::{
     StageTimestamp,
 };
 use raptorq_datagram_fec::{
-    source_symbol_count, DatagramFecEncoder, DatagramFecHeader, MediaCodec, MediaFecDecoder,
-    MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE,
-    ENCODING_PACKET_HEADER_LEN, HEADER_LEN, MAX_SOURCE_SYMBOLS_PER_BLOCK,
+    source_symbol_count, AudioPayloadKind, DatagramFecEncoder, DatagramFecHeader, MediaCodec,
+    MediaFecDecoder, MediaFecEncoder, MediaFrame, MediaFrameMetadata, DEFAULT_SOURCE_SYMBOLS,
+    DEFAULT_SYMBOL_SIZE, ENCODING_PACKET_HEADER_LEN, HEADER_LEN, MAX_SOURCE_SYMBOLS_PER_BLOCK,
 };
 use relay_session::{
-    encoded_datagram_len as relay_datagram_len, EncodedRaptorQObject, MediaDatagramRole,
-    MediaDeadline, ObjectAnnouncement, PathMetrics, PrivateUdpConfig, PrivateUdpTransport,
-    RaptorQObjectEncoder, RelayLimits, RelayTransport, SubscriptionId, TopologyGeneration,
+    encoded_datagram_len as relay_datagram_len, AdaptiveFecController, AdaptiveFecPolicy,
+    CongestionConfig, EncodedRaptorQObject, MediaDatagramRole, MediaDeadline, ObjectAnnouncement,
+    PathMetrics, PrivateUdpConfig, PrivateUdpTransport, RaptorQObjectEncoder, RelayLimits,
+    RelayTransport, SubscriptionId, TopologyGeneration,
 };
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
@@ -53,9 +54,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, info, trace, warn};
+#[cfg(feature = "srt-ingest")]
+use upload_response::SrtIngest as UploadSrtIngest;
 use upload_response::{
-    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile,
-    SrtIngest as UploadSrtIngest, TailSlot, UploadResponseConfig, UploadResponseService,
+    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile, TailSlot,
+    UploadResponseConfig, UploadResponseService,
 };
 use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
@@ -511,6 +514,12 @@ struct Args {
     )]
     relay_deadline_ms: u64,
 
+    /// Minimum initial repair symbols for each canonical RelaySession object.
+    /// Use a floor at least as large as the small-object source-symbol count
+    /// when complete correlated source loss must remain recoverable.
+    #[arg(long, env = "AV_RELAY_MIN_REPAIR_SYMBOLS", default_value_t = 0)]
+    relay_min_repair_symbols: u32,
+
     /// Controller-observed loss across the selected source path, as a fraction
     /// from zero through one. This seeds the adaptive RaptorQ policy until live
     /// carrier feedback supplies a newer observation.
@@ -612,6 +621,16 @@ struct Args {
     )]
     daw_hls_packaging: DawHlsPackaging,
 
+    /// AEP1 audio formats that this LL-HLS view publishes.
+    #[arg(
+        long,
+        env = "AV_DAW_HLS_FORMATS",
+        value_enum,
+        value_delimiter = ',',
+        default_value = "flac"
+    )]
+    daw_hls_formats: Vec<DawHlsFormat>,
+
     #[arg(long, default_value_t = 1)]
     stream_id: u64,
 
@@ -668,6 +687,23 @@ struct Args {
 enum DawHlsPackaging {
     Opaque,
     Fmp4,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DawHlsFormat {
+    Opus,
+    Flac,
+    Pcm,
+}
+
+impl From<DawHlsFormat> for AudioPayloadKind {
+    fn from(value: DawHlsFormat) -> Self {
+        match value {
+            DawHlsFormat::Opus => Self::Opus,
+            DawHlsFormat::Flac => Self::Flac,
+            DawHlsFormat::Pcm => Self::Pcm,
+        }
+    }
 }
 
 impl From<DawHlsPackaging> for AudioEpochHlsPackaging {
@@ -911,7 +947,18 @@ impl RelaySessionPublisher {
             None
         };
 
-        let mut encoder = RaptorQObjectEncoder::default();
+        let mut policy = AdaptiveFecPolicy::default();
+        if args.relay_min_repair_symbols > policy.max_repair_symbols {
+            bail!(
+                "--relay-min-repair-symbols cannot exceed {}",
+                policy.max_repair_symbols
+            );
+        }
+        policy.min_repair_symbols = args.relay_min_repair_symbols;
+        let mut encoder = RaptorQObjectEncoder::new(
+            AdaptiveFecController::new(policy, CongestionConfig::default()),
+            limits,
+        )?;
         encoder.update_path_metrics(adaptive_relay_path_metrics(
             primary_path_metrics,
             secondary_path_metrics,
@@ -1248,6 +1295,11 @@ fn adaptive_relay_path_metrics(primary: PathMetrics, secondary: PathMetrics) -> 
     }
 }
 
+type StreamSourceEpoch = (u64, u64);
+type Fmp4InitializationObject = (ObjectKey, u64);
+type Fmp4InitializationIndex = HashMap<StreamSourceEpoch, Fmp4InitializationObject>;
+type Fmp4InitializationPayloadIndex = HashMap<StreamSourceEpoch, Bytes>;
+
 #[derive(Clone)]
 struct MeshForwarder {
     byte_socket: Arc<UdpSocket>,
@@ -1262,8 +1314,8 @@ struct MeshForwarder {
     audio_epoch_ingress_targets: Arc<Vec<SocketAddr>>,
     next_media_sequence: Arc<AtomicU64>,
     source_epoch: u64,
-    fmp4_initializations: Arc<Mutex<HashMap<u64, (ObjectKey, u64)>>>,
-    fmp4_initialization_payloads: Arc<Mutex<HashMap<u64, Bytes>>>,
+    fmp4_initializations: Arc<Mutex<Fmp4InitializationIndex>>,
+    fmp4_initialization_payloads: Arc<Mutex<Fmp4InitializationPayloadIndex>>,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
     relay: Option<Arc<RelaySessionPublisher>>,
@@ -1916,13 +1968,18 @@ async fn bind_daw_media_udp_socket(bind: SocketAddr) -> Result<UdpSocket> {
 #[async_trait::async_trait]
 impl Fmp4PartPublisher for MeshForwarder {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
+        let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
+        self.telemetry
+            .media_object_source_epoch
+            .fetch_max(source_epoch, Ordering::AcqRel);
+        let stream_epoch = (part.stream_id, source_epoch);
         let initialization = part
             .init
             .as_ref()
             .map(|init| {
                 build_live_fmp4_initialization_object(
                     part.stream_id,
-                    self.source_epoch,
+                    source_epoch,
                     init,
                     part.published_at_unix_ns,
                     self.delivery_budget_ms,
@@ -1957,21 +2014,21 @@ impl Fmp4PartPublisher for MeshForwarder {
                 self.fmp4_initializations
                     .lock()
                     .await
-                    .insert(part.stream_id, (key.clone(), epoch));
+                    .insert(stream_epoch, (key.clone(), epoch));
                 let init = part.init.clone().ok_or_else(|| {
                     "fMP4 initialization object was built without bytes".to_string()
                 })?;
                 self.fmp4_initialization_payloads
                     .lock()
                     .await
-                    .insert(part.stream_id, init.clone());
+                    .insert(stream_epoch, init.clone());
                 (key, epoch, init)
             } else {
                 let (key, epoch) = self
                     .fmp4_initializations
                     .lock()
                     .await
-                    .get(&part.stream_id)
+                    .get(&stream_epoch)
                     .cloned()
                     .ok_or_else(|| {
                         format!(
@@ -1983,7 +2040,7 @@ impl Fmp4PartPublisher for MeshForwarder {
                     .fmp4_initialization_payloads
                     .lock()
                     .await
-                    .get(&part.stream_id)
+                    .get(&stream_epoch)
                     .cloned()
                     .ok_or_else(|| {
                         format!(
@@ -2001,7 +2058,7 @@ impl Fmp4PartPublisher for MeshForwarder {
             &bundled_media,
             initialization_key,
             configuration_epoch,
-            self.source_epoch,
+            source_epoch,
             self.delivery_budget_ms,
             self.estimated_clock_error_ns,
         )
@@ -2035,9 +2092,13 @@ impl Fmp4PartPublisher for MeshForwarder {
         &self,
         part: PublishedOpaquePart,
     ) -> std::result::Result<(), String> {
+        let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
+        self.telemetry
+            .media_object_source_epoch
+            .fetch_max(source_epoch, Ordering::AcqRel);
         let object = build_opaque_media_object(
             &part,
-            self.source_epoch,
+            source_epoch,
             self.delivery_budget_ms,
             self.estimated_clock_error_ns,
         )
@@ -2193,6 +2254,7 @@ struct UploadTsBridgeState {
     bridge: Option<TsFmp4Bridge>,
 }
 
+#[cfg(feature = "srt-ingest")]
 #[derive(Debug, Clone, Copy)]
 struct SrtIngestConfig {
     bind: SocketAddr,
@@ -2200,6 +2262,7 @@ struct SrtIngestConfig {
     min_part_ms: u32,
 }
 
+#[cfg(feature = "srt-ingest")]
 async fn start_srt_ingest(
     config: SrtIngestConfig,
     playlists: Arc<playlists::Playlists>,
@@ -6532,6 +6595,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    validate_compiled_ingress_features(&args)?;
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
     let (cert, key) = load_tls(&args)?;
@@ -6568,6 +6632,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    #[cfg(feature = "srt-ingest")]
     let srt_shutdown = if let Some(bind) = args.srt_bind {
         Some(
             start_srt_ingest(
@@ -6633,6 +6698,11 @@ async fn main() -> Result<()> {
                 args.stream_id,
                 args.fmp4_part_ms,
                 args.daw_hls_packaging.into(),
+                args.daw_hls_formats
+                    .iter()
+                    .copied()
+                    .map(AudioPayloadKind::from)
+                    .collect(),
                 playlists.clone(),
                 publisher.clone(),
             ),
@@ -6724,6 +6794,7 @@ async fn main() -> Result<()> {
             args.rist_stream_id
         );
     }
+    #[cfg(feature = "srt-ingest")]
     if let Some(bind) = args.srt_bind {
         println!(
             "srt:     srt://127.0.0.1:{} stream_id={}",
@@ -6754,6 +6825,7 @@ async fn main() -> Result<()> {
     if let Some(shutdown) = rist_shutdown {
         let _ = shutdown.send(());
     }
+    #[cfg(feature = "srt-ingest")]
     if let Some(shutdown) = srt_shutdown {
         let _ = shutdown.send(());
     }
@@ -7252,6 +7324,19 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
     }
 }
 
+#[cfg(feature = "srt-ingest")]
+fn validate_compiled_ingress_features(_args: &Args) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "srt-ingest"))]
+fn validate_compiled_ingress_features(args: &Args) -> Result<()> {
+    if args.srt_bind.is_some() {
+        bail!("--srt-bind requires the srt-ingest Cargo feature");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7282,6 +7367,7 @@ mod tests {
         PublishedFmp4Part {
             stream_id,
             stream_idx: 0,
+            source_epoch: None,
             sequence,
             duration_ms: 67,
             packaged_at_unix_ns: published_at_unix_ns - 2_000_000,
@@ -7478,6 +7564,7 @@ mod tests {
         let part = PublishedOpaquePart {
             stream_id: 91,
             stream_idx: 91,
+            source_epoch: None,
             sequence: 17,
             duration_ms: 5,
             packaged_at_unix_ns: PACKAGED_NS,
@@ -8046,6 +8133,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_session_applies_and_bounds_the_initial_repair_floor() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(receiver.local_addr().unwrap());
+        args.relay_min_repair_symbols = 3;
+
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relay
+                .encoder
+                .lock()
+                .await
+                .controller()
+                .policy()
+                .min_repair_symbols,
+            3
+        );
+
+        args.relay_min_repair_symbols = AdaptiveFecPolicy::default().max_repair_symbols + 1;
+        let error = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .err()
+            .expect("an excessive repair floor must fail");
+        assert!(error
+            .to_string()
+            .contains("--relay-min-repair-symbols cannot exceed"));
+    }
+
+    #[tokio::test]
     async fn relay_session_drops_an_expired_object_before_encoding_and_counts_one_miss() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut args = contrib_status_args();
@@ -8296,6 +8415,7 @@ mod tests {
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            relay_min_repair_symbols: 0,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -8314,6 +8434,7 @@ mod tests {
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
+            daw_hls_formats: vec![DawHlsFormat::Flac],
             stream_id: 1,
             rist_stream_id: 1,
             srt_stream_id: 1,
@@ -8332,6 +8453,21 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
         }
+    }
+
+    #[cfg(feature = "srt-ingest")]
+    #[test]
+    fn default_build_accepts_an_srt_listener() {
+        assert!(validate_compiled_ingress_features(&contrib_status_args()).is_ok());
+    }
+
+    #[cfg(not(feature = "srt-ingest"))]
+    #[test]
+    fn rist_only_build_rejects_an_srt_listener() {
+        let error = validate_compiled_ingress_features(&contrib_status_args()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--srt-bind requires the srt-ingest Cargo feature"));
     }
 
     #[test]
@@ -8354,6 +8490,7 @@ mod tests {
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            relay_min_repair_symbols: 0,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -8372,6 +8509,7 @@ mod tests {
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
+            daw_hls_formats: vec![DawHlsFormat::Flac],
             stream_id: 9_007_199_254_741_993,
             rist_stream_id: 9_007_199_254_741_994,
             srt_stream_id: 9_007_199_254_741_995,
@@ -8931,6 +9069,7 @@ mod tests {
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            relay_min_repair_symbols: 0,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -8949,6 +9088,7 @@ mod tests {
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
+            daw_hls_formats: vec![DawHlsFormat::Flac],
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -9035,6 +9175,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stream_slot_forwarder_encodes_same_stream_concurrently_without_wire_id_collisions() {
         let mesh_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        SockRef::from(&mesh_socket)
+            .set_recv_buffer_size(4 * 1024 * 1024)
+            .unwrap();
+        let mesh_socket = Arc::new(mesh_socket);
         let mut args = contrib_status_args();
         args.mesh_fec_target = mesh_socket.local_addr().unwrap();
         args.mesh_media_fec_target = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -9045,7 +9189,24 @@ mod tests {
                 .unwrap(),
         );
         let stream_id = 77;
-        let payload_count = 32u32;
+        let payload_count = 16u32;
+        let expected_datagrams = usize::try_from(
+            stream_fec_geometry(4_096, args.symbol_size, args.repair_symbols)
+                .unwrap()
+                .packet_count,
+        )
+        .unwrap()
+            * payload_count as usize;
+        let receive_socket = Arc::clone(&mesh_socket);
+        let (datagram_tx, mut datagram_rx) = mpsc::unbounded_channel();
+        let receiver = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            for _ in 0..expected_datagrams {
+                let (len, _peer) = receive_socket.recv_from(&mut buf).await.unwrap();
+                datagram_tx.send(buf[..len].to_vec()).unwrap();
+            }
+        });
+        tokio::task::yield_now().await;
         let mut tasks = Vec::new();
         let mut expected_payloads = HashSet::new();
         for index in 0..payload_count {
@@ -9061,33 +9222,30 @@ mod tests {
             }));
         }
 
-        let mut expected_datagrams = 0usize;
+        let mut sent_datagrams = 0usize;
         for task in tasks {
-            expected_datagrams += task.await.unwrap();
+            sent_datagrams += task.await.unwrap();
         }
-
+        assert_eq!(sent_datagrams, expected_datagrams);
+        timeout(Duration::from_secs(3), receiver)
+            .await
+            .unwrap()
+            .unwrap();
         let mut decoder = FecDatagramDecoder::webtransport_with_stream_prefix(stream_id);
-        let mut buf = vec![0u8; 65_536];
         let mut block_ids = HashSet::new();
         let mut packet_sequences = HashSet::new();
         let mut decoded_payloads = HashSet::new();
-        timeout(Duration::from_secs(3), async {
-            for _ in 0..expected_datagrams {
-                let (len, _peer) = mesh_socket.recv_from(&mut buf).await.unwrap();
-                let datagram = &buf[..len];
-                let (decoded_stream_id, raw) = split_stream_id_prefix(datagram).unwrap();
-                assert_eq!(decoded_stream_id, stream_id);
-                let header = DatagramFecHeader::decode(raw).unwrap();
-                header.payload(raw).unwrap();
-                block_ids.insert(header.block_id);
-                assert!(packet_sequences.insert(header.packet_sequence));
-                if let Some(payload) = decoder.push_datagram(datagram).unwrap() {
-                    decoded_payloads.insert(payload);
-                }
+        while let Some(datagram) = datagram_rx.recv().await {
+            let (decoded_stream_id, raw) = split_stream_id_prefix(&datagram).unwrap();
+            assert_eq!(decoded_stream_id, stream_id);
+            let header = DatagramFecHeader::decode(raw).unwrap();
+            header.payload(raw).unwrap();
+            block_ids.insert(header.block_id);
+            assert!(packet_sequences.insert(header.packet_sequence));
+            if let Some(payload) = decoder.push_datagram(&datagram).unwrap() {
+                decoded_payloads.insert(payload);
             }
-        })
-        .await
-        .unwrap();
+        }
 
         assert_eq!(block_ids.len(), payload_count as usize);
         assert_eq!(packet_sequences.len(), expected_datagrams);
@@ -9126,6 +9284,7 @@ mod tests {
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            relay_min_repair_symbols: 0,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -9144,6 +9303,7 @@ mod tests {
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
+            daw_hls_formats: vec![DawHlsFormat::Flac],
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -9239,6 +9399,7 @@ mod tests {
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
+            relay_min_repair_symbols: 0,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -9257,6 +9418,7 @@ mod tests {
             audio_epoch_redundant_ingress_target: None,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
+            daw_hls_formats: vec![DawHlsFormat::Flac],
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,

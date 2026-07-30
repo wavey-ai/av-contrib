@@ -1,18 +1,20 @@
-//! Asynchronous AEP1 audio to opaque LL-HLS publication.
+//! Asynchronous AEP1 audio to LL-HLS publication.
 //!
 //! The UDP receive loop only copies an AEP1 datagram into a bounded queue. FEC
-//! recovery happens in the worker owned by this module. Recovered group bytes
-//! are never inspected or transformed: AEP1 owns timing and continuity, while
-//! producers and consumers own any framing within the payload. Publication is
-//! sharded by rendition so wide logical streams can use multiple cores while
-//! preserving ordering within each rendition.
+//! recovery happens in the worker owned by this module. Opaque publication does
+//! not inspect recovered group bytes. The fMP4 policy boxes supported elementary
+//! audio and removes an unencrypted SoundKit header from Opus. Publication uses
+//! one worker for each session, group, and audio format.
 
 use crate::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, PublishedOpaquePart, TimestampInput, DEFAULT_MIN_PART_MS,
 };
-use access_unit::{AccessUnit, PSI_STREAM_PRIVATE_DATA};
-use boxer::fmp4::{AudioTrackConfig, PcmAudioConfig, PcmSampleKind};
+use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS, PSI_STREAM_PRIVATE_DATA};
+use boxer::fmp4::{
+    opus_packet_info, AudioTrackConfig, OpusAudioConfig, PcmAudioConfig, PcmSampleKind,
+};
 use bytes::{Bytes, BytesMut};
+use frame_header::{EncodingFlag, FrameHeaderV2};
 use music_audio_session::{
     DecodedMultichannelAudioGroup, MultichannelAudioReceiver, MultichannelAudioSessionConfig,
 };
@@ -20,6 +22,7 @@ use playlists::Playlists;
 use raptorq_datagram_fec::{AudioPayloadKind, AudioSampleFormat};
 use raptorq_fec_transport::MultichannelAudioTransportAdapter;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -37,6 +40,8 @@ const AUDIO_EPOCH_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const AUDIO_EPOCH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUDIO_GROUP_FLAG_DISCONTINUITY: u8 = 1 << 0;
 const AUDIO_GROUP_FLAG_ERASURE: u8 = 1 << 1;
+const OPUS_RENDITION_STREAM_OFFSET: u64 = 1_000;
+const PCM_RENDITION_STREAM_OFFSET: u64 = 2_000;
 static WORKER_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 static WORKER_GROUPS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static WORKER_RAPTORQ_FRAGMENTS_RECOVERED: AtomicU64 = AtomicU64::new(0);
@@ -79,10 +84,11 @@ pub struct AudioEpochHlsDatagram {
 
 #[derive(Clone)]
 pub struct AudioEpochHlsConfig {
-    /// LL-HLS id used by group zero. Each subsequent group uses base + group_id.
+    /// LL-HLS id used by FLAC group zero. Opus and PCM use separate id ranges.
     pub base_stream_id: u64,
     pub min_part_ms: u32,
     pub packaging: AudioEpochHlsPackaging,
+    pub formats: Vec<AudioPayloadKind>,
     pub playlists: Arc<Playlists>,
     pub publisher: Arc<dyn Fmp4PartPublisher>,
 }
@@ -91,7 +97,7 @@ pub struct AudioEpochHlsConfig {
 pub enum AudioEpochHlsPackaging {
     /// Publish the recovered AEP1 payload bytes without inspecting them.
     Opaque,
-    /// Convert supported elementary PCM or FLAC payloads into CMAF/fMP4.
+    /// Convert supported elementary PCM, FLAC, or Opus payloads into CMAF/fMP4.
     Fmp4,
 }
 
@@ -100,13 +106,21 @@ impl AudioEpochHlsConfig {
         base_stream_id: u64,
         min_part_ms: u32,
         packaging: AudioEpochHlsPackaging,
+        formats: Vec<AudioPayloadKind>,
         playlists: Arc<Playlists>,
         publisher: Arc<dyn Fmp4PartPublisher>,
     ) -> Self {
+        let formats = formats.into_iter().fold(Vec::new(), |mut unique, format| {
+            if !unique.contains(&format) {
+                unique.push(format);
+            }
+            unique
+        });
         Self {
             base_stream_id,
             min_part_ms: min_part_ms.max(1),
             packaging,
+            formats,
             playlists,
             publisher,
         }
@@ -120,6 +134,7 @@ impl std::fmt::Debug for AudioEpochHlsConfig {
             .field("base_stream_id", &self.base_stream_id)
             .field("min_part_ms", &self.min_part_ms)
             .field("packaging", &self.packaging)
+            .field("formats", &self.formats)
             .finish_non_exhaustive()
     }
 }
@@ -141,12 +156,13 @@ struct RenditionState {
 
 enum RenditionPackager {
     Opaque(OpaquePartSegmenter),
-    Fmp4(Fmp4Segmenter),
+    Fmp4(Box<Fmp4Segmenter>),
 }
 
 struct OpaquePartSegmenter {
     output_stream_id: u64,
     output_stream_idx: usize,
+    source_epoch: u64,
     min_part_ms: u32,
     publisher: Arc<dyn Fmp4PartPublisher>,
     bytes: BytesMut,
@@ -213,12 +229,14 @@ impl OpaquePartSegmenter {
     fn new(
         output_stream_id: u64,
         output_stream_idx: usize,
+        source_epoch: u64,
         min_part_ms: u32,
         publisher: Arc<dyn Fmp4PartPublisher>,
     ) -> Self {
         Self {
             output_stream_id,
             output_stream_idx,
+            source_epoch: source_epoch.max(1),
             min_part_ms: min_part_ms.max(1),
             publisher,
             bytes: BytesMut::new(),
@@ -256,6 +274,7 @@ impl OpaquePartSegmenter {
         let part = PublishedOpaquePart {
             stream_id: self.output_stream_id,
             stream_idx: self.output_stream_idx,
+            source_epoch: Some(self.source_epoch),
             sequence: self.published_parts,
             duration_ms: self.duration_ms.max(1),
             packaged_at_unix_ns,
@@ -276,10 +295,19 @@ fn now_unix_ns() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenditionKey {
     session_id: u64,
     group_id: u16,
+    payload_kind: AudioPayloadKind,
+}
+
+impl Hash for RenditionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.session_id.hash(state);
+        self.group_id.hash(state);
+        (self.payload_kind as u8).hash(state);
+    }
 }
 
 pub fn channel(
@@ -337,6 +365,9 @@ pub async fn run_audio_epoch_hls_worker(
                                 u64::from(group.raptorq_recovered_fragments),
                                 Ordering::Relaxed,
                             );
+                            if !config.formats.contains(&group.payload_kind) {
+                                continue;
+                            }
                             if let Err(error) = dispatch_group_to_rendition_worker(
                                 &config,
                                 &mut rendition_workers,
@@ -378,6 +409,9 @@ pub async fn run_audio_epoch_hls_worker(
                     u64::from(group.raptorq_recovered_fragments),
                     Ordering::Relaxed,
                 );
+                if !config.formats.contains(&group.payload_kind) {
+                    continue;
+                }
                 if let Err(error) =
                     dispatch_group_to_rendition_worker(&config, &mut rendition_workers, group).await
                 {
@@ -408,6 +442,7 @@ async fn dispatch_group_to_rendition_worker(
     let key = RenditionKey {
         session_id: group.session_id,
         group_id: group.group_id,
+        payload_kind: group.payload_kind,
     };
     let now = Instant::now();
     let sender = match workers.entry(key) {
@@ -497,6 +532,7 @@ async fn run_rendition_worker(
             warn!(
                 session_id = key.session_id,
                 group_id = key.group_id,
+                payload_kind = ?key.payload_kind,
                 error = %error,
                 "failed to package recovered AEP1 group into LL-HLS"
             );
@@ -512,6 +548,7 @@ async fn run_rendition_worker(
     debug!(
         session_id = key.session_id,
         group_id = key.group_id,
+        payload_kind = ?key.payload_kind,
         "AEP1 LL-HLS rendition worker stopped"
     );
 }
@@ -536,24 +573,31 @@ fn new_rendition_packager(
     config: &AudioEpochHlsConfig,
     output_stream_id: u64,
     output_stream_idx: usize,
+    session_id: u64,
 ) -> RenditionPackager {
+    let source_epoch = session_id.saturating_div(1_000).max(1);
     match config.packaging {
         AudioEpochHlsPackaging::Opaque => RenditionPackager::Opaque(OpaquePartSegmenter::new(
             output_stream_id,
             output_stream_idx,
+            source_epoch,
             config.min_part_ms,
             Arc::clone(&config.publisher),
         )),
-        AudioEpochHlsPackaging::Fmp4 => RenditionPackager::Fmp4(Fmp4Segmenter::new_publish_only(
-            output_stream_id,
-            output_stream_idx,
-            Arc::clone(&config.playlists),
-            TimestampInput::MillisAbsolute,
-            config
-                .min_part_ms
-                .max(DEFAULT_MIN_PART_MS.min(config.min_part_ms)),
-            Arc::clone(&config.publisher),
-        )),
+        AudioEpochHlsPackaging::Fmp4 => {
+            let mut segmenter = Fmp4Segmenter::new_publish_only(
+                output_stream_id,
+                output_stream_idx,
+                Arc::clone(&config.playlists),
+                TimestampInput::MillisAbsolute,
+                config
+                    .min_part_ms
+                    .max(DEFAULT_MIN_PART_MS.min(config.min_part_ms)),
+                Arc::clone(&config.publisher),
+            );
+            segmenter.set_source_epoch(source_epoch);
+            RenditionPackager::Fmp4(Box::new(segmenter))
+        }
     }
 }
 
@@ -584,14 +628,13 @@ async fn package_group(
     let key = RenditionKey {
         session_id: group.session_id,
         group_id: group.group_id,
+        payload_kind: group.payload_kind,
     };
     let state = match renditions.entry(key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
-            let output_stream_id = config
-                .base_stream_id
-                .checked_add(u64::from(group.group_id))
-                .ok_or_else(|| "AEP1 LL-HLS stream id overflow".to_string())?;
+            let output_stream_id =
+                rendition_stream_id(config.base_stream_id, group.group_id, group.payload_kind)?;
             // The contributor publishes canonical media objects but does not
             // host a viewer cache. Keep the logical stream identity without
             // allocating a local chunk-cache slot for every source session.
@@ -600,11 +643,17 @@ async fn package_group(
             let state = entry.insert(RenditionState {
                 format,
                 expected_pts_samples: None,
-                packager: new_rendition_packager(config, output_stream_id, output_stream_idx),
+                packager: new_rendition_packager(
+                    config,
+                    output_stream_id,
+                    output_stream_idx,
+                    group.session_id,
+                ),
             });
             info!(
                 session_id = group.session_id,
                 group_id = group.group_id,
+                payload_kind = ?group.payload_kind,
                 output_stream_id,
                 sample_rate = group.sample_rate,
                 channels = group.channel_count,
@@ -662,29 +711,24 @@ async fn package_group_as_fmp4(
     group: DecodedMultichannelAudioGroup,
 ) -> Result<(), String> {
     let audio_config = audio_track_config(&group)?;
-    let segmenter = state.packager.fmp4()?;
-    segmenter.set_audio_track_config(audio_config);
-    let audio = match group.payload_kind {
-        AudioPayloadKind::Flac => group.payload,
+    let (audio, stream_type) = match group.payload_kind {
+        AudioPayloadKind::Flac => (group.payload.clone(), PSI_STREAM_PRIVATE_DATA),
         AudioPayloadKind::Pcm => {
             validate_pcm_group(&group)?;
-            group.payload
+            (group.payload.clone(), PSI_STREAM_PRIVATE_DATA)
         }
-        AudioPayloadKind::Opus => {
-            return Err(
-                "AEP1 Opus may contain producer framing or encryption; use opaque packaging"
-                    .to_string(),
-            )
-        }
+        AudioPayloadKind::Opus => (raw_opus_packet(&group)?, PSI_STREAM_AUDIO_OPUS),
     };
     let pts_ms = samples_to_millis(group.pts_samples, group.sample_rate)?;
+    let segmenter = state.packager.fmp4()?;
+    segmenter.set_audio_track_config(audio_config);
     segmenter
         .push_access_unit(AccessUnit {
             key: true,
             pts: pts_ms,
             dts: pts_ms,
             data: audio,
-            stream_type: PSI_STREAM_PRIVATE_DATA,
+            stream_type,
             id: group.epoch_id,
         })
         .await;
@@ -696,10 +740,15 @@ fn audio_track_config(
 ) -> Result<Option<AudioTrackConfig>, String> {
     match group.payload_kind {
         AudioPayloadKind::Flac => Ok(None),
-        AudioPayloadKind::Opus => Err(
-            "AEP1 Opus may contain producer framing or encryption; use opaque packaging"
-                .to_string(),
-        ),
+        AudioPayloadKind::Opus if matches!(group.channel_count, 1 | 2) => {
+            Ok(Some(AudioTrackConfig::Opus(OpusAudioConfig {
+                input_sample_rate: group.sample_rate,
+                channel_count: group.channel_count,
+                pre_skip: 0,
+                output_gain: 0,
+            })))
+        }
+        AudioPayloadKind::Opus => Err("Opus fMP4 supports one or two output channels".to_string()),
         AudioPayloadKind::Pcm => {
             let (sample_size, sample_kind) = match group.sample_format {
                 AudioSampleFormat::S16Le => (16, PcmSampleKind::Integer),
@@ -719,6 +768,75 @@ fn audio_track_config(
             })))
         }
     }
+}
+
+fn rendition_stream_id(
+    base_stream_id: u64,
+    group_id: u16,
+    payload_kind: AudioPayloadKind,
+) -> Result<u64, String> {
+    let format_offset = match payload_kind {
+        AudioPayloadKind::Flac => 0,
+        AudioPayloadKind::Opus => OPUS_RENDITION_STREAM_OFFSET,
+        AudioPayloadKind::Pcm => PCM_RENDITION_STREAM_OFFSET,
+    };
+    base_stream_id
+        .checked_add(format_offset)
+        .and_then(|stream_id| stream_id.checked_add(u64::from(group_id)))
+        .ok_or_else(|| "AEP1 LL-HLS stream id overflow".to_string())
+}
+
+fn raw_opus_packet(group: &DecodedMultichannelAudioGroup) -> Result<Bytes, String> {
+    let packet = match FrameHeaderV2::header_size(&group.payload) {
+        Ok(header_size) => {
+            let header_bytes = group
+                .payload
+                .get(..header_size)
+                .ok_or_else(|| "SoundKit Opus header is truncated".to_string())?;
+            let header = FrameHeaderV2::decode(&mut &header_bytes[..])
+                .map_err(|error| format!("invalid SoundKit Opus header: {error}"))?;
+            if header.encoding() != &EncodingFlag::Opus {
+                return Err("AEP1 Opus payload has a non-Opus SoundKit header".to_string());
+            }
+            if header.is_encrypted() {
+                return Err(
+                    "encrypted SoundKit Opus cannot be published as public fMP4".to_string()
+                );
+            }
+            if header.sample_rate() != group.sample_rate
+                || u16::from(header.channels()) != group.channel_count
+                || header.frame_count() != group.frame_count
+            {
+                return Err("SoundKit Opus metadata does not match its AEP1 group".to_string());
+            }
+            let payload_size = usize::try_from(header.payload_size())
+                .map_err(|_| "SoundKit Opus payload exceeds this platform".to_string())?;
+            let packet_end = header_size
+                .checked_add(payload_size)
+                .ok_or_else(|| "SoundKit Opus payload size overflow".to_string())?;
+            if packet_end != group.payload.len() {
+                return Err("AEP1 Opus group must contain exactly one SoundKit packet".to_string());
+            }
+            let packet = group.payload.slice(header_size..packet_end);
+            if header.packet_crc32_value().is_some()
+                && !header
+                    .verify_packet_crc32(header_bytes, &packet)
+                    .map_err(|error| format!("cannot verify SoundKit Opus checksum: {error}"))?
+            {
+                return Err("SoundKit Opus checksum does not match its payload".to_string());
+            }
+            packet
+        }
+        Err(_) => group.payload.clone(),
+    };
+    let packet_info = opus_packet_info(&packet)
+        .ok_or_else(|| "AEP1 Opus payload is not one valid raw Opus packet".to_string())?;
+    if u64::from(group.frame_count).saturating_mul(48_000)
+        != u64::from(packet_info.duration_samples).saturating_mul(u64::from(group.sample_rate))
+    {
+        return Err("raw Opus duration does not match its AEP1 group".to_string());
+    }
+    Ok(packet)
 }
 
 fn validate_pcm_group(group: &DecodedMultichannelAudioGroup) -> Result<(), String> {
@@ -787,14 +905,42 @@ mod tests {
         packaging: AudioEpochHlsPackaging,
         publisher: Arc<dyn Fmp4PartPublisher>,
     ) -> AudioEpochHlsConfig {
+        test_config_with_formats(
+            base_stream_id,
+            min_part_ms,
+            packaging,
+            vec![
+                AudioPayloadKind::Opus,
+                AudioPayloadKind::Flac,
+                AudioPayloadKind::Pcm,
+            ],
+            publisher,
+        )
+    }
+
+    fn test_config_with_formats(
+        base_stream_id: u64,
+        min_part_ms: u32,
+        packaging: AudioEpochHlsPackaging,
+        formats: Vec<AudioPayloadKind>,
+        publisher: Arc<dyn Fmp4PartPublisher>,
+    ) -> AudioEpochHlsConfig {
         let (playlists, _, _) = Playlists::new(Options {
             num_playlists: 256,
             part_target_ms: min_part_ms,
             ..Options::default()
         });
-        AudioEpochHlsConfig::new(base_stream_id, min_part_ms, packaging, playlists, publisher)
+        AudioEpochHlsConfig::new(
+            base_stream_id,
+            min_part_ms,
+            packaging,
+            formats,
+            playlists,
+            publisher,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decoded_group(
         epoch_id: u64,
         pts_samples: u64,
@@ -864,6 +1010,7 @@ mod tests {
         let key = RenditionKey {
             session_id: 99,
             group_id: 7,
+            payload_kind: AudioPayloadKind::Flac,
         };
         let mut workers = HashMap::from([(
             key,
@@ -958,16 +1105,88 @@ mod tests {
         assert!(captured.fmp4_parts.lock().unwrap().is_empty());
         let parts = captured.opaque_parts.lock().unwrap();
         assert_eq!(parts.len(), expected.len());
-        for (group_id, bytes) in expected.iter().enumerate() {
+        for (group_id, (bytes, (payload_kind, _))) in expected.iter().zip(descriptors).enumerate() {
+            let stream_id = rendition_stream_id(20, group_id as u16, payload_kind).unwrap();
             let part = parts
                 .iter()
-                .find(|part| part.stream_id == 20 + group_id as u64)
+                .find(|part| part.stream_id == stream_id)
                 .expect("one published part per AEP1 group");
             assert_eq!(part.sequence, 0);
             assert_eq!(part.duration_ms, 5);
             assert_eq!(part.audio_units, 1);
             assert_eq!(part.bytes.as_ref(), bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn format_selection_publishes_flac_and_leaves_opus_on_the_wire() {
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let config = test_config_with_formats(
+            20,
+            5,
+            AudioEpochHlsPackaging::Opaque,
+            vec![AudioPayloadKind::Flac],
+            publisher,
+        );
+        let (tx, rx) = channel(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_audio_epoch_hls_worker(config, rx, shutdown_rx));
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let peer: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+        for (payload_kind, sample_format, payload) in [
+            (
+                AudioPayloadKind::Opus,
+                AudioSampleFormat::Unspecified,
+                b"opus".as_slice(),
+            ),
+            (
+                AudioPayloadKind::Flac,
+                AudioSampleFormat::S24Le,
+                b"flac".as_slice(),
+            ),
+        ] {
+            let groups = [MultichannelAudioGroup {
+                group_id: 0,
+                channel_start: 0,
+                channel_count: 2,
+                payload_kind,
+                sample_format,
+                flags: 0,
+                payload,
+            }];
+            let encoded = sender
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 99,
+                    config_generation: 3,
+                    epoch_id: 0,
+                    pts_samples: 0,
+                    sample_rate: 48_000,
+                    frame_count: 240,
+                    groups: &groups,
+                })
+                .unwrap();
+            for datagram in transport.wrap_epoch(encoded).unwrap().datagrams {
+                tx.send(AudioEpochHlsDatagram {
+                    peer,
+                    bytes: datagram.payload,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        worker.await.unwrap();
+
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].bytes.as_ref(), b"flac");
     }
 
     #[tokio::test]
@@ -1012,6 +1231,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_audio_sessions_get_distinct_canonical_source_epochs() {
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let config = test_config(40, 5, AudioEpochHlsPackaging::Fmp4, publisher);
+        let mut renditions = HashMap::new();
+        let payload = Bytes::from(vec![0_u8; 240 * 2 * 3]);
+
+        for session_id in [1_784_151_600_000_000_000, 1_784_151_610_000_000_000] {
+            let mut group = decoded_group(
+                0,
+                0,
+                0,
+                0,
+                2,
+                AudioPayloadKind::Pcm,
+                AudioSampleFormat::S24Le,
+                payload.clone(),
+            );
+            group.session_id = session_id;
+            package_group(&config, &mut renditions, group)
+                .await
+                .unwrap();
+        }
+
+        let parts = captured.fmp4_parts.lock().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].stream_id, parts[1].stream_id);
+        assert_eq!(parts[0].sequence, 0);
+        assert_eq!(parts[1].sequence, 0);
+        assert_eq!(parts[0].source_epoch, Some(1_784_151_600_000_000));
+        assert_eq!(parts[1].source_epoch, Some(1_784_151_610_000_000));
+        assert_ne!(parts[0].source_epoch, parts[1].source_epoch);
+    }
+
+    #[tokio::test]
+    async fn explicit_fmp4_policy_boxes_raw_opus_without_changing_packet() {
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let config = test_config(40, 5, AudioEpochHlsPackaging::Fmp4, publisher);
+        let mut renditions = HashMap::new();
+        let packet = vec![(17 << 3) | (1 << 2), 0x11, 0x22];
+
+        package_group(
+            &config,
+            &mut renditions,
+            decoded_group(
+                0,
+                0,
+                0,
+                0,
+                2,
+                AudioPayloadKind::Opus,
+                AudioSampleFormat::Unspecified,
+                Bytes::from(packet.clone()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(captured.opaque_parts.lock().unwrap().is_empty());
+        let parts = captured.fmp4_parts.lock().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].stream_id, 1_040);
+        assert_eq!(parts[0].audio_codec, Some("opus"));
+        assert_eq!(mdat_payload(&parts[0].bytes), Some(packet.as_slice()));
+        assert!(parts[0].init.as_ref().is_some_and(|init| {
+            init.windows(4).any(|bytes| bytes == b"Opus")
+                && init.windows(4).any(|bytes| bytes == b"dOps")
+        }));
+    }
+
+    #[tokio::test]
     async fn opaque_parts_can_coalesce_twenty_five_ms_units_without_parsing() {
         let captured = Arc::new(CapturingPublisher::default());
         let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
@@ -1048,7 +1339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_format_changes_do_not_reset_object_sequence() {
+    async fn declared_formats_use_independent_streams_and_object_sequences() {
         let captured = Arc::new(CapturingPublisher::default());
         let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
         let config = test_config(7, 5, AudioEpochHlsPackaging::Opaque, publisher);
@@ -1090,7 +1381,9 @@ mod tests {
         let parts = captured.opaque_parts.lock().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].sequence, 0);
-        assert_eq!(parts[1].sequence, 1);
+        assert_eq!(parts[1].sequence, 0);
+        assert_eq!(parts[0].stream_id, 2_007);
+        assert_eq!(parts[1].stream_id, 1_007);
         assert_eq!(parts[0].bytes.as_ref(), b"first opaque payload");
         assert_eq!(parts[1].bytes.as_ref(), b"second opaque payload");
     }
@@ -1128,9 +1421,9 @@ mod tests {
             .iter()
             .map(|part| part.stream_id)
             .collect::<HashSet<_>>();
-        assert_eq!(streams, (100..132).collect::<HashSet<_>>());
+        assert_eq!(streams, (2_100..2_132).collect::<HashSet<_>>());
         for part in parts.iter() {
-            let group_id = usize::try_from(part.stream_id - 100).unwrap();
+            let group_id = usize::try_from(part.stream_id - 2_100).unwrap();
             assert_eq!(part.bytes.as_ref(), vec![group_id as u8; 37 + group_id]);
         }
     }

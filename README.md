@@ -32,6 +32,134 @@ low-latency recovery for bounded loss. FEC is not magic reliability. If repair
 budget is exceeded, the mesh needs a separate slot repair/backfill path rather
 than pushing raw RIST/SRT semantics through every mesh node.
 
+## Measured DAW audio capacity
+
+One track is one independent stereo, 48 kHz, 24-bit DAW source.
+
+The test produced FLAC and Opus LL-HLS renditions for each track.
+
+The contributor used a GCP `n2-standard-2` VM in London.
+
+The VM had two vCPUs on Intel Cascade Lake.
+
+Both tests used 250 ms parts and the same RaptorQ relay fan-out.
+
+| Measurement | Eight tracks | Sixteen tracks |
+| --- | ---: | ---: |
+| Measurement window | 600 seconds | 106 seconds |
+| LL-HLS output streams | 16 | 32 |
+| Contributor CPU | P99 83.92% | Maximum 198.07% |
+| Contributor host capacity | P99 41.96% | Maximum 99.03% |
+| Maximum service memory | 175.28 MiB | 208.02 MiB |
+| LL-HLS queue capacity | 4,096 | 4,096 |
+| LL-HLS queue drops | 0 | 480,572 |
+| Mesh queue capacity | 32,768 | 32,768 |
+| Mesh queue drops | 0 | 84,423 |
+
+The eight-track contributor window had no queue drops or worker errors.
+
+It also had no ingress errors, mesh forwarding errors, or kernel UDP socket drops.
+
+The eight-track result proves contributor capacity for this configuration.
+
+It does not prove playback qualification.
+
+Reused stream IDs caused invalid edge sequence state during the playback checks.
+
+The sixteen-track LL-HLS queue first became full approximately five seconds after media started.
+
+The mesh forwarding queue became full approximately 12 seconds after media started.
+
+The contributor then used both vCPUs and could not drain either handoff queue.
+
+The source kept all 16 tracks connected during the partial run.
+
+The source reported no dropped frames, connection failures, or UDP send errors.
+
+Its latest host sample used 11.85% CPU.
+
+The DAW source process used 7.37% of the 16-vCPU source host.
+
+The Linux UDP counters reported no receive-buffer or send-buffer errors.
+
+These results locate the sixteen-track limit in contributor processing.
+
+### Why sixteen tracks failed
+
+The eight-track source sent approximately 5,762 AEP1 datagrams each second.
+
+The contributor accepted all these datagrams.
+
+The sixteen-track source sent approximately 10,632 AEP1 datagrams each second.
+
+The LL-HLS handoff accepted approximately 6,100 datagrams each second.
+
+It rejected approximately 4,532 datagrams each second.
+
+The mesh handoff accepted approximately 9,836 datagrams each second.
+
+It rejected approximately 796 datagrams each second.
+
+The UDP receive loop copies each datagram into one LL-HLS queue and one mesh queue.
+
+One LL-HLS recovery task owns the FEC state for all datagrams from the source peer.
+
+That task sends recovered groups to 32 rendition tasks.
+
+Each rendition task boxes 250 ms fMP4 parts and creates canonical media objects.
+
+It then applies RaptorQ and waits for relay publication.
+
+One mesh task also forwards each source datagram to two relay ingress targets.
+
+The default Tokio runtime had two worker threads on the two-vCPU host.
+
+Slow fMP4 publication and two renditions for each track kept both worker threads busy.
+
+The UDP receive loop remained live because both handoffs use nonblocking `try_send`.
+
+The bounded queues absorbed the initial processing deficit.
+
+They rejected new datagrams after they became full.
+
+The kernel socket, source, and network did not cause these drops.
+
+### Limits for the next capacity test
+
+Treat approximately 6,100 LL-HLS input datagrams each second as the measured limit for this two-vCPU configuration.
+
+Limit this configuration to eight tracks until another complete test passes.
+
+Use a dedicated 16-vCPU contributor for the next sixteen-track qualification.
+
+Test smaller machine sizes separately if the minimum production size is required.
+
+Do not increase queue capacity as the primary correction.
+
+A larger queue can delay the first drop.
+
+It cannot correct sustained processing overload.
+
+Keep the 4,096-entry LL-HLS queue as an early overload detector during qualification.
+
+Keep the 32,768-entry mesh queue unless measured network bursts require a different value.
+
+Add LL-HLS queue-age and drain-rate metrics before changing either queue.
+
+Add FEC recovery, rendition dispatch, fMP4 boxing, and relay publication stage metrics.
+
+If a larger host still reaches one-core recovery saturation, divide FEC recovery by object identity.
+
+Keep publication order for each stream when work moves between worker shards.
+
+Support a per-format packaging policy.
+
+Publish FLAC as opaque byte-exact parts and publish Opus as fMP4.
+
+This policy removes unnecessary FLAC boxing without removing the required Opus rendition.
+
+Require zero handoff drops before the timed measurement starts.
+
 ```sh
 cargo run --bin av-contrib -- \
   --http-port 9443 \

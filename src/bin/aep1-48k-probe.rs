@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use boxer::fmp4::opus_packet_info;
 use bytes::{Buf, Bytes, BytesMut};
 use clap::{Parser, Subcommand, ValueEnum};
 use frame_header::{EncodingFlag, FrameHeaderV2};
@@ -8,15 +9,16 @@ use futures_util::{
     FutureExt, StreamExt,
 };
 use music_audio_session::{
-    MultichannelAudioReceiver, MultichannelAudioSender, MultichannelAudioSessionConfig,
+    DecodedMultichannelAudioGroup, MultichannelAudioReceiver, MultichannelAudioSender,
+    MultichannelAudioSessionConfig,
 };
 use playlists::tail_bundle::{
     decode_tail_bundle, decode_tail_bundle_stream_frame, TailBundleEntry, MAX_TAIL_BUNDLE_ENTRIES,
     TAIL_BUNDLE_STREAM_CONTENT_TYPE,
 };
 use raptorq_datagram_fec::{
-    AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch, MultichannelAudioFecConfig,
-    MultichannelAudioGroup,
+    inspect_multichannel_audio_datagram, AudioPayloadKind, AudioSampleFormat,
+    MultichannelAudioEpoch, MultichannelAudioFecConfig, MultichannelAudioGroup,
 };
 use raptorq_fec_transport::MultichannelAudioTransportAdapter;
 use serde::Serialize;
@@ -33,7 +35,9 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::{interval_at, sleep_until, timeout, Instant as TokioInstant, MissedTickBehavior};
+use tokio::time::{
+    interval_at, sleep, sleep_until, timeout, Instant as TokioInstant, MissedTickBehavior,
+};
 
 const SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_CHANNELS: u16 = 2;
@@ -43,12 +47,15 @@ const LOGICAL_MAX_CHANNELS: u16 = 128;
 const FRAME_COUNT: u32 = 240;
 const FRAME_DURATION: Duration = Duration::from_millis(5);
 const MAX_DATAGRAM_BYTES: usize = 1_200;
+const AUDIO_GROUP_FLAG_DISCONTINUITY: u8 = 1 << 0;
+const AUDIO_GROUP_FLAG_ERASURE: u8 = 1 << 1;
 // Cover 40 ms of bandwidth-delay product at the qualified 5 ms part size.
 // Viewers use a nearby edge cache; a deeper intercontinental prefetch adds
 // latency and is not a substitute for selecting the local mesh edge.
 const H3_PART_PIPELINE_DEPTH: usize = 8;
 const H3_PART_PRELOAD_LEAD: Duration = Duration::from_millis(100);
 const HLS_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const H3_REQUEST_RECONNECT_LIMIT: u64 = 3;
 // Keep four-hour load qualifications bounded while retaining a deterministic,
 // uniform reservoir for latency percentiles. Exact continuity uses a bitset and
 // is never sampled.
@@ -84,6 +91,9 @@ enum Command {
         /// Deterministic source signal used to size codec and transport work.
         #[arg(long, value_enum, default_value_t = ProbeSignal::Decorrelated)]
         signal: ProbeSignal,
+        /// Interleaved raw S24LE PCM to loop for the complete publication.
+        #[arg(long, value_name = "PATH", conflicts_with = "signal")]
+        pcm_s24le_file: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         group_id: u16,
         #[arg(long, default_value_t = 12)]
@@ -100,6 +110,12 @@ enum Command {
         session_id: u64,
         #[arg(long, default_value_t = 0)]
         group_id: u16,
+        /// Number of consecutive groups to observe through one relay subscription.
+        #[arg(long, default_value_t = 1)]
+        group_count: u16,
+        /// Audio representations to include in exact-delivery totals.
+        #[arg(long, value_enum, value_delimiter = ',', default_value = "flac")]
+        formats: Vec<ReceiveAudioFormat>,
         #[arg(long, default_value_t = 10)]
         duration_seconds: u64,
         #[arg(long, default_value_t = 25)]
@@ -119,6 +135,9 @@ enum Command {
         session_id: u64,
         #[arg(long, default_value_t = 0)]
         group_id: u16,
+        /// Audio representations to include in exact-delivery totals.
+        #[arg(long, value_enum, value_delimiter = ',', default_value = "flac")]
+        formats: Vec<ReceiveAudioFormat>,
         #[arg(long, default_value_t = 10)]
         duration_seconds: u64,
         #[arg(long, default_value_t = 250)]
@@ -254,6 +273,24 @@ enum ProbePayload {
     Pcm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum ReceiveAudioFormat {
+    Opus,
+    Flac,
+    Pcm,
+}
+
+impl ReceiveAudioFormat {
+    fn from_payload_kind(kind: AudioPayloadKind) -> Self {
+        match kind {
+            AudioPayloadKind::Opus => Self::Opus,
+            AudioPayloadKind::Flac => Self::Flac,
+            AudioPayloadKind::Pcm => Self::Pcm,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum HlsTransport {
     H3,
@@ -264,6 +301,7 @@ enum HlsTransport {
 enum HlsAudioCodec {
     Flac,
     OpaqueFlac,
+    Opus,
     SoundkitOpus,
     Ipcm,
     Fpcm,
@@ -274,6 +312,7 @@ impl HlsAudioCodec {
         match self {
             Self::Flac => "flac",
             Self::OpaqueFlac => "opaque_flac",
+            Self::Opus => "opus",
             Self::SoundkitOpus => "soundkit_opus",
             Self::Ipcm => "ipcm_s24le",
             Self::Fpcm => "fpcm_f32le",
@@ -283,7 +322,7 @@ impl HlsAudioCodec {
     fn media_extension(self) -> &'static str {
         match self {
             Self::OpaqueFlac | Self::SoundkitOpus => "bin",
-            Self::Flac | Self::Ipcm | Self::Fpcm => "mp4",
+            Self::Flac | Self::Opus | Self::Ipcm | Self::Fpcm => "mp4",
         }
     }
 
@@ -291,6 +330,7 @@ impl HlsAudioCodec {
         match self {
             Self::OpaqueFlac | Self::SoundkitOpus => None,
             Self::Flac => Some(b"fLaC"),
+            Self::Opus => Some(b"Opus"),
             Self::Ipcm => Some(b"ipcm"),
             Self::Fpcm => Some(b"fpcm"),
         }
@@ -335,12 +375,102 @@ impl ProbeSignal {
     }
 }
 
+enum PcmSource {
+    Generated(ProbeSignal),
+    File(LoopingPcm),
+}
+
+impl PcmSource {
+    fn new(signal: ProbeSignal, path: Option<&Path>, channels: u16) -> Result<Self> {
+        path.map_or_else(
+            || Ok(Self::Generated(signal)),
+            |path| {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("failed to read raw PCM input: {}", path.display()))?;
+                LoopingPcm::new(bytes, channels).map(Self::File)
+            },
+        )
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Generated(signal) => signal.as_str(),
+            Self::File(_) => "file_loop",
+        }
+    }
+
+    fn input_frames(&self) -> Option<u64> {
+        match self {
+            Self::Generated(_) => None,
+            Self::File(source) => Some(source.frames as u64),
+        }
+    }
+
+    fn group_s24le(&self, first_sample: u64, channel_start: u16, channels: u16) -> Vec<u8> {
+        match self {
+            Self::Generated(signal) => signal_s24le(first_sample, channel_start, channels, *signal),
+            Self::File(source) => source.group_s24le(first_sample, channel_start, channels),
+        }
+    }
+}
+
+struct LoopingPcm {
+    bytes: Vec<u8>,
+    channels: usize,
+    frames: usize,
+}
+
+impl LoopingPcm {
+    fn new(bytes: Vec<u8>, channels: u16) -> Result<Self> {
+        let channels = usize::from(channels);
+        let frame_bytes = channels
+            .checked_mul(3)
+            .context("raw PCM frame size overflow")?;
+        if bytes.is_empty() {
+            bail!("raw PCM input must contain at least one frame");
+        }
+        if !bytes.len().is_multiple_of(frame_bytes) {
+            bail!(
+                "raw PCM input has {} bytes; expected complete {}-byte frames for {channels} channels",
+                bytes.len(),
+                frame_bytes
+            );
+        }
+        Ok(Self {
+            frames: bytes.len() / frame_bytes,
+            bytes,
+            channels,
+        })
+    }
+
+    fn group_s24le(&self, first_sample: u64, channel_start: u16, channels: u16) -> Vec<u8> {
+        let channel_start = usize::from(channel_start);
+        let channels = usize::from(channels);
+        debug_assert!(channel_start + channels <= self.channels);
+        let frame_bytes = self.channels * 3;
+        let group_bytes = channels * 3;
+        let channel_offset = channel_start * 3;
+        let mut pcm = Vec::with_capacity(FRAME_COUNT as usize * group_bytes);
+        let mut source_frame = (first_sample % self.frames as u64) as usize;
+        for _ in 0..FRAME_COUNT {
+            let start = source_frame * frame_bytes + channel_offset;
+            pcm.extend_from_slice(&self.bytes[start..start + group_bytes]);
+            source_frame += 1;
+            if source_frame == self.frames {
+                source_frame = 0;
+            }
+        }
+        pcm
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SendReport {
     schema: &'static str,
     lane: &'static str,
     payload: &'static str,
     signal: &'static str,
+    input_pcm_frames: Option<u64>,
     session_id: u64,
     group_id: u16,
     group_count: u16,
@@ -367,6 +497,7 @@ struct ReceiveReport {
     lane: &'static str,
     session_id: u64,
     group_id: u16,
+    formats: Vec<ReceiveAudioFormat>,
     sample_rate: u32,
     duration_seconds: u64,
     expected_epochs: u64,
@@ -374,14 +505,201 @@ struct ReceiveReport {
     missing_epochs: u64,
     deadline_ms: u64,
     deadline_misses: u64,
+    transport_counter_scope: &'static str,
     datagrams_received: u64,
+    source_datagrams_received: u64,
+    repair_datagrams_received: u64,
     systematic_shards_received: u64,
     raptorq_shards_recovered: u64,
+    selected_raptorq_fragments_recovered: u64,
+    opus_epochs: u64,
+    flac_epochs: u64,
+    pcm_fallback_epochs: u64,
+    erasure_epochs: u64,
+    unexpected_payload_epochs: u64,
+    discontinuity_epochs: u64,
+    expected_pcm_frames: u64,
+    received_pcm_frames: u64,
+    missing_pcm_frames: u64,
     duplicate_or_late_epochs: u64,
+    transport_duplicate_or_late_epochs: u64,
     wire_bytes: u64,
     /// Capture-to-exact-decode latency at the point the epoch can be rendered.
     latency_ms: Percentiles,
     render_ready_latency_ms: Percentiles,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    latency_time_series: Vec<UdpLatencyBucket>,
+}
+
+#[derive(Debug, Serialize)]
+struct UdpTransportCounters {
+    datagrams_received: u64,
+    source_datagrams_received: u64,
+    repair_datagrams_received: u64,
+    systematic_shards_received: u64,
+    raptorq_shards_recovered: u64,
+    transport_duplicate_or_late_epochs: u64,
+    wire_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiGroupReceiveReport {
+    schema: &'static str,
+    lane: &'static str,
+    session_id: u64,
+    group_id: u16,
+    group_count: u16,
+    group_ids: Vec<u16>,
+    shared_transport: UdpTransportCounters,
+    groups: Vec<ReceiveReport>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum UdpReceiveOutput {
+    Single(Box<ReceiveReport>),
+    Multiple(MultiGroupReceiveReport),
+}
+
+struct ReceiveFormatState {
+    formats: Vec<ReceiveAudioFormat>,
+    selected_epochs: HashSet<(ReceiveAudioFormat, u64)>,
+    opus_epochs: HashSet<u64>,
+    flac_epochs: HashSet<u64>,
+    pcm_epochs: HashSet<u64>,
+    deadline_misses: u64,
+    erasure_epochs: u64,
+    discontinuity_epochs: u64,
+    duplicate_or_late_epochs: u64,
+    selected_raptorq_fragments_recovered: u64,
+    received_pcm_frames: u64,
+    latencies_ns: Vec<u64>,
+    latency_buckets: BTreeMap<(u8, u64), UdpLatencyBucketSamples>,
+}
+
+impl ReceiveFormatState {
+    fn new(formats: &[ReceiveAudioFormat]) -> Result<Self> {
+        let formats = formats
+            .iter()
+            .copied()
+            .fold(Vec::new(), |mut unique, format| {
+                if !unique.contains(&format) {
+                    unique.push(format);
+                }
+                unique
+            });
+        if formats.is_empty() {
+            bail!("--formats must contain at least one audio representation");
+        }
+        Ok(Self {
+            formats,
+            selected_epochs: HashSet::new(),
+            opus_epochs: HashSet::new(),
+            flac_epochs: HashSet::new(),
+            pcm_epochs: HashSet::new(),
+            deadline_misses: 0,
+            erasure_epochs: 0,
+            discontinuity_epochs: 0,
+            duplicate_or_late_epochs: 0,
+            selected_raptorq_fragments_recovered: 0,
+            received_pcm_frames: 0,
+            latencies_ns: Vec::new(),
+            latency_buckets: BTreeMap::new(),
+        })
+    }
+
+    fn observe(
+        &mut self,
+        group: &DecodedMultichannelAudioGroup,
+        arrival_ns: u64,
+        deadline_ms: u64,
+    ) {
+        let format = ReceiveAudioFormat::from_payload_kind(group.payload_kind);
+        if group.flags & AUDIO_GROUP_FLAG_ERASURE == 0 {
+            match format {
+                ReceiveAudioFormat::Opus => &mut self.opus_epochs,
+                ReceiveAudioFormat::Flac => &mut self.flac_epochs,
+                ReceiveAudioFormat::Pcm => &mut self.pcm_epochs,
+            }
+            .insert(group.epoch_id);
+        }
+        if !self.formats.contains(&format) {
+            return;
+        }
+        if !self.selected_epochs.insert((format, group.epoch_id)) {
+            self.duplicate_or_late_epochs = self.duplicate_or_late_epochs.saturating_add(1);
+            return;
+        }
+
+        let capture_ns = group.session_id.saturating_add(
+            group.pts_samples.saturating_mul(1_000_000_000) / u64::from(group.sample_rate),
+        );
+        let latency_ns = arrival_ns.saturating_sub(capture_ns);
+        let deadline_missed = latency_ns > deadline_ms.saturating_mul(1_000_000);
+        if deadline_missed {
+            self.deadline_misses = self.deadline_misses.saturating_add(1);
+        }
+        let discontinuity = group.flags & AUDIO_GROUP_FLAG_DISCONTINUITY != 0;
+        if discontinuity {
+            self.discontinuity_epochs = self.discontinuity_epochs.saturating_add(1);
+        }
+        let erasure = group.flags & AUDIO_GROUP_FLAG_ERASURE != 0;
+        if erasure {
+            self.erasure_epochs = self.erasure_epochs.saturating_add(1);
+        } else {
+            self.received_pcm_frames = self
+                .received_pcm_frames
+                .saturating_add(u64::from(group.frame_count));
+        }
+        self.selected_raptorq_fragments_recovered = self
+            .selected_raptorq_fragments_recovered
+            .saturating_add(u64::from(group.raptorq_recovered_fragments));
+        self.latencies_ns.push(latency_ns);
+        let pts_ms = group
+            .pts_samples
+            .saturating_mul(1_000)
+            .saturating_div(u64::from(group.sample_rate));
+        self.latency_buckets
+            .entry((receive_audio_format_order(format), pts_ms / 1_000))
+            .or_default()
+            .record(latency_ns, deadline_missed, erasure, discontinuity);
+    }
+
+    fn selected_epoch_count(&self) -> u64 {
+        self.selected_epochs.len() as u64
+    }
+
+    fn finish_latency_time_series(
+        &mut self,
+        session_id: u64,
+        duration_seconds: u64,
+    ) -> Vec<UdpLatencyBucket> {
+        let mut buckets = Vec::new();
+        for second in 0..duration_seconds {
+            for format in &self.formats {
+                let samples = self
+                    .latency_buckets
+                    .remove(&(receive_audio_format_order(*format), second))
+                    .unwrap_or_default();
+                let received_epochs = samples.latencies_ns.len() as u64;
+                let expected_epochs = 1_000 / 5;
+                buckets.push(UdpLatencyBucket {
+                    format: *format,
+                    start_offset_ms: second.saturating_mul(1_000),
+                    start_unix_ns: session_id.saturating_add(second.saturating_mul(1_000_000_000)),
+                    bucket_ms: 1_000,
+                    expected_epochs,
+                    received_epochs,
+                    missing_epochs: expected_epochs.saturating_sub(received_epochs),
+                    erasure_epochs: samples.erasure_epochs,
+                    discontinuity_epochs: samples.discontinuity_epochs,
+                    deadline_misses: samples.deadline_misses,
+                    render_ready_latency_ms: percentiles_ms(samples.latencies_ns),
+                });
+            }
+        }
+        buckets
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -393,6 +711,7 @@ struct HlsReceiveReport {
     tls_certificate_verified: bool,
     persistent_connection: bool,
     connection_setup_ms: Option<f64>,
+    connection_reconnects: u64,
     path_prefix: String,
     stream_id: u64,
     session_id: u64,
@@ -433,6 +752,7 @@ struct HlsReceiveReport {
     first_part_to_response_latency_ms: Percentiles,
     final_part_to_response_latency_ms: Percentiles,
     estimated_render_latency_ms: Percentiles,
+    latency_time_series: Vec<HlsLatencyBucket>,
 }
 
 #[derive(Debug, Serialize)]
@@ -530,12 +850,216 @@ struct Percentiles {
     max: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct UdpLatencyBucket {
+    format: ReceiveAudioFormat,
+    start_offset_ms: u64,
+    start_unix_ns: u64,
+    bucket_ms: u64,
+    expected_epochs: u64,
+    received_epochs: u64,
+    missing_epochs: u64,
+    erasure_epochs: u64,
+    discontinuity_epochs: u64,
+    deadline_misses: u64,
+    render_ready_latency_ms: Percentiles,
+}
+
+#[derive(Debug, Default)]
+struct UdpLatencyBucketSamples {
+    latencies_ns: Vec<u64>,
+    erasure_epochs: u64,
+    discontinuity_epochs: u64,
+    deadline_misses: u64,
+}
+
+impl UdpLatencyBucketSamples {
+    fn record(
+        &mut self,
+        latency_ns: u64,
+        deadline_missed: bool,
+        erasure: bool,
+        discontinuity: bool,
+    ) {
+        self.latencies_ns.push(latency_ns);
+        self.deadline_misses = self
+            .deadline_misses
+            .saturating_add(u64::from(deadline_missed));
+        self.erasure_epochs = self.erasure_epochs.saturating_add(u64::from(erasure));
+        self.discontinuity_epochs = self
+            .discontinuity_epochs
+            .saturating_add(u64::from(discontinuity));
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HlsLatencyBucket {
+    start_offset_ms: u64,
+    start_unix_ns: u64,
+    bucket_ms: u64,
+    expected_parts: u64,
+    received_parts: u64,
+    missing_parts: u64,
+    deadline_misses: u64,
+    availability_latency_ms: Percentiles,
+    publication_to_cache_latency_ms: Percentiles,
+    cache_to_client_latency_ms: Percentiles,
+    estimated_render_latency_ms: Percentiles,
+}
+
+#[derive(Debug, Default)]
+struct HlsLatencyBucketSamples {
+    availability_ns: Vec<u64>,
+    publication_to_cache_ns: Vec<u64>,
+    cache_to_client_ns: Vec<u64>,
+    render_ns: Vec<u64>,
+    deadline_misses: u64,
+}
+
+#[derive(Debug, Default)]
+struct HlsLatencyTimeSeries {
+    buckets: BTreeMap<u64, HlsLatencyBucketSamples>,
+}
+
+impl HlsLatencyTimeSeries {
+    fn record_part(
+        &mut self,
+        pts_ms: u64,
+        availability_ns: u64,
+        render_ns: u64,
+        deadline_missed: bool,
+    ) {
+        let bucket = self.buckets.entry(pts_ms / 1_000).or_default();
+        bucket.availability_ns.push(availability_ns);
+        bucket.render_ns.push(render_ns);
+        bucket.deadline_misses = bucket
+            .deadline_misses
+            .saturating_add(u64::from(deadline_missed));
+    }
+
+    fn record_cache(&mut self, pts_ms: u64, publication_to_cache_ns: u64, cache_to_client_ns: u64) {
+        let bucket = self.buckets.entry(pts_ms / 1_000).or_default();
+        bucket.publication_to_cache_ns.push(publication_to_cache_ns);
+        bucket.cache_to_client_ns.push(cache_to_client_ns);
+    }
+
+    fn finish(
+        mut self,
+        session_id: u64,
+        start_offset_ms: u64,
+        end_offset_ms: u64,
+        part_ms: u64,
+    ) -> Vec<HlsLatencyBucket> {
+        let mut output = Vec::new();
+        let mut bucket_start_ms = start_offset_ms / 1_000 * 1_000;
+        while bucket_start_ms < end_offset_ms {
+            let range_start_ms = bucket_start_ms.max(start_offset_ms);
+            let range_end_ms = bucket_start_ms.saturating_add(1_000).min(end_offset_ms);
+            let expected_parts = range_end_ms
+                .saturating_sub(range_start_ms)
+                .saturating_div(part_ms);
+            let samples = self
+                .buckets
+                .remove(&(bucket_start_ms / 1_000))
+                .unwrap_or_default();
+            let received_parts = samples.availability_ns.len() as u64;
+            output.push(HlsLatencyBucket {
+                start_offset_ms: bucket_start_ms,
+                start_unix_ns: session_id.saturating_add(bucket_start_ms.saturating_mul(1_000_000)),
+                bucket_ms: 1_000,
+                expected_parts,
+                received_parts,
+                missing_parts: expected_parts.saturating_sub(received_parts),
+                deadline_misses: samples.deadline_misses,
+                availability_latency_ms: percentiles_ms(samples.availability_ns),
+                publication_to_cache_latency_ms: percentiles_ms(samples.publication_to_cache_ns),
+                cache_to_client_latency_ms: percentiles_ms(samples.cache_to_client_ns),
+                estimated_render_latency_ms: percentiles_ms(samples.render_ns),
+            });
+            bucket_start_ms = bucket_start_ms.saturating_add(1_000);
+        }
+        output
+    }
+}
+
+fn receive_audio_format_order(format: ReceiveAudioFormat) -> u8 {
+    match format {
+        ReceiveAudioFormat::Opus => 0,
+        ReceiveAudioFormat::Flac => 1,
+        ReceiveAudioFormat::Pcm => 2,
+    }
+}
+
 struct PartCoverage {
     start_sequence: u64,
     part_ms: u64,
     expected_parts: u64,
     words: Vec<u64>,
     received_parts: u64,
+}
+
+struct MediaTimelineCoverage {
+    start_sequence: u64,
+    expected_parts: u64,
+    start_offset_ms: u64,
+    end_offset_ms: u64,
+    parts: BTreeMap<u64, (u64, u64)>,
+}
+
+impl MediaTimelineCoverage {
+    fn new(
+        start_sequence: u64,
+        expected_parts: u64,
+        start_offset_ms: u64,
+        end_offset_ms: u64,
+    ) -> Self {
+        Self {
+            start_sequence,
+            expected_parts,
+            start_offset_ms,
+            end_offset_ms,
+            parts: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, sequence: u64, pts_ms: u64, duration_ms: u64) {
+        self.parts.entry(sequence).or_insert((pts_ms, duration_ms));
+    }
+
+    fn discontinuities(&self) -> u64 {
+        let mut previous: Option<(u64, u64, u64)> = None;
+        let mut discontinuities = 0_u64;
+        for (&sequence, &(pts_ms, duration_ms)) in &self.parts {
+            if let Some((previous_sequence, previous_pts_ms, previous_duration_ms)) = previous {
+                if sequence == previous_sequence + 1
+                    && pts_ms != previous_pts_ms.saturating_add(previous_duration_ms)
+                {
+                    discontinuities = discontinuities.saturating_add(1);
+                }
+            }
+            previous = Some((sequence, pts_ms, duration_ms));
+        }
+
+        if self.parts.len() as u64 == self.expected_parts {
+            let first = self.parts.get(&self.start_sequence);
+            let last_sequence = self
+                .start_sequence
+                .saturating_add(self.expected_parts.saturating_sub(1));
+            let last = self.parts.get(&last_sequence);
+            if first.is_none_or(|(pts_ms, _)| pts_ms.abs_diff(self.start_offset_ms) > 5) {
+                discontinuities = discontinuities.saturating_add(1);
+            }
+            if last.is_none_or(|(pts_ms, duration_ms)| {
+                pts_ms
+                    .saturating_add(*duration_ms)
+                    .abs_diff(self.end_offset_ms)
+                    > 5
+            }) {
+                discontinuities = discontinuities.saturating_add(1);
+            }
+        }
+        discontinuities
+    }
 }
 
 impl PartCoverage {
@@ -585,6 +1109,10 @@ impl PartCoverage {
             .is_some_and(|value| value & (1_u64 << (relative % 64)) != 0)
     }
 
+    fn first_missing_relative(&self) -> Option<u64> {
+        (0..self.expected_parts).find(|relative| !self.contains_relative(*relative))
+    }
+
     fn first_pts_ms(&self) -> Option<u64> {
         (0..self.expected_parts)
             .find(|relative| self.contains_relative(*relative))
@@ -620,6 +1148,13 @@ impl PartCoverage {
         }
         gaps
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HlsPlaylistObjectWindow {
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+    next_sequence: u64,
 }
 
 struct BoundedLatencySamples {
@@ -659,6 +1194,19 @@ struct WebTransportReceiveOptions<'a> {
     tls_ca: Option<&'a Path>,
     session_id: u64,
     group_id: u16,
+    formats: &'a [ReceiveAudioFormat],
+    duration_seconds: u64,
+    deadline_ms: u64,
+    tail_seconds: u64,
+}
+
+struct UdpReceiveOptions<'a> {
+    relay: SocketAddr,
+    bind: Option<SocketAddr>,
+    session_id: u64,
+    group_id: u16,
+    group_count: u16,
+    formats: &'a [ReceiveAudioFormat],
     duration_seconds: u64,
     deadline_ms: u64,
     tail_seconds: u64,
@@ -797,6 +1345,14 @@ impl SoundKitOpusConsumer {
             self.decode_part(&bytes)?;
             self.next_sequence = self.next_sequence.saturating_add(1);
         }
+        Ok(())
+    }
+
+    fn rebase_before_media(&mut self, first_sequence: u64) -> Result<()> {
+        if self.soundkit_v2_packets > 0 || !self.pending_parts.is_empty() {
+            bail!("cannot change the SoundKit object baseline after media");
+        }
+        self.next_sequence = first_sequence;
         Ok(())
     }
 
@@ -1152,22 +1708,24 @@ async fn main() -> Result<()> {
             channels,
             group_channels,
             signal,
+            pcm_s24le_file,
             group_id,
             repair_percent,
             min_repair_symbols,
         } => {
-            let report = send(
+            let report = send(SendOptions {
                 target,
                 duration_seconds,
                 session_id,
-                payload,
+                payload_kind: payload,
                 channels,
                 group_channels,
                 signal,
+                pcm_s24le_file: pcm_s24le_file.as_deref(),
                 group_id,
                 repair_percent,
                 min_repair_symbols,
-            )
+            })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -1176,21 +1734,25 @@ async fn main() -> Result<()> {
             bind,
             session_id,
             group_id,
+            group_count,
+            formats,
             duration_seconds,
             deadline_ms,
             tail_seconds,
         } => {
             let report = timeout(
                 receive_command_timeout(session_id, duration_seconds, tail_seconds)?,
-                receive_udp(
+                receive_udp(UdpReceiveOptions {
                     relay,
                     bind,
                     session_id,
                     group_id,
+                    group_count,
+                    formats: &formats,
                     duration_seconds,
                     deadline_ms,
                     tail_seconds,
-                ),
+                }),
             )
             .await
             .context("native UDP probe exceeded its overall deadline")??;
@@ -1202,6 +1764,7 @@ async fn main() -> Result<()> {
             tls_ca,
             session_id,
             group_id,
+            formats,
             duration_seconds,
             deadline_ms,
             tail_seconds,
@@ -1214,6 +1777,7 @@ async fn main() -> Result<()> {
                     tls_ca: tls_ca.as_deref(),
                     session_id,
                     group_id,
+                    formats: &formats,
                     duration_seconds,
                     deadline_ms,
                     tail_seconds,
@@ -1429,7 +1993,7 @@ fn h3_preload_at_ns(session_id: u64, start_offset_ms: u64) -> u64 {
     start_ns.saturating_sub(preload_lead_ns)
 }
 
-async fn send(
+struct SendOptions<'a> {
     target: SocketAddr,
     duration_seconds: u64,
     session_id: Option<u64>,
@@ -1437,17 +2001,34 @@ async fn send(
     channels: u16,
     group_channels: u16,
     signal: ProbeSignal,
+    pcm_s24le_file: Option<&'a Path>,
     group_id: u16,
     repair_percent: u32,
     min_repair_symbols: u32,
-) -> Result<SendReport> {
+}
+
+async fn send(options: SendOptions<'_>) -> Result<SendReport> {
+    let SendOptions {
+        target,
+        duration_seconds,
+        session_id,
+        payload_kind,
+        channels,
+        group_channels,
+        signal,
+        pcm_s24le_file,
+        group_id,
+        repair_percent,
+        min_repair_symbols,
+    } = options;
     if duration_seconds == 0 {
         bail!("--duration-seconds must be positive");
     }
     let group_plan = source_group_plan(group_id, channels, group_channels)?;
+    let pcm_source = PcmSource::new(signal, pcm_s24le_file, channels)?;
     let session_id = session_id.unwrap_or(now_unix_ns()?.saturating_add(1_000_000_000));
     let now_ns = now_unix_ns()?;
-    if session_id + 60_000_000_000 < now_ns {
+    if session_id.saturating_add(60_000_000_000) < now_ns {
         bail!("--session-id is too far in the past to be an origin clock");
     }
     if session_id > now_ns {
@@ -1512,12 +2093,8 @@ async fn send(
         let first_sample = epoch_id.saturating_mul(u64::from(FRAME_COUNT));
         let mut payloads = Vec::with_capacity(group_plan.len());
         for (index, group) in group_plan.iter().enumerate() {
-            let pcm = signal_s24le(
-                first_sample,
-                group.channel_start,
-                group.channel_count,
-                signal,
-            );
+            let pcm =
+                pcm_source.group_s24le(first_sample, group.channel_start, group.channel_count);
             let payload = match payload_kind {
                 ProbePayload::Flac => flac_encoders[index].encode_s24le(&pcm)?.payload,
                 ProbePayload::Pcm => pcm,
@@ -1576,10 +2153,11 @@ async fn send(
         .saturating_mul(u64::from(channels))
         .saturating_mul(3);
     Ok(SendReport {
-        schema: "needletail.aep1-48k-probe.send.v2",
+        schema: "needletail.aep1-48k-probe.send.v3",
         lane: "source",
         payload: payload_kind.as_str(),
-        signal: signal.as_str(),
+        signal: pcm_source.label(),
+        input_pcm_frames: pcm_source.input_frames(),
         session_id,
         group_id,
         group_count: group_plan.len() as u16,
@@ -1646,15 +2224,31 @@ fn source_group_plan(
     Ok(groups)
 }
 
-async fn receive_udp(
-    relay: SocketAddr,
-    bind: Option<SocketAddr>,
-    session_id: u64,
-    group_id: u16,
-    duration_seconds: u64,
-    deadline_ms: u64,
-    tail_seconds: u64,
-) -> Result<ReceiveReport> {
+fn receive_group_ids(base_group_id: u16, group_count: u16) -> Result<Vec<u16>> {
+    if group_count == 0 {
+        bail!("--group-count must be positive");
+    }
+    if u32::from(base_group_id) + u32::from(group_count) > u32::from(u16::MAX) + 1 {
+        bail!("--group-id plus --group-count exceeds the u16 group-id range");
+    }
+    Ok((0..group_count)
+        .map(|index| base_group_id + index)
+        .collect())
+}
+
+async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput> {
+    let UdpReceiveOptions {
+        relay,
+        bind,
+        session_id,
+        group_id,
+        group_count,
+        formats,
+        duration_seconds,
+        deadline_ms,
+        tail_seconds,
+    } = options;
+    let group_ids = receive_group_ids(group_id, group_count)?;
     let default_bind = if relay.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -1678,10 +2272,14 @@ async fn receive_udp(
         session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
     let refresh = Duration::from_secs(5);
     let mut next_refresh = TokioInstant::now() + refresh;
-    let mut latencies_ns = Vec::new();
-    let mut epochs = HashSet::new();
-    let mut deadline_misses = 0_u64;
+    let mut format_states = group_ids
+        .iter()
+        .copied()
+        .map(|group_id| Ok((group_id, ReceiveFormatState::new(formats)?)))
+        .collect::<Result<Vec<_>>>()?;
     let mut wire_bytes = 0_u64;
+    let mut source_datagrams_received = 0_u64;
+    let mut repair_datagrams_received = 0_u64;
 
     while now_unix_ns()? < stop_ns {
         let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
@@ -1692,23 +2290,25 @@ async fn receive_udp(
                     Ok(payload) => payload,
                     Err(_) => continue,
                 };
+                if let Ok(identity) = inspect_multichannel_audio_datagram(payload) {
+                    if identity.source_index.is_some() {
+                        source_datagrams_received = source_datagrams_received.saturating_add(1);
+                    } else {
+                        repair_datagrams_received = repair_datagrams_received.saturating_add(1);
+                    }
+                }
                 wire_bytes = wire_bytes.saturating_add(len as u64);
                 let outcome = receiver.push_datagram(payload)?;
                 let arrival_ns = now_unix_ns()?;
                 for group in outcome.completed_groups {
-                    if group.session_id != session_id || group.group_id != group_id {
+                    if group.session_id != session_id {
                         continue;
                     }
-                    let capture_ns = session_id.saturating_add(
-                        group.pts_samples.saturating_mul(1_000_000_000)
-                            / u64::from(group.sample_rate),
-                    );
-                    let latency_ns = arrival_ns.saturating_sub(capture_ns);
-                    if latency_ns > deadline_ms.saturating_mul(1_000_000) {
-                        deadline_misses = deadline_misses.saturating_add(1);
-                    }
-                    if epochs.insert(group.epoch_id) {
-                        latencies_ns.push(latency_ns);
+                    if let Some((_, format_state)) = format_states
+                        .iter_mut()
+                        .find(|(observed_group_id, _)| *observed_group_id == group.group_id)
+                    {
+                        format_state.observe(&group, arrival_ns, deadline_ms);
                     }
                 }
             }
@@ -1722,28 +2322,120 @@ async fn receive_udp(
     }
 
     let stats = receiver.stats();
-    let expected_epochs = duration_seconds.saturating_mul(1_000) / 5;
-    let latency_ms = percentiles_ms(latencies_ns);
-    Ok(ReceiveReport {
-        schema: "needletail.aep1-48k-probe.receive.v1",
+    let has_shared_transport_envelope = group_count > 1;
+    let reports = format_states
+        .into_iter()
+        .map(|(group_id, mut format_state)| {
+            let selected_formats = format_state.formats.len() as u64;
+            let expected_epochs = duration_seconds
+                .saturating_mul(1_000)
+                .saturating_div(5)
+                .saturating_mul(selected_formats);
+            let expected_pcm_frames = duration_seconds
+                .saturating_mul(u64::from(SAMPLE_RATE))
+                .saturating_mul(selected_formats);
+            let received_epochs = format_state.selected_epoch_count();
+            let latency_ms = percentiles_ms(std::mem::take(&mut format_state.latencies_ns));
+            let latency_time_series =
+                format_state.finish_latency_time_series(session_id, duration_seconds);
+            ReceiveReport {
+                schema: "needletail.aep1-48k-probe.receive.v2",
+                lane: "native_udp_fec",
+                session_id,
+                group_id,
+                formats: format_state.formats,
+                sample_rate: SAMPLE_RATE,
+                duration_seconds,
+                expected_epochs,
+                received_epochs,
+                missing_epochs: expected_epochs.saturating_sub(received_epochs),
+                deadline_ms,
+                deadline_misses: format_state.deadline_misses,
+                transport_counter_scope: if has_shared_transport_envelope {
+                    "multigroup_envelope"
+                } else {
+                    "report"
+                },
+                datagrams_received: if has_shared_transport_envelope {
+                    0
+                } else {
+                    stats.datagrams_received
+                },
+                source_datagrams_received: if has_shared_transport_envelope {
+                    0
+                } else {
+                    source_datagrams_received
+                },
+                repair_datagrams_received: if has_shared_transport_envelope {
+                    0
+                } else {
+                    repair_datagrams_received
+                },
+                systematic_shards_received: if has_shared_transport_envelope {
+                    0
+                } else {
+                    stats.systematic_shards_received
+                },
+                raptorq_shards_recovered: if has_shared_transport_envelope {
+                    0
+                } else {
+                    stats.raptorq_shards_recovered
+                },
+                selected_raptorq_fragments_recovered: format_state
+                    .selected_raptorq_fragments_recovered,
+                opus_epochs: format_state.opus_epochs.len() as u64,
+                flac_epochs: format_state.flac_epochs.len() as u64,
+                pcm_fallback_epochs: format_state.pcm_epochs.len() as u64,
+                erasure_epochs: format_state.erasure_epochs,
+                unexpected_payload_epochs: 0,
+                discontinuity_epochs: format_state.discontinuity_epochs,
+                expected_pcm_frames,
+                received_pcm_frames: format_state.received_pcm_frames,
+                missing_pcm_frames: expected_pcm_frames
+                    .saturating_sub(format_state.received_pcm_frames),
+                duplicate_or_late_epochs: format_state.duplicate_or_late_epochs,
+                transport_duplicate_or_late_epochs: if has_shared_transport_envelope {
+                    0
+                } else {
+                    stats.duplicate_or_late_epochs
+                },
+                wire_bytes: if has_shared_transport_envelope {
+                    0
+                } else {
+                    wire_bytes
+                },
+                render_ready_latency_ms: latency_ms.clone(),
+                latency_ms,
+                latency_time_series,
+            }
+        })
+        .collect::<Vec<_>>();
+    if group_count == 1 {
+        return Ok(UdpReceiveOutput::Single(Box::new(
+            reports
+                .into_iter()
+                .next()
+                .context("single-group UDP report is missing")?,
+        )));
+    }
+    Ok(UdpReceiveOutput::Multiple(MultiGroupReceiveReport {
+        schema: "needletail.aep1-48k-probe.receive-multigroup.v2",
         lane: "native_udp_fec",
         session_id,
         group_id,
-        sample_rate: SAMPLE_RATE,
-        duration_seconds,
-        expected_epochs,
-        received_epochs: epochs.len() as u64,
-        missing_epochs: expected_epochs.saturating_sub(epochs.len() as u64),
-        deadline_ms,
-        deadline_misses,
-        datagrams_received: stats.datagrams_received,
-        systematic_shards_received: stats.systematic_shards_received,
-        raptorq_shards_recovered: stats.raptorq_shards_recovered,
-        duplicate_or_late_epochs: stats.duplicate_or_late_epochs,
-        wire_bytes,
-        render_ready_latency_ms: latency_ms.clone(),
-        latency_ms,
-    })
+        group_count,
+        group_ids,
+        shared_transport: UdpTransportCounters {
+            datagrams_received: stats.datagrams_received,
+            source_datagrams_received,
+            repair_datagrams_received,
+            systematic_shards_received: stats.systematic_shards_received,
+            raptorq_shards_recovered: stats.raptorq_shards_recovered,
+            transport_duplicate_or_late_epochs: stats.duplicate_or_late_epochs,
+            wire_bytes,
+        },
+        groups: reports,
+    }))
 }
 
 async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result<ReceiveReport> {
@@ -1753,6 +2445,7 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
         tls_ca,
         session_id,
         group_id,
+        formats,
         duration_seconds,
         deadline_ms,
         tail_seconds,
@@ -1808,11 +2501,11 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
     let stop_ns =
         session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
-    let media_end_ns = session_id.saturating_add(duration_seconds * 1_000_000_000);
-    let mut latencies_ns = Vec::new();
-    let mut epochs = HashSet::new();
-    let mut deadline_misses = 0_u64;
+    let media_end_ns = session_id.saturating_add(duration_seconds.saturating_mul(1_000_000_000));
+    let mut format_state = ReceiveFormatState::new(formats)?;
     let mut wire_bytes = 0_u64;
+    let mut source_datagrams_received = 0_u64;
+    let mut repair_datagrams_received = 0_u64;
 
     while now_unix_ns()? < stop_ns {
         let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
@@ -1840,6 +2533,13 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
             Ok(payload) => payload,
             Err(_) => continue,
         };
+        if let Ok(identity) = inspect_multichannel_audio_datagram(payload) {
+            if identity.source_index.is_some() {
+                source_datagrams_received = source_datagrams_received.saturating_add(1);
+            } else {
+                repair_datagrams_received = repair_datagrams_received.saturating_add(1);
+            }
+        }
         wire_bytes = wire_bytes.saturating_add(wire.len() as u64);
         let outcome = receiver.push_datagram(payload)?;
         let arrival_ns = now_unix_ns()?;
@@ -1847,42 +2547,57 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
             if group.session_id != session_id || group.group_id != group_id {
                 continue;
             }
-            let capture_ns = session_id.saturating_add(
-                group.pts_samples.saturating_mul(1_000_000_000) / u64::from(group.sample_rate),
-            );
-            let latency_ns = arrival_ns.saturating_sub(capture_ns);
-            if latency_ns > deadline_ms.saturating_mul(1_000_000) {
-                deadline_misses = deadline_misses.saturating_add(1);
-            }
-            if epochs.insert(group.epoch_id) {
-                latencies_ns.push(latency_ns);
-            }
+            format_state.observe(&group, arrival_ns, deadline_ms);
         }
     }
     endpoint.close(0_u32.into(), b"probe complete");
 
     let stats = receiver.stats();
-    let expected_epochs = duration_seconds.saturating_mul(1_000) / 5;
-    let latency_ms = percentiles_ms(latencies_ns);
+    let selected_formats = format_state.formats.len() as u64;
+    let expected_epochs = duration_seconds
+        .saturating_mul(1_000)
+        .saturating_div(5)
+        .saturating_mul(selected_formats);
+    let expected_pcm_frames = duration_seconds
+        .saturating_mul(u64::from(SAMPLE_RATE))
+        .saturating_mul(selected_formats);
+    let received_epochs = format_state.selected_epoch_count();
+    let latency_ms = percentiles_ms(std::mem::take(&mut format_state.latencies_ns));
     Ok(ReceiveReport {
         schema: "needletail.aep1-48k-probe.receive.v1",
         lane: "webtransport",
         session_id,
         group_id,
+        formats: format_state.formats,
         sample_rate: SAMPLE_RATE,
         duration_seconds,
         expected_epochs,
-        received_epochs: epochs.len() as u64,
-        missing_epochs: expected_epochs.saturating_sub(epochs.len() as u64),
+        received_epochs,
+        missing_epochs: expected_epochs.saturating_sub(received_epochs),
         deadline_ms,
-        deadline_misses,
+        deadline_misses: format_state.deadline_misses,
+        transport_counter_scope: "report",
         datagrams_received: stats.datagrams_received,
+        source_datagrams_received,
+        repair_datagrams_received,
         systematic_shards_received: stats.systematic_shards_received,
         raptorq_shards_recovered: stats.raptorq_shards_recovered,
-        duplicate_or_late_epochs: stats.duplicate_or_late_epochs,
+        selected_raptorq_fragments_recovered: format_state.selected_raptorq_fragments_recovered,
+        opus_epochs: format_state.opus_epochs.len() as u64,
+        flac_epochs: format_state.flac_epochs.len() as u64,
+        pcm_fallback_epochs: format_state.pcm_epochs.len() as u64,
+        erasure_epochs: format_state.erasure_epochs,
+        unexpected_payload_epochs: 0,
+        discontinuity_epochs: format_state.discontinuity_epochs,
+        expected_pcm_frames,
+        received_pcm_frames: format_state.received_pcm_frames,
+        missing_pcm_frames: expected_pcm_frames.saturating_sub(format_state.received_pcm_frames),
+        duplicate_or_late_epochs: format_state.duplicate_or_late_epochs,
+        transport_duplicate_or_late_epochs: stats.duplicate_or_late_epochs,
         wire_bytes,
         render_ready_latency_ms: latency_ms.clone(),
         latency_ms,
+        latency_time_series: Vec::new(),
     })
 }
 
@@ -1943,16 +2658,29 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     {
         bail!("--expected-pcm-channels must be positive for PCM LL-HLS");
     }
-    // Edge `from` is inclusive, while direct-origin part IDs start at one.
-    // Begin at the requested PTS without draining the retained prefix.
-    let initial_from_sequence = start_offset_ms.saturating_div(part_ms);
+    if soundkit_key_file.is_some() && expected_audio_codec != HlsAudioCodec::SoundkitOpus {
+        bail!("--soundkit-key-file requires --expected-audio-codec soundkit-opus");
+    }
+    if soundkit_key_file.is_none()
+        && (decoded_pcm_output.is_some() || reference_pcm_s16le.is_some())
+    {
+        bail!("consumer decode outputs require --soundkit-key-file");
+    }
+    let initial_pts_sequence = start_offset_ms.saturating_div(part_ms);
     let expected_parts = end_offset_ms.saturating_sub(start_offset_ms) / part_ms;
     let mut after_sequence: Option<u64> = None;
-    let mut part_coverage = PartCoverage::new(initial_from_sequence, expected_parts, part_ms)?;
+    let mut part_coverage = PartCoverage::new(initial_pts_sequence, expected_parts, part_ms)?;
+    let mut media_timeline = MediaTimelineCoverage::new(
+        initial_pts_sequence,
+        expected_parts,
+        start_offset_ms,
+        end_offset_ms,
+    );
     let mut availability_latencies_ns = BoundedLatencySamples::new();
     let mut publication_to_cache_latencies_ns = BoundedLatencySamples::new();
     let mut cache_to_client_latencies_ns = BoundedLatencySamples::new();
     let mut render_latencies_ns = BoundedLatencySamples::new();
+    let mut latency_time_series = HlsLatencyTimeSeries::default();
     let mut first_part_to_response_latencies_ns = BoundedLatencySamples::new();
     let mut final_part_to_response_latencies_ns = BoundedLatencySamples::new();
     let mut media_responses = 0_u64;
@@ -1966,28 +2694,6 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     let mut opaque_flac_frame_mismatches = 0_u64;
     let mut opus_media_parts_verified = 0_u64;
     let mut opus_media_packet_mismatches = 0_u64;
-    let mut opus_consumer = match soundkit_key_file {
-        Some(key_file) => {
-            if expected_audio_codec != HlsAudioCodec::SoundkitOpus {
-                bail!("--soundkit-key-file requires --expected-audio-codec soundkit-opus");
-            }
-            Some(SoundKitOpusConsumer::from_key_file(
-                key_file,
-                initial_from_sequence,
-                decoded_pcm_output,
-                reference_pcm_s16le,
-                reference_leading_silence_frames,
-                start_offset_ms,
-                end_offset_ms.saturating_sub(start_offset_ms),
-            )?)
-        }
-        None => {
-            if decoded_pcm_output.is_some() || reference_pcm_s16le.is_some() {
-                bail!("consumer decode outputs require --soundkit-key-file");
-            }
-            None
-        }
-    };
     if let Some(dir) = raw_part_output_dir {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create raw LL-HLS part output dir {}", dir.display()))?;
@@ -2012,6 +2718,51 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         HlsTransport::Http1 => None,
     };
     let connection_setup_ms = h3_client.as_ref().map(ActiveH3Client::connection_setup_ms);
+    let mut observed_empty_playlist = false;
+    let (mut object_sequence_baseline, mut allow_initial_object_rebase) = loop {
+        let playlist = timeout(
+            HLS_CONTROL_REQUEST_TIMEOUT,
+            hls_https_get(
+                &mut h3_client,
+                edge,
+                server_name,
+                tls_ca,
+                &hls_path(path_prefix, stream_id, "stream.m3u8"),
+            ),
+        )
+        .await
+        .context("initial LL-HLS playlist request exceeded two seconds")??;
+        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
+        if playlist.status == 200 {
+            playlist_has_ll_hls_tags |=
+                playlist_matches_format(&playlist.body, expected_audio_codec);
+            if let Some(window) = hls_playlist_object_window(&playlist.body)? {
+                break (
+                    initial_hls_object_sequence(window, observed_empty_playlist),
+                    window.first_sequence.is_none(),
+                );
+            }
+        }
+        observed_empty_playlist = true;
+        if now_unix_ns()? >= stop_ns {
+            bail!("LL-HLS playlist never advertised a part object sequence");
+        }
+        sleep(Duration::from_millis(part_ms.clamp(1, 25))).await;
+    };
+    let mut object_sequence_started = false;
+    let mut opus_consumer = soundkit_key_file
+        .map(|key_file| {
+            SoundKitOpusConsumer::from_key_file(
+                key_file,
+                object_sequence_baseline,
+                decoded_pcm_output,
+                reference_pcm_s16le,
+                reference_leading_silence_frames,
+                start_offset_ms,
+                end_offset_ms.saturating_sub(start_offset_ms),
+            )
+        })
+        .transpose()?;
 
     if parts_per_response > 1 {
         if expected_parts % parts_per_response != 0 {
@@ -2023,7 +2774,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     hls_path(
                         path_prefix,
                         stream_id,
-                        &format!("tail?from={initial_from_sequence}&parts={parts_per_response}"),
+                        &format!("tail?from={object_sequence_baseline}&parts={parts_per_response}"),
                     )
                 },
                 |sequence| {
@@ -2055,7 +2806,13 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     let continuation_sequence = header_u64("x-sequence")?;
                     let expected_start = after_sequence
                         .and_then(|sequence| sequence.checked_add(1))
-                        .unwrap_or(initial_from_sequence);
+                        .unwrap_or({
+                            if allow_initial_object_rebase {
+                                start_sequence
+                            } else {
+                                object_sequence_baseline
+                            }
+                        });
                     let expected_end = start_sequence
                         .checked_add(parts_per_response.saturating_sub(1))
                         .context("aggregated LL-HLS sequence range overflow")?;
@@ -2075,17 +2832,35 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             parts.len()
                         );
                     }
+                    if !object_sequence_started && start_sequence != object_sequence_baseline {
+                        object_sequence_baseline = start_sequence;
+                        if let Some(consumer) = opus_consumer.as_mut() {
+                            consumer.rebase_before_media(start_sequence)?;
+                        }
+                    }
+                    allow_initial_object_rebase = false;
+                    object_sequence_started = true;
                     let arrival_ns = now_unix_ns()?;
-                    let first_capture_ns = session_id.saturating_add(
-                        start_sequence
-                            .saturating_mul(part_ms)
-                            .saturating_mul(1_000_000),
-                    );
-                    let final_capture_ns = session_id.saturating_add(
-                        end_sequence
-                            .saturating_mul(part_ms)
-                            .saturating_mul(1_000_000),
-                    );
+                    let first_pts_ms = media_part_pts_ms(
+                        expected_audio_codec,
+                        &[],
+                        start_sequence,
+                        object_sequence_baseline,
+                        start_offset_ms,
+                        part_ms,
+                    )?;
+                    let final_pts_ms = media_part_pts_ms(
+                        expected_audio_codec,
+                        &[],
+                        end_sequence,
+                        object_sequence_baseline,
+                        start_offset_ms,
+                        part_ms,
+                    )?;
+                    let first_capture_ns =
+                        session_id.saturating_add(first_pts_ms.saturating_mul(1_000_000));
+                    let final_capture_ns =
+                        session_id.saturating_add(final_pts_ms.saturating_mul(1_000_000));
                     if arrival_ns >= first_capture_ns {
                         first_part_to_response_latencies_ns.record(arrival_ns - first_capture_ns);
                     }
@@ -2095,19 +2870,38 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
 
                     for (offset, part) in parts.into_iter().enumerate() {
                         let sequence = start_sequence.saturating_add(offset as u64);
-                        let pts_ms = sequence.saturating_mul(part_ms);
-                        if pts_ms < start_offset_ms || pts_ms >= end_offset_ms {
+                        let pts_ms = media_part_pts_ms(
+                            expected_audio_codec,
+                            part,
+                            sequence,
+                            object_sequence_baseline,
+                            start_offset_ms,
+                            part_ms,
+                        )?;
+                        let coverage_pts_ms = nominal_hls_object_pts_ms(
+                            sequence,
+                            object_sequence_baseline,
+                            start_offset_ms,
+                            part_ms,
+                        )?;
+                        if coverage_pts_ms < start_offset_ms || coverage_pts_ms >= end_offset_ms {
                             continue;
                         }
-                        if !part_coverage.insert_pts(pts_ms) {
+                        if !part_coverage.insert_pts(coverage_pts_ms) {
                             bail!(
-                                "aggregated LL-HLS returned duplicate or invalid PTS {pts_ms} ms"
+                                "aggregated LL-HLS returned duplicate or invalid object {sequence}"
                             );
                         }
+                        media_timeline.insert(
+                            sequence,
+                            pts_ms,
+                            media_part_duration_ms(expected_audio_codec, part, part_ms)?,
+                        );
                         let capture_ns =
                             session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
                         let latency_ns = arrival_ns.saturating_sub(capture_ns);
-                        if latency_ns > deadline_ms.saturating_mul(1_000_000) {
+                        let deadline_missed = latency_ns > deadline_ms.saturating_mul(1_000_000);
+                        if deadline_missed {
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
                         availability_latencies_ns.record(latency_ns);
@@ -2122,8 +2916,14 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         if let Some(consumer) = opus_consumer.as_mut() {
                             consumer.push_part(sequence, part)?;
                         }
-                        render_latencies_ns.record(
-                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
+                        let render_latency_ns =
+                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000));
+                        render_latencies_ns.record(render_latency_ns);
+                        latency_time_series.record_part(
+                            coverage_pts_ms,
+                            latency_ns,
+                            render_latency_ns,
+                            deadline_missed,
                         );
                     }
                     if let Some((publication_to_cache_ns, cache_to_client_ns)) =
@@ -2131,6 +2931,11 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     {
                         publication_to_cache_latencies_ns.record(publication_to_cache_ns);
                         cache_to_client_latencies_ns.record(cache_to_client_ns);
+                        latency_time_series.record_cache(
+                            final_pts_ms,
+                            publication_to_cache_ns,
+                            cache_to_client_ns,
+                        );
                     }
                     after_sequence = Some(end_sequence);
                 }
@@ -2139,10 +2944,10 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             }
         }
     } else if !matches!(transport, HlsTransport::H3) || direct_part_route {
-        while now_unix_ns()? < stop_ns {
-            let requested_sequence = after_sequence
-                .unwrap_or(initial_from_sequence)
-                .saturating_add(1);
+        while now_unix_ns()? < stop_ns && part_coverage.received_parts < expected_parts {
+            let requested_sequence = after_sequence.map_or(object_sequence_baseline, |sequence| {
+                sequence.saturating_add(1)
+            });
             let path = if direct_part_route {
                 hls_path(
                     path_prefix,
@@ -2158,7 +2963,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         hls_path(
                             path_prefix,
                             stream_id,
-                            &format!("tail?from={initial_from_sequence}"),
+                            &format!("tail?from={object_sequence_baseline}"),
                         )
                     },
                     |sequence| hls_path(path_prefix, stream_id, &format!("tail?after={sequence}")),
@@ -2179,23 +2984,54 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             .parse::<u64>()
                             .context("LL-HLS tail returned an invalid x-sequence")?
                     };
+                    if !object_sequence_started && sequence != object_sequence_baseline {
+                        if !allow_initial_object_rebase {
+                            bail!(
+                                "LL-HLS tail started at object {sequence}, expected playlist object {object_sequence_baseline}"
+                            );
+                        }
+                        object_sequence_baseline = sequence;
+                        if let Some(consumer) = opus_consumer.as_mut() {
+                            consumer.rebase_before_media(sequence)?;
+                        }
+                    }
+                    allow_initial_object_rebase = false;
+                    object_sequence_started = true;
                     after_sequence = Some(sequence);
-                    let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
-                        && soundkit_opus_part_is_valid(&response.body, part_ms);
+                    let opus_valid =
+                        opus_media_part_is_valid(expected_audio_codec, &response.body, part_ms);
                     let opaque_flac_valid = expected_audio_codec == HlsAudioCodec::OpaqueFlac
                         && opaque_flac_part_is_valid(&response.body);
-                    let pts_ms =
-                        media_part_pts_ms(expected_audio_codec, &response.body, sequence, part_ms)?;
+                    let pts_ms = media_part_pts_ms(
+                        expected_audio_codec,
+                        &response.body,
+                        sequence,
+                        object_sequence_baseline,
+                        start_offset_ms,
+                        part_ms,
+                    )?;
+                    let coverage_pts_ms = nominal_hls_object_pts_ms(
+                        sequence,
+                        object_sequence_baseline,
+                        start_offset_ms,
+                        part_ms,
+                    )?;
                     let arrival_ns = now_unix_ns()?;
                     if arrival_ns >= session_id
-                        && pts_ms >= start_offset_ms
-                        && pts_ms < end_offset_ms
-                        && part_coverage.insert_pts(pts_ms)
+                        && coverage_pts_ms >= start_offset_ms
+                        && coverage_pts_ms < end_offset_ms
+                        && part_coverage.insert_pts(coverage_pts_ms)
                     {
+                        media_timeline.insert(
+                            sequence,
+                            pts_ms,
+                            media_part_duration_ms(expected_audio_codec, &response.body, part_ms)?,
+                        );
                         let capture_ns =
                             session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
                         let latency_ns = arrival_ns.saturating_sub(capture_ns);
-                        if latency_ns > deadline_ms.saturating_mul(1_000_000) {
+                        let deadline_missed = latency_ns > deadline_ms.saturating_mul(1_000_000);
+                        if deadline_missed {
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
                         availability_latencies_ns.record(latency_ns);
@@ -2216,11 +3052,13 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     pcm_media_size_mismatches.saturating_add(1);
                             }
                         }
-                        if expected_audio_codec == HlsAudioCodec::SoundkitOpus {
-                            if soundkit_valid {
+                        if let Some(opus_valid) = opus_valid {
+                            if opus_valid {
                                 opus_media_parts_verified =
                                     opus_media_parts_verified.saturating_add(1);
-                                init_audio_codec_verified = true;
+                                if expected_audio_codec == HlsAudioCodec::SoundkitOpus {
+                                    init_audio_codec_verified = true;
+                                }
                             } else {
                                 opus_media_packet_mismatches =
                                     opus_media_packet_mismatches.saturating_add(1);
@@ -2245,9 +3083,20 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         {
                             publication_to_cache_latencies_ns.record(publication_to_cache_ns);
                             cache_to_client_latencies_ns.record(cache_to_client_ns);
+                            latency_time_series.record_cache(
+                                coverage_pts_ms,
+                                publication_to_cache_ns,
+                                cache_to_client_ns,
+                            );
                         }
-                        render_latencies_ns.record(
-                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
+                        let render_latency_ns =
+                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000));
+                        render_latencies_ns.record(render_latency_ns);
+                        latency_time_series.record_part(
+                            coverage_pts_ms,
+                            latency_ns,
+                            render_latency_ns,
+                            deadline_missed,
                         );
                     }
                     if expected_audio_codec.init_marker().is_some() && init_audio_codec.is_none() {
@@ -2287,16 +3136,48 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         }
                     }
                 }
-                204 | 404 => tokio::task::yield_now().await,
+                204 | 404 => {
+                    if !object_sequence_started {
+                        let playlist = timeout(
+                            HLS_CONTROL_REQUEST_TIMEOUT,
+                            hls_https_get(
+                                &mut h3_client,
+                                edge,
+                                server_name,
+                                tls_ca,
+                                &hls_path(path_prefix, stream_id, "stream.m3u8"),
+                            ),
+                        )
+                        .await
+                        .context("LL-HLS playlist baseline refresh exceeded two seconds")??;
+                        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
+                        if playlist.status == 200 {
+                            playlist_has_ll_hls_tags |=
+                                playlist_matches_format(&playlist.body, expected_audio_codec);
+                            if let Some(window) = hls_playlist_object_window(&playlist.body)? {
+                                let refreshed_sequence =
+                                    refreshed_hls_object_sequence(object_sequence_baseline, window);
+                                if refreshed_sequence != object_sequence_baseline {
+                                    object_sequence_baseline = refreshed_sequence;
+                                    after_sequence = object_sequence_baseline.checked_sub(1);
+                                    allow_initial_object_rebase = window.first_sequence.is_none();
+                                    if let Some(consumer) = opus_consumer.as_mut() {
+                                        consumer.rebase_before_media(object_sequence_baseline)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
                 status => bail!("LL-HLS tail returned HTTP {status}"),
             }
         }
     } else {
         type PartRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
-        let final_sequence = end_offset_ms.saturating_div(part_ms);
-        let mut next_sequence = initial_from_sequence;
+        let mut next_sequence = object_sequence_baseline;
         let mut in_flight = FuturesUnordered::<PartRequest>::new();
-        while in_flight.len() < H3_PART_PIPELINE_DEPTH && next_sequence < final_sequence {
+        while in_flight.len() < H3_PART_PIPELINE_DEPTH {
             let requested_sequence = next_sequence;
             next_sequence = next_sequence.saturating_add(1);
             let path = hls_path(
@@ -2314,45 +3195,104 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
         }
 
-        while now_unix_ns()? < stop_ns && !in_flight.is_empty() {
+        while now_unix_ns()? < stop_ns
+            && !in_flight.is_empty()
+            && part_coverage.received_parts < expected_parts
+        {
             let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
             let Some((requested_sequence, response)) =
                 timeout(remaining, in_flight.next()).await.ok().flatten()
             else {
                 break;
             };
-            let response = response?;
+            let response = match response {
+                Ok(response) => response,
+                Err(first_error) => {
+                    let restart_sequence = object_sequence_baseline.saturating_add(
+                        part_coverage
+                            .first_missing_relative()
+                            .unwrap_or(expected_parts),
+                    );
+                    let client = h3_client
+                        .as_mut()
+                        .context("HTTP/3 media pipeline omitted its connection")?;
+                    let ActiveH3Client::Owned(client) = client else {
+                        bail!(
+                            "shared HTTP/3 media pipeline cannot reconnect after request failure: {first_error:#}"
+                        );
+                    };
+                    client
+                        .reconnect(edge, server_name, tls_ca)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "HTTP/3 media pipeline reconnect failed after object {requested_sequence}: {first_error:#}"
+                            )
+                        })?;
+
+                    // Every pending request belongs to the closed connection.
+                    // Restart at the earliest part that has not passed validation.
+                    in_flight = FuturesUnordered::<PartRequest>::new();
+                    next_sequence = restart_sequence;
+                    while in_flight.len() < H3_PART_PIPELINE_DEPTH {
+                        let requested_sequence = next_sequence;
+                        next_sequence = next_sequence.saturating_add(1);
+                        let path = hls_path(
+                            path_prefix,
+                            stream_id,
+                            &format!(
+                                "part{requested_sequence}.{}",
+                                expected_audio_codec.media_extension()
+                            ),
+                        );
+                        let sender = client.request_sender();
+                        in_flight.push(
+                            async move { (requested_sequence, sender.get(path).await) }.boxed(),
+                        );
+                    }
+                    continue;
+                }
+            };
             wire_bytes = wire_bytes.saturating_add(response.wire_bytes as u64);
             let mut retry_sequence = None;
             match response.status {
                 200 => {
                     media_responses = media_responses.saturating_add(1);
-                    let soundkit_valid = expected_audio_codec == HlsAudioCodec::SoundkitOpus
-                        && soundkit_opus_part_is_valid(&response.body, part_ms);
+                    object_sequence_started = true;
+                    let opus_valid =
+                        opus_media_part_is_valid(expected_audio_codec, &response.body, part_ms);
                     let opaque_flac_valid = expected_audio_codec == HlsAudioCodec::OpaqueFlac
                         && opaque_flac_part_is_valid(&response.body);
                     let pts_ms = media_part_pts_ms(
                         expected_audio_codec,
                         &response.body,
                         requested_sequence,
+                        object_sequence_baseline,
+                        start_offset_ms,
                         part_ms,
                     )?;
-                    let expected_pts_ms = requested_sequence.saturating_mul(part_ms);
-                    if pts_ms != expected_pts_ms {
-                        bail!(
-                            "pipelined LL-HLS part {requested_sequence} carried PTS {pts_ms} ms, expected {expected_pts_ms} ms"
-                        );
-                    }
+                    let coverage_pts_ms = nominal_hls_object_pts_ms(
+                        requested_sequence,
+                        object_sequence_baseline,
+                        start_offset_ms,
+                        part_ms,
+                    )?;
                     let arrival_ns = now_unix_ns()?;
                     if arrival_ns >= session_id
-                        && pts_ms >= start_offset_ms
-                        && pts_ms < end_offset_ms
-                        && part_coverage.insert_pts(pts_ms)
+                        && coverage_pts_ms >= start_offset_ms
+                        && coverage_pts_ms < end_offset_ms
+                        && part_coverage.insert_pts(coverage_pts_ms)
                     {
+                        media_timeline.insert(
+                            requested_sequence,
+                            pts_ms,
+                            media_part_duration_ms(expected_audio_codec, &response.body, part_ms)?,
+                        );
                         let capture_ns =
                             session_id.saturating_add(pts_ms.saturating_mul(1_000_000));
                         let latency_ns = arrival_ns.saturating_sub(capture_ns);
-                        if latency_ns > deadline_ms.saturating_mul(1_000_000) {
+                        let deadline_missed = latency_ns > deadline_ms.saturating_mul(1_000_000);
+                        if deadline_missed {
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
                         availability_latencies_ns.record(latency_ns);
@@ -2373,11 +3313,13 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     pcm_media_size_mismatches.saturating_add(1);
                             }
                         }
-                        if expected_audio_codec == HlsAudioCodec::SoundkitOpus {
-                            if soundkit_valid {
+                        if let Some(opus_valid) = opus_valid {
+                            if opus_valid {
                                 opus_media_parts_verified =
                                     opus_media_parts_verified.saturating_add(1);
-                                init_audio_codec_verified = true;
+                                if expected_audio_codec == HlsAudioCodec::SoundkitOpus {
+                                    init_audio_codec_verified = true;
+                                }
                             } else {
                                 opus_media_packet_mismatches =
                                     opus_media_packet_mismatches.saturating_add(1);
@@ -2407,9 +3349,20 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         {
                             publication_to_cache_latencies_ns.record(publication_to_cache_ns);
                             cache_to_client_latencies_ns.record(cache_to_client_ns);
+                            latency_time_series.record_cache(
+                                coverage_pts_ms,
+                                publication_to_cache_ns,
+                                cache_to_client_ns,
+                            );
                         }
-                        render_latencies_ns.record(
-                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000)),
+                        let render_latency_ns =
+                            latency_ns.saturating_add(render_buffer_ms.saturating_mul(1_000_000));
+                        render_latencies_ns.record(render_latency_ns);
+                        latency_time_series.record_part(
+                            coverage_pts_ms,
+                            latency_ns,
+                            render_latency_ns,
+                            deadline_missed,
                         );
                     }
                     if expected_audio_codec.init_marker().is_some() && init_audio_codec.is_none() {
@@ -2434,12 +3387,46 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         }
                     }
                 }
-                204 | 404 => retry_sequence = Some(requested_sequence),
+                204 | 404 => {
+                    if !object_sequence_started {
+                        let playlist = timeout(
+                            HLS_CONTROL_REQUEST_TIMEOUT,
+                            hls_https_get(
+                                &mut h3_client,
+                                edge,
+                                server_name,
+                                tls_ca,
+                                &hls_path(path_prefix, stream_id, "stream.m3u8"),
+                            ),
+                        )
+                        .await
+                        .context("LL-HLS playlist baseline refresh exceeded two seconds")??;
+                        wire_bytes = wire_bytes.saturating_add(playlist.wire_bytes as u64);
+                        if playlist.status == 200 {
+                            playlist_has_ll_hls_tags |=
+                                playlist_matches_format(&playlist.body, expected_audio_codec);
+                            if let Some(window) = hls_playlist_object_window(&playlist.body)? {
+                                let refreshed_sequence =
+                                    refreshed_hls_object_sequence(object_sequence_baseline, window);
+                                if refreshed_sequence != object_sequence_baseline {
+                                    object_sequence_baseline = refreshed_sequence;
+                                    next_sequence = next_sequence.max(object_sequence_baseline);
+                                    if let Some(consumer) = opus_consumer.as_mut() {
+                                        consumer.rebase_before_media(object_sequence_baseline)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if requested_sequence >= object_sequence_baseline {
+                        retry_sequence = Some(requested_sequence);
+                    }
+                }
                 status => bail!("LL-HLS tail returned HTTP {status}"),
             }
 
             let sequence_to_schedule = retry_sequence.or_else(|| {
-                if next_sequence < final_sequence {
+                if part_coverage.received_parts < expected_parts {
                     let sequence = next_sequence;
                     next_sequence = next_sequence.saturating_add(1);
                     Some(sequence)
@@ -2485,24 +3472,30 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
     }
 
-    let non_contiguous_pts = part_coverage.non_contiguous_pts();
+    let non_contiguous_pts = media_timeline.discontinuities();
 
     // Known-duration audio closes on the access unit that reaches the target,
     // so a duration aligned to the part boundary has no open tail part.
     if let Some(client) = h3_client.as_ref() {
         wire_bytes = client.wire_bytes();
     }
+    let connection_reconnects = h3_client
+        .as_ref()
+        .map_or(0, ActiveH3Client::connection_reconnects);
     let opus_consumer = opus_consumer
         .map(SoundKitOpusConsumer::finish)
         .transpose()?;
+    let latency_time_series =
+        latency_time_series.finish(session_id, start_offset_ms, end_offset_ms, part_ms);
     Ok(HlsReceiveReport {
-        schema: "needletail.aep1-48k-probe.hls-receive.v5",
+        schema: "needletail.aep1-48k-probe.hls-receive.v6",
         lane: "ll_hls",
         transport: transport.as_str(),
         tls_protocol: "TLSv1.3",
         tls_certificate_verified: true,
         persistent_connection: matches!(transport, HlsTransport::H3),
         connection_setup_ms,
+        connection_reconnects,
         path_prefix: path_prefix.to_owned(),
         stream_id,
         session_id,
@@ -2543,6 +3536,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         first_part_to_response_latency_ms: first_part_to_response_latencies_ns.summary(),
         final_part_to_response_latency_ms: final_part_to_response_latencies_ns.summary(),
         estimated_render_latency_ms: render_latencies_ns.summary(),
+        latency_time_series,
     })
 }
 
@@ -2560,6 +3554,7 @@ struct HlsBundleStreamState {
     first_part_to_response_latencies_ns: BoundedLatencySamples,
     final_part_to_response_latencies_ns: BoundedLatencySamples,
     render_latencies_ns: BoundedLatencySamples,
+    latency_time_series: HlsLatencyTimeSeries,
 }
 
 impl HlsBundleStreamState {
@@ -2578,6 +3573,7 @@ impl HlsBundleStreamState {
             first_part_to_response_latencies_ns: BoundedLatencySamples::new(),
             final_part_to_response_latencies_ns: BoundedLatencySamples::new(),
             render_latencies_ns: BoundedLatencySamples::new(),
+            latency_time_series: HlsLatencyTimeSeries::default(),
         })
     }
 
@@ -2592,14 +3588,21 @@ impl HlsBundleStreamState {
         let first_pts_ms = self.coverage.first_pts_ms();
         let last_pts_ms = self.coverage.last_pts_ms();
         let non_contiguous_pts = self.coverage.non_contiguous_pts();
+        let latency_time_series = self.latency_time_series.finish(
+            reader.session_id,
+            start_offset_ms,
+            end_offset_ms,
+            reader.part_ms,
+        );
         HlsReceiveReport {
-            schema: "needletail.aep1-48k-probe.hls-receive.v5",
+            schema: "needletail.aep1-48k-probe.hls-receive.v6",
             lane: "ll_hls",
             transport: reader.transport.as_str(),
             tls_protocol: "TLSv1.3",
             tls_certificate_verified: true,
             persistent_connection: true,
             connection_setup_ms: None,
+            connection_reconnects: 0,
             path_prefix: reader.path_prefix.clone(),
             stream_id: self.stream_id,
             session_id: reader.session_id,
@@ -2641,6 +3644,7 @@ impl HlsBundleStreamState {
             first_part_to_response_latency_ms: self.first_part_to_response_latencies_ns.summary(),
             final_part_to_response_latency_ms: self.final_part_to_response_latencies_ns.summary(),
             estimated_render_latency_ms: self.render_latencies_ns.summary(),
+            latency_time_series,
         }
     }
 }
@@ -2873,11 +3877,18 @@ async fn receive_hls_bundle_customer(
                     .session_id
                     .saturating_add(pts_ms.saturating_mul(1_000_000));
                 let latency_ns = arrival_ns.saturating_sub(capture_ns);
-                if latency_ns > reader.deadline_ms.saturating_mul(1_000_000) {
+                let deadline_missed = latency_ns > reader.deadline_ms.saturating_mul(1_000_000);
+                if deadline_missed {
                     state.deadline_misses = state.deadline_misses.saturating_add(1);
                 }
                 state.availability_latencies_ns.record(latency_ns);
                 state.render_latencies_ns.record(latency_ns);
+                state.latency_time_series.record_part(
+                    pts_ms,
+                    latency_ns,
+                    latency_ns,
+                    deadline_missed,
+                );
                 if soundkit_opus_part_is_valid(part, reader.part_ms) {
                     state.opus_media_parts_verified =
                         state.opus_media_parts_verified.saturating_add(1);
@@ -2897,6 +3908,11 @@ async fn receive_hls_bundle_customer(
                     state
                         .cache_to_client_latencies_ns
                         .record(arrival_ns - available_ns);
+                    state.latency_time_series.record_cache(
+                        entry.end_sequence.saturating_mul(reader.part_ms),
+                        available_ns - final_capture_ns,
+                        arrival_ns - available_ns,
+                    );
                 }
             }
         }
@@ -3579,6 +4595,8 @@ struct H3HttpsClient {
     _driver_task: tokio::task::JoinHandle<()>,
     authority: String,
     connection_setup_ms: f64,
+    prior_wire_bytes: u64,
+    reconnects: u64,
 }
 
 #[derive(Clone)]
@@ -3624,6 +4642,13 @@ impl ActiveH3Client {
         match self {
             Self::Owned(client) => client.wire_bytes(),
             // The load caller records a shared connection exactly once.
+            Self::Shared(_) => 0,
+        }
+    }
+
+    fn connection_reconnects(&self) -> u64 {
+        match self {
+            Self::Owned(client) => client.reconnects,
             Self::Shared(_) => 0,
         }
     }
@@ -3732,7 +4757,27 @@ impl H3HttpsClient {
             _driver_task: driver_task,
             authority: format!("{server_name}:{}", edge.port()),
             connection_setup_ms: setup_started.elapsed().as_secs_f64() * 1_000.0,
+            prior_wire_bytes: 0,
+            reconnects: 0,
         })
+    }
+
+    async fn reconnect(
+        &mut self,
+        edge: SocketAddr,
+        server_name: &str,
+        tls_ca: Option<&Path>,
+    ) -> Result<()> {
+        if self.reconnects >= H3_REQUEST_RECONNECT_LIMIT {
+            bail!("HTTP/3 connection exceeded {H3_REQUEST_RECONNECT_LIMIT} reconnects");
+        }
+        let prior_wire_bytes = self.wire_bytes();
+        let reconnects = self.reconnects.saturating_add(1);
+        let mut replacement = Self::connect(edge, server_name, tls_ca).await?;
+        replacement.prior_wire_bytes = prior_wire_bytes;
+        replacement.reconnects = reconnects;
+        *self = replacement;
+        Ok(())
     }
 
     fn request_sender(&self) -> H3RequestSender {
@@ -3755,7 +4800,9 @@ impl H3HttpsClient {
 
     fn wire_bytes(&self) -> u64 {
         let stats = self.connection.stats();
-        stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes)
+        self.prior_wire_bytes
+            .saturating_add(stats.udp_tx.bytes)
+            .saturating_add(stats.udp_rx.bytes)
     }
 }
 
@@ -3774,7 +4821,28 @@ async fn hls_https_get(
     path: &str,
 ) -> Result<SimpleHttpResponse> {
     match h3_client {
-        Some(client) => client.get(path).await,
+        Some(client) => {
+            let first_error = match client.get(path).await {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            let ActiveH3Client::Owned(client) = client else {
+                return Err(first_error);
+            };
+            client
+                .reconnect(edge, server_name, tls_ca)
+                .await
+                .with_context(|| {
+                    format!(
+                        "HTTP/3 reconnect failed after the request for {path} failed: {first_error:#}"
+                    )
+                })?;
+            client.get(path).await.with_context(|| {
+                format!(
+                    "HTTP/3 retry for {path} failed after reconnect; first error: {first_error:#}"
+                )
+            })
+        }
         None => https_get_http1(edge, server_name, tls_ca, path).await,
     }
 }
@@ -3866,18 +4934,157 @@ fn decode_chunked_body(mut wire: &[u8]) -> Result<Vec<u8>> {
 fn media_part_pts_ms(
     codec: HlsAudioCodec,
     bytes: &[u8],
-    sequence: u64,
+    object_sequence: u64,
+    object_sequence_baseline: u64,
+    baseline_pts_ms: u64,
     part_ms: u64,
 ) -> Result<u64> {
     if matches!(
         codec,
         HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus
     ) {
-        return sequence
-            .checked_mul(part_ms)
-            .context("opaque LL-HLS part PTS overflow");
+        return nominal_hls_object_pts_ms(
+            object_sequence,
+            object_sequence_baseline,
+            baseline_pts_ms,
+            part_ms,
+        );
     }
-    parse_fmp4_tfdt_ms(bytes).context("LL-HLS fMP4 part omitted a valid tfdt")
+    let decode_time = parse_fmp4_tfdt_ms(bytes).context("LL-HLS fMP4 part omitted a valid tfdt")?;
+    if codec == HlsAudioCodec::Opus {
+        return decode_time
+            .checked_mul(1_000)
+            .and_then(|samples| samples.checked_div(u64::from(SAMPLE_RATE)))
+            .context("Opus LL-HLS part PTS overflow");
+    }
+    Ok(decode_time)
+}
+
+fn media_part_duration_ms(codec: HlsAudioCodec, bytes: &[u8], part_ms: u64) -> Result<u64> {
+    if matches!(
+        codec,
+        HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus
+    ) {
+        return Ok(part_ms);
+    }
+    let duration = fmp4_trun_sample_geometry(bytes)
+        .context("LL-HLS fMP4 part omitted valid sample durations")?
+        .into_iter()
+        .try_fold(0_u64, |total, (sample_duration, _)| {
+            total
+                .checked_add(u64::from(sample_duration))
+                .context("LL-HLS fMP4 sample duration overflow")
+        })?;
+    if codec == HlsAudioCodec::Opus {
+        return duration
+            .checked_mul(1_000)
+            .and_then(|samples| samples.checked_div(u64::from(SAMPLE_RATE)))
+            .context("Opus LL-HLS part duration overflow");
+    }
+    Ok(duration)
+}
+
+fn nominal_hls_object_pts_ms(
+    object_sequence: u64,
+    object_sequence_baseline: u64,
+    baseline_pts_ms: u64,
+    part_ms: u64,
+) -> Result<u64> {
+    object_sequence
+        .checked_sub(object_sequence_baseline)
+        .context("LL-HLS object preceded the playlist baseline")?
+        .checked_mul(part_ms)
+        .and_then(|relative_pts_ms| baseline_pts_ms.checked_add(relative_pts_ms))
+        .context("LL-HLS object position overflow")
+}
+
+fn hls_playlist_object_window(bytes: &[u8]) -> Result<Option<HlsPlaylistObjectWindow>> {
+    let playlist = std::str::from_utf8(bytes).context("LL-HLS playlist was not UTF-8")?;
+    let mut first_sequence = None;
+    let mut last_sequence = None;
+    let mut preload_sequence = None;
+
+    for line in playlist.lines() {
+        let is_completed_part = line.starts_with("#EXT-X-PART:");
+        let preload_attributes = line.strip_prefix("#EXT-X-PRELOAD-HINT:");
+        let is_preload_part = preload_attributes.is_some_and(|attributes| {
+            attributes
+                .split(',')
+                .any(|attribute| attribute.trim() == "TYPE=PART")
+        });
+        if !is_completed_part && !is_preload_part {
+            continue;
+        }
+        let uri = hls_attribute_uri(line)
+            .with_context(|| format!("LL-HLS part tag omitted its URI: {line}"))?;
+        let sequence = hls_part_object_sequence(uri)
+            .with_context(|| format!("LL-HLS part URI has no object sequence: {uri}"))?;
+        if is_completed_part {
+            first_sequence =
+                Some(first_sequence.map_or(sequence, |first: u64| first.min(sequence)));
+            last_sequence = Some(last_sequence.map_or(sequence, |last: u64| last.max(sequence)));
+        } else if preload_sequence.replace(sequence).is_some() {
+            bail!("LL-HLS playlist advertised more than one part preload hint");
+        }
+    }
+
+    let Some(next_sequence) =
+        preload_sequence.or_else(|| last_sequence.and_then(|sequence| sequence.checked_add(1)))
+    else {
+        return Ok(None);
+    };
+    if last_sequence.is_some_and(|last| next_sequence <= last) {
+        bail!(
+            "LL-HLS part preload sequence {next_sequence} did not follow completed object {}",
+            last_sequence.unwrap()
+        );
+    }
+    Ok(Some(HlsPlaylistObjectWindow {
+        first_sequence,
+        last_sequence,
+        next_sequence,
+    }))
+}
+
+fn initial_hls_object_sequence(
+    window: HlsPlaylistObjectWindow,
+    observed_empty_playlist: bool,
+) -> u64 {
+    if observed_empty_playlist {
+        window.first_sequence.unwrap_or(window.next_sequence)
+    } else {
+        window.next_sequence
+    }
+}
+
+fn refreshed_hls_object_sequence(current_sequence: u64, window: HlsPlaylistObjectWindow) -> u64 {
+    match window.first_sequence {
+        Some(first_sequence) if current_sequence < first_sequence => first_sequence,
+        None if current_sequence < window.next_sequence => window.next_sequence,
+        _ => current_sequence,
+    }
+}
+
+fn hls_attribute_uri(line: &str) -> Option<&str> {
+    let start = line.find("URI=\"")?.checked_add("URI=\"".len())?;
+    let remainder = line.get(start..)?;
+    let end = remainder.find('"')?;
+    remainder.get(..end)
+}
+
+fn hls_part_object_sequence(uri: &str) -> Option<u64> {
+    let path = uri.split(['?', '#']).next()?;
+    let file_name = path.rsplit('/').next()?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    let sequence = stem
+        .strip_prefix("part")
+        .or_else(|| stem.strip_prefix('p'))?;
+    if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    sequence.parse().ok()
 }
 
 fn playlist_matches_format(bytes: &[u8], codec: HlsAudioCodec) -> bool {
@@ -3904,6 +5111,7 @@ fn playlist_matches_format(bytes: &[u8], codec: HlsAudioCodec) -> bool {
 
 fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
     [
+        HlsAudioCodec::Opus,
         HlsAudioCodec::Ipcm,
         HlsAudioCodec::Fpcm,
         HlsAudioCodec::Flac,
@@ -3919,7 +5127,7 @@ fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
 
 fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channels: u16) -> bool {
     let (sample_size, marker) = match codec {
-        HlsAudioCodec::Flac => return true,
+        HlsAudioCodec::Flac | HlsAudioCodec::Opus => return true,
         HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus => return false,
         HlsAudioCodec::Ipcm => (24, b"ipcm"),
         HlsAudioCodec::Fpcm => (32, b"fpcm"),
@@ -3941,9 +5149,10 @@ fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channe
 
 fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) -> Option<u64> {
     let bytes_per_sample = match codec {
-        HlsAudioCodec::Flac | HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus => {
-            return None;
-        }
+        HlsAudioCodec::Flac
+        | HlsAudioCodec::OpaqueFlac
+        | HlsAudioCodec::Opus
+        | HlsAudioCodec::SoundkitOpus => return None,
         HlsAudioCodec::Ipcm => 3_u64,
         HlsAudioCodec::Fpcm => 4_u64,
     };
@@ -4051,6 +5260,114 @@ fn soundkit_opus_part_is_valid(mut bytes: &[u8], part_ms: u64) -> bool {
     }
     packets > 0
         && total_frames.saturating_mul(1_000) == u64::from(SAMPLE_RATE).saturating_mul(part_ms)
+}
+
+fn opus_media_part_is_valid(codec: HlsAudioCodec, bytes: &[u8], part_ms: u64) -> Option<bool> {
+    match codec {
+        HlsAudioCodec::Opus => Some(fmp4_opus_part_is_valid(bytes, part_ms)),
+        HlsAudioCodec::SoundkitOpus => Some(soundkit_opus_part_is_valid(bytes, part_ms)),
+        _ => None,
+    }
+}
+
+fn fmp4_opus_part_is_valid(bytes: &[u8], part_ms: u64) -> bool {
+    if part_ms == 0 {
+        return false;
+    }
+    let Some(samples) = fmp4_trun_sample_geometry(bytes) else {
+        return false;
+    };
+    let Some(payload) = fmp4_mdat_payload(bytes) else {
+        return false;
+    };
+    let mut offset = 0_usize;
+    let mut total_duration = 0_u64;
+    for (duration, size) in samples {
+        let Ok(size) = usize::try_from(size) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(size) else {
+            return false;
+        };
+        let Some(packet) = payload.get(offset..end) else {
+            return false;
+        };
+        let Some(packet_info) = opus_packet_info(packet) else {
+            return false;
+        };
+        if packet_info.duration_samples != duration {
+            return false;
+        }
+        total_duration = total_duration.saturating_add(u64::from(duration));
+        offset = end;
+    }
+    offset == payload.len()
+        && total_duration.saturating_mul(1_000) == u64::from(SAMPLE_RATE).saturating_mul(part_ms)
+}
+
+fn fmp4_trun_sample_geometry(bytes: &[u8]) -> Option<Vec<(u32, u32)>> {
+    let type_offset = bytes.windows(4).position(|window| window == b"trun")?;
+    let box_start = type_offset.checked_sub(4)?;
+    let box_size = usize::try_from(u32::from_be_bytes(
+        bytes.get(box_start..type_offset)?.try_into().ok()?,
+    ))
+    .ok()?;
+    let box_end = box_start.checked_add(box_size)?;
+    if box_size < 16 || box_end > bytes.len() {
+        return None;
+    }
+
+    let version_and_flags = u32::from_be_bytes(
+        bytes
+            .get(type_offset + 4..type_offset + 8)?
+            .try_into()
+            .ok()?,
+    );
+    let flags = version_and_flags & 0x00ff_ffff;
+    if flags & 0x000100 == 0 || flags & 0x000200 == 0 {
+        return None;
+    }
+    let sample_count = usize::try_from(u32::from_be_bytes(
+        bytes
+            .get(type_offset + 8..type_offset + 12)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    if sample_count == 0 {
+        return None;
+    }
+
+    let mut cursor = type_offset.checked_add(12)?;
+    if flags & 0x000001 != 0 {
+        cursor = cursor.checked_add(4)?;
+    }
+    if flags & 0x000004 != 0 {
+        cursor = cursor.checked_add(4)?;
+    }
+    let fields_per_sample = 2_usize
+        .checked_add(usize::from(flags & 0x000400 != 0))?
+        .checked_add(usize::from(flags & 0x000800 != 0))?;
+    let bytes_per_sample = fields_per_sample.checked_mul(4)?;
+    if sample_count.checked_mul(bytes_per_sample)? > box_end.checked_sub(cursor)? {
+        return None;
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let duration = u32::from_be_bytes(bytes.get(cursor..cursor + 4)?.try_into().ok()?);
+        cursor += 4;
+        let size = u32::from_be_bytes(bytes.get(cursor..cursor + 4)?.try_into().ok()?);
+        cursor += 4;
+        if flags & 0x000400 != 0 {
+            cursor += 4;
+        }
+        if flags & 0x000800 != 0 {
+            cursor += 4;
+        }
+        samples.push((duration, size));
+    }
+    (cursor == box_end).then_some(samples)
 }
 
 fn fmp4_mdat_payload(bytes: &[u8]) -> Option<&[u8]> {
@@ -4380,6 +5697,67 @@ mod tests {
     }
 
     #[test]
+    fn standard_opus_fmp4_requires_valid_raw_packets_and_48khz_timestamps() {
+        use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS};
+        use boxer::fmp4::{
+            box_fmp4_with_init_and_audio_config, AudioTrackConfig, Config, OpusAudioConfig,
+        };
+
+        let units = (0_u64..50)
+            .map(|index| AccessUnit {
+                key: true,
+                pts: 250 + index * 5,
+                dts: 250 + index * 5,
+                data: Bytes::from(vec![(17 << 3) | (1 << 2), index as u8]),
+                stream_type: PSI_STREAM_AUDIO_OPUS,
+                id: index,
+            })
+            .collect();
+        let fmp4 = box_fmp4_with_init_and_audio_config(
+            6,
+            Config {
+                width: 0,
+                height: 0,
+                avcc: None,
+            },
+            Vec::new(),
+            units,
+            0,
+            true,
+            Some(AudioTrackConfig::Opus(OpusAudioConfig {
+                input_sample_rate: SAMPLE_RATE,
+                channel_count: 2,
+                pre_skip: 0,
+                output_gain: 0,
+            })),
+        );
+        let init = fmp4.init.expect("Opus init segment");
+
+        assert_eq!(HlsAudioCodec::Opus.media_extension(), "mp4");
+        assert_eq!(detect_init_audio_codec(&init), Some(HlsAudioCodec::Opus));
+        assert!(pcm_init_parameters_match(&init, HlsAudioCodec::Opus, 2));
+        assert_eq!(
+            fmp4_trun_sample_geometry(&fmp4.data)
+                .expect("Opus sample geometry")
+                .len(),
+            50
+        );
+        assert!(fmp4_opus_part_is_valid(&fmp4.data, 250));
+        assert_eq!(
+            media_part_pts_ms(HlsAudioCodec::Opus, &fmp4.data, 3_984, 3_984, 0, 250).unwrap(),
+            250
+        );
+        assert_eq!(
+            media_part_duration_ms(HlsAudioCodec::Opus, &fmp4.data, 250).unwrap(),
+            250
+        );
+
+        let mut truncated = fmp4.data.to_vec();
+        truncated.pop();
+        assert!(!fmp4_opus_part_is_valid(&truncated, 250));
+    }
+
+    #[test]
     fn bundled_tail_entries_require_exact_stream_order_and_shared_sequence() {
         let entries = vec![
             TailBundleEntry {
@@ -4444,14 +5822,57 @@ mod tests {
         let expected_parts = 4 * 60 * 60 * 200;
         let mut coverage = PartCoverage::new(0, expected_parts, 5).unwrap();
         assert!(coverage.words.len() * std::mem::size_of::<u64>() < 400_000);
+        assert_eq!(coverage.first_missing_relative(), Some(0));
         assert!(coverage.insert_pts(0));
         assert!(coverage.insert_pts(5));
         assert!(coverage.insert_pts((expected_parts - 1) * 5));
         assert!(!coverage.insert_pts(5));
         assert_eq!(coverage.received_parts, 3);
+        assert_eq!(coverage.first_missing_relative(), Some(2));
         assert_eq!(coverage.first_pts_ms(), Some(0));
         assert_eq!(coverage.last_pts_ms(), Some((expected_parts - 1) * 5));
         assert_eq!(coverage.non_contiguous_pts(), 1);
+    }
+
+    #[test]
+    fn udp_time_series_includes_empty_media_seconds() {
+        let mut state = ReceiveFormatState::new(&[ReceiveAudioFormat::Flac]).unwrap();
+        state
+            .latency_buckets
+            .entry((receive_audio_format_order(ReceiveAudioFormat::Flac), 0))
+            .or_default()
+            .record(12_000_000, false, false, false);
+
+        let buckets = state.finish_latency_time_series(1_000_000_000, 2);
+
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].expected_epochs, 200);
+        assert_eq!(buckets[0].received_epochs, 1);
+        assert_eq!(buckets[0].missing_epochs, 199);
+        assert_eq!(buckets[0].render_ready_latency_ms.p99, 12.0);
+        assert_eq!(buckets[1].received_epochs, 0);
+        assert_eq!(buckets[1].missing_epochs, 200);
+    }
+
+    #[test]
+    fn hls_time_series_uses_source_pts_and_preserves_missing_parts() {
+        let mut timeline = HlsLatencyTimeSeries::default();
+        timeline.record_part(0, 20_000_000, 170_000_000, false);
+        timeline.record_cache(0, 12_000_000, 8_000_000);
+        timeline.record_part(250, 30_000_000, 180_000_000, true);
+
+        let buckets = timeline.finish(5_000_000_000, 0, 2_000, 250);
+
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].start_unix_ns, 5_000_000_000);
+        assert_eq!(buckets[0].expected_parts, 4);
+        assert_eq!(buckets[0].received_parts, 2);
+        assert_eq!(buckets[0].missing_parts, 2);
+        assert_eq!(buckets[0].deadline_misses, 1);
+        assert_eq!(buckets[0].availability_latency_ms.p99, 30.0);
+        assert_eq!(buckets[0].publication_to_cache_latency_ms.p99, 12.0);
+        assert_eq!(buckets[1].expected_parts, 4);
+        assert_eq!(buckets[1].received_parts, 0);
     }
 
     #[test]
@@ -4542,7 +5963,83 @@ mod tests {
             hls_path("/live", 24_001, "tail?from=0"),
             "/live/24001/tail?from=0"
         );
+        assert_eq!(
+            hls_path("/live", 24_001, "part3984.mp4"),
+            "/live/24001/part3984.mp4"
+        );
         assert_eq!(hls_path("", 24_001, "stream.m3u8"), "/24001/stream.m3u8");
+        assert_eq!(hls_path("", 24_001, "p72.mp4"), "/24001/p72.mp4");
+    }
+
+    #[test]
+    fn playlist_object_window_uses_part_uris_not_media_sequence() {
+        let playlist = b"#EXTM3U\n\
+#EXT-X-MEDIA-SEQUENCE:996\n\
+#EXT-X-PART:DURATION=0.005,URI=\"part3982.mp4\",INDEPENDENT=YES\n\
+#EXT-X-PART:DURATION=0.005,URI=\"part3983.mp4\",INDEPENDENT=YES\n\
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part3984.mp4\"\n";
+
+        assert_eq!(
+            hls_playlist_object_window(playlist).unwrap(),
+            Some(HlsPlaylistObjectWindow {
+                first_sequence: Some(3_982),
+                last_sequence: Some(3_983),
+                next_sequence: 3_984,
+            })
+        );
+    }
+
+    #[test]
+    fn playlist_object_window_supports_direct_origin_part_names() {
+        let playlist = b"#EXTM3U\n\
+#EXT-X-PART:DURATION=0.005,URI=\"tracks/p71.mp4?token=test\"\n\
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p72.mp4\"\n";
+
+        assert_eq!(
+            hls_playlist_object_window(playlist).unwrap(),
+            Some(HlsPlaylistObjectWindow {
+                first_sequence: Some(71),
+                last_sequence: Some(71),
+                next_sequence: 72,
+            })
+        );
+    }
+
+    #[test]
+    fn playlist_object_window_reads_a_preload_only_baseline() {
+        let playlist = b"#EXTM3U\n#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part3984.mp4\"\n";
+
+        assert_eq!(
+            hls_playlist_object_window(playlist).unwrap(),
+            Some(HlsPlaylistObjectWindow {
+                first_sequence: None,
+                last_sequence: None,
+                next_sequence: 3_984,
+            })
+        );
+    }
+
+    #[test]
+    fn playlist_baseline_preserves_the_first_part_after_an_empty_snapshot() {
+        let window = HlsPlaylistObjectWindow {
+            first_sequence: Some(3_984),
+            last_sequence: Some(3_985),
+            next_sequence: 3_986,
+        };
+
+        assert_eq!(initial_hls_object_sequence(window, false), 3_986);
+        assert_eq!(initial_hls_object_sequence(window, true), 3_984);
+        assert_eq!(refreshed_hls_object_sequence(0, window), 3_984);
+        assert_eq!(refreshed_hls_object_sequence(3_984, window), 3_984);
+    }
+
+    #[test]
+    fn playlist_object_window_rejects_a_receding_preload_hint() {
+        let playlist = b"#EXTM3U\n\
+#EXT-X-PART:DURATION=0.005,URI=\"part3984.mp4\"\n\
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part3983.mp4\"\n";
+
+        assert!(hls_playlist_object_window(playlist).is_err());
     }
 
     #[test]
@@ -4577,9 +6074,26 @@ mod tests {
         assert_eq!(HlsAudioCodec::OpaqueFlac.media_extension(), "bin");
         assert_eq!(HlsAudioCodec::OpaqueFlac.init_marker(), None);
         assert_eq!(
-            media_part_pts_ms(HlsAudioCodec::OpaqueFlac, &[0xff, 0xf8], 7, 50).unwrap(),
+            media_part_pts_ms(
+                HlsAudioCodec::OpaqueFlac,
+                &[0xff, 0xf8],
+                3_991,
+                3_984,
+                0,
+                50,
+            )
+            .unwrap(),
             350
         );
+        assert!(media_part_pts_ms(
+            HlsAudioCodec::OpaqueFlac,
+            &[0xff, 0xf8],
+            3_983,
+            3_984,
+            0,
+            50,
+        )
+        .is_err());
         assert!(opaque_flac_part_is_valid(&[0xff, 0xf8, 0x01]));
         assert!(opaque_flac_part_is_valid(&[0xff, 0xf9, 0x01]));
         assert!(!opaque_flac_part_is_valid(b"fLaC"));
@@ -4595,6 +6109,63 @@ mod tests {
             sine_s24le(0).len(),
             FRAME_COUNT as usize * usize::from(DEFAULT_CHANNELS) * 3
         );
+    }
+
+    #[test]
+    fn raw_pcm_source_loops_frames_and_selects_channel_groups() {
+        let source = LoopingPcm::new(
+            vec![
+                0, 0, 0, 1, 1, 1, 2, 2, 2, 10, 10, 10, 11, 11, 11, 12, 12, 12,
+            ],
+            3,
+        )
+        .unwrap();
+        let group = source.group_s24le(1, 1, 2);
+
+        assert_eq!(group.len(), FRAME_COUNT as usize * 2 * 3);
+        assert_eq!(&group[..12], &[11, 11, 11, 12, 12, 12, 1, 1, 1, 2, 2, 2]);
+        assert_eq!(&group[12..18], &[11, 11, 11, 12, 12, 12]);
+    }
+
+    #[test]
+    fn raw_pcm_source_rejects_empty_or_partial_frames() {
+        assert!(LoopingPcm::new(Vec::new(), 2).is_err());
+        assert!(LoopingPcm::new(vec![0; 7], 2).is_err());
+    }
+
+    #[test]
+    fn flac_selection_counts_the_opus_companion_without_selecting_it() {
+        let mut state = ReceiveFormatState::new(&[ReceiveAudioFormat::Flac]).unwrap();
+        for payload_kind in [AudioPayloadKind::Opus, AudioPayloadKind::Flac] {
+            state.observe(
+                &DecodedMultichannelAudioGroup {
+                    session_id: 1_000_000_000,
+                    config_generation: 1,
+                    epoch_id: 0,
+                    pts_samples: 0,
+                    sample_rate: SAMPLE_RATE,
+                    frame_count: FRAME_COUNT,
+                    group_count: 1,
+                    group_id: 0,
+                    group_index: 0,
+                    channel_start: 0,
+                    channel_count: 2,
+                    payload_kind,
+                    sample_format: AudioSampleFormat::S24Le,
+                    flags: 0,
+                    payload: Bytes::from_static(b"packet"),
+                    raptorq_recovered_fragments: 1,
+                },
+                1_001_000_000,
+                25,
+            );
+        }
+
+        assert_eq!(state.selected_epoch_count(), 1);
+        assert_eq!(state.opus_epochs.len(), 1);
+        assert_eq!(state.flac_epochs.len(), 1);
+        assert_eq!(state.received_pcm_frames, u64::from(FRAME_COUNT));
+        assert_eq!(state.duplicate_or_late_epochs, 0);
     }
 
     #[test]
@@ -4633,6 +6204,14 @@ mod tests {
     }
 
     #[test]
+    fn receive_group_plan_uses_one_subscription_for_consecutive_groups() {
+        assert_eq!(receive_group_ids(40, 4).unwrap(), vec![40, 41, 42, 43]);
+        assert_eq!(receive_group_ids(u16::MAX, 1).unwrap(), vec![u16::MAX]);
+        assert!(receive_group_ids(0, 0).is_err());
+        assert!(receive_group_ids(u16::MAX, 2).is_err());
+    }
+
+    #[test]
     fn decorrelated_multichannel_signal_has_expected_s24le_geometry() {
         let pcm = signal_s24le(0, 8, 16, ProbeSignal::Decorrelated);
         assert_eq!(pcm.len(), FRAME_COUNT as usize * 16 * 3);
@@ -4646,6 +6225,48 @@ mod tests {
         ];
         assert_eq!(parse_fmp4_tfdt_ms(&v0), Some(50));
         assert_eq!(parse_fmp4_tfdt_ms(&v1), Some((1_u64 << 32) + 25));
+    }
+
+    #[test]
+    fn fmp4_pts_is_independent_of_retained_object_sequence() {
+        let part = [0, 0, 0, 16, b't', b'f', b'd', b't', 0, 0, 0, 0, 0, 0, 0, 50];
+        let pts_ms = media_part_pts_ms(HlsAudioCodec::Flac, &part, 3_984, 3_984, 0, 5).unwrap();
+        let mut coverage = PartCoverage::new(10, 1, 5).unwrap();
+
+        assert_eq!(pts_ms, 50);
+        assert!(coverage.insert_pts(pts_ms));
+    }
+
+    #[test]
+    fn fmp4_coverage_uses_object_position_after_a_short_boundary_part() {
+        let mut coverage = PartCoverage::new(0, 2_400, 250).unwrap();
+        let media_pts_ms = 597_755;
+        let object_sequence = 2_392;
+
+        assert!(!coverage.insert_pts(media_pts_ms));
+        let coverage_pts_ms = nominal_hls_object_pts_ms(object_sequence, 0, 0, 250).unwrap();
+        assert_eq!(coverage_pts_ms, 598_000);
+        assert!(coverage.insert_pts(coverage_pts_ms));
+    }
+
+    #[test]
+    fn media_timeline_accepts_a_contiguous_short_boundary_part() {
+        let mut timeline = MediaTimelineCoverage::new(10, 3, 0, 610);
+        timeline.insert(10, 0, 250);
+        timeline.insert(11, 250, 110);
+        timeline.insert(12, 360, 250);
+
+        assert_eq!(timeline.discontinuities(), 0);
+    }
+
+    #[test]
+    fn media_timeline_rejects_missing_media_time_inside_complete_objects() {
+        let mut timeline = MediaTimelineCoverage::new(10, 3, 0, 615);
+        timeline.insert(10, 0, 250);
+        timeline.insert(11, 250, 110);
+        timeline.insert(12, 365, 250);
+
+        assert_eq!(timeline.discontinuities(), 1);
     }
 
     #[test]
