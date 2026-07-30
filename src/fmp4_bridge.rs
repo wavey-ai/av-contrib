@@ -152,6 +152,7 @@ pub struct TsFmp4Bridge {
     segmenter: Fmp4Segmenter,
     drained_access_units: Vec<AccessUnit>,
     access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
+    publish_source: bool,
 }
 
 impl TsFmp4Bridge {
@@ -164,6 +165,7 @@ impl TsFmp4Bridge {
             None,
             true,
             None,
+            true,
         )
     }
 
@@ -182,6 +184,7 @@ impl TsFmp4Bridge {
             publisher,
             true,
             None,
+            true,
         )
     }
 
@@ -202,6 +205,7 @@ impl TsFmp4Bridge {
             Some(publisher),
             false,
             None,
+            true,
         )
     }
 
@@ -225,6 +229,29 @@ impl TsFmp4Bridge {
             Some(publisher),
             false,
             Some(access_unit_sink),
+            true,
+        )
+    }
+
+    /// Demux the source solely for an external rendition pipeline. This is
+    /// used by a separate hardware contributor so it cannot duplicate the
+    /// canonical source publication owned by the primary contributor.
+    pub fn new_access_unit_sink_only(
+        output_stream_id: u64,
+        output_stream_idx: usize,
+        playlists: Arc<Playlists>,
+        min_part_ms: u32,
+        access_unit_sink: Arc<dyn AccessUnitSink>,
+    ) -> Self {
+        Self::new_with_options(
+            output_stream_id,
+            output_stream_idx,
+            playlists,
+            min_part_ms,
+            None,
+            false,
+            Some(access_unit_sink),
+            false,
         )
     }
 
@@ -236,6 +263,7 @@ impl TsFmp4Bridge {
         publisher: Option<Arc<dyn Fmp4PartPublisher>>,
         retain_local_cache: bool,
         access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
+        publish_source: bool,
     ) -> Self {
         let mut context = TsDemuxContext::new(publisher.clone());
         let demux = demultiplex::Demultiplex::new(&mut context);
@@ -255,6 +283,7 @@ impl TsFmp4Bridge {
             segmenter,
             drained_access_units: Vec::new(),
             access_unit_sink,
+            publish_source,
         }
     }
 
@@ -279,13 +308,9 @@ impl TsFmp4Bridge {
                 "MPEG-TS chunk buffered without complete access unit"
             );
         }
-        for access_unit in self.drained_access_units.drain(..) {
-            if let Some(sink) = &self.access_unit_sink {
-                if let Err(error) = sink.push_access_unit(access_unit.clone()).await {
-                    error!(error, "access-unit processing sink rejected live media");
-                }
-            }
-            self.segmenter.push_access_unit(access_unit).await;
+        let access_units = std::mem::take(&mut self.drained_access_units);
+        for access_unit in access_units {
+            self.dispatch_access_unit(access_unit, false).await;
         }
     }
 
@@ -293,22 +318,36 @@ impl TsFmp4Bridge {
         self.demux.flush(&mut self.context);
         self.context
             .drain_access_units_into(&mut self.drained_access_units);
-        for access_unit in self.drained_access_units.drain(..) {
-            if let Some(sink) = &self.access_unit_sink {
-                if let Err(error) = sink.push_access_unit(access_unit.clone()).await {
-                    error!(
-                        error,
-                        "access-unit processing sink rejected final live media"
-                    );
-                }
-            }
-            self.segmenter.push_access_unit(access_unit).await;
+        let access_units = std::mem::take(&mut self.drained_access_units);
+        for access_unit in access_units {
+            self.dispatch_access_unit(access_unit, true).await;
         }
-        self.segmenter.finish().await;
+        if self.publish_source {
+            self.segmenter.finish().await;
+        }
         if let Some(sink) = &self.access_unit_sink {
             if let Err(error) = sink.finish().await {
                 error!(error, "access-unit processing sink failed to finish");
             }
+        }
+    }
+
+    async fn dispatch_access_unit(&mut self, access_unit: AccessUnit, final_unit: bool) {
+        if let Some(sink) = &self.access_unit_sink {
+            let result = sink.push_access_unit(access_unit.clone()).await;
+            if let Err(error) = result {
+                if final_unit {
+                    error!(
+                        error,
+                        "access-unit processing sink rejected final live media"
+                    );
+                } else {
+                    error!(error, "access-unit processing sink rejected live media");
+                }
+            }
+        }
+        if self.publish_source {
+            self.segmenter.push_access_unit(access_unit).await;
         }
     }
 
@@ -1569,6 +1608,7 @@ fn audio_codec_name(
 mod tests {
     use super::*;
     use playlists::Options;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
@@ -1582,6 +1622,49 @@ mod tests {
             self.parts.lock().unwrap().push(part);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingAccessUnitSink {
+        access_units: StdMutex<Vec<AccessUnit>>,
+        finished: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl AccessUnitSink for CapturingAccessUnitSink {
+        async fn push_access_unit(&self, access_unit: AccessUnit) -> Result<(), String> {
+            self.access_units.lock().unwrap().push(access_unit);
+            Ok(())
+        }
+
+        async fn finish(&self) -> Result<(), String> {
+            self.finished.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_only_bridge_never_packages_the_duplicate_source() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let sink = Arc::new(CapturingAccessUnitSink::default());
+        let mut bridge = TsFmp4Bridge::new_access_unit_sink_only(
+            9_001,
+            0,
+            playlists,
+            DEFAULT_MIN_PART_MS,
+            sink.clone(),
+        );
+        bridge
+            .dispatch_access_unit(h264_access_unit(90_000, 90_000), false)
+            .await;
+        bridge.finish().await;
+
+        let access_units = sink.access_units.lock().unwrap();
+        assert_eq!(access_units.len(), 1);
+        assert_eq!(access_units[0].pts, 90_000);
+        assert!(sink.finished.load(Ordering::Relaxed));
+        assert!(!bridge.publish_source);
+        assert!(bridge.segmenter.video_buf.is_empty());
     }
 
     #[test]

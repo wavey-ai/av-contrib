@@ -721,6 +721,12 @@ struct QuadraCliArgs {
 
     #[arg(long, env = "AV_QUADRA_QUEUE_CAPACITY", default_value_t = 256)]
     queue_capacity: usize,
+
+    /// Publish only the hardware-derived renditions. Use this on a separate
+    /// VPU contributor so the primary contributor remains the sole publisher
+    /// of the canonical source stream.
+    #[arg(long, env = "AV_QUADRA_DERIVED_ONLY")]
+    derived_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2235,6 +2241,7 @@ async fn start_rist_ingest(
     playlists: Arc<playlists::Playlists>,
     publisher: Arc<dyn Fmp4PartPublisher>,
     access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
+    publish_source: bool,
     telemetry: Arc<IngestTelemetry>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
@@ -2257,6 +2264,7 @@ async fn start_rist_ingest(
         config.output_stream_idx,
         config.min_part_ms,
         access_unit_sink,
+        publish_source,
         shutdown_rx,
     ));
     info!(
@@ -2374,6 +2382,7 @@ async fn start_srt_ingest(
         output_stream_idx,
         config.min_part_ms,
         None,
+        true,
         shutdown_rx,
     ));
     info!(
@@ -2397,6 +2406,7 @@ async fn run_upload_response_ts_bridge(
     output_stream_idx: usize,
     min_part_ms: u32,
     access_unit_sink: Option<Arc<dyn AccessUnitSink>>,
+    publish_source: bool,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let mut tick = interval(Duration::from_millis(HLS_BRIDGE_POLL_MS));
@@ -2566,14 +2576,24 @@ async fn run_upload_response_ts_bridge(
                                     state.bridge = Some(
                                         if public_stream_id == output_stream_id {
                                             if let Some(sink) = &access_unit_sink {
-                                                TsFmp4Bridge::new_publish_only_with_access_unit_sink(
-                                                    public_stream_id,
-                                                    public_stream_idx,
-                                                    playlists.clone(),
-                                                    min_part_ms,
-                                                    publisher.clone(),
-                                                    sink.clone(),
-                                                )
+                                                if publish_source {
+                                                    TsFmp4Bridge::new_publish_only_with_access_unit_sink(
+                                                        public_stream_id,
+                                                        public_stream_idx,
+                                                        playlists.clone(),
+                                                        min_part_ms,
+                                                        publisher.clone(),
+                                                        sink.clone(),
+                                                    )
+                                                } else {
+                                                    TsFmp4Bridge::new_access_unit_sink_only(
+                                                        public_stream_id,
+                                                        public_stream_idx,
+                                                        playlists.clone(),
+                                                        min_part_ms,
+                                                        sink.clone(),
+                                                    )
+                                                }
                                             } else {
                                                 TsFmp4Bridge::new_publish_only(
                                                     public_stream_id,
@@ -6758,6 +6778,10 @@ async fn main() -> Result<()> {
     });
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+    if args.quadra.derived_only && args.quadra.renditions.is_empty() {
+        bail!("--quadra-derived-only requires at least one --quadra-rendition");
+    }
+    #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     let rist_access_unit_sink: Option<Arc<dyn AccessUnitSink>> =
         if args.quadra.renditions.is_empty() {
             None
@@ -6798,8 +6822,12 @@ async fn main() -> Result<()> {
                 })?,
             )
         };
+    #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
+    let rist_publish_source = !args.quadra.derived_only;
     #[cfg(not(all(feature = "quadra-renditions", target_os = "linux")))]
     let rist_access_unit_sink: Option<Arc<dyn AccessUnitSink>> = None;
+    #[cfg(not(all(feature = "quadra-renditions", target_os = "linux")))]
+    let rist_publish_source = true;
     let status = Arc::new(ContribStatusConfig::from_args(&args, telemetry.clone()));
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let rist_shutdown = if let Some(bind) = args.rist_bind {
@@ -6816,6 +6844,7 @@ async fn main() -> Result<()> {
                 playlists.clone(),
                 publisher.clone(),
                 rist_access_unit_sink,
+                rist_publish_source,
                 telemetry.clone(),
                 shutdown_rx.clone(),
             )
