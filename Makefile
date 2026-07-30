@@ -17,7 +17,6 @@ CONTRIB_HTTP_PORT ?= 19443
 MESH_FEC_TARGET ?= 127.0.0.1:22001
 MESH_MEDIA_FEC_TARGET ?= 127.0.0.1:22101
 RIST_BIND ?= 127.0.0.1:27000
-RIST_FLOW_ID ?= 0x11223344
 SRT_BIND ?= 127.0.0.1:27001
 RTMP_BIND ?= 127.0.0.1:19350
 
@@ -69,7 +68,6 @@ service:
 		--rtmp-stream-id $(STREAM_ID) \
 		--fmp4-part-ms $(PART_MS) \
 		--rist-bind $(RIST_BIND) \
-		--rist-flow-id $(RIST_FLOW_ID) \
 		--srt-bind $(SRT_BIND) \
 		--rtmp-bind $(RTMP_BIND) \
 		$(SERVICE_ARGS)

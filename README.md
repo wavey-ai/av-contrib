@@ -260,9 +260,9 @@ Useful endpoints:
   error, object metadata, and dependency/timing fields feed the same view.
   `/api/status` carries the configured targets/carrier state and latest deadline
   headroom.
-- `rist://<rist-bind>`: accepts RIST MPEG-TS and demuxes H.264/AAC. It
-  boxes fMP4/CMAF parts and serves LL-HLS locally. It publishes fMP4 part bytes
-  to mesh under `--rist-stream-id` (default `0`).
+- `rist://<rist-bind>`: accepts RIST MPEG-TS through librist and demuxes
+  H.264/AAC. It boxes fMP4/CMAF parts and serves LL-HLS locally. It publishes
+  fMP4 part bytes to mesh under `--rist-stream-id` (default `0`).
 - `srt://<srt-bind>`: accepts SRT MPEG-TS and follows the same fMP4
   path under `--srt-stream-id` (default `6`).
 - `rtmp://<rtmp-bind>`: accepts RTMP/FLV access units and boxes them
@@ -272,7 +272,6 @@ The stdin senders are kept for local smoke tests and protocol debugging:
 
 ```sh
 cargo run --bin udp-fec-send -- 127.0.0.1:12001
-cargo run --bin rist-send -- 127.0.0.1:7000
 cargo run --bin media-fec-send -- --stream-id 55 --codec auto 127.0.0.1:12101
 ```
 
@@ -282,10 +281,7 @@ fixtures and logs are written under ignored `test/work/`:
 ```sh
 test/local-video-pipeline.sh prepare all
 test/local-video-pipeline.sh run srt 720p
-test/local-video-pipeline.sh run rist-ffmpeg-pure 720p
 test/local-video-pipeline.sh run rist-ffmpeg-librist 720p
-test/local-video-pipeline.sh run rist-rust-pure 720p
-test/local-video-pipeline.sh run rist-rust-librist 720p
 ```
 
 For local live-ingest testing with both mesh nodes and the contributor ingress
@@ -311,7 +307,7 @@ By default, it uses stream ID `1`, UK egress
 
 Any compatible sender can publish SRT to
 `srt://local.infidelity.io:27001?mode=caller` or RIST to
-`local.infidelity.io:27000` with main profile and flow id `0x11223344`. RTMP
+`local.infidelity.io:27000` with the main profile. RTMP
 compatibility remains available at `rtmp://local.infidelity.io:19350/live` with
 stream key `live-local`.
 The supervisor defaults the LL-HLS part target to 50 ms. Override it with

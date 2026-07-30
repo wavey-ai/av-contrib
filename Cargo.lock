@@ -280,8 +280,6 @@ dependencies = [
  "hyper-util",
  "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "reqwest 0.13.4",
- "rist-core",
- "rist-mio",
  "rustls 0.23.42",
  "rustls-pemfile",
  "serde",
@@ -290,6 +288,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
+ "wavey-rist",
  "wavey-srt",
 ]
 
@@ -434,6 +433,26 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.13.1",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex 1.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
@@ -447,7 +466,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "shlex 1.3.0",
  "syn 2.0.119",
 ]
@@ -2425,7 +2444,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "rustls 0.23.42",
  "socket2 0.5.10",
  "thiserror 2.0.19",
@@ -2447,7 +2466,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "ring",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "rustls 0.23.42",
  "rustls-pki-types",
  "slab",
@@ -2831,6 +2850,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rist-sys"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0de2fb48dc6d7996ddbb31dabebdce0729894c48a31608f3d31cfbf3805c8fb"
+dependencies = [
+ "bindgen 0.70.1",
+ "pkg-config",
+]
+
+[[package]]
 name = "rml_amf0"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2892,6 +2921,12 @@ name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -3409,7 +3444,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f206e7becfb887690a7fc7037147bfbff1708021a38ef7a054e5beea8e2744f8"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cmake",
  "libc",
 ]
@@ -4191,6 +4226,18 @@ dependencies = [
  "fixedbitset",
  "log",
  "smptera-format-identifiers-rust",
+]
+
+[[package]]
+name = "wavey-rist"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afc60f7f003c30c3f505a63fa6229fd574500e19f3076267fa1a9eeb95755519"
+dependencies = [
+ "libc",
+ "rist-sys",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

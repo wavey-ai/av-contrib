@@ -21,7 +21,6 @@ PLAYLIST_COUNT="${AV_CONTRIB_TEST_PLAYLIST_COUNT:-120}"
 PLAYLIST_BUFFER_KB="${AV_CONTRIB_TEST_PLAYLIST_BUFFER_KB:-2048}"
 
 RIST_PROFILE="${AV_CONTRIB_TEST_RIST_PROFILE:-main}"
-RIST_FLOW_ID="${AV_CONTRIB_TEST_RIST_FLOW_ID:-0x11223344}"
 RIST_BUFFER_MS="${AV_CONTRIB_TEST_RIST_BUFFER_MS:-120}"
 
 FFMPEG_LOGLEVEL="${AV_CONTRIB_TEST_FFMPEG_LOGLEVEL:-info}"
@@ -45,10 +44,7 @@ Usage:
 
 Modes:
   srt
-  rist-ffmpeg-pure
   rist-ffmpeg-librist
-  rist-rust-pure
-  rist-rust-librist
 
 Defaults:
   source:     $SOURCE
@@ -241,7 +237,6 @@ wait_for_health() {
 
 start_contrib() {
   local mode="$1"
-  local backend="$2"
   mkdir -p "$LOG_DIR"
   cargo build --bin av-contrib
 
@@ -270,8 +265,6 @@ start_contrib() {
       --rist-bind "127.0.0.1:$RIST_PORT"
       --rist-stream-id "$STREAM_ID"
       --rist-profile "$RIST_PROFILE"
-      --rist-backend "$backend"
-      --rist-flow-id "$RIST_FLOW_ID"
     )
   fi
 
@@ -394,58 +387,19 @@ send_rist_ffmpeg() {
     -f mpegts "$url"
 }
 
-send_rist_rust() {
-  local fixture="$1"
-  log "sending RIST fixture with native Rust sender: $fixture"
-  cargo build --bin rist-send
-  ffmpeg -hide_banner -nostdin -loglevel "$FFMPEG_LOGLEVEL" \
-    $(ffmpeg_input_args) -i "$fixture" $(ffmpeg_limit_args) \
-    -map 0 -c copy -f mpegts pipe:1 | \
-    "$ROOT/target/debug/rist-send" \
-      --profile "$RIST_PROFILE" \
-      --flow-id "$RIST_FLOW_ID" \
-      "127.0.0.1:$RIST_PORT"
-}
-
-send_rist() {
-  local fixture="$1"
-  local sender="$2"
-  case "$sender" in
-    ffmpeg) send_rist_ffmpeg "$fixture" ;;
-    rust) send_rist_rust "$fixture" ;;
-    *) die "unknown RIST sender: $sender" ;;
-  esac
-}
-
-mode_backend() {
-  case "$1" in
-    srt) printf '\n' ;;
-    rist-ffmpeg-pure|rist-rust-pure) printf 'pure\n' ;;
-    rist-ffmpeg-librist|rist-rust-librist) printf 'librist\n' ;;
-    *) die "unknown run mode: $1" ;;
-  esac
-}
-
-mode_sender() {
-  case "$1" in
-    srt) printf '\n' ;;
-    rist-ffmpeg-pure|rist-ffmpeg-librist) printf 'ffmpeg\n' ;;
-    rist-rust-pure|rist-rust-librist) printf 'rust\n' ;;
-    *) die "unknown run mode: $1" ;;
-  esac
-}
-
 run_once() {
   local mode="$1"
   local variant="${2:-720p}"
-  local backend sender fixture
-  backend="$(mode_backend "$mode")"
-  sender="$(mode_sender "$mode")"
+  local fixture
+  case "$mode" in
+    srt|rist-ffmpeg-librist) ;;
+    *) die "unknown run mode: $mode" ;;
+  esac
   fixture="$(variant_file "$variant")"
   [[ -s "$fixture" ]] || prepare_variant "$variant"
 
   trap cleanup EXIT INT TERM
-  start_contrib "$mode" "$backend"
+  start_contrib "$mode"
   log "HLS URL: $(hls_url)"
   start_hls_watch
 
@@ -454,7 +408,7 @@ run_once() {
   if [[ "$mode" == "srt" ]]; then
     send_srt "$fixture"
   else
-    send_rist "$fixture" "$sender"
+    send_rist_ffmpeg "$fixture"
   fi
   sender_status=$?
   set -e
@@ -475,7 +429,7 @@ run_once() {
 
 matrix() {
   local variant mode rc overall
-  local modes=(srt rist-ffmpeg-pure rist-ffmpeg-librist rist-rust-pure rist-rust-librist)
+  local modes=(srt rist-ffmpeg-librist)
   overall=0
   while IFS= read -r variant; do
     for mode in "${modes[@]}"; do

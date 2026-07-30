@@ -57,7 +57,7 @@ use tracing::{debug, info, trace, warn};
 #[cfg(feature = "srt-ingest")]
 use upload_response::SrtIngest as UploadSrtIngest;
 use upload_response::{
-    PureRistIngest as UploadPureRistIngest, PureRistProfile as UploadPureRistProfile, TailSlot,
+    CachedResponse, RistIngest as UploadRistIngest, RistProfile as UploadRistProfile, TailSlot,
     UploadResponseConfig, UploadResponseService,
 };
 use web_service::{
@@ -66,7 +66,6 @@ use web_service::{
     WebTransportHandler,
 };
 
-const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
 const NEEDLETAIL_AEP1_INGEST_PATH: &str = "/v1/ingest/aep1";
 const NEEDLETAIL_AEP1_CONTENT_TYPE: &str = "application/x-needletail-aep1-stream";
@@ -413,7 +412,6 @@ fn is_audio_transport_datagram(datagram: &[u8]) -> bool {
 }
 const UPLOAD_RESPONSE_HLS_WORKER_ID: &str = "av-contrib-upload-response-fmp4-bridge";
 const HLS_BRIDGE_POLL_MS: u64 = 5;
-const LOW_LATENCY_RIST_BODY_FLUSH_BYTES: usize = 2 * 1_316;
 const DEFAULT_SEGMENT_MS: u32 = 1_000;
 const DEFAULT_TARGET_DURATION_MS: u32 = 6_000;
 const CONTRIB_ACTIVITY_LIMIT: usize = 64;
@@ -655,12 +653,6 @@ struct Args {
     #[arg(long, value_enum, default_value = "main")]
     rist_profile: RistProfile,
 
-    #[arg(long, value_enum, default_value = "pure")]
-    rist_backend: RistBackend,
-
-    #[arg(long, value_parser = parse_u32_auto, default_value_t = DEFAULT_FLOW_ID)]
-    rist_flow_id: u32,
-
     #[arg(long)]
     srt_bind: Option<SocketAddr>,
 
@@ -730,7 +722,7 @@ impl RistProfile {
     }
 }
 
-impl From<RistProfile> for UploadPureRistProfile {
+impl From<RistProfile> for UploadRistProfile {
     fn from(profile: RistProfile) -> Self {
         match profile {
             RistProfile::Simple => Self::Simple,
@@ -739,24 +731,10 @@ impl From<RistProfile> for UploadPureRistProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum RistBackend {
-    Pure,
-}
-
-impl RistBackend {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pure => "pure",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct RistIngestConfig {
     bind: SocketAddr,
     profile: RistProfile,
-    flow_id: u32,
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
@@ -2212,10 +2190,8 @@ async fn start_rist_ingest(
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
     let service = Arc::new(UploadResponseService::new(upload_response_config()));
-    let rist_shutdown = UploadPureRistIngest::new(service.clone())
+    let rist_shutdown = UploadRistIngest::new(service.clone())
         .with_profile(config.profile.into())
-        .with_flow_id(config.flow_id)
-        .with_body_flush_bytes(LOW_LATENCY_RIST_BODY_FLUSH_BYTES)
         .start(config.bind)
         .await
         .map_err(|error| {
@@ -2227,6 +2203,7 @@ async fn start_rist_ingest(
         publisher,
         telemetry,
         "rist",
+        UploadTsOutputPolicy::FixedConfigured,
         config.output_stream_id,
         config.output_stream_idx,
         config.min_part_ms,
@@ -2235,8 +2212,7 @@ async fn start_rist_ingest(
     info!(
         bind = %config.bind,
         profile = config.profile.as_str(),
-        backend = RistBackend::Pure.as_str(),
-        flow_id = format_args!("0x{:08x}", config.flow_id),
+        backend = "librist",
         output_stream_id = config.output_stream_id,
         output_stream_idx = config.output_stream_idx,
         "RIST contributor frontend listening via upload-response"
@@ -2252,6 +2228,67 @@ struct UploadTsBridgeState {
     body_slots: u64,
     ended: bool,
     bridge: Option<TsFmp4Bridge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadTsOutputPolicy {
+    FixedConfigured,
+    #[cfg(any(feature = "srt-ingest", test))]
+    ConcurrentFallback,
+}
+
+fn select_upload_ts_output_stream_id(
+    policy: UploadTsOutputPolicy,
+    configured_stream_id: u64,
+    request_stream_id: u64,
+    has_active_bridge: bool,
+) -> u64 {
+    #[cfg(not(any(feature = "srt-ingest", test)))]
+    let _ = (request_stream_id, has_active_bridge);
+
+    match policy {
+        UploadTsOutputPolicy::FixedConfigured => configured_stream_id,
+        #[cfg(any(feature = "srt-ingest", test))]
+        UploadTsOutputPolicy::ConcurrentFallback if has_active_bridge => request_stream_id,
+        #[cfg(any(feature = "srt-ingest", test))]
+        UploadTsOutputPolicy::ConcurrentFallback => configured_stream_id,
+    }
+}
+
+fn upload_output_has_active_successor(
+    bridges: &HashMap<u64, UploadTsBridgeState>,
+    request_stream_id: u64,
+    output_stream_id: u64,
+) -> bool {
+    bridges.iter().any(|(&other_request_stream_id, state)| {
+        other_request_stream_id != request_stream_id
+            && !state.ended
+            && state.output_stream_id == Some(output_stream_id)
+    })
+}
+
+async fn advance_upload_request_reader(
+    service: &UploadResponseService,
+    stream_id: u64,
+    slot: usize,
+    end_of_request: bool,
+) -> bool {
+    let advanced = service
+        .mark_request_reader_position(stream_id, UPLOAD_RESPONSE_HLS_WORKER_ID, slot)
+        .await;
+    if end_of_request && advanced {
+        service
+            .complete_response(
+                stream_id,
+                Ok(CachedResponse {
+                    status: StatusCode::NO_CONTENT,
+                    body: Bytes::new(),
+                    headers: Vec::new(),
+                }),
+            )
+            .await;
+    }
+    advanced
 }
 
 #[cfg(feature = "srt-ingest")]
@@ -2282,6 +2319,7 @@ async fn start_srt_ingest(
         publisher,
         telemetry,
         "srt",
+        UploadTsOutputPolicy::ConcurrentFallback,
         config.output_stream_id,
         output_stream_idx,
         config.min_part_ms,
@@ -2303,6 +2341,7 @@ async fn run_upload_response_ts_bridge(
     publisher: Arc<dyn Fmp4PartPublisher>,
     telemetry: Arc<IngestTelemetry>,
     protocol: &'static str,
+    output_policy: UploadTsOutputPolicy,
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
@@ -2349,7 +2388,19 @@ async fn run_upload_response_ts_bridge(
                             bridge.finish().await;
                         }
                         if let Some(output_stream_id) = state.output_stream_id {
-                            playlists.fin(output_stream_id);
+                            if upload_output_has_active_successor(
+                                &bridges,
+                                stream_id,
+                                output_stream_id,
+                            ) {
+                                debug!(
+                                    stream_id,
+                                    output_stream_id,
+                                    "preserving upload output for an active successor"
+                                );
+                            } else {
+                                playlists.fin(output_stream_id);
+                            }
                         }
                         telemetry.end_ingest_session(protocol, stream_id, "inactive");
                     }
@@ -2381,6 +2432,21 @@ async fn run_upload_response_ts_bridge(
                         continue;
                     }
 
+                    if !state.reader_registered {
+                        service
+                            .register_request_reader(
+                                stream_id,
+                                UPLOAD_RESPONSE_HLS_WORKER_ID,
+                            )
+                            .await;
+                        state.reader_registered = true;
+                        debug!(
+                            stream_id,
+                            worker_id = UPLOAD_RESPONSE_HLS_WORKER_ID,
+                            "registered upload-response fMP4 bridge reader"
+                        );
+                    }
+
                     if stream.request_last <= state.last_seen {
                         trace!(
                             stream_id,
@@ -2391,8 +2457,9 @@ async fn run_upload_response_ts_bridge(
                         continue;
                     }
 
-                    let mut stream_ended = false;
+                    let mut finished_output_stream_id = None;
                     for slot in (state.last_seen + 1)..=stream.request_last {
+                        let mut slot_ended = false;
                         match service.tail_request(stream_id, slot).await {
                             Some(TailSlot::Headers(headers)) => {
                                 let path = Some(String::from_utf8_lossy(&headers.path).into_owned());
@@ -2422,11 +2489,13 @@ async fn run_upload_response_ts_bridge(
                             }
                             Some(TailSlot::Body(data)) => {
                                 if state.bridge.is_none() {
-                                    let public_stream_id = if has_active_bridge {
-                                        stream_id
-                                    } else {
-                                        output_stream_id
-                                    };
+                                    let public_stream_id =
+                                        select_upload_ts_output_stream_id(
+                                            output_policy,
+                                            output_stream_id,
+                                            stream_id,
+                                            has_active_bridge,
+                                        );
                                     let public_stream_idx = if public_stream_id == output_stream_id {
                                         output_stream_idx
                                     } else {
@@ -2454,20 +2523,6 @@ async fn run_upload_response_ts_bridge(
                                         output_stream_id = public_stream_id,
                                         output_stream_idx = public_stream_idx,
                                         "created upload-response MPEG-TS fMP4 bridge after first body slot"
-                                    );
-                                }
-                                if !state.reader_registered {
-                                    service
-                                        .register_request_reader(
-                                            stream_id,
-                                            UPLOAD_RESPONSE_HLS_WORKER_ID,
-                                        )
-                                        .await;
-                                    state.reader_registered = true;
-                                    debug!(
-                                        stream_id,
-                                        worker_id = UPLOAD_RESPONSE_HLS_WORKER_ID,
-                                        "registered upload-response fMP4 bridge reader"
                                     );
                                 }
                                 state.body_slots = state.body_slots.saturating_add(1);
@@ -2505,9 +2560,7 @@ async fn run_upload_response_ts_bridge(
                                         "upload-response fMP4 bridge reached stream end"
                                     );
                                     bridge.finish().await;
-                                    if let Some(output_stream_id) = state.output_stream_id {
-                                        playlists.fin(output_stream_id);
-                                    }
+                                    finished_output_stream_id = state.output_stream_id;
                                 } else {
                                     trace!(
                                         stream_id,
@@ -2516,7 +2569,8 @@ async fn run_upload_response_ts_bridge(
                                     );
                                 }
                                 telemetry.end_ingest_session(protocol, stream_id, "ended");
-                                stream_ended = true;
+                                state.ended = true;
+                                slot_ended = true;
                             }
                             Some(TailSlot::Control(_)) => {
                                 trace!(
@@ -2533,18 +2587,38 @@ async fn run_upload_response_ts_bridge(
                                 );
                             }
                         }
-                        service
-                            .mark_request_reader_position(
+                        if !advance_upload_request_reader(
+                            service.as_ref(),
+                            stream_id,
+                            slot,
+                            slot_ended,
+                        )
+                        .await
+                            && slot_ended
+                        {
+                            warn!(
                                 stream_id,
-                                UPLOAD_RESPONSE_HLS_WORKER_ID,
                                 slot,
-                            )
-                            .await;
+                                "upload-response end reader position did not advance"
+                            );
+                        }
                     }
 
                     state.last_seen = stream.request_last;
-                    if stream_ended {
-                        state.ended = true;
+                    if let Some(finished_output_stream_id) = finished_output_stream_id {
+                        if upload_output_has_active_successor(
+                            &bridges,
+                            stream_id,
+                            finished_output_stream_id,
+                        ) {
+                            debug!(
+                                stream_id,
+                                output_stream_id = finished_output_stream_id,
+                                "preserving upload output across an overlapping successor"
+                            );
+                        } else {
+                            playlists.fin(finished_output_stream_id);
+                        }
                     }
                 }
             }
@@ -5808,9 +5882,9 @@ impl ListenerStatus {
             bind: args.rist_bind.map(|bind| bind.to_string()),
             output_stream_id: args.rist_stream_id.to_string(),
             output_hls_path: format!("/{}/stream.m3u8", args.rist_stream_id),
-            backend: Some(args.rist_backend.as_str()),
+            backend: Some("librist"),
             profile: Some(args.rist_profile.as_str()),
-            flow_id: Some(format!("0x{:08x}", args.rist_flow_id)),
+            flow_id: None,
         }
     }
 
@@ -6617,7 +6691,6 @@ async fn main() -> Result<()> {
                 RistIngestConfig {
                     bind,
                     profile: args.rist_profile,
-                    flow_id: args.rist_flow_id,
                     output_stream_id: args.rist_stream_id,
                     output_stream_idx,
                     min_part_ms: args.fmp4_part_ms,
@@ -6786,11 +6859,9 @@ async fn main() -> Result<()> {
     }
     if let Some(bind) = args.rist_bind {
         println!(
-            "rist:    rist://127.0.0.1:{} backend={} profile={} flow_id=0x{:08x} stream_id={}",
+            "rist:    rist://127.0.0.1:{} backend=librist profile={} stream_id={}",
             bind.port(),
-            args.rist_backend.as_str(),
             args.rist_profile.as_str(),
-            args.rist_flow_id,
             args.rist_stream_id
         );
     }
@@ -7312,18 +7383,6 @@ fn now_unix_us() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
-    let trimmed = value.trim();
-    if let Some(hex) = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-    {
-        u32::from_str_radix(hex, 16).map_err(|err| err.to_string())
-    } else {
-        trimmed.parse::<u32>().map_err(|err| err.to_string())
-    }
-}
-
 #[cfg(feature = "srt-ingest")]
 fn validate_compiled_ingress_features(_args: &Args) -> Result<()> {
     Ok(())
@@ -7385,9 +7444,101 @@ mod tests {
     }
 
     #[test]
-    fn parses_decimal_and_hex_rist_flow_ids() {
-        assert_eq!(parse_u32_auto("0x11223344").unwrap(), DEFAULT_FLOW_ID);
-        assert_eq!(parse_u32_auto("287454020").unwrap(), DEFAULT_FLOW_ID);
+    fn fixed_upload_output_policy_preserves_the_configured_stream_across_rollovers() {
+        for request_stream_id in [1, 2, 3] {
+            assert_eq!(
+                select_upload_ts_output_stream_id(
+                    UploadTsOutputPolicy::FixedConfigured,
+                    1,
+                    request_stream_id,
+                    false,
+                ),
+                1
+            );
+            assert_eq!(
+                select_upload_ts_output_stream_id(
+                    UploadTsOutputPolicy::FixedConfigured,
+                    1,
+                    request_stream_id,
+                    true,
+                ),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_upload_output_policy_uses_request_identity_only_during_overlap() {
+        assert_eq!(
+            select_upload_ts_output_stream_id(
+                UploadTsOutputPolicy::ConcurrentFallback,
+                6,
+                41,
+                false,
+            ),
+            6
+        );
+        assert_eq!(
+            select_upload_ts_output_stream_id(
+                UploadTsOutputPolicy::ConcurrentFallback,
+                6,
+                42,
+                true,
+            ),
+            42
+        );
+    }
+
+    #[test]
+    fn fixed_output_is_not_finalized_while_a_successor_is_active() {
+        let state = |output_stream_id, ended| UploadTsBridgeState {
+            output_stream_id,
+            output_stream_idx: output_stream_id.map(|id| id as usize),
+            last_seen: 0,
+            reader_registered: false,
+            body_slots: 0,
+            ended,
+            bridge: None,
+        };
+        let mut bridges = HashMap::from([(2, state(Some(1), false)), (3, state(Some(3), false))]);
+
+        assert!(upload_output_has_active_successor(&bridges, 1, 1));
+        bridges.get_mut(&2).unwrap().ended = true;
+        assert!(!upload_output_has_active_successor(&bridges, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn upload_response_completes_only_after_the_end_reader_position_advances() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            slot_size_kb: 1,
+            slots_per_stream: 8,
+            response_timeout_ms: 1_000,
+        }));
+        let stream = service.open_stream().await.unwrap();
+        let stream_id = stream.stream_id();
+        let mut response_rx = service.register_response(stream_id).await;
+        assert!(
+            service
+                .register_request_reader(stream_id, UPLOAD_RESPONSE_HLS_WORKER_ID)
+                .await
+        );
+
+        assert!(advance_upload_request_reader(service.as_ref(), stream_id, 1, false).await);
+        assert!(timeout(Duration::from_millis(10), &mut response_rx)
+            .await
+            .is_err());
+        assert!(advance_upload_request_reader(service.as_ref(), stream_id, 2, true).await);
+
+        let response = timeout(Duration::from_secs(1), response_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+        assert!(response.body.is_empty());
+        assert!(response.headers.is_empty());
+        stream.close().await;
     }
 
     #[test]
@@ -8443,8 +8594,6 @@ mod tests {
             symbol_size: DEFAULT_SYMBOL_SIZE,
             rist_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_000))),
             rist_profile: RistProfile::Main,
-            rist_backend: RistBackend::Pure,
-            rist_flow_id: DEFAULT_FLOW_ID,
             srt_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_001))),
             rtmp_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 19_350))),
             fmp4_part_ms: 50,
@@ -8518,8 +8667,6 @@ mod tests {
             symbol_size: DEFAULT_SYMBOL_SIZE,
             rist_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_000))),
             rist_profile: RistProfile::Main,
-            rist_backend: RistBackend::Pure,
-            rist_flow_id: DEFAULT_FLOW_ID,
             srt_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_001))),
             rtmp_bind: None,
             fmp4_part_ms: 50,
@@ -8680,7 +8827,8 @@ mod tests {
             .expect("missing RIST listener status");
         assert!(rist.enabled);
         assert_eq!(rist.output_stream_id, "9007199254741994");
-        assert_eq!(rist.flow_id.as_deref(), Some("0x11223344"));
+        assert_eq!(rist.backend, Some("librist"));
+        assert!(rist.flow_id.is_none());
     }
 
     #[test]
@@ -9097,8 +9245,6 @@ mod tests {
             symbol_size: DEFAULT_SYMBOL_SIZE,
             rist_bind: None,
             rist_profile: RistProfile::Main,
-            rist_backend: RistBackend::Pure,
-            rist_flow_id: DEFAULT_FLOW_ID,
             srt_bind: None,
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
@@ -9312,8 +9458,6 @@ mod tests {
             symbol_size: DEFAULT_SYMBOL_SIZE,
             rist_bind: None,
             rist_profile: RistProfile::Main,
-            rist_backend: RistBackend::Pure,
-            rist_flow_id: DEFAULT_FLOW_ID,
             srt_bind: None,
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
@@ -9427,8 +9571,6 @@ mod tests {
             symbol_size: DEFAULT_SYMBOL_SIZE,
             rist_bind: None,
             rist_profile: RistProfile::Main,
-            rist_backend: RistBackend::Pure,
-            rist_flow_id: DEFAULT_FLOW_ID,
             srt_bind: None,
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
