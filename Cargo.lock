@@ -12,6 +12,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "access-unit"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/access-unit.git#ae7aa5f0baa6c2827e17ce19319d57181bdb401a"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -180,12 +188,12 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "av-contrib"
 version = "0.1.0"
 dependencies = [
- "access-unit",
+ "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "anyhow",
  "async-trait",
  "av-hls",
  "av-upload-response",
- "av-web-service",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd)",
  "base64",
  "bytes",
  "clap 4.6.3",
@@ -199,7 +207,7 @@ dependencies = [
  "media-capability",
  "media-object",
  "music-audio-session",
- "playlists",
+ "playlists 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "relay-session",
@@ -234,7 +242,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d918cf4c1258276146c4457e7012516a955d142ef4b7f2ab47fd0250131474c2"
 dependencies = [
  "async-trait",
- "av-web-service",
+ "av-web-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",
  "env_logger",
  "flate2",
@@ -246,7 +254,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "playlists",
+ "playlists 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "regex",
  "structopt",
  "tokio",
@@ -259,19 +267,18 @@ dependencies = [
 [[package]]
 name = "av-upload-response"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a43d0735dcc8a1c71a2012ac8a2804114f370aba8d9e0368e3dab16ead7850ec"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd#6517df971b15bd2b2193aa7d1837852b80909dfd"
 dependencies = [
  "anyhow",
  "async-trait",
- "av-web-service",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd)",
  "bytes",
  "futures-util",
  "http",
- "http-pack",
+ "http-pack 0.1.0 (git+https://github.com/wavey-ai/http-pack.git)",
  "hyper",
  "hyper-util",
- "playlists",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "reqwest 0.13.4",
  "rist-core",
  "rist-mio",
@@ -307,11 +314,55 @@ dependencies = [
  "h3-webtransport",
  "http",
  "http-body-util",
- "http-pack",
+ "http-pack 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "playlists",
+ "playlists 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "quinn",
+ "regex",
+ "rustls 0.23.42",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "structopt",
+ "thiserror 2.0.19",
+ "tls-helpers 0.2.0",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "webpki-roots 1.0.9",
+ "xmpegts",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "av-web-service"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=6517df971b15bd2b2193aa7d1837852b80909dfd#6517df971b15bd2b2193aa7d1837852b80909dfd"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "dotenvy",
+ "env_logger",
+ "futures-util",
+ "gen-id",
+ "h2",
+ "h3",
+ "h3-datagram",
+ "h3-quinn",
+ "h3-webtransport",
+ "http",
+ "http-body-util",
+ "http-pack 0.1.0 (git+https://github.com/wavey-ai/http-pack.git)",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "quinn",
  "regex",
  "rustls 0.23.42",
@@ -1473,6 +1524,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-pack"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/http-pack.git#a6766dfc4b996e3c066b4c5086bfb10c727475f3"
+dependencies = [
+ "bytes",
+ "h3",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "message-packetizer",
+ "serde",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1539,7 +1605,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2213,7 +2279,23 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a079df8689d40f9bcecbdfea78f0b5af588637777078715ec24a7b2a48c565f"
 dependencies = [
- "access-unit",
+ "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "chrono",
+ "flate2",
+ "thiserror 1.0.69",
+ "tls-helpers 0.2.0",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "playlists"
+version = "0.1.6"
+source = "git+https://github.com/wavey-ai/playlists.git#f9037f88749671dde5436158086838c136cd20ce"
+dependencies = [
+ "access-unit 0.1.3 (git+https://github.com/wavey-ai/access-unit.git)",
  "bytes",
  "chrono",
  "flate2",
@@ -2345,7 +2427,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.42",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2384,7 +2466,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -2779,7 +2861,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19cc0de7cad709a7bfbf889c9cc9cebc46a9f879d555c1f48ba0a92244a9ff14"
 dependencies = [
- "access-unit",
+ "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",
  "chrono",
  "futures",
@@ -3262,7 +3344,7 @@ version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d32b6a8f310caabc9156ecf6ecef61cb2b9250d9ed7808c864d1441c83cafc9b"
 dependencies = [
- "access-unit",
+ "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "flacenc",
  "libc",
  "oxideav-core",
@@ -4063,7 +4145,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ade634d8b5d26d475c3d2ccc6a582479f97d988fe697a8de4060d08c95ac9d"
 dependencies = [
- "access-unit",
+ "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",
  "libopus-rs",
 ]
