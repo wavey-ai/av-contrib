@@ -9,12 +9,13 @@
 use crate::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, PublishedOpaquePart, TimestampInput, DEFAULT_MIN_PART_MS,
 };
+use crate::soundkit_v2::{terminalize_soundkit_group, SoundKitV2StreamRef};
 use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS, PSI_STREAM_PRIVATE_DATA};
 use boxer::fmp4::{
     opus_packet_info, AudioTrackConfig, OpusAudioConfig, PcmAudioConfig, PcmSampleKind,
 };
 use bytes::{Bytes, BytesMut};
-use frame_header::{EncodingFlag, FrameHeaderV2};
+use frame_header::EncodingFlag;
 use music_audio_session::{
     DecodedMultichannelAudioGroup, MultichannelAudioReceiver, MultichannelAudioSessionConfig,
 };
@@ -50,6 +51,10 @@ static ACTIVE_RECEIVERS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_RENDITION_WORKERS: AtomicU64 = AtomicU64::new(0);
 static RETIRED_RECEIVERS: AtomicU64 = AtomicU64::new(0);
 static RETIRED_RENDITION_WORKERS: AtomicU64 = AtomicU64::new(0);
+static RENDITION_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static RENDITION_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static RENDITION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static RENDITION_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AudioEpochHlsWorkerStats {
@@ -61,6 +66,11 @@ pub struct AudioEpochHlsWorkerStats {
     pub active_rendition_workers: u64,
     pub retired_receivers: u64,
     pub retired_rendition_workers: u64,
+    pub rendition_queue_capacity_per_worker: u64,
+    pub rendition_queue_enqueued: u64,
+    pub rendition_queue_dropped: u64,
+    pub rendition_queue_depth: u64,
+    pub rendition_queue_max_depth: u64,
 }
 
 pub fn worker_stats() -> AudioEpochHlsWorkerStats {
@@ -73,6 +83,11 @@ pub fn worker_stats() -> AudioEpochHlsWorkerStats {
         active_rendition_workers: ACTIVE_RENDITION_WORKERS.load(Ordering::Relaxed),
         retired_receivers: RETIRED_RECEIVERS.load(Ordering::Relaxed),
         retired_rendition_workers: RETIRED_RENDITION_WORKERS.load(Ordering::Relaxed),
+        rendition_queue_capacity_per_worker: RENDITION_WORKER_QUEUE_CAPACITY as u64,
+        rendition_queue_enqueued: RENDITION_QUEUE_ENQUEUED.load(Ordering::Relaxed),
+        rendition_queue_dropped: RENDITION_QUEUE_DROPPED.load(Ordering::Relaxed),
+        rendition_queue_depth: RENDITION_QUEUE_DEPTH.load(Ordering::Relaxed),
+        rendition_queue_max_depth: RENDITION_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
     }
 }
 
@@ -365,6 +380,14 @@ pub async fn run_audio_epoch_hls_worker(
                                 u64::from(group.raptorq_recovered_fragments),
                                 Ordering::Relaxed,
                             );
+                            let group = match terminalize_soundkit_group(group) {
+                                Ok(group) => group,
+                                Err(error) => {
+                                    WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                    warn!(peer = %message.peer, error = %error, "rejected non-canonical SoundKit v2 group");
+                                    continue;
+                                }
+                            };
                             if !config.formats.contains(&group.payload_kind) {
                                 continue;
                             }
@@ -409,6 +432,14 @@ pub async fn run_audio_epoch_hls_worker(
                     u64::from(group.raptorq_recovered_fragments),
                     Ordering::Relaxed,
                 );
+                let group = match terminalize_soundkit_group(group) {
+                    Ok(group) => group,
+                    Err(error) => {
+                        WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
+                        warn!(peer = %message.peer, error = %error, "rejected non-canonical SoundKit v2 group");
+                        continue;
+                    }
+                };
                 if !config.formats.contains(&group.payload_kind) {
                     continue;
                 }
@@ -465,11 +496,31 @@ async fn dispatch_group_to_rendition_worker(
                 .clone()
         }
     };
-    sender
-        .send(group)
-        .await
-        .map_err(|_| format!("AEP1 LL-HLS rendition worker {key:?} stopped"))?;
-    Ok(())
+    try_handoff_rendition_group(&sender, key, group)
+}
+
+fn try_handoff_rendition_group(
+    sender: &mpsc::Sender<DecodedMultichannelAudioGroup>,
+    key: RenditionKey,
+    group: DecodedMultichannelAudioGroup,
+) -> Result<(), String> {
+    match sender.try_send(group) {
+        Ok(()) => {
+            RENDITION_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+            let depth = RENDITION_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+            RENDITION_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            RENDITION_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
+            Err(format!(
+                "AEP1 LL-HLS rendition worker {key:?} queue is full; newest group dropped"
+            ))
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(format!("AEP1 LL-HLS rendition worker {key:?} stopped"))
+        }
+    }
 }
 
 fn retire_idle_receivers(receivers: &mut HashMap<SocketAddr, ReceiverState>, now: Instant) {
@@ -527,6 +578,11 @@ async fn run_rendition_worker(
 ) {
     let mut renditions = HashMap::<RenditionKey, RenditionState>::new();
     while let Some(group) = input.recv().await {
+        let _ = RENDITION_QUEUE_DEPTH.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |depth| Some(depth.saturating_sub(1)),
+        );
         if let Err(error) = package_group(&config, &mut renditions, group).await {
             WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
             warn!(
@@ -711,28 +767,57 @@ async fn package_group_as_fmp4(
     group: DecodedMultichannelAudioGroup,
 ) -> Result<(), String> {
     let audio_config = audio_track_config(&group)?;
-    let (audio, stream_type) = match group.payload_kind {
-        AudioPayloadKind::Flac => (group.payload.clone(), PSI_STREAM_PRIVATE_DATA),
+    let (packets, stream_type) = match group.payload_kind {
+        AudioPayloadKind::Flac => (
+            vec![ElementaryAudioPacket {
+                data: group.payload.clone(),
+                frame_count: group.frame_count,
+                id: group.epoch_id,
+            }],
+            PSI_STREAM_PRIVATE_DATA,
+        ),
         AudioPayloadKind::Pcm => {
             validate_pcm_group(&group)?;
-            (group.payload.clone(), PSI_STREAM_PRIVATE_DATA)
+            (
+                vec![ElementaryAudioPacket {
+                    data: group.payload.clone(),
+                    frame_count: group.frame_count,
+                    id: group.epoch_id,
+                }],
+                PSI_STREAM_PRIVATE_DATA,
+            )
         }
-        AudioPayloadKind::Opus => (raw_opus_packet(&group)?, PSI_STREAM_AUDIO_OPUS),
+        AudioPayloadKind::Opus => (raw_opus_packets(&group)?, PSI_STREAM_AUDIO_OPUS),
+        AudioPayloadKind::SoundKitV2 => {
+            return Err("SoundKit v2 group reached fMP4 before terminal decoding".to_string())
+        }
     };
-    let pts_ms = samples_to_millis(group.pts_samples, group.sample_rate)?;
     let segmenter = state.packager.fmp4()?;
     segmenter.set_audio_track_config(audio_config);
-    segmenter
-        .push_access_unit(AccessUnit {
+    let mut pts_samples = group.pts_samples;
+    for packet in packets {
+        let pts_ms = samples_to_millis(pts_samples, group.sample_rate)?;
+        segmenter
+            .push_access_unit(AccessUnit {
             key: true,
             pts: pts_ms,
             dts: pts_ms,
-            data: audio,
+            data: packet.data,
             stream_type,
-            id: group.epoch_id,
-        })
-        .await;
+            id: packet.id,
+            })
+            .await;
+        pts_samples = pts_samples
+            .checked_add(u64::from(packet.frame_count))
+            .ok_or_else(|| "AEP1 audio packet PTS overflow".to_string())?;
+    }
     Ok(())
+}
+
+struct ElementaryAudioPacket {
+    data: Bytes,
+    frame_count: u32,
+    id: u64,
 }
 
 fn audio_track_config(
@@ -767,6 +852,9 @@ fn audio_track_config(
                 sample_kind,
             })))
         }
+        AudioPayloadKind::SoundKitV2 => {
+            Err("SoundKit v2 group reached track configuration before terminal decoding".to_string())
+        }
     }
 }
 
@@ -779,6 +867,9 @@ fn rendition_stream_id(
         AudioPayloadKind::Flac => 0,
         AudioPayloadKind::Opus => OPUS_RENDITION_STREAM_OFFSET,
         AudioPayloadKind::Pcm => PCM_RENDITION_STREAM_OFFSET,
+        AudioPayloadKind::SoundKitV2 => {
+            return Err("SoundKit v2 group reached stream routing before terminal decoding".to_string())
+        }
     };
     base_stream_id
         .checked_add(format_offset)
@@ -786,57 +877,74 @@ fn rendition_stream_id(
         .ok_or_else(|| "AEP1 LL-HLS stream id overflow".to_string())
 }
 
-fn raw_opus_packet(group: &DecodedMultichannelAudioGroup) -> Result<Bytes, String> {
-    let packet = match FrameHeaderV2::header_size(&group.payload) {
-        Ok(header_size) => {
-            let header_bytes = group
-                .payload
-                .get(..header_size)
-                .ok_or_else(|| "SoundKit Opus header is truncated".to_string())?;
-            let header = FrameHeaderV2::decode(&mut &header_bytes[..])
-                .map_err(|error| format!("invalid SoundKit Opus header: {error}"))?;
+fn raw_opus_packets(
+    group: &DecodedMultichannelAudioGroup,
+) -> Result<Vec<ElementaryAudioPacket>, String> {
+    let stream = match SoundKitV2StreamRef::parse(&group.payload, false) {
+        Ok(stream) => Some(stream),
+        Err(_) => None,
+    };
+    let packets = if let Some(stream) = stream {
+        if stream.total_frame_count != u64::from(group.frame_count) {
+            return Err(
+                "SoundKit Opus frame counts do not add up to the AEP1 group".to_string(),
+            );
+        }
+        let mut expected_pts = group.pts_samples;
+        let mut packets = Vec::with_capacity(stream.packets.len());
+        for packet in stream.packets {
+            let header = packet.header;
             if header.encoding() != &EncodingFlag::Opus {
                 return Err("AEP1 Opus payload has a non-Opus SoundKit header".to_string());
             }
             if header.is_encrypted() {
                 return Err(
-                    "encrypted SoundKit Opus cannot be published as public fMP4".to_string()
+                    "encrypted SoundKit Opus cannot be published as public fMP4".to_string(),
                 );
             }
             if header.sample_rate() != group.sample_rate
                 || u16::from(header.channels()) != group.channel_count
-                || header.frame_count() != group.frame_count
             {
                 return Err("SoundKit Opus metadata does not match its AEP1 group".to_string());
             }
-            let payload_size = usize::try_from(header.payload_size())
-                .map_err(|_| "SoundKit Opus payload exceeds this platform".to_string())?;
-            let packet_end = header_size
-                .checked_add(payload_size)
-                .ok_or_else(|| "SoundKit Opus payload size overflow".to_string())?;
-            if packet_end != group.payload.len() {
-                return Err("AEP1 Opus group must contain exactly one SoundKit packet".to_string());
+            if header.pts().is_some_and(|pts| pts != expected_pts) {
+                return Err("SoundKit Opus packet PTS is not contiguous".to_string());
             }
-            let packet = group.payload.slice(header_size..packet_end);
-            if header.packet_crc32_value().is_some()
-                && !header
-                    .verify_packet_crc32(header_bytes, &packet)
-                    .map_err(|error| format!("cannot verify SoundKit Opus checksum: {error}"))?
-            {
-                return Err("SoundKit Opus checksum does not match its payload".to_string());
-            }
-            packet
+            validate_raw_opus_packet(packet.payload, header.frame_count(), group.sample_rate)?;
+            packets.push(ElementaryAudioPacket {
+                data: Bytes::copy_from_slice(packet.payload),
+                frame_count: header.frame_count(),
+                id: header.id().unwrap_or(group.epoch_id),
+            });
+            expected_pts = expected_pts
+                .checked_add(u64::from(header.frame_count()))
+                .ok_or_else(|| "SoundKit Opus PTS overflow".to_string())?;
         }
-        Err(_) => group.payload.clone(),
+        packets
+    } else {
+        validate_raw_opus_packet(&group.payload, group.frame_count, group.sample_rate)?;
+        vec![ElementaryAudioPacket {
+            data: group.payload.clone(),
+            frame_count: group.frame_count,
+            id: group.epoch_id,
+        }]
     };
-    let packet_info = opus_packet_info(&packet)
+    Ok(packets)
+}
+
+fn validate_raw_opus_packet(
+    packet: &[u8],
+    frame_count: u32,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let packet_info = opus_packet_info(packet)
         .ok_or_else(|| "AEP1 Opus payload is not one valid raw Opus packet".to_string())?;
-    if u64::from(group.frame_count).saturating_mul(48_000)
-        != u64::from(packet_info.duration_samples).saturating_mul(u64::from(group.sample_rate))
+    if u64::from(frame_count).saturating_mul(48_000)
+        != u64::from(packet_info.duration_samples).saturating_mul(u64::from(sample_rate))
     {
-        return Err("raw Opus duration does not match its AEP1 group".to_string());
+        return Err("raw Opus duration does not match its SoundKit packet".to_string());
     }
-    Ok(packet)
+    Ok(())
 }
 
 fn validate_pcm_group(group: &DecodedMultichannelAudioGroup) -> Result<(), String> {
@@ -1302,6 +1410,52 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn soundkit_opus_stream_yields_one_access_unit_per_v2_packet() {
+        let first_raw = vec![(17 << 3) | (1 << 2), 0x11, 0x22];
+        let second_raw = vec![(17 << 3) | (1 << 2), 0x33, 0x44];
+        let packet = |id, pts, payload: &[u8]| {
+            crate::soundkit_v2::frame_soundkit_v2_packet(
+                crate::soundkit_v2::SoundKitV2PacketMetadata {
+                    encoding: EncodingFlag::Opus,
+                    frame_count: 240,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bits_per_sample: 0,
+                    endianness: frame_header::Endianness::LittleEndian,
+                    id: Some(id),
+                    pts: Some(pts),
+                },
+                payload,
+            )
+            .unwrap()
+        };
+        let first = packet(10, 0, &first_raw);
+        let second = packet(11, 240, &second_raw);
+        let mut framed = Vec::from(first.as_ref());
+        framed.extend_from_slice(&second);
+        let mut group = decoded_group(
+            0,
+            0,
+            0,
+            0,
+            2,
+            AudioPayloadKind::Opus,
+            AudioSampleFormat::Unspecified,
+            Bytes::from(framed),
+        );
+        group.frame_count = 480;
+
+        let packets = raw_opus_packets(&group).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].data.as_ref(), first_raw);
+        assert_eq!(packets[0].frame_count, 240);
+        assert_eq!(packets[0].id, 10);
+        assert_eq!(packets[1].data.as_ref(), second_raw);
+        assert_eq!(packets[1].frame_count, 240);
+        assert_eq!(packets[1].id, 11);
+    }
+
     #[tokio::test]
     async fn opaque_parts_can_coalesce_twenty_five_ms_units_without_parsing() {
         let captured = Arc::new(CapturingPublisher::default());
@@ -1426,5 +1580,30 @@ mod tests {
             let group_id = usize::try_from(part.stream_id - 2_100).unwrap();
             assert_eq!(part.bytes.as_ref(), vec![group_id as u8; 37 + group_id]);
         }
+    }
+
+    #[test]
+    fn full_rendition_queue_rejects_newest_group_without_waiting() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let key = RenditionKey {
+            session_id: 99,
+            group_id: 7,
+            payload_kind: AudioPayloadKind::Opus,
+        };
+        let group = decoded_group(
+            0,
+            0,
+            7,
+            0,
+            2,
+            AudioPayloadKind::Opus,
+            AudioSampleFormat::Unspecified,
+            Bytes::from_static(b"opus-packet"),
+        );
+        try_handoff_rendition_group(&sender, key, group.clone()).unwrap();
+
+        let error = try_handoff_rendition_group(&sender, key, group).unwrap_err();
+        assert!(error.contains("queue is full"));
+        assert_eq!(sender.capacity(), 0);
     }
 }

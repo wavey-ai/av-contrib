@@ -13,6 +13,7 @@ use av_contrib::ingress_authorization::{
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
+use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
     start_quadra_rendition_pipeline, QuadraRenditionConfig, QuadraRenditionSpec,
@@ -100,6 +101,18 @@ const DEFAULT_RELAY_TOPOLOGY_GENERATION: u64 = 1;
 const DEFAULT_RELAY_SUBSCRIPTION_ID: u64 = 1;
 const RELAY_LANE_IMPAIRED_HOLD_MS: u64 = 3_000;
 const AUDIO_EPOCH_MESH_QUEUE_CAPACITY: usize = 32_768;
+const AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY: usize = 32_768;
+const PUBLICATION_WORKERS: usize = 8;
+const PUBLICATION_QUEUE_CAPACITY: usize = 256;
+const PUBLICATION_QUEUE_CAPACITY_PER_WORKER: usize =
+    PUBLICATION_QUEUE_CAPACITY / PUBLICATION_WORKERS;
+static PUBLICATION_QUEUE_CAPACITY_METRIC: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_ERRORS: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -111,10 +124,27 @@ static AUDIO_EPOCH_MESH_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_MESH_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_MESH_FORWARD_ERRORS: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_NORMALIZED_EPOCHS: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_NORMALIZATION_ERRORS: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY_METRIC: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_SEND_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_SEND_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static AUDIO_EPOCH_MESH_SEND_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_INGRESS_TARGETS: AtomicU64 = AtomicU64::new(0);
 static DAW_MEDIA_UDP_SOCKET_INODE: AtomicU64 = AtomicU64::new(0);
 
 fn audio_epoch_ingress_queue_age() -> &'static AtomicDurationHistogram {
+    static HISTOGRAM: OnceLock<AtomicDurationHistogram> = OnceLock::new();
+    HISTOGRAM.get_or_init(AtomicDurationHistogram::default)
+}
+
+fn publication_queue_age() -> &'static AtomicDurationHistogram {
+    static HISTOGRAM: OnceLock<AtomicDurationHistogram> = OnceLock::new();
+    HISTOGRAM.get_or_init(AtomicDurationHistogram::default)
+}
+
+fn publication_duration() -> &'static AtomicDurationHistogram {
     static HISTOGRAM: OnceLock<AtomicDurationHistogram> = OnceLock::new();
     HISTOGRAM.get_or_init(AtomicDurationHistogram::default)
 }
@@ -641,6 +671,10 @@ struct Args {
         default_value = "flac"
     )]
     daw_hls_formats: Vec<DawHlsFormat>,
+
+    /// First HLS publication stream ID reserved for DAW Soundkit v2 audio.
+    #[arg(long, env = "AV_DAW_HLS_BASE_STREAM_ID", default_value_t = 2001)]
+    daw_hls_base_stream_id: u64,
 
     #[arg(long, default_value_t = 1)]
     stream_id: u64,
@@ -1739,6 +1773,7 @@ impl MeshForwarder {
 }
 
 struct QueuedAudioEpochIngressDatagram {
+    peer: SocketAddr,
     bytes: Bytes,
     enqueued_at: Instant,
 }
@@ -1817,6 +1852,7 @@ fn handoff_audio_epoch_mesh_datagram(
     }
 
     if let Err(error) = tx.try_send(QueuedAudioEpochIngressDatagram {
+        peer,
         bytes: Bytes::copy_from_slice(datagram),
         enqueued_at: Instant::now(),
     }) {
@@ -1841,6 +1877,78 @@ fn handoff_audio_epoch_mesh_datagram(
     }
 }
 
+fn handoff_canonical_audio_epoch_datagram(
+    tx: &mpsc::Sender<QueuedAudioEpochIngressDatagram>,
+    peer: SocketAddr,
+    bytes: Bytes,
+) -> Result<()> {
+    match tx.try_send(QueuedAudioEpochIngressDatagram {
+        peer,
+        bytes,
+        enqueued_at: Instant::now(),
+    }) {
+        Ok(()) => {
+            AUDIO_EPOCH_MESH_SEND_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+            let depth = AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+            AUDIO_EPOCH_MESH_SEND_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) => {
+            let dropped = AUDIO_EPOCH_MESH_SEND_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped <= 16 || dropped.is_power_of_two() {
+                warn!(%peer, dropped, error = %error, "canonical SoundKit v2 mesh-send queue is full");
+            }
+            Err(anyhow::anyhow!("canonical SoundKit v2 mesh-send queue rejected datagram: {error}"))
+        }
+    }
+}
+
+async fn run_audio_epoch_soundkit_normalizer(
+    mut input: mpsc::Receiver<QueuedAudioEpochIngressDatagram>,
+    output: mpsc::Sender<QueuedAudioEpochIngressDatagram>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut normalizer = SoundKitV2EpochNormalizer::udp(1_200);
+    loop {
+        let datagram = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            datagram = input.recv() => datagram,
+        };
+        let Some(datagram) = datagram else { break; };
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |depth| Some(depth.saturating_sub(1)),
+        ).ok();
+        match normalizer.push_datagram(datagram.peer, &datagram.bytes) {
+            Ok(Some(datagrams)) => {
+                AUDIO_EPOCH_NORMALIZED_EPOCHS.fetch_add(1, Ordering::Relaxed);
+                for bytes in datagrams {
+                    let _ = handoff_canonical_audio_epoch_datagram(&output, datagram.peer, bytes);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                AUDIO_EPOCH_NORMALIZATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+                warn!(peer = %datagram.peer, error = %error, "rejected AEP1 epoch during SoundKit v2 normalization");
+            }
+        }
+    }
+    while let Some(datagram) = input.recv().await {
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |depth| Some(depth.saturating_sub(1)),
+        ).ok();
+        if let Ok(Some(datagrams)) = normalizer.push_datagram(datagram.peer, &datagram.bytes) {
+            AUDIO_EPOCH_NORMALIZED_EPOCHS.fetch_add(1, Ordering::Relaxed);
+            for bytes in datagrams {
+                let _ = handoff_canonical_audio_epoch_datagram(&output, datagram.peer, bytes);
+            }
+        }
+    }
+}
+
 async fn run_audio_epoch_mesh_forward_worker(
     forwarder: Arc<MeshForwarder>,
     mut input: mpsc::Receiver<QueuedAudioEpochIngressDatagram>,
@@ -1851,6 +1959,11 @@ async fn run_audio_epoch_mesh_forward_worker(
             _ = shutdown_rx.changed() => break,
             datagram = input.recv() => {
                 let Some(datagram) = datagram else { break; };
+                AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |depth| Some(depth.saturating_sub(1)),
+                ).ok();
                 audio_epoch_ingress_queue_age().record(datagram.enqueued_at.elapsed());
                 if let Err(error) = forwarder.forward_audio_epoch_datagram(&datagram.bytes).await {
                     AUDIO_EPOCH_MESH_FORWARD_ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -1859,13 +1972,16 @@ async fn run_audio_epoch_mesh_forward_worker(
                         "failed to forward DAW audio epoch datagram to mesh"
                     );
                 }
-                AUDIO_EPOCH_MESH_QUEUE_DEPTH
-                    .store(input.max_capacity().saturating_sub(input.capacity()) as u64, Ordering::Relaxed);
             }
         }
     }
 
-    while let Ok(datagram) = input.try_recv() {
+    while let Some(datagram) = input.recv().await {
+        AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |depth| Some(depth.saturating_sub(1)),
+        ).ok();
         audio_epoch_ingress_queue_age().record(datagram.enqueued_at.elapsed());
         if let Err(error) = forwarder
             .forward_audio_epoch_datagram(&datagram.bytes)
@@ -1877,10 +1993,6 @@ async fn run_audio_epoch_mesh_forward_worker(
                 "failed to drain DAW audio epoch datagram into mesh"
             );
         }
-        AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(
-            input.max_capacity().saturating_sub(input.capacity()) as u64,
-            Ordering::Relaxed,
-        );
     }
 }
 
@@ -2159,58 +2271,60 @@ impl Fmp4PartPublisher for MeshForwarder {
     }
 }
 
-struct TelemetryFmp4Publisher {
-    inner: Arc<dyn Fmp4PartPublisher>,
+enum QueuedPublication {
+    Fmp4 {
+        part: PublishedFmp4Part,
+        enqueued_at: Instant,
+    },
+    Opaque {
+        part: PublishedOpaquePart,
+        enqueued_at: Instant,
+    },
+}
+
+impl QueuedPublication {
+    fn stream_id(&self) -> u64 {
+        match self {
+            Self::Fmp4 { part, .. } => part.stream_id,
+            Self::Opaque { part, .. } => part.stream_id,
+        }
+    }
+
+    fn enqueued_at(&self) -> Instant {
+        match self {
+            Self::Fmp4 { enqueued_at, .. } | Self::Opaque { enqueued_at, .. } => *enqueued_at,
+        }
+    }
+}
+
+struct BoundedFmp4Publisher {
+    senders: Vec<mpsc::Sender<QueuedPublication>>,
     telemetry: Arc<IngestTelemetry>,
     canonical_sequences: Mutex<HashMap<u64, u64>>,
 }
 
 #[async_trait::async_trait]
-impl Fmp4PartPublisher for TelemetryFmp4Publisher {
+impl Fmp4PartPublisher for BoundedFmp4Publisher {
     async fn publish_fmp4_part(
         &self,
         mut part: PublishedFmp4Part,
     ) -> std::result::Result<(), String> {
-        // Segmenters may be recreated when an ingest protocol reconnects.
-        // Keep the canonical object sequence at the shared publisher boundary
-        // so it remains contiguous for the entire source incarnation.
-        part.sequence = {
-            let mut sequences = self.canonical_sequences.lock().await;
-            let next = sequences.entry(part.stream_id).or_insert(0);
-            let sequence = *next;
-            *next = next.saturating_add(1);
-            sequence
-        };
         let stream_id = part.stream_id;
         let stream_idx = part.stream_idx;
+        let mut sequences = self.canonical_sequences.lock().await;
+        let next = sequences.entry(stream_id).or_insert(0);
+        part.sequence = *next;
         let sequence = part.sequence;
-        let bytes = part.bytes.len() as u64;
-        let init_bytes = part.init.as_ref().map_or(0, |init| init.len() as u64);
-        let video_width = part.video_width;
-        let video_height = part.video_height;
-        let video_units = part.video_units;
-        let audio_units = part.audio_units;
-        self.telemetry.record_fmp4_tracks(
-            stream_id,
-            stream_idx,
-            sequence,
-            video_width,
-            video_height,
-            video_units,
-            audio_units,
-        );
-        match self.inner.publish_fmp4_part(part).await {
-            Ok(()) => {
-                self.telemetry
-                    .record_fmp4_part(stream_id, stream_idx, sequence, bytes, init_bytes);
-                Ok(())
-            }
-            Err(error) => {
-                self.telemetry
-                    .record_fmp4_publish_error(stream_id, stream_idx, sequence, &error);
-                Err(error)
-            }
+        let shard = stream_id as usize % self.senders.len();
+        let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
+            part,
+            enqueued_at: Instant::now(),
+        });
+        if result.is_ok() {
+            *next = next.saturating_add(1);
         }
+        drop(sequences);
+        enqueue_publication_result(result, stream_id, stream_idx, sequence, &self.telemetry)
     }
 
     fn record_mpeg_ts_continuity_issue(&self, issue: MpegTsContinuityIssue) {
@@ -2225,14 +2339,216 @@ impl Fmp4PartPublisher for TelemetryFmp4Publisher {
         &self,
         mut part: PublishedOpaquePart,
     ) -> std::result::Result<(), String> {
-        part.sequence = {
-            let mut sequences = self.canonical_sequences.lock().await;
-            let next = sequences.entry(part.stream_id).or_insert(0);
-            let sequence = *next;
+        let stream_id = part.stream_id;
+        let mut sequences = self.canonical_sequences.lock().await;
+        let next = sequences.entry(stream_id).or_insert(0);
+        part.sequence = *next;
+        let sequence = part.sequence;
+        let shard = stream_id as usize % self.senders.len();
+        let result = self.senders[shard].try_send(QueuedPublication::Opaque {
+            part,
+            enqueued_at: Instant::now(),
+        });
+        if result.is_ok() {
             *next = next.saturating_add(1);
-            sequence
-        };
-        self.inner.publish_opaque_part(part).await
+        }
+        drop(sequences);
+        enqueue_publication_result(result, stream_id, stream_id as usize, sequence, &self.telemetry)
+    }
+}
+
+fn enqueue_publication_result(
+    result: std::result::Result<(), mpsc::error::TrySendError<QueuedPublication>>,
+    stream_id: u64,
+    stream_idx: usize,
+    sequence: u64,
+    telemetry: &IngestTelemetry,
+) -> std::result::Result<(), String> {
+    match result {
+        Ok(()) => {
+            PUBLICATION_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+            let depth = PUBLICATION_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+            PUBLICATION_QUEUE_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) => {
+            let reason = match error {
+                mpsc::error::TrySendError::Full(_) => "publication queue is full",
+                mpsc::error::TrySendError::Closed(_) => "publication queue is closed",
+            };
+            let dropped = PUBLICATION_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            telemetry.record_fmp4_publish_error(stream_id, stream_idx, sequence, reason);
+            if dropped <= 10 || dropped.is_power_of_two() {
+                warn!(
+                    stream_id,
+                    sequence,
+                    dropped,
+                    queue_depth = PUBLICATION_QUEUE_DEPTH.load(Ordering::Relaxed),
+                    reason,
+                    "bounded media publication handoff rejected a part"
+                );
+            }
+            Err(reason.to_owned())
+        }
+    }
+}
+
+fn start_bounded_publication_pipeline(
+    inner: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
+    shutdown_rx: watch::Receiver<()>,
+) -> (
+    Arc<dyn Fmp4PartPublisher>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    assert!(PUBLICATION_WORKERS > 0);
+    assert!(PUBLICATION_QUEUE_CAPACITY_PER_WORKER > 0);
+    let mut senders = Vec::with_capacity(PUBLICATION_WORKERS);
+    let mut tasks = Vec::with_capacity(PUBLICATION_WORKERS);
+    for shard in 0..PUBLICATION_WORKERS {
+        let (sender, receiver) = mpsc::channel(PUBLICATION_QUEUE_CAPACITY_PER_WORKER);
+        senders.push(sender);
+        tasks.push(tokio::spawn(run_publication_worker(
+            shard,
+            Arc::clone(&inner),
+            Arc::clone(&telemetry),
+            receiver,
+            shutdown_rx.clone(),
+        )));
+    }
+    PUBLICATION_QUEUE_CAPACITY_METRIC.store(
+        (PUBLICATION_WORKERS * PUBLICATION_QUEUE_CAPACITY_PER_WORKER) as u64,
+        Ordering::Relaxed,
+    );
+    PUBLICATION_QUEUE_DEPTH.store(0, Ordering::Relaxed);
+    (
+        Arc::new(BoundedFmp4Publisher {
+            senders,
+            telemetry,
+            canonical_sequences: Mutex::new(HashMap::new()),
+        }),
+        tasks,
+    )
+}
+
+async fn run_publication_worker(
+    shard: usize,
+    inner: Arc<dyn Fmp4PartPublisher>,
+    telemetry: Arc<IngestTelemetry>,
+    mut input: mpsc::Receiver<QueuedPublication>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut initializations = HashMap::<u64, Bytes>::new();
+    let mut force_initialization = std::collections::HashSet::<u64>::new();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            publication = input.recv() => {
+                let Some(publication) = publication else { break; };
+                process_queued_publication(
+                    shard,
+                    &inner,
+                    &telemetry,
+                    &mut initializations,
+                    &mut force_initialization,
+                    publication,
+                ).await;
+            }
+        }
+    }
+    while let Ok(publication) = input.try_recv() {
+        process_queued_publication(
+            shard,
+            &inner,
+            &telemetry,
+            &mut initializations,
+            &mut force_initialization,
+            publication,
+        )
+        .await;
+    }
+}
+
+async fn process_queued_publication(
+    shard: usize,
+    inner: &Arc<dyn Fmp4PartPublisher>,
+    telemetry: &IngestTelemetry,
+    initializations: &mut HashMap<u64, Bytes>,
+    force_initialization: &mut std::collections::HashSet<u64>,
+    publication: QueuedPublication,
+) {
+    PUBLICATION_QUEUE_DEPTH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+            Some(depth.saturating_sub(1))
+        })
+        .ok();
+    publication_queue_age().record(publication.enqueued_at().elapsed());
+    let started = Instant::now();
+    let stream_id = publication.stream_id();
+    let result = match publication {
+        QueuedPublication::Fmp4 { mut part, .. } => {
+            if let Some(init) = part.init.as_ref() {
+                initializations.insert(stream_id, init.clone());
+            } else if force_initialization.contains(&stream_id) {
+                part.init = initializations.get(&stream_id).cloned();
+            }
+            let stream_idx = part.stream_idx;
+            let sequence = part.sequence;
+            let bytes = part.bytes.len() as u64;
+            let init_bytes = part.init.as_ref().map_or(0, |init| init.len() as u64);
+            telemetry.record_fmp4_tracks(
+                stream_id,
+                stream_idx,
+                sequence,
+                part.video_width,
+                part.video_height,
+                part.video_units,
+                part.audio_units,
+            );
+            let carried_initialization = part.init.is_some();
+            match inner.publish_fmp4_part(part).await {
+                Ok(()) => {
+                    if carried_initialization {
+                        force_initialization.remove(&stream_id);
+                    }
+                    telemetry.record_fmp4_part(
+                        stream_id,
+                        stream_idx,
+                        sequence,
+                        bytes,
+                        init_bytes,
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    force_initialization.insert(stream_id);
+                    telemetry.record_fmp4_publish_error(
+                        stream_id,
+                        stream_idx,
+                        sequence,
+                        &error,
+                    );
+                    Err(error)
+                }
+            }
+        }
+        QueuedPublication::Opaque { part, .. } => inner.publish_opaque_part(part).await,
+    };
+    publication_duration().record(started.elapsed());
+    match result {
+        Ok(()) => {
+            PUBLICATION_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => {
+            let errors = PUBLICATION_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                shard,
+                stream_id,
+                errors,
+                error = %error,
+                "asynchronous media publication failed"
+            );
+        }
     }
 }
 
@@ -4353,6 +4669,48 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             AUDIO_EPOCH_HLS_QUEUE_CAPACITY.load(Ordering::Relaxed),
         ),
         (
+            "av_contrib_publication_queue_capacity",
+            "Configured capacity of the bounded media publication handoff.",
+            "gauge",
+            PUBLICATION_QUEUE_CAPACITY_METRIC.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_queue_enqueued_total",
+            "Media parts accepted by the bounded publication handoff.",
+            "counter",
+            PUBLICATION_QUEUE_ENQUEUED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_queue_dropped_total",
+            "Media parts rejected by a full or closed publication handoff.",
+            "counter",
+            PUBLICATION_QUEUE_DROPPED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_queue_depth",
+            "Current media publication queue depth.",
+            "gauge",
+            PUBLICATION_QUEUE_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_queue_max_depth",
+            "Maximum media publication queue depth since process start.",
+            "gauge",
+            PUBLICATION_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_completed_total",
+            "Media parts completed by asynchronous publication workers.",
+            "counter",
+            PUBLICATION_COMPLETED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_errors_total",
+            "Downstream media publication failures in asynchronous workers.",
+            "counter",
+            PUBLICATION_ERRORS.load(Ordering::Relaxed),
+        ),
+        (
             "av_contrib_audio_epoch_hls_queue_enqueued_total",
             "AEP1 datagrams accepted by the asynchronous LL-HLS handoff.",
             "counter",
@@ -4411,6 +4769,48 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "AEP1 mesh forward worker errors.",
             "counter",
             AUDIO_EPOCH_MESH_FORWARD_ERRORS.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_normalized_epochs_total",
+            "Recovered contributor epochs re-encoded with codec-neutral SoundKit v2 payloads.",
+            "counter",
+            AUDIO_EPOCH_NORMALIZED_EPOCHS.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_normalization_errors_total",
+            "Contributor epochs rejected before canonical SoundKit v2 mesh publication.",
+            "counter",
+            AUDIO_EPOCH_NORMALIZATION_ERRORS.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_send_queue_capacity",
+            "Bounded capacity between SoundKit v2 normalization and mesh sending.",
+            "gauge",
+            AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY_METRIC.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_send_queue_enqueued_total",
+            "Canonical SoundKit v2 datagrams admitted for mesh sending.",
+            "counter",
+            AUDIO_EPOCH_MESH_SEND_QUEUE_ENQUEUED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_send_queue_dropped_total",
+            "Canonical SoundKit v2 datagrams rejected by a full mesh-send queue.",
+            "counter",
+            AUDIO_EPOCH_MESH_SEND_QUEUE_DROPPED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_send_queue_depth",
+            "Canonical SoundKit v2 datagrams currently queued for mesh sending.",
+            "gauge",
+            AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_audio_epoch_mesh_send_queue_max_depth",
+            "Maximum canonical SoundKit v2 mesh-send queue depth since process start.",
+            "gauge",
+            AUDIO_EPOCH_MESH_SEND_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
         ),
         (
             "av_contrib_audio_epoch_ingress_targets",
@@ -4515,6 +4915,36 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             audio_hls_worker.retired_rendition_workers,
         ),
         (
+            "av_contrib_audio_epoch_hls_rendition_queue_capacity_per_worker",
+            "Bounded recovered-group queue capacity for each AEP1 LL-HLS rendition worker.",
+            "gauge",
+            audio_hls_worker.rendition_queue_capacity_per_worker,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_rendition_queue_enqueued_total",
+            "Recovered AEP1 groups admitted to rendition workers.",
+            "counter",
+            audio_hls_worker.rendition_queue_enqueued,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_rendition_queue_dropped_total",
+            "Recovered AEP1 groups rejected because a rendition queue was full.",
+            "counter",
+            audio_hls_worker.rendition_queue_dropped,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_rendition_queue_depth",
+            "Recovered AEP1 groups currently queued across rendition workers.",
+            "gauge",
+            audio_hls_worker.rendition_queue_depth,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_rendition_queue_max_depth",
+            "Maximum recovered AEP1 groups queued across rendition workers since process start.",
+            "gauge",
+            audio_hls_worker.rendition_queue_max_depth,
+        ),
+        (
             "av_contrib_local_playback_cache_enabled",
             "Whether the contributor retains a viewer-facing LL-HLS playback cache.",
             "gauge",
@@ -4553,6 +4983,39 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
         "av_contrib_audio_epoch_ingress_queue_age_seconds_count {}\n",
         ingress_queue_age.count
     ));
+
+    for (name, help, histogram) in [
+        (
+            "av_contrib_publication_queue_age_seconds",
+            "Time a media part waits before downstream publication begins.",
+            publication_queue_age().snapshot(),
+        ),
+        (
+            "av_contrib_publication_duration_seconds",
+            "Time required to complete downstream publication for one media part.",
+            publication_duration().snapshot(),
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "histogram");
+        for (upper_bound_us, count) in DURATION_HISTOGRAM_BUCKETS_US
+            .iter()
+            .zip(histogram.buckets.iter())
+        {
+            output.push_str(&format!(
+                "{name}_bucket{{le=\"{}\"}} {count}\n",
+                *upper_bound_us as f64 / 1_000_000.0
+            ));
+        }
+        output.push_str(&format!(
+            "{name}_bucket{{le=\"+Inf\"}} {}\n",
+            histogram.count
+        ));
+        output.push_str(&format!(
+            "{name}_sum {}\n",
+            histogram.sum_us as f64 / 1_000_000.0
+        ));
+        output.push_str(&format!("{name}_count {}\n", histogram.count));
+    }
 
     push_prometheus_metric_header(
         &mut output,
@@ -6768,14 +7231,15 @@ async fn main() -> Result<()> {
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
     let (cert, key) = load_tls(&args)?;
+    let (publication_shutdown_tx, publication_shutdown_rx) = watch::channel(());
     let telemetry = Arc::new(IngestTelemetry::default());
     let forwarder = Arc::new(MeshForwarder::new(&args, Arc::clone(&telemetry)).await?);
     let mesh_publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
-    let publisher: Arc<dyn Fmp4PartPublisher> = Arc::new(TelemetryFmp4Publisher {
-        inner: mesh_publisher,
-        telemetry: telemetry.clone(),
-        canonical_sequences: Mutex::new(HashMap::new()),
-    });
+    let (publisher, publication_tasks) = start_bounded_publication_pipeline(
+        mesh_publisher,
+        telemetry.clone(),
+        publication_shutdown_rx,
+    );
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     if args.quadra.derived_only && args.quadra.renditions.is_empty() {
@@ -6900,6 +7364,7 @@ async fn main() -> Result<()> {
     let (
         daw_media_task,
         audio_epoch_hls_task,
+        audio_epoch_normalizer_task,
         audio_epoch_mesh_task,
         router_audio_epoch_hls_tx,
         router_audio_epoch_mesh_tx,
@@ -6910,13 +7375,19 @@ async fn main() -> Result<()> {
             audio_epoch_hls_channel(args.daw_hls_queue_capacity);
         let (audio_epoch_mesh_tx, audio_epoch_mesh_rx) =
             mpsc::channel(AUDIO_EPOCH_MESH_QUEUE_CAPACITY);
+        let (audio_epoch_mesh_send_tx, audio_epoch_mesh_send_rx) =
+            mpsc::channel(AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY);
         AUDIO_EPOCH_HLS_QUEUE_CAPACITY
             .store(audio_epoch_hls_tx.max_capacity() as u64, Ordering::Relaxed);
         AUDIO_EPOCH_MESH_QUEUE_CAPACITY_METRIC
             .store(audio_epoch_mesh_tx.max_capacity() as u64, Ordering::Relaxed);
+        AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY_METRIC.store(
+            audio_epoch_mesh_send_tx.max_capacity() as u64,
+            Ordering::Relaxed,
+        );
         let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
             AudioEpochHlsConfig::new(
-                args.stream_id,
+                args.daw_hls_base_stream_id,
                 args.fmp4_part_ms,
                 args.daw_hls_packaging.into(),
                 args.daw_hls_formats
@@ -6930,9 +7401,14 @@ async fn main() -> Result<()> {
             audio_epoch_hls_rx,
             shutdown_rx.clone(),
         ));
+        let audio_epoch_normalizer_task = tokio::spawn(run_audio_epoch_soundkit_normalizer(
+            audio_epoch_mesh_rx,
+            audio_epoch_mesh_send_tx,
+            shutdown_rx.clone(),
+        ));
         let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
             forwarder.clone(),
-            audio_epoch_mesh_rx,
+            audio_epoch_mesh_send_rx,
             shutdown_rx.clone(),
         ));
         info!(
@@ -6953,12 +7429,13 @@ async fn main() -> Result<()> {
                 shutdown_rx.clone(),
             ))),
             Some(audio_epoch_hls_task),
+            Some(audio_epoch_normalizer_task),
             Some(audio_epoch_mesh_task),
             Some(audio_epoch_hls_tx),
             Some(audio_epoch_mesh_tx),
         )
     } else {
-        (None, None, None, None, None)
+        (None, None, None, None, None, None)
     };
     let needletail_authorizer = NeedletailSessionAuthorizer::from_environment(args.stream_id)?;
     let router = Box::new(ContribRouter::new(
@@ -7064,7 +7541,15 @@ async fn main() -> Result<()> {
     if let Some(task) = audio_epoch_hls_task {
         let _ = task.await;
     }
+    if let Some(task) = audio_epoch_normalizer_task {
+        let _ = task.await;
+    }
     if let Some(task) = audio_epoch_mesh_task {
+        let _ = task.await;
+    }
+    let _ = publication_shutdown_tx.send(());
+    drop(publisher);
+    for task in publication_tasks {
         let _ = task.await;
     }
     Ok(())
@@ -7560,6 +8045,105 @@ mod tests {
 
     const TEST_SOURCE_EPOCH: u64 = 1_784_151_600_000_001;
 
+    fn now_unix_ns() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn audio_epoch_normalizer_worker_emits_only_soundkit_v2() {
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        let mut source = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let pcm = vec![0x42; 240 * 2 * 2];
+        let framed = av_contrib::soundkit_v2::frame_soundkit_v2_packet(
+            av_contrib::soundkit_v2::SoundKitV2PacketMetadata {
+                encoding: frame_header::EncodingFlag::PCMSigned,
+                frame_count: 240,
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 16,
+                endianness: frame_header::Endianness::LittleEndian,
+                id: Some(4),
+                pts: Some(960),
+            },
+            &pcm,
+        )
+        .unwrap();
+        let groups = [MultichannelAudioGroup {
+            group_id: 0,
+            channel_start: 0,
+            channel_count: 2,
+            payload_kind: AudioPayloadKind::SoundKitV2,
+            sample_format: AudioSampleFormat::Unspecified,
+            flags: 0,
+            payload: framed.as_ref(),
+        }];
+        let input = transport
+            .wrap_epoch(
+                source
+                    .encode_epoch(MultichannelAudioEpoch {
+                        session_id: 91,
+                        config_generation: 1,
+                        epoch_id: 4,
+                        pts_samples: 960,
+                        sample_rate: 48_000,
+                        frame_count: 240,
+                        groups: &groups,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let (input_tx, input_rx) = mpsc::channel(64);
+        let (output_tx, mut output_rx) = mpsc::channel(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_audio_epoch_soundkit_normalizer(
+            input_rx,
+            output_tx,
+            shutdown_rx,
+        ));
+        for datagram in input.datagrams {
+            input_tx
+                .send(QueuedAudioEpochIngressDatagram {
+                    peer,
+                    bytes: datagram.payload,
+                    enqueued_at: Instant::now(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(input_tx);
+        worker.await.unwrap();
+
+        let mut receiver = music_audio_session::MultichannelAudioReceiver::new(
+            MultichannelAudioSessionConfig::default(),
+        );
+        let mut canonical = None;
+        while let Some(datagram) = output_rx.recv().await {
+            let payload = transport.payload(&datagram.bytes).unwrap();
+            if let Some(epoch) = receiver.push_datagram(payload).unwrap().completed_epoch {
+                canonical = Some(epoch);
+            }
+        }
+        let canonical = canonical.expect("normalizer worker emitted a complete epoch");
+        assert!(canonical
+            .groups
+            .iter()
+            .all(|group| group.payload_kind == AudioPayloadKind::SoundKitV2));
+        let stream = av_contrib::soundkit_v2::SoundKitV2StreamRef::parse(
+            &canonical.groups[0].payload,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stream.packets[0].payload, pcm);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn test_fmp4_part(
         stream_id: u64,
@@ -7588,6 +8172,99 @@ mod tests {
             video_units,
             audio_codec: (audio_units > 0).then_some("aac"),
             audio_units,
+        }
+    }
+
+    struct BlockingPublicationSink {
+        blocked: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Fmp4PartPublisher for BlockingPublicationSink {
+        async fn publish_fmp4_part(
+            &self,
+            _part: PublishedFmp4Part,
+        ) -> std::result::Result<(), String> {
+            if !self.blocked.swap(true, Ordering::AcqRel) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_publication_pipeline_keeps_packaging_nonblocking_and_reports_overflow() {
+        let sink = Arc::new(BlockingPublicationSink {
+            blocked: std::sync::atomic::AtomicBool::new(false),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let inner: Arc<dyn Fmp4PartPublisher> = sink.clone();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let (publisher, tasks) =
+            start_bounded_publication_pipeline(inner, telemetry, shutdown_rx);
+        let first = test_fmp4_part(
+            91,
+            0,
+            false,
+            0,
+            1,
+            Some(Bytes::from_static(b"init")),
+            Bytes::from_static(b"part-0"),
+            now_unix_ns(),
+        );
+        timeout(
+            Duration::from_millis(50),
+            publisher.publish_fmp4_part(first),
+        )
+        .await
+        .expect("publication handoff blocked packaging")
+        .unwrap();
+        timeout(Duration::from_secs(1), sink.started.notified())
+            .await
+            .expect("publication worker did not start");
+
+        for sequence in 1..=PUBLICATION_QUEUE_CAPACITY_PER_WORKER as u64 {
+            publisher
+                .publish_fmp4_part(test_fmp4_part(
+                    91,
+                    sequence,
+                    false,
+                    0,
+                    1,
+                    None,
+                    Bytes::from_static(b"part"),
+                    now_unix_ns(),
+                ))
+                .await
+                .unwrap();
+        }
+        let overflow = publisher
+            .publish_fmp4_part(test_fmp4_part(
+                91,
+                999,
+                false,
+                0,
+                1,
+                None,
+                Bytes::from_static(b"overflow"),
+                now_unix_ns(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(overflow, "publication queue is full");
+
+        sink.release.notify_one();
+        let _ = shutdown_tx.send(());
+        for task in tasks {
+            timeout(Duration::from_secs(1), task)
+                .await
+                .expect("publication worker did not drain")
+                .unwrap();
         }
     }
 
@@ -8734,6 +9411,7 @@ mod tests {
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
+            daw_hls_base_stream_id: 2001,
             stream_id: 1,
             rist_stream_id: 1,
             srt_stream_id: 1,
@@ -8807,6 +9485,7 @@ mod tests {
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
+            daw_hls_base_stream_id: 2001,
             stream_id: 9_007_199_254_741_993,
             rist_stream_id: 9_007_199_254_741_994,
             srt_stream_id: 9_007_199_254_741_995,
@@ -9385,6 +10064,7 @@ mod tests {
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
+            daw_hls_base_stream_id: 2001,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -9598,6 +10278,7 @@ mod tests {
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
+            daw_hls_base_stream_id: 2001,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,
@@ -9711,6 +10392,7 @@ mod tests {
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
+            daw_hls_base_stream_id: 2001,
             stream_id: 1,
             rist_stream_id: 0,
             srt_stream_id: 6,

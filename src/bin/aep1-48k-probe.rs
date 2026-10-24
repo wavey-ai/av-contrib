@@ -1,4 +1,7 @@
 use anyhow::{bail, Context, Result};
+use av_contrib::fixture_replay::{
+    capture_fixture, replay_fixture, CaptureFixtureOptions, ReplayFixtureOptions,
+};
 use boxer::fmp4::opus_packet_info;
 use bytes::{Buf, Bytes, BytesMut};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -96,6 +99,60 @@ enum Command {
         pcm_s24le_file: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         group_id: u16,
+        #[arg(long, default_value_t = 12)]
+        repair_percent: u32,
+        #[arg(long, default_value_t = 1)]
+        min_repair_symbols: u32,
+    },
+    /// Capture immutable codec-valid SoundKit v2 FLAC+Opus records from a live publication.
+    CaptureFixture {
+        #[arg(long)]
+        relay: SocketAddr,
+        #[arg(long)]
+        bind: Option<SocketAddr>,
+        #[arg(long)]
+        session_id: u64,
+        #[arg(long, default_value_t = 0)]
+        group_id: u16,
+        #[arg(long, default_value_t = 60)]
+        duration_seconds: u64,
+        #[arg(long, default_value_t = 8)]
+        tail_seconds: u64,
+        #[arg(long)]
+        producer_sha256: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Replay fixture codec bytes with fresh AEP1/RaptorQ identity and absolute pacing.
+    ReplayFixture {
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        bind: SocketAddr,
+        #[arg(long)]
+        target: SocketAddr,
+        #[arg(long)]
+        secondary_bind: SocketAddr,
+        #[arg(long)]
+        secondary_target: SocketAddr,
+        #[arg(long)]
+        local_node_id: String,
+        #[arg(long)]
+        primary_node_id: String,
+        #[arg(long)]
+        secondary_node_id: String,
+        #[arg(long)]
+        topology_generation: u64,
+        #[arg(long)]
+        subscription_id: u64,
+        #[arg(long, default_value_t = 10)]
+        duration_seconds: u64,
+        #[arg(long, default_value_t = 1)]
+        tracks: u16,
+        #[arg(long, default_value_t = 0)]
+        group_id: u16,
+        #[arg(long)]
+        session_id: Option<u64>,
         #[arg(long, default_value_t = 12)]
         repair_percent: u32,
         #[arg(long, default_value_t = 1)]
@@ -282,11 +339,28 @@ enum ReceiveAudioFormat {
 }
 
 impl ReceiveAudioFormat {
-    fn from_payload_kind(kind: AudioPayloadKind) -> Self {
-        match kind {
-            AudioPayloadKind::Opus => Self::Opus,
-            AudioPayloadKind::Flac => Self::Flac,
-            AudioPayloadKind::Pcm => Self::Pcm,
+    fn from_soundkit_v2_payload(payload: &[u8]) -> Option<Self> {
+        let header_size = FrameHeaderV2::header_size(payload).ok()?;
+        let header_bytes = payload.get(..header_size)?;
+        let header = FrameHeaderV2::decode(&mut &header_bytes[..]).ok()?;
+        let payload_size = usize::try_from(header.payload_size()).ok()?;
+        let packet_size = header_size.checked_add(payload_size)?;
+        if packet_size != payload.len() {
+            return None;
+        }
+        if header.packet_crc32_value().is_some()
+            && !matches!(
+                header.verify_packet_crc32(header_bytes, &payload[header_size..]),
+                Ok(true)
+            )
+        {
+            return None;
+        }
+        match header.encoding() {
+            EncodingFlag::Opus => Some(Self::Opus),
+            EncodingFlag::FLAC => Some(Self::Flac),
+            EncodingFlag::PCMSigned | EncodingFlag::PCMFloat => Some(Self::Pcm),
+            EncodingFlag::AAC | EncodingFlag::H264 => None,
         }
     }
 }
@@ -614,7 +688,12 @@ impl ReceiveFormatState {
         arrival_ns: u64,
         deadline_ms: u64,
     ) {
-        let format = ReceiveAudioFormat::from_payload_kind(group.payload_kind);
+        if group.payload_kind != AudioPayloadKind::SoundKitV2 {
+            return;
+        }
+        let Some(format) = ReceiveAudioFormat::from_soundkit_v2_payload(&group.payload) else {
+            return;
+        };
         if group.flags & AUDIO_GROUP_FLAG_ERASURE == 0 {
             match format {
                 ReceiveAudioFormat::Opus => &mut self.opus_epochs,
@@ -1729,6 +1808,68 @@ async fn main() -> Result<()> {
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::CaptureFixture {
+            relay,
+            bind,
+            session_id,
+            group_id,
+            duration_seconds,
+            tail_seconds,
+            producer_sha256,
+            output,
+        } => {
+            let report = capture_fixture(CaptureFixtureOptions {
+                relay,
+                bind,
+                session_id,
+                group_id,
+                duration_seconds,
+                tail_seconds,
+                producer_sha256,
+                output,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::ReplayFixture {
+            fixture,
+            bind,
+            target,
+            secondary_bind,
+            secondary_target,
+            local_node_id,
+            primary_node_id,
+            secondary_node_id,
+            topology_generation,
+            subscription_id,
+            duration_seconds,
+            tracks,
+            group_id,
+            session_id,
+            repair_percent,
+            min_repair_symbols,
+        } => {
+            let report = replay_fixture(ReplayFixtureOptions {
+                fixture,
+                bind,
+                target,
+                secondary_bind,
+                secondary_target,
+                local_node_id,
+                primary_node_id,
+                secondary_node_id,
+                topology_generation,
+                subscription_id,
+                duration_seconds,
+                tracks,
+                group_id,
+                session_id,
+                repair_percent,
+                min_repair_symbols,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::ReceiveUdp {
             relay,
             bind,
@@ -2102,20 +2243,49 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             lossless_payload_bytes = lossless_payload_bytes.saturating_add(payload.len() as u64);
             payloads.push(payload);
         }
-        let groups = group_plan
+        let framed_payloads = group_plan
             .iter()
             .zip(payloads.iter())
-            .map(|(group, payload)| MultichannelAudioGroup {
+            .map(|(group, payload)| {
+                let encoding = match payload_kind {
+                    ProbePayload::Flac => EncodingFlag::FLAC,
+                    ProbePayload::Pcm => EncodingFlag::PCMSigned,
+                };
+                let header = FrameHeaderV2::new(
+                    encoding,
+                    u32::try_from(payload.len()).expect("probe payload fits the v2 wire header"),
+                    FRAME_COUNT,
+                    SAMPLE_RATE,
+                    u8::try_from(group.channel_count)
+                        .expect("probe groups are limited to eight channels"),
+                    24,
+                    frame_header::Endianness::LittleEndian,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("probe Soundkit v2 header is valid")
+                .with_packet_crc32(payload)
+                .expect("probe Soundkit v2 payload CRC is valid");
+                let mut framed = Vec::with_capacity(header.size() + payload.len());
+                header
+                    .encode(&mut framed)
+                    .expect("probe Soundkit v2 header encodes");
+                framed.extend_from_slice(payload);
+                framed
+            })
+            .collect::<Vec<_>>();
+        let groups = group_plan
+            .iter()
+            .zip(framed_payloads.iter())
+            .map(|(group, framed)| MultichannelAudioGroup {
                 group_id: group.group_id,
                 channel_start: group.channel_start,
                 channel_count: group.channel_count,
-                payload_kind: match payload_kind {
-                    ProbePayload::Flac => AudioPayloadKind::Flac,
-                    ProbePayload::Pcm => AudioPayloadKind::Pcm,
-                },
-                sample_format: AudioSampleFormat::S24Le,
+                payload_kind: AudioPayloadKind::SoundKitV2,
+                sample_format: AudioSampleFormat::Unspecified,
                 flags: 0,
-                payload,
+                payload: framed,
             })
             .collect::<Vec<_>>();
         let encoded = sender.encode_epoch(MultichannelAudioEpoch {
@@ -6136,7 +6306,34 @@ mod tests {
     #[test]
     fn flac_selection_counts_the_opus_companion_without_selecting_it() {
         let mut state = ReceiveFormatState::new(&[ReceiveAudioFormat::Flac]).unwrap();
-        for payload_kind in [AudioPayloadKind::Opus, AudioPayloadKind::Flac] {
+        for encoding in [EncodingFlag::Opus, EncodingFlag::FLAC] {
+            let encrypted = encoding == EncodingFlag::Opus;
+            let payload = [7_u8; 12];
+            let header = FrameHeaderV2::new(
+                encoding,
+                payload.len() as u32,
+                FRAME_COUNT,
+                SAMPLE_RATE,
+                2,
+                24,
+                frame_header::Endianness::LittleEndian,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let header = if encrypted {
+                header
+                    .with_packet_flags(FrameHeaderV2::FLAG_ENCRYPTED)
+                    .unwrap()
+            } else {
+                header
+            }
+            .with_packet_crc32(&payload)
+            .unwrap();
+            let mut packet = Vec::with_capacity(header.size() + payload.len());
+            header.encode(&mut packet).unwrap();
+            packet.extend_from_slice(&payload);
             state.observe(
                 &DecodedMultichannelAudioGroup {
                     session_id: 1_000_000_000,
@@ -6150,10 +6347,10 @@ mod tests {
                     group_index: 0,
                     channel_start: 0,
                     channel_count: 2,
-                    payload_kind,
-                    sample_format: AudioSampleFormat::S24Le,
+                    payload_kind: AudioPayloadKind::SoundKitV2,
+                    sample_format: AudioSampleFormat::Unspecified,
                     flags: 0,
-                    payload: Bytes::from_static(b"packet"),
+                    payload: Bytes::from(packet),
                     raptorq_recovered_fragments: 1,
                 },
                 1_001_000_000,

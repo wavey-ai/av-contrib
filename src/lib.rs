@@ -1,7 +1,9 @@
 pub mod audio_epoch_hls;
 pub mod fmp4_bridge;
+pub mod fixture_replay;
 pub mod ingress_authorization;
 pub mod quadra_renditions;
+pub mod soundkit_v2;
 pub mod synchronized_stem_ingress;
 pub mod talkback_publish;
 
