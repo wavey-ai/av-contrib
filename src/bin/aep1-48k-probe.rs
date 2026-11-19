@@ -245,6 +245,11 @@ enum Command {
         /// PCM channels carried by this LL-HLS rendition; required for ipcm size checks.
         #[arg(long, default_value_t = 0)]
         expected_pcm_channels: u16,
+        /// Packet protection the SoundKit Opus rendition must carry. Production
+        /// publishers encrypt every packet. The direct qualification source
+        /// publishes plain packets, which must then carry a valid packet CRC32.
+        #[arg(long, value_enum, default_value_t = SoundkitOpusProtection::Encrypted)]
+        soundkit_opus_protection: SoundkitOpusProtection,
         /// Decimal SoundKit media key, read from this file, for consumer-side Opus decode.
         #[arg(long)]
         soundkit_key_file: Option<PathBuf>,
@@ -321,6 +326,11 @@ enum Command {
         /// PCM channels carried by this LL-HLS rendition; required for ipcm size checks.
         #[arg(long, default_value_t = 0)]
         expected_pcm_channels: u16,
+        /// Packet protection the SoundKit Opus rendition must carry. Production
+        /// publishers encrypt every packet. The direct qualification source
+        /// publishes plain packets, which must then carry a valid packet CRC32.
+        #[arg(long, value_enum, default_value_t = SoundkitOpusProtection::Encrypted)]
+        soundkit_opus_protection: SoundkitOpusProtection,
     },
 }
 
@@ -369,6 +379,26 @@ impl ReceiveAudioFormat {
 enum HlsTransport {
     H3,
     Http1,
+}
+
+/// Packet protection expected of a SoundKit v2 Opus rendition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SoundkitOpusProtection {
+    /// Every packet carries the encrypted flag. A packet CRC32 is verified
+    /// when the packet carries one.
+    Encrypted,
+    /// No packet carries the encrypted flag, and every packet carries a
+    /// packet CRC32 that matches its header and payload.
+    Plain,
+}
+
+impl SoundkitOpusProtection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Encrypted => "encrypted",
+            Self::Plain => "plain",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -817,6 +847,7 @@ struct HlsReceiveReport {
     init_audio_codec: Option<&'static str>,
     init_audio_codec_verified: bool,
     expected_pcm_channels: u16,
+    soundkit_opus_protection: &'static str,
     pcm_media_parts_verified: u64,
     pcm_media_size_mismatches: u64,
     opaque_flac_media_parts_verified: u64,
@@ -877,6 +908,7 @@ struct HlsLoadReport {
     arrival_seed: u64,
     expected_audio_codec: &'static str,
     expected_pcm_channels: u16,
+    soundkit_opus_protection: &'static str,
     customers_requested: usize,
     h3_connections: usize,
     readers_requested: usize,
@@ -1309,6 +1341,7 @@ struct HlsReceiveOptions<'a> {
     tail_seconds: u64,
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
+    soundkit_opus_protection: SoundkitOpusProtection,
     soundkit_key_file: Option<&'a Path>,
     decoded_pcm_output: Option<&'a Path>,
     raw_part_output_dir: Option<&'a Path>,
@@ -1340,6 +1373,7 @@ struct HlsLoadOptions {
     arrival_seed: u64,
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
+    soundkit_opus_protection: SoundkitOpusProtection,
 }
 
 struct SoundKitOpusConsumer {
@@ -1946,6 +1980,7 @@ async fn main() -> Result<()> {
             tail_seconds,
             expected_audio_codec,
             expected_pcm_channels,
+            soundkit_opus_protection,
             soundkit_key_file,
             decoded_pcm_output,
             raw_part_output_dir,
@@ -1974,6 +2009,7 @@ async fn main() -> Result<()> {
                     tail_seconds,
                     expected_audio_codec,
                     expected_pcm_channels,
+                    soundkit_opus_protection,
                     soundkit_key_file: soundkit_key_file.as_deref(),
                     decoded_pcm_output: decoded_pcm_output.as_deref(),
                     raw_part_output_dir: raw_part_output_dir.as_deref(),
@@ -2026,6 +2062,7 @@ async fn main() -> Result<()> {
             arrival_seed,
             expected_audio_codec,
             expected_pcm_channels,
+            soundkit_opus_protection,
         } => {
             let report = load_hls(HlsLoadOptions {
                 edge,
@@ -2049,6 +2086,7 @@ async fn main() -> Result<()> {
                 arrival_seed,
                 expected_audio_codec,
                 expected_pcm_channels,
+                soundkit_opus_protection,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2790,6 +2828,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         tail_seconds,
         expected_audio_codec,
         expected_pcm_channels,
+        soundkit_opus_protection,
         soundkit_key_file,
         decoded_pcm_output,
         raw_part_output_dir,
@@ -3075,7 +3114,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             deadline_misses = deadline_misses.saturating_add(1);
                         }
                         availability_latencies_ns.record(latency_ns);
-                        if soundkit_opus_part_is_valid(part, part_ms) {
+                        if soundkit_opus_part_is_valid(part, part_ms, soundkit_opus_protection) {
                             opus_media_parts_verified = opus_media_parts_verified.saturating_add(1);
                             init_audio_codec_verified = true;
                         } else {
@@ -3168,8 +3207,12 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     allow_initial_object_rebase = false;
                     object_sequence_started = true;
                     after_sequence = Some(sequence);
-                    let opus_valid =
-                        opus_media_part_is_valid(expected_audio_codec, &response.body, part_ms);
+                    let opus_valid = opus_media_part_is_valid(
+                        expected_audio_codec,
+                        &response.body,
+                        part_ms,
+                        soundkit_opus_protection,
+                    );
                     let opaque_flac_valid = expected_audio_codec == HlsAudioCodec::OpaqueFlac
                         && opaque_flac_part_is_valid(&response.body);
                     let pts_ms = media_part_pts_ms(
@@ -3429,8 +3472,12 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                 200 => {
                     media_responses = media_responses.saturating_add(1);
                     object_sequence_started = true;
-                    let opus_valid =
-                        opus_media_part_is_valid(expected_audio_codec, &response.body, part_ms);
+                    let opus_valid = opus_media_part_is_valid(
+                        expected_audio_codec,
+                        &response.body,
+                        part_ms,
+                        soundkit_opus_protection,
+                    );
                     let opaque_flac_valid = expected_audio_codec == HlsAudioCodec::OpaqueFlac
                         && opaque_flac_part_is_valid(&response.body);
                     let pts_ms = media_part_pts_ms(
@@ -3692,6 +3739,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         init_audio_codec: init_audio_codec.map(HlsAudioCodec::as_str),
         init_audio_codec_verified,
         expected_pcm_channels,
+        soundkit_opus_protection: soundkit_opus_protection.as_str(),
         pcm_media_parts_verified,
         pcm_media_size_mismatches,
         opaque_flac_media_parts_verified,
@@ -3800,6 +3848,7 @@ impl HlsBundleStreamState {
             init_audio_codec_verified: self.opus_media_parts_verified > 0
                 && self.opus_media_packet_mismatches == 0,
             expected_pcm_channels: reader.expected_pcm_channels,
+            soundkit_opus_protection: reader.soundkit_opus_protection.as_str(),
             pcm_media_parts_verified: 0,
             pcm_media_size_mismatches: 0,
             opaque_flac_media_parts_verified: 0,
@@ -4059,7 +4108,11 @@ async fn receive_hls_bundle_customer(
                     latency_ns,
                     deadline_missed,
                 );
-                if soundkit_opus_part_is_valid(part, reader.part_ms) {
+                if soundkit_opus_part_is_valid(
+                    part,
+                    reader.part_ms,
+                    reader.soundkit_opus_protection,
+                ) {
                     state.opus_media_parts_verified =
                         state.opus_media_parts_verified.saturating_add(1);
                 } else {
@@ -4244,6 +4297,7 @@ async fn receive_hls_load_customer(
                 tail_seconds: reader.tail_seconds,
                 expected_audio_codec: reader.expected_audio_codec,
                 expected_pcm_channels: reader.expected_pcm_channels,
+                soundkit_opus_protection: reader.soundkit_opus_protection,
                 soundkit_key_file: None,
                 decoded_pcm_output: None,
                 raw_part_output_dir: None,
@@ -4330,6 +4384,7 @@ async fn receive_hls_load_customer(
                     tail_seconds: stream_reader.tail_seconds,
                     expected_audio_codec: stream_reader.expected_audio_codec,
                     expected_pcm_channels: stream_reader.expected_pcm_channels,
+                    soundkit_opus_protection: stream_reader.soundkit_opus_protection,
                     soundkit_key_file: None,
                     decoded_pcm_output: None,
                     raw_part_output_dir: None,
@@ -4674,6 +4729,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         arrival_seed: options.arrival_seed,
         expected_audio_codec: options.expected_audio_codec.as_str(),
         expected_pcm_channels: options.expected_pcm_channels,
+        soundkit_opus_protection: options.soundkit_opus_protection.as_str(),
         customers_requested: options.readers,
         h3_connections: matches!(options.transport, HlsTransport::H3)
             .then_some(options.readers)
@@ -5387,7 +5443,17 @@ fn split_soundkit_opus_parts(bytes: &[u8], part_ms: u64) -> Result<Vec<&[u8]>> {
     Ok(parts)
 }
 
-fn soundkit_opus_part_is_valid(mut bytes: &[u8], part_ms: u64) -> bool {
+/// Validate every SoundKit v2 Opus packet of one cached media part.
+///
+/// The packet CRC32 is written by the publisher over the header and the
+/// payload, so a match proves the bytes are the ones that were published.
+/// Plain packets have no AEAD tag to protect them, so plain protection
+/// requires the CRC32 on every packet.
+fn soundkit_opus_part_is_valid(
+    mut bytes: &[u8],
+    part_ms: u64,
+    protection: SoundkitOpusProtection,
+) -> bool {
     if bytes.is_empty() || part_ms == 0 {
         return false;
     }
@@ -5412,16 +5478,31 @@ fn soundkit_opus_part_is_valid(mut bytes: &[u8], part_ms: u64) -> bool {
             || !(1..=2).contains(&header.channels())
             || header.frame_count() == 0
             || payload_size == 0
-            || !header.is_encrypted()
         {
             return false;
         }
-        if header.packet_crc32_value().is_some()
-            && !matches!(
+        let crc_required = match protection {
+            SoundkitOpusProtection::Encrypted => {
+                if !header.is_encrypted() {
+                    return false;
+                }
+                false
+            }
+            SoundkitOpusProtection::Plain => {
+                if header.is_encrypted() {
+                    return false;
+                }
+                true
+            }
+        };
+        if header.packet_crc32_value().is_some() {
+            if !matches!(
                 header.verify_packet_crc32(&bytes[..header_size], &bytes[header_size..packet_size]),
                 Ok(true)
-            )
-        {
+            ) {
+                return false;
+            }
+        } else if crc_required {
             return false;
         }
         total_frames = total_frames.saturating_add(u64::from(header.frame_count()));
@@ -5432,10 +5513,19 @@ fn soundkit_opus_part_is_valid(mut bytes: &[u8], part_ms: u64) -> bool {
         && total_frames.saturating_mul(1_000) == u64::from(SAMPLE_RATE).saturating_mul(part_ms)
 }
 
-fn opus_media_part_is_valid(codec: HlsAudioCodec, bytes: &[u8], part_ms: u64) -> Option<bool> {
+fn opus_media_part_is_valid(
+    codec: HlsAudioCodec,
+    bytes: &[u8],
+    part_ms: u64,
+    soundkit_opus_protection: SoundkitOpusProtection,
+) -> Option<bool> {
     match codec {
         HlsAudioCodec::Opus => Some(fmp4_opus_part_is_valid(bytes, part_ms)),
-        HlsAudioCodec::SoundkitOpus => Some(soundkit_opus_part_is_valid(bytes, part_ms)),
+        HlsAudioCodec::SoundkitOpus => Some(soundkit_opus_part_is_valid(
+            bytes,
+            part_ms,
+            soundkit_opus_protection,
+        )),
         _ => None,
     }
 }
@@ -5862,8 +5952,101 @@ mod tests {
         assert_eq!(parts.len(), 40);
         for (actual, expected) in parts.into_iter().zip(&expected) {
             assert_eq!(actual, expected);
-            assert!(soundkit_opus_part_is_valid(actual, 5));
+            assert!(soundkit_opus_part_is_valid(
+                actual,
+                5,
+                SoundkitOpusProtection::Encrypted
+            ));
         }
+    }
+
+    /// One plain SoundKit Opus packet as the direct qualification source
+    /// publishes it: no encrypted flag, and a packet CRC32 when requested.
+    fn test_plain_soundkit_opus_part(id: u8, with_crc: bool) -> Vec<u8> {
+        let payload = [id; 12];
+        let mut header = FrameHeaderV2::new(
+            EncodingFlag::Opus,
+            payload.len() as u32,
+            FRAME_COUNT,
+            SAMPLE_RATE,
+            2,
+            16,
+            frame_header::Endianness::LittleEndian,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        if with_crc {
+            header = header.with_packet_crc32(&payload).unwrap();
+        }
+        let mut bytes = Vec::with_capacity(header.size() + payload.len());
+        header.encode(&mut bytes).unwrap();
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[test]
+    fn soundkit_opus_protection_selects_the_packet_contract() {
+        let encrypted = test_soundkit_opus_part(3);
+        let plain = test_plain_soundkit_opus_part(3, true);
+        let plain_without_crc = test_plain_soundkit_opus_part(3, false);
+
+        // The production contract is unchanged: encrypted packets only.
+        assert!(soundkit_opus_part_is_valid(
+            &encrypted,
+            5,
+            SoundkitOpusProtection::Encrypted
+        ));
+        assert!(!soundkit_opus_part_is_valid(
+            &plain,
+            5,
+            SoundkitOpusProtection::Encrypted
+        ));
+
+        // The qualification contract accepts plain packets with a CRC32 and
+        // nothing else.
+        assert!(soundkit_opus_part_is_valid(
+            &plain,
+            5,
+            SoundkitOpusProtection::Plain
+        ));
+        assert!(!soundkit_opus_part_is_valid(
+            &encrypted,
+            5,
+            SoundkitOpusProtection::Plain
+        ));
+        assert!(!soundkit_opus_part_is_valid(
+            &plain_without_crc,
+            5,
+            SoundkitOpusProtection::Plain
+        ));
+    }
+
+    #[test]
+    fn plain_soundkit_opus_part_rejects_any_changed_byte() {
+        let plain = test_plain_soundkit_opus_part(9, true);
+        for index in 0..plain.len() {
+            let mut corrupt = plain.clone();
+            corrupt[index] ^= 0x01;
+            assert!(
+                !soundkit_opus_part_is_valid(&corrupt, 5, SoundkitOpusProtection::Plain),
+                "a changed bit in byte {index} must fail validation"
+            );
+        }
+        // A truncated or extended part is never a whole number of packets.
+        assert!(!soundkit_opus_part_is_valid(
+            &plain[..plain.len() - 1],
+            5,
+            SoundkitOpusProtection::Plain
+        ));
+        let mut extended = plain.clone();
+        extended.push(0);
+        assert!(!soundkit_opus_part_is_valid(
+            &extended,
+            5,
+            SoundkitOpusProtection::Plain
+        ));
     }
 
     #[test]
