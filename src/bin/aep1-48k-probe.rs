@@ -250,6 +250,13 @@ enum Command {
         /// publishes plain packets, which must then carry a valid packet CRC32.
         #[arg(long, value_enum, default_value_t = SoundkitOpusProtection::Encrypted)]
         soundkit_opus_protection: SoundkitOpusProtection,
+        /// Object sequence of the part at offset zero of the publication. A
+        /// reader that joins at --start-offset-ms then starts at exactly this
+        /// sequence plus the offset in parts. Without it a late reader takes
+        /// the newest playlist part as its first part, which places an opaque
+        /// part (no timestamp of its own) only as exactly as the join time.
+        #[arg(long)]
+        object_sequence_origin: Option<u64>,
         /// Decimal SoundKit media key, read from this file, for consumer-side Opus decode.
         #[arg(long)]
         soundkit_key_file: Option<PathBuf>,
@@ -331,6 +338,13 @@ enum Command {
         /// publishes plain packets, which must then carry a valid packet CRC32.
         #[arg(long, value_enum, default_value_t = SoundkitOpusProtection::Encrypted)]
         soundkit_opus_protection: SoundkitOpusProtection,
+        /// Object sequence of the part at offset zero of the publication. A
+        /// reader that joins at --start-offset-ms then starts at exactly this
+        /// sequence plus the offset in parts. Without it a late reader takes
+        /// the newest playlist part as its first part, which places an opaque
+        /// part (no timestamp of its own) only as exactly as the join time.
+        #[arg(long)]
+        object_sequence_origin: Option<u64>,
     },
 }
 
@@ -1342,6 +1356,7 @@ struct HlsReceiveOptions<'a> {
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
     soundkit_opus_protection: SoundkitOpusProtection,
+    object_sequence_origin: Option<u64>,
     soundkit_key_file: Option<&'a Path>,
     decoded_pcm_output: Option<&'a Path>,
     raw_part_output_dir: Option<&'a Path>,
@@ -1374,6 +1389,7 @@ struct HlsLoadOptions {
     expected_audio_codec: HlsAudioCodec,
     expected_pcm_channels: u16,
     soundkit_opus_protection: SoundkitOpusProtection,
+    object_sequence_origin: Option<u64>,
 }
 
 struct SoundKitOpusConsumer {
@@ -1981,6 +1997,7 @@ async fn main() -> Result<()> {
             expected_audio_codec,
             expected_pcm_channels,
             soundkit_opus_protection,
+            object_sequence_origin,
             soundkit_key_file,
             decoded_pcm_output,
             raw_part_output_dir,
@@ -2010,6 +2027,7 @@ async fn main() -> Result<()> {
                     expected_audio_codec,
                     expected_pcm_channels,
                     soundkit_opus_protection,
+                    object_sequence_origin,
                     soundkit_key_file: soundkit_key_file.as_deref(),
                     decoded_pcm_output: decoded_pcm_output.as_deref(),
                     raw_part_output_dir: raw_part_output_dir.as_deref(),
@@ -2063,6 +2081,7 @@ async fn main() -> Result<()> {
             expected_audio_codec,
             expected_pcm_channels,
             soundkit_opus_protection,
+            object_sequence_origin,
         } => {
             let report = load_hls(HlsLoadOptions {
                 edge,
@@ -2087,6 +2106,7 @@ async fn main() -> Result<()> {
                 expected_audio_codec,
                 expected_pcm_channels,
                 soundkit_opus_protection,
+                object_sequence_origin,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2829,6 +2849,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         expected_audio_codec,
         expected_pcm_channels,
         soundkit_opus_protection,
+        object_sequence_origin,
         soundkit_key_file,
         decoded_pcm_output,
         raw_part_output_dir,
@@ -2958,6 +2979,14 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         }
         sleep(Duration::from_millis(part_ms.clamp(1, 25))).await;
     };
+    if let Some(origin) = object_sequence_origin {
+        // The caller knows which object carries offset zero, so the first
+        // object of this window is exact and is never moved by the playlist.
+        object_sequence_baseline = origin
+            .checked_add(initial_pts_sequence)
+            .context("--object-sequence-origin plus the start offset overflows")?;
+        allow_initial_object_rebase = false;
+    }
     let mut object_sequence_started = false;
     let mut opus_consumer = soundkit_key_file
         .map(|key_file| {
@@ -3368,8 +3397,11 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             playlist_has_ll_hls_tags |=
                                 playlist_matches_format(&playlist.body, expected_audio_codec);
                             if let Some(window) = hls_playlist_object_window(&playlist.body)? {
-                                let refreshed_sequence =
-                                    refreshed_hls_object_sequence(object_sequence_baseline, window);
+                                let refreshed_sequence = if object_sequence_origin.is_some() {
+                                    object_sequence_baseline
+                                } else {
+                                    refreshed_hls_object_sequence(object_sequence_baseline, window)
+                                };
                                 if refreshed_sequence != object_sequence_baseline {
                                     object_sequence_baseline = refreshed_sequence;
                                     after_sequence = object_sequence_baseline.checked_sub(1);
@@ -3623,8 +3655,11 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             playlist_has_ll_hls_tags |=
                                 playlist_matches_format(&playlist.body, expected_audio_codec);
                             if let Some(window) = hls_playlist_object_window(&playlist.body)? {
-                                let refreshed_sequence =
-                                    refreshed_hls_object_sequence(object_sequence_baseline, window);
+                                let refreshed_sequence = if object_sequence_origin.is_some() {
+                                    object_sequence_baseline
+                                } else {
+                                    refreshed_hls_object_sequence(object_sequence_baseline, window)
+                                };
                                 if refreshed_sequence != object_sequence_baseline {
                                     object_sequence_baseline = refreshed_sequence;
                                     next_sequence = next_sequence.max(object_sequence_baseline);
@@ -4298,6 +4333,7 @@ async fn receive_hls_load_customer(
                 expected_audio_codec: reader.expected_audio_codec,
                 expected_pcm_channels: reader.expected_pcm_channels,
                 soundkit_opus_protection: reader.soundkit_opus_protection,
+                object_sequence_origin: reader.object_sequence_origin,
                 soundkit_key_file: None,
                 decoded_pcm_output: None,
                 raw_part_output_dir: None,
@@ -4385,6 +4421,7 @@ async fn receive_hls_load_customer(
                     expected_audio_codec: stream_reader.expected_audio_codec,
                     expected_pcm_channels: stream_reader.expected_pcm_channels,
                     soundkit_opus_protection: stream_reader.soundkit_opus_protection,
+                    object_sequence_origin: stream_reader.object_sequence_origin,
                     soundkit_key_file: None,
                     decoded_pcm_output: None,
                     raw_part_output_dir: None,
