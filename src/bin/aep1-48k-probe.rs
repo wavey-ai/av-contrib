@@ -3521,6 +3521,46 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
         }
 
+        // Keep H3_PART_PIPELINE_DEPTH requests outstanding that are not
+        // overdue. Used with --abandon-after-ms only: an overdue request does
+        // not hold back later parts, and a reader that was behind does not
+        // request further ahead than the pipeline depth afterwards.
+        macro_rules! top_up_part_requests {
+            () => {{
+                let now_ns = now_unix_ns()?;
+                loop {
+                    let active = pending
+                        .iter()
+                        .rev()
+                        .take_while(|sequence| {
+                            complete_ns(**sequence, object_sequence_baseline)
+                                .saturating_add(H3_PART_OVERDUE_GRACE_NS)
+                                > now_ns
+                        })
+                        .count();
+                    if active >= H3_PART_PIPELINE_DEPTH
+                        || pending.len() >= H3_PART_PENDING_LIMIT
+                        || part_coverage.received_parts >= expected_parts
+                    {
+                        break;
+                    }
+                    let sequence = next_sequence;
+                    next_sequence = next_sequence.saturating_add(1);
+                    let path = hls_path(
+                        path_prefix,
+                        stream_id,
+                        &format!("part{sequence}.{}", expected_audio_codec.media_extension()),
+                    );
+                    let sender = h3_client
+                        .as_ref()
+                        .context("HTTP/3 media pipeline omitted its connection")?
+                        .request_sender();
+                    pending.insert(sequence);
+                    in_flight.push(async move { (sequence, sender.get(path).await) }.boxed());
+                }
+            }};
+        }
+
         while now_unix_ns()? < stop_ns
             && !in_flight.is_empty()
             && part_coverage.received_parts < expected_parts
@@ -3534,41 +3574,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     Ok(Some(answer)) => answer,
                     Ok(None) => break,
                     Err(_) => {
-                        let now_ns = now_unix_ns()?;
-                        loop {
-                            let active = pending
-                                .iter()
-                                .rev()
-                                .take_while(|sequence| {
-                                    complete_ns(**sequence, object_sequence_baseline)
-                                        .saturating_add(H3_PART_OVERDUE_GRACE_NS)
-                                        > now_ns
-                                })
-                                .count();
-                            if active >= H3_PART_PIPELINE_DEPTH
-                                || pending.len() >= H3_PART_PENDING_LIMIT
-                                || part_coverage.received_parts >= expected_parts
-                            {
-                                break;
-                            }
-                            let sequence = next_sequence;
-                            next_sequence = next_sequence.saturating_add(1);
-                            let path = hls_path(
-                                path_prefix,
-                                stream_id,
-                                &format!(
-                                    "part{sequence}.{}",
-                                    expected_audio_codec.media_extension()
-                                ),
-                            );
-                            let sender = h3_client
-                                .as_ref()
-                                .context("HTTP/3 media pipeline omitted its connection")?
-                                .request_sender();
-                            pending.insert(sequence);
-                            in_flight
-                                .push(async move { (sequence, sender.get(path).await) }.boxed());
-                        }
+                        top_up_part_requests!();
                         continue;
                     }
                 }
@@ -3839,15 +3845,21 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                 status => bail!("LL-HLS tail returned HTTP {status}"),
             }
 
-            let sequence_to_schedule = retry_sequence.or_else(|| {
-                if part_coverage.received_parts < expected_parts {
-                    let sequence = next_sequence;
-                    next_sequence = next_sequence.saturating_add(1);
-                    Some(sequence)
-                } else {
-                    None
-                }
-            });
+            let sequence_to_schedule = if abandon_after_ns.is_some() {
+                // The top-up below requests the next parts, bounded by the
+                // pipeline depth.
+                retry_sequence
+            } else {
+                retry_sequence.or_else(|| {
+                    if part_coverage.received_parts < expected_parts {
+                        let sequence = next_sequence;
+                        next_sequence = next_sequence.saturating_add(1);
+                        Some(sequence)
+                    } else {
+                        None
+                    }
+                })
+            };
             if let Some(requested_sequence) = sequence_to_schedule {
                 let path = hls_path(
                     path_prefix,
@@ -3863,6 +3875,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     .request_sender();
                 pending.insert(requested_sequence);
                 in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
+            }
+            if abandon_after_ns.is_some() {
+                top_up_part_requests!();
             }
         }
     }
