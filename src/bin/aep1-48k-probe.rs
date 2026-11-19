@@ -423,6 +423,9 @@ enum HlsAudioCodec {
     SoundkitOpus,
     Ipcm,
     Fpcm,
+    /// H.264 video in fMP4 parts, with or without an audio track. The probe
+    /// checks the structure and the timeline of each part. It does not decode.
+    H264,
 }
 
 impl HlsAudioCodec {
@@ -434,13 +437,14 @@ impl HlsAudioCodec {
             Self::SoundkitOpus => "soundkit_opus",
             Self::Ipcm => "ipcm_s24le",
             Self::Fpcm => "fpcm_f32le",
+            Self::H264 => "h264_fmp4",
         }
     }
 
     fn media_extension(self) -> &'static str {
         match self {
             Self::OpaqueFlac | Self::SoundkitOpus => "bin",
-            Self::Flac | Self::Opus | Self::Ipcm | Self::Fpcm => "mp4",
+            Self::Flac | Self::Opus | Self::Ipcm | Self::Fpcm | Self::H264 => "mp4",
         }
     }
 
@@ -451,6 +455,7 @@ impl HlsAudioCodec {
             Self::Opus => Some(b"Opus"),
             Self::Ipcm => Some(b"ipcm"),
             Self::Fpcm => Some(b"fpcm"),
+            Self::H264 => Some(b"avc1"),
         }
     }
 }
@@ -868,6 +873,8 @@ struct HlsReceiveReport {
     opaque_flac_frame_mismatches: u64,
     opus_media_parts_verified: u64,
     opus_media_packet_mismatches: u64,
+    fmp4_video_parts_verified: u64,
+    fmp4_video_part_mismatches: u64,
     opus_consumer: Option<OpusConsumerReport>,
     playlist_has_ll_hls_tags: bool,
     publication_to_cache_latency_ms: Percentiles,
@@ -939,6 +946,7 @@ struct HlsLoadReport {
     pcm_media_size_mismatches_total: u64,
     opaque_flac_frame_mismatches_total: u64,
     opus_media_packet_mismatches_total: u64,
+    fmp4_video_part_mismatches_total: u64,
     playlist_verified_readers: usize,
     wire_bytes_total: u64,
     connection_setup_ms: Percentiles,
@@ -2043,6 +2051,7 @@ async fn main() -> Result<()> {
                 || report.pcm_media_size_mismatches > 0
                 || report.opaque_flac_frame_mismatches > 0
                 || report.opus_media_packet_mismatches > 0
+                || report.fmp4_video_part_mismatches > 0
                 || report
                     .opus_consumer
                     .as_ref()
@@ -2924,6 +2933,9 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
     let mut opaque_flac_frame_mismatches = 0_u64;
     let mut opus_media_parts_verified = 0_u64;
     let mut opus_media_packet_mismatches = 0_u64;
+    let mut fmp4_video_parts_verified = 0_u64;
+    let mut fmp4_video_part_mismatches = 0_u64;
+    let mut fmp4_sequence_offset: Option<i64> = None;
     if let Some(dir) = raw_part_output_dir {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create raw LL-HLS part output dir {}", dir.display()))?;
@@ -3306,6 +3318,19 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     opus_media_packet_mismatches.saturating_add(1);
                             }
                         }
+                        if expected_audio_codec == HlsAudioCodec::H264 {
+                            if h264_part_is_valid(
+                                &response.body,
+                                sequence,
+                                &mut fmp4_sequence_offset,
+                            ) {
+                                fmp4_video_parts_verified =
+                                    fmp4_video_parts_verified.saturating_add(1);
+                            } else {
+                                fmp4_video_part_mismatches =
+                                    fmp4_video_part_mismatches.saturating_add(1);
+                            }
+                        }
                         if expected_audio_codec == HlsAudioCodec::OpaqueFlac {
                             if opaque_flac_valid {
                                 opaque_flac_media_parts_verified =
@@ -3574,6 +3599,19 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                                     opus_media_packet_mismatches.saturating_add(1);
                             }
                         }
+                        if expected_audio_codec == HlsAudioCodec::H264 {
+                            if h264_part_is_valid(
+                                &response.body,
+                                requested_sequence,
+                                &mut fmp4_sequence_offset,
+                            ) {
+                                fmp4_video_parts_verified =
+                                    fmp4_video_parts_verified.saturating_add(1);
+                            } else {
+                                fmp4_video_part_mismatches =
+                                    fmp4_video_part_mismatches.saturating_add(1);
+                            }
+                        }
                         if expected_audio_codec == HlsAudioCodec::OpaqueFlac {
                             if opaque_flac_valid {
                                 opaque_flac_media_parts_verified =
@@ -3781,6 +3819,8 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         opaque_flac_frame_mismatches,
         opus_media_parts_verified,
         opus_media_packet_mismatches,
+        fmp4_video_parts_verified,
+        fmp4_video_part_mismatches,
         opus_consumer,
         playlist_has_ll_hls_tags,
         publication_to_cache_latency_ms: publication_to_cache_latencies_ns.summary(),
@@ -3890,6 +3930,8 @@ impl HlsBundleStreamState {
             opaque_flac_frame_mismatches: 0,
             opus_media_parts_verified: self.opus_media_parts_verified,
             opus_media_packet_mismatches: self.opus_media_packet_mismatches,
+            fmp4_video_parts_verified: 0,
+            fmp4_video_part_mismatches: 0,
             opus_consumer: None,
             playlist_has_ll_hls_tags: self.playlist_has_ll_hls_tags,
             publication_to_cache_latency_ms: self.publication_to_cache_latencies_ns.summary(),
@@ -4679,6 +4721,10 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         .iter()
         .map(|report| report.opus_media_packet_mismatches)
         .sum::<u64>();
+    let fmp4_video_part_mismatches_total = reports
+        .iter()
+        .map(|report| report.fmp4_video_part_mismatches)
+        .sum::<u64>();
     let playlist_verified_readers = reports
         .iter()
         .filter(|report| report.playlist_has_ll_hls_tags)
@@ -4736,6 +4782,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         && pcm_media_size_mismatches_total == 0
         && opaque_flac_frame_mismatches_total == 0
         && opus_media_packet_mismatches_total == 0
+        && fmp4_video_part_mismatches_total == 0
         && playlist_verified_readers == requested_track_readers;
 
     Ok(HlsLoadReport {
@@ -4785,6 +4832,7 @@ async fn load_hls(options: HlsLoadOptions) -> Result<HlsLoadReport> {
         pcm_media_size_mismatches_total,
         opaque_flac_frame_mismatches_total,
         opus_media_packet_mismatches_total,
+        fmp4_video_part_mismatches_total,
         playlist_verified_readers,
         wire_bytes_total,
         connection_setup_ms,
@@ -5214,6 +5262,12 @@ fn media_part_pts_ms(
         );
     }
     let decode_time = parse_fmp4_tfdt_ms(bytes).context("LL-HLS fMP4 part omitted a valid tfdt")?;
+    if codec == HlsAudioCodec::H264 {
+        return decode_time
+            .checked_mul(1_000)
+            .map(|ticks| ticks / VIDEO_TIMESCALE)
+            .context("H.264 LL-HLS part PTS overflow");
+    }
     if codec == HlsAudioCodec::Opus {
         return decode_time
             .checked_mul(1_000)
@@ -5238,6 +5292,12 @@ fn media_part_duration_ms(codec: HlsAudioCodec, bytes: &[u8], part_ms: u64) -> R
                 .checked_add(u64::from(sample_duration))
                 .context("LL-HLS fMP4 sample duration overflow")
         })?;
+    if codec == HlsAudioCodec::H264 {
+        return duration
+            .checked_mul(1_000)
+            .map(|ticks| ticks / VIDEO_TIMESCALE)
+            .context("H.264 LL-HLS part duration overflow");
+    }
     if codec == HlsAudioCodec::Opus {
         return duration
             .checked_mul(1_000)
@@ -5374,6 +5434,8 @@ fn playlist_matches_format(bytes: &[u8], codec: HlsAudioCodec) -> bool {
 
 fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
     [
+        // A video initialization segment may also carry an audio track.
+        HlsAudioCodec::H264,
         HlsAudioCodec::Opus,
         HlsAudioCodec::Ipcm,
         HlsAudioCodec::Fpcm,
@@ -5391,6 +5453,7 @@ fn detect_init_audio_codec(bytes: &[u8]) -> Option<HlsAudioCodec> {
 fn pcm_init_parameters_match(bytes: &[u8], codec: HlsAudioCodec, expected_channels: u16) -> bool {
     let (sample_size, marker) = match codec {
         HlsAudioCodec::Flac | HlsAudioCodec::Opus => return true,
+        HlsAudioCodec::H264 => return fmp4_first_mdhd_timescale(bytes) == Some(VIDEO_TIMESCALE),
         HlsAudioCodec::OpaqueFlac | HlsAudioCodec::SoundkitOpus => return false,
         HlsAudioCodec::Ipcm => (24, b"ipcm"),
         HlsAudioCodec::Fpcm => (32, b"fpcm"),
@@ -5415,7 +5478,8 @@ fn expected_pcm_part_bytes(codec: HlsAudioCodec, channels: u16, part_ms: u64) ->
         HlsAudioCodec::Flac
         | HlsAudioCodec::OpaqueFlac
         | HlsAudioCodec::Opus
-        | HlsAudioCodec::SoundkitOpus => return None,
+        | HlsAudioCodec::SoundkitOpus
+        | HlsAudioCodec::H264 => return None,
         HlsAudioCodec::Ipcm => 3_u64,
         HlsAudioCodec::Fpcm => 4_u64,
     };
@@ -5680,6 +5744,122 @@ fn fmp4_mdat_payload(bytes: &[u8]) -> Option<&[u8]> {
         offset += size;
     }
     None
+}
+
+/// Timescale of the video track that the contributor's fMP4 bridge writes.
+const VIDEO_TIMESCALE: u64 = 90_000;
+
+/// One fMP4 media part: its fragment sequence number and whether the sample
+/// sizes of every track add up to the media data that follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fmp4FragmentSummary {
+    fragment_sequence: u32,
+    sample_bytes: u64,
+    media_data_bytes: u64,
+    tracks: u32,
+}
+
+fn fmp4_child_boxes(bytes: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
+    let mut boxes = Vec::new();
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let header = bytes.get(offset..offset.checked_add(8)?)?;
+        let size = usize::try_from(u32::from_be_bytes(header[..4].try_into().ok()?)).ok()?;
+        let kind: [u8; 4] = header[4..8].try_into().ok()?;
+        let end = offset.checked_add(size)?;
+        if size < 8 || end > bytes.len() {
+            return None;
+        }
+        boxes.push((kind, &bytes[offset + 8..end]));
+        offset = end;
+    }
+    Some(boxes)
+}
+
+/// Parse a part that must be exactly one `moof` followed by one `mdat`.
+fn fmp4_fragment_summary(bytes: &[u8]) -> Option<Fmp4FragmentSummary> {
+    let top = fmp4_child_boxes(bytes)?;
+    let [(moof_kind, moof), (mdat_kind, mdat)] = top.as_slice() else {
+        return None;
+    };
+    if moof_kind != b"moof" || mdat_kind != b"mdat" {
+        return None;
+    }
+    let mut fragment_sequence = None;
+    let mut sample_bytes = 0_u64;
+    let mut tracks = 0_u32;
+    for (kind, body) in fmp4_child_boxes(moof)? {
+        match &kind {
+            b"mfhd" => {
+                fragment_sequence = Some(u32::from_be_bytes(body.get(4..8)?.try_into().ok()?));
+            }
+            b"traf" => {
+                let mut has_decode_time = false;
+                let mut has_run = false;
+                for (kind, body) in fmp4_child_boxes(body)? {
+                    match &kind {
+                        b"tfdt" => has_decode_time = true,
+                        b"trun" => {
+                            // Rebuild the box header that the geometry parser expects.
+                            let mut boxed = Vec::with_capacity(body.len() + 8);
+                            boxed.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+                            boxed.extend_from_slice(b"trun");
+                            boxed.extend_from_slice(body);
+                            for (_duration, size) in fmp4_trun_sample_geometry(&boxed)? {
+                                sample_bytes = sample_bytes.checked_add(u64::from(size))?;
+                            }
+                            has_run = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if !has_decode_time || !has_run {
+                    return None;
+                }
+                tracks = tracks.checked_add(1)?;
+            }
+            _ => {}
+        }
+    }
+    Some(Fmp4FragmentSummary {
+        fragment_sequence: fragment_sequence?,
+        sample_bytes,
+        media_data_bytes: mdat.len() as u64,
+        tracks,
+    })
+}
+
+/// Structure check of one H.264 fMP4 part. `sequence_offset` is the difference
+/// between the fragment sequence number and the object sequence. The first
+/// valid part sets it, and every later part must keep it.
+fn h264_part_is_valid(
+    bytes: &[u8],
+    object_sequence: u64,
+    sequence_offset: &mut Option<i64>,
+) -> bool {
+    let Some(summary) = fmp4_fragment_summary(bytes) else {
+        return false;
+    };
+    if summary.tracks == 0
+        || summary.sample_bytes == 0
+        || summary.sample_bytes != summary.media_data_bytes
+    {
+        return false;
+    }
+    let Ok(object_sequence) = i64::try_from(object_sequence) else {
+        return false;
+    };
+    let offset = i64::from(summary.fragment_sequence) - object_sequence;
+    *sequence_offset.get_or_insert(offset) == offset
+}
+
+fn fmp4_first_mdhd_timescale(bytes: &[u8]) -> Option<u64> {
+    let type_offset = bytes.windows(4).position(|window| window == b"mdhd")?;
+    let version = *bytes.get(type_offset + 4)?;
+    let value_offset = type_offset + 8 + if version == 1 { 16 } else { 8 };
+    Some(u64::from(u32::from_be_bytes(
+        bytes.get(value_offset..value_offset + 4)?.try_into().ok()?,
+    )))
 }
 
 fn parse_fmp4_tfdt_ms(bytes: &[u8]) -> Option<u64> {
@@ -6021,6 +6201,83 @@ mod tests {
         header.encode(&mut bytes).unwrap();
         bytes.extend_from_slice(&payload);
         bytes
+    }
+
+    /// One fMP4 part with a video and an audio track fragment.
+    fn test_fmp4_av_part(
+        fragment_sequence: u32,
+        decode_time: u64,
+        video: &[u32],
+        audio: &[u32],
+    ) -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            out
+        }
+        fn traf(track: u32, decode_time: u64, duration: u32, sizes: &[u32]) -> Vec<u8> {
+            let mut tfhd = vec![0, 0, 0, 0];
+            tfhd.extend_from_slice(&track.to_be_bytes());
+            let mut tfdt = vec![1, 0, 0, 0];
+            tfdt.extend_from_slice(&decode_time.to_be_bytes());
+            // Flags: data offset, sample duration, sample size.
+            let mut trun = vec![0, 0, 0x03, 0x01];
+            trun.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
+            trun.extend_from_slice(&0_u32.to_be_bytes());
+            for size in sizes {
+                trun.extend_from_slice(&duration.to_be_bytes());
+                trun.extend_from_slice(&size.to_be_bytes());
+            }
+            let mut body = boxed(b"tfhd", &tfhd);
+            body.extend_from_slice(&boxed(b"tfdt", &tfdt));
+            body.extend_from_slice(&boxed(b"trun", &trun));
+            boxed(b"traf", &body)
+        }
+        let mut mfhd = vec![0, 0, 0, 0];
+        mfhd.extend_from_slice(&fragment_sequence.to_be_bytes());
+        let mut moof = boxed(b"mfhd", &mfhd);
+        moof.extend_from_slice(&traf(1, decode_time, 3_750, video));
+        moof.extend_from_slice(&traf(2, 0, 1_024, audio));
+        let media = vec![0x5a; (video.iter().sum::<u32>() + audio.iter().sum::<u32>()) as usize];
+        let mut part = boxed(b"moof", &moof);
+        part.extend_from_slice(&boxed(b"mdat", &media));
+        part
+    }
+
+    #[test]
+    fn h264_part_check_requires_whole_samples_and_a_steady_fragment_sequence() {
+        let part = test_fmp4_av_part(61, 1_351_920, &[900, 400, 300, 200, 100, 100], &[40, 41]);
+        let summary = fmp4_fragment_summary(&part).unwrap();
+        assert_eq!(summary.fragment_sequence, 61);
+        assert_eq!(summary.tracks, 2);
+        assert_eq!(summary.sample_bytes, 2_081);
+        assert_eq!(summary.media_data_bytes, 2_081);
+
+        // The first valid part fixes the fragment-to-object sequence offset.
+        let mut offset = None;
+        assert!(h264_part_is_valid(&part, 60, &mut offset));
+        assert_eq!(offset, Some(1));
+        let next = test_fmp4_av_part(62, 1_374_420, &[500, 500], &[40]);
+        assert!(h264_part_is_valid(&next, 61, &mut offset));
+        // A part that belongs to another object fails the check.
+        assert!(!h264_part_is_valid(&next, 63, &mut offset));
+
+        // A truncated or extended part fails, and so does a lost byte of media.
+        assert!(!h264_part_is_valid(&part[..part.len() - 1], 60, &mut None));
+        let mut extended = part.clone();
+        extended.push(0);
+        assert!(!h264_part_is_valid(&extended, 60, &mut None));
+
+        // The video timeline comes from the track fragment decode time.
+        assert_eq!(
+            media_part_pts_ms(HlsAudioCodec::H264, &part, 60, 0, 0, 250).unwrap(),
+            15_021
+        );
+        assert_eq!(
+            media_part_duration_ms(HlsAudioCodec::H264, &part, 250).unwrap(),
+            250
+        );
     }
 
     #[test]
