@@ -59,6 +59,11 @@ const H3_PART_PIPELINE_DEPTH: usize = 8;
 const H3_PART_PRELOAD_LEAD: Duration = Duration::from_millis(100);
 const HLS_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const H3_REQUEST_RECONNECT_LIMIT: u64 = 3;
+/// With --abandon-after-ms, a request this long past the nominal completion of
+/// its part no longer holds back the requests for later parts.
+const H3_PART_OVERDUE_GRACE_NS: u64 = 20_000_000;
+/// Upper bound on unanswered part requests of one reader.
+const H3_PART_PENDING_LIMIT: usize = 4_096;
 
 /// Reconnects that one HTTP/3 reader may make before it fails. A multi-hour
 /// soak raises the limit with NEEDLETAIL_PROBE_H3_RECONNECT_LIMIT, so that a
@@ -270,6 +275,13 @@ enum Command {
         /// part (no timestamp of its own) only as exactly as the join time.
         #[arg(long)]
         object_sequence_origin: Option<u64>,
+        /// Milliseconds after its nominal time at which a part that the edge
+        /// does not have is given up: it is not requested again and counts as
+        /// missing. Later parts are requested on time while an earlier part is
+        /// overdue. Without this option a reader asks for a missing part until
+        /// the run ends, and every part after it is late or missing.
+        #[arg(long)]
+        abandon_after_ms: Option<u64>,
         /// Decimal SoundKit media key, read from this file, for consumer-side Opus decode.
         #[arg(long)]
         soundkit_key_file: Option<PathBuf>,
@@ -358,6 +370,13 @@ enum Command {
         /// part (no timestamp of its own) only as exactly as the join time.
         #[arg(long)]
         object_sequence_origin: Option<u64>,
+        /// Milliseconds after its nominal time at which a part that the edge
+        /// does not have is given up: it is not requested again and counts as
+        /// missing. Later parts are requested on time while an earlier part is
+        /// overdue. Without this option a reader asks for a missing part until
+        /// the run ends, and every part after it is late or missing.
+        #[arg(long)]
+        abandon_after_ms: Option<u64>,
     },
 }
 
@@ -1378,6 +1397,7 @@ struct HlsReceiveOptions<'a> {
     expected_pcm_channels: u16,
     soundkit_opus_protection: SoundkitOpusProtection,
     object_sequence_origin: Option<u64>,
+    abandon_after_ms: Option<u64>,
     soundkit_key_file: Option<&'a Path>,
     decoded_pcm_output: Option<&'a Path>,
     raw_part_output_dir: Option<&'a Path>,
@@ -1411,6 +1431,7 @@ struct HlsLoadOptions {
     expected_pcm_channels: u16,
     soundkit_opus_protection: SoundkitOpusProtection,
     object_sequence_origin: Option<u64>,
+    abandon_after_ms: Option<u64>,
 }
 
 struct SoundKitOpusConsumer {
@@ -2019,6 +2040,7 @@ async fn main() -> Result<()> {
             expected_pcm_channels,
             soundkit_opus_protection,
             object_sequence_origin,
+            abandon_after_ms,
             soundkit_key_file,
             decoded_pcm_output,
             raw_part_output_dir,
@@ -2049,6 +2071,7 @@ async fn main() -> Result<()> {
                     expected_pcm_channels,
                     soundkit_opus_protection,
                     object_sequence_origin,
+                    abandon_after_ms,
                     soundkit_key_file: soundkit_key_file.as_deref(),
                     decoded_pcm_output: decoded_pcm_output.as_deref(),
                     raw_part_output_dir: raw_part_output_dir.as_deref(),
@@ -2104,6 +2127,7 @@ async fn main() -> Result<()> {
             expected_pcm_channels,
             soundkit_opus_protection,
             object_sequence_origin,
+            abandon_after_ms,
         } => {
             let report = load_hls(HlsLoadOptions {
                 edge,
@@ -2129,6 +2153,7 @@ async fn main() -> Result<()> {
                 expected_pcm_channels,
                 soundkit_opus_protection,
                 object_sequence_origin,
+                abandon_after_ms,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2872,6 +2897,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         expected_pcm_channels,
         soundkit_opus_protection,
         object_sequence_origin,
+        abandon_after_ms,
         soundkit_key_file,
         decoded_pcm_output,
         raw_part_output_dir,
@@ -3460,9 +3486,26 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
         type PartRequest = BoxFuture<'static, (u64, Result<SimpleHttpResponse>)>;
         let mut next_sequence = object_sequence_baseline;
         let mut in_flight = FuturesUnordered::<PartRequest>::new();
+        // Requested sequences that have no answer yet.
+        let mut pending = std::collections::BTreeSet::<u64>::new();
+        let abandon_after_ns = abandon_after_ms.map(|ms| ms.saturating_mul(1_000_000));
+        // Nominal time at which an object is complete at the source.
+        let complete_ns = |sequence: u64, baseline: u64| -> u64 {
+            session_id.saturating_add(
+                start_offset_ms
+                    .saturating_add(
+                        sequence
+                            .saturating_sub(baseline)
+                            .saturating_add(1)
+                            .saturating_mul(part_ms),
+                    )
+                    .saturating_mul(1_000_000),
+            )
+        };
         while in_flight.len() < H3_PART_PIPELINE_DEPTH {
             let requested_sequence = next_sequence;
             next_sequence = next_sequence.saturating_add(1);
+            pending.insert(requested_sequence);
             let path = hls_path(
                 path_prefix,
                 stream_id,
@@ -3483,11 +3526,59 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             && part_coverage.received_parts < expected_parts
         {
             let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
-            let Some((requested_sequence, response)) =
-                timeout(remaining, in_flight.next()).await.ok().flatten()
-            else {
-                break;
+            let (requested_sequence, response) = if abandon_after_ns.is_some() {
+                // Wake often enough to request a part on time while an earlier
+                // request is overdue.
+                let tick = Duration::from_millis(part_ms.clamp(1, 20)).min(remaining);
+                match timeout(tick, in_flight.next()).await {
+                    Ok(Some(answer)) => answer,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let now_ns = now_unix_ns()?;
+                        loop {
+                            let active = pending
+                                .iter()
+                                .rev()
+                                .take_while(|sequence| {
+                                    complete_ns(**sequence, object_sequence_baseline)
+                                        .saturating_add(H3_PART_OVERDUE_GRACE_NS)
+                                        > now_ns
+                                })
+                                .count();
+                            if active >= H3_PART_PIPELINE_DEPTH
+                                || pending.len() >= H3_PART_PENDING_LIMIT
+                                || part_coverage.received_parts >= expected_parts
+                            {
+                                break;
+                            }
+                            let sequence = next_sequence;
+                            next_sequence = next_sequence.saturating_add(1);
+                            let path = hls_path(
+                                path_prefix,
+                                stream_id,
+                                &format!(
+                                    "part{sequence}.{}",
+                                    expected_audio_codec.media_extension()
+                                ),
+                            );
+                            let sender = h3_client
+                                .as_ref()
+                                .context("HTTP/3 media pipeline omitted its connection")?
+                                .request_sender();
+                            pending.insert(sequence);
+                            in_flight
+                                .push(async move { (sequence, sender.get(path).await) }.boxed());
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                let Some(answer) = timeout(remaining, in_flight.next()).await.ok().flatten() else {
+                    break;
+                };
+                answer
             };
+            pending.remove(&requested_sequence);
             let response = match response {
                 Ok(response) => response,
                 Err(first_error) => {
@@ -3514,12 +3605,24 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                         })?;
 
                     // Every pending request belongs to the closed connection.
-                    // Restart at the earliest part that has not passed validation.
+                    // Restart at the earliest part that has not passed validation
+                    // and has not been given up.
                     in_flight = FuturesUnordered::<PartRequest>::new();
+                    pending.clear();
                     next_sequence = restart_sequence;
+                    if let Some(abandon_ns) = abandon_after_ns {
+                        let now_ns = now_unix_ns()?;
+                        while complete_ns(next_sequence, object_sequence_baseline)
+                            .saturating_add(abandon_ns)
+                            <= now_ns
+                        {
+                            next_sequence = next_sequence.saturating_add(1);
+                        }
+                    }
                     while in_flight.len() < H3_PART_PIPELINE_DEPTH {
                         let requested_sequence = next_sequence;
                         next_sequence = next_sequence.saturating_add(1);
+                        pending.insert(requested_sequence);
                         let path = hls_path(
                             path_prefix,
                             stream_id,
@@ -3538,6 +3641,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
             };
             wire_bytes = wire_bytes.saturating_add(response.wire_bytes as u64);
             let mut retry_sequence = None;
+            let arrival_or_now_ns = now_unix_ns()?;
             match response.status {
                 200 => {
                     media_responses = media_responses.saturating_add(1);
@@ -3721,7 +3825,14 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                             }
                         }
                     }
-                    if requested_sequence >= object_sequence_baseline {
+                    // A part the edge still lacks after the abandon time is not
+                    // requested again. It stays missing in the report.
+                    let given_up = abandon_after_ns.is_some_and(|abandon_ns| {
+                        complete_ns(requested_sequence, object_sequence_baseline)
+                            .saturating_add(abandon_ns)
+                            <= arrival_or_now_ns
+                    });
+                    if requested_sequence >= object_sequence_baseline && !given_up {
                         retry_sequence = Some(requested_sequence);
                     }
                 }
@@ -3750,6 +3861,7 @@ async fn receive_hls(options: HlsReceiveOptions<'_>) -> Result<HlsReceiveReport>
                     .as_ref()
                     .context("HTTP/3 media pipeline omitted its connection")?
                     .request_sender();
+                pending.insert(requested_sequence);
                 in_flight.push(async move { (requested_sequence, sender.get(path).await) }.boxed());
             }
         }
@@ -4389,6 +4501,7 @@ async fn receive_hls_load_customer(
                 expected_pcm_channels: reader.expected_pcm_channels,
                 soundkit_opus_protection: reader.soundkit_opus_protection,
                 object_sequence_origin: reader.object_sequence_origin,
+                abandon_after_ms: reader.abandon_after_ms,
                 soundkit_key_file: None,
                 decoded_pcm_output: None,
                 raw_part_output_dir: None,
@@ -4477,6 +4590,7 @@ async fn receive_hls_load_customer(
                     expected_pcm_channels: stream_reader.expected_pcm_channels,
                     soundkit_opus_protection: stream_reader.soundkit_opus_protection,
                     object_sequence_origin: stream_reader.object_sequence_origin,
+                    abandon_after_ms: stream_reader.abandon_after_ms,
                     soundkit_key_file: None,
                     decoded_pcm_output: None,
                     raw_part_output_dir: None,
