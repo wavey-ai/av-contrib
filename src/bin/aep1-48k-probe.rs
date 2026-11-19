@@ -59,6 +59,19 @@ const H3_PART_PIPELINE_DEPTH: usize = 8;
 const H3_PART_PRELOAD_LEAD: Duration = Duration::from_millis(100);
 const HLS_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const H3_REQUEST_RECONNECT_LIMIT: u64 = 3;
+
+/// Reconnects that one HTTP/3 reader may make before it fails. A multi-hour
+/// soak raises the limit with NEEDLETAIL_PROBE_H3_RECONNECT_LIMIT, so that a
+/// reader outlives a rare connection reset. The report counts each reconnect.
+fn h3_request_reconnect_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NEEDLETAIL_PROBE_H3_RECONNECT_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(H3_REQUEST_RECONNECT_LIMIT)
+    })
+}
 // Keep four-hour load qualifications bounded while retaining a deterministic,
 // uniform reservoir for latency percentiles. Exact continuity uses a bitset and
 // is never sampled.
@@ -5079,8 +5092,9 @@ impl H3HttpsClient {
         server_name: &str,
         tls_ca: Option<&Path>,
     ) -> Result<()> {
-        if self.reconnects >= H3_REQUEST_RECONNECT_LIMIT {
-            bail!("HTTP/3 connection exceeded {H3_REQUEST_RECONNECT_LIMIT} reconnects");
+        let limit = h3_request_reconnect_limit();
+        if self.reconnects >= limit {
+            bail!("HTTP/3 connection exceeded {limit} reconnects");
         }
         let prior_wire_bytes = self.wire_bytes();
         let reconnects = self.reconnects.saturating_add(1);
