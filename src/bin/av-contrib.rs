@@ -8995,15 +8995,26 @@ fn load_tls(args: &Args) -> Result<(String, String)> {
     }
 }
 
+/// Segments and parts per segment of the contributor's local playlist
+/// caches.
+///
+/// Every segmenter of the contributor publishes only (`retain_local_cache`
+/// is false outside tests): the local Playlists maps stream ids to cache
+/// indexes and nothing more, and its ChunkCache and M3u8Cache are never
+/// written or served. playlists 0.1.6 still builds both caches up front, a
+/// slot per stream x segment x part each. Sized from the 1 ms default part
+/// (1,008 parts a segment, 32 segments, 65 streams) they took 2.1M slots
+/// each, 276 MB of RSS at start, for memory nobody reads; 128 parts (the
+/// old floor) took 34 MB. These sizes take about 1 MB, whatever the part.
+const LOCAL_PLAYLIST_SEGMENTS: usize = 4;
+const LOCAL_PLAYLIST_PARTS_PER_SEGMENT: usize = 16;
+
 fn playlist_options(args: &Args) -> playlists::Options {
     playlists::Options {
-        max_segments: 32,
+        max_segments: LOCAL_PLAYLIST_SEGMENTS,
         num_playlists: args.playlist_count.max(1),
-        max_parts_per_segment: playlist_part_capacity(
-            args.fmp4_segment_ms,
-            args.nominal_audio_part_ms(),
-        ),
-        max_parted_segments: 32,
+        max_parts_per_segment: LOCAL_PLAYLIST_PARTS_PER_SEGMENT,
+        max_parted_segments: LOCAL_PLAYLIST_SEGMENTS,
         segment_min_ms: args
             .fmp4_segment_ms
             .max(args.nominal_audio_part_ms())
@@ -9013,18 +9024,6 @@ fn playlist_options(args: &Args) -> playlists::Options {
         buffer_size_kb: args.playlist_buffer_kb.max(1),
         init_size_kb: 5,
     }
-}
-
-fn playlist_part_capacity(segment_ms: u32, part_ms: u32) -> usize {
-    const LEGACY_MINIMUM: u64 = 128;
-    const ROLLOVER_MARGIN: u64 = 8;
-    const DEFENSIVE_MAXIMUM: u64 = 4_096;
-
-    let part_ms = u64::from(part_ms.max(1));
-    let target_parts = u64::from(segment_ms.max(1)).div_ceil(part_ms);
-    target_parts
-        .saturating_add(ROLLOVER_MARGIN)
-        .clamp(LEGACY_MINIMUM, DEFENSIVE_MAXIMUM) as usize
 }
 
 fn local_sender_addr(peer: SocketAddr) -> SocketAddr {
@@ -10304,12 +10303,22 @@ mod tests {
     }
 
     #[test]
-    fn playlist_capacity_supports_five_millisecond_parts() {
-        assert_eq!(playlist_part_capacity(1_000, 50), 128);
-        assert_eq!(playlist_part_capacity(1_000, 20), 128);
-        assert_eq!(playlist_part_capacity(1_000, 10), 128);
-        assert_eq!(playlist_part_capacity(1_000, 5), 208);
-        assert_eq!(playlist_part_capacity(u32::MAX, 1), 4_096);
+    fn the_unused_local_playlist_caches_stay_small_whatever_the_part() {
+        // The caches are never written (every segmenter publishes only), so
+        // their size does not follow the part: 1 ms parts sized them at
+        // 2.1M slots each.
+        for flags in [
+            vec!["av-contrib"],
+            vec!["av-contrib", "--audio-part", "12samples"],
+            vec!["av-contrib", "--fmp4-part-ms", "50"],
+        ] {
+            let args = Args::try_parse_from(&flags).unwrap();
+            let options = playlist_options(&args);
+            let slots =
+                options.num_playlists * options.max_segments * options.max_parts_per_segment;
+            assert!(slots <= 65 * 64, "{flags:?}: {slots} slots");
+            assert_eq!(options.num_playlists, args.playlist_count);
+        }
     }
 
     #[test]
