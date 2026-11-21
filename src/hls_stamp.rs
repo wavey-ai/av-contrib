@@ -69,12 +69,20 @@ pub struct StreamStamper {
     /// number of parts since the first of them.
     longer_parts: Vec<u32>,
     parts_since_longer: u32,
+    /// Recent segments that were longer than the declared target duration,
+    /// and the number of segments since the first of them.
+    longer_segments: Vec<u32>,
+    segments_since_longer: u32,
 }
 
 /// Parts longer than the declared target that widen it.
 const LONGER_PARTS_TO_WIDEN: usize = 3;
 /// Parts within which they must come.
 const LONGER_PARTS_WINDOW: u32 = 100;
+/// Segments longer than the declared target duration that widen it, and the
+/// segments within which they must come.
+const LONGER_SEGMENTS_TO_WIDEN: usize = 3;
+const LONGER_SEGMENTS_WINDOW: u32 = 20;
 
 impl StreamStamper {
     /// `part_ms` and `segment_ms` are the configured part and segment
@@ -94,6 +102,40 @@ impl StreamStamper {
             last_part_ms: part_ms,
             longer_parts: Vec::with_capacity(LONGER_PARTS_TO_WIDEN),
             parts_since_longer: 0,
+            longer_segments: Vec::with_capacity(LONGER_SEGMENTS_TO_WIDEN),
+            segments_since_longer: 0,
+        }
+    }
+
+    /// Take the duration of a finished segment into the declared target
+    /// duration.
+    ///
+    /// A stream whose groups of pictures are longer than the configured
+    /// segment has long segments all the time, and its target duration
+    /// follows. One long segment is a fault upstream, for example parts that
+    /// were lost with their key frame. It widened the target duration from
+    /// 2 s to 8 s for the life of a stream, and every cache then held 80 s
+    /// of the stream instead of 20 s: 190 MB more on each node for one 4K
+    /// stream. The target now follows a duration that recurs.
+    fn segment_finished(&mut self, duration_ms: u32) {
+        if !self.longer_segments.is_empty() {
+            self.segments_since_longer += 1;
+            if self.segments_since_longer > LONGER_SEGMENTS_WINDOW {
+                self.longer_segments.clear();
+            }
+        }
+        // Half a second of slack: a target duration is a whole number of
+        // seconds, and 2.04 s is a segment of 2 s.
+        if duration_ms > self.target_duration_ms.saturating_add(499) {
+            if self.longer_segments.is_empty() {
+                self.segments_since_longer = 0;
+            }
+            self.longer_segments.push(duration_ms);
+            if self.longer_segments.len() >= LONGER_SEGMENTS_TO_WIDEN {
+                let recurring = self.longer_segments.iter().copied().min().unwrap_or(0);
+                self.target_duration_ms = self.target_duration_ms.max(recurring);
+                self.longer_segments.clear();
+            }
         }
     }
 
@@ -131,7 +173,7 @@ impl StreamStamper {
                     u64::from(self.last_part_ms) * 100 < u64::from(self.part_target_ms) * 85;
                 if can_start_segment && (full || !self.segment_starts_clean || after_short_part) {
                     let finished = u32::try_from(self.segment_elapsed_ms).unwrap_or(u32::MAX);
-                    self.target_duration_ms = self.target_duration_ms.max(finished);
+                    self.segment_finished(finished);
                     self.segment_elapsed_ms = 0;
                     self.part = 0;
                     self.segment_starts_clean = true;
@@ -294,7 +336,39 @@ mod tests {
         assert_eq!(last.part, 19);
         let next = stamper.stamp(200, true, 0);
         assert_eq!(next.msn, 1);
-        assert_eq!(next.target_duration_ms, 4_000);
+        // The stream goes on in groups of four seconds: the target duration
+        // follows after the third such segment.
+        assert_eq!(next.target_duration_ms, 2_000);
+        let mut last = next;
+        for part in 1..=60 {
+            last = stamper.stamp(200, part % 20 == 0, 0);
+        }
+        assert_eq!(last.msn, 4);
+        assert_eq!(last.target_duration_ms, 4_000);
+    }
+
+    #[test]
+    fn one_long_segment_does_not_widen_the_target_duration() {
+        let mut stamper = StreamStamper::new(200, 2_000);
+        let mut last = stamper.stamp(200, true, 0);
+        // A fault upstream: 7.6 s pass before the next key frame arrives.
+        for _ in 0..37 {
+            last = stamper.stamp(200, false, 0);
+        }
+        assert_eq!(last.msn, 0);
+        // An hour of two-second segments after it.
+        for part in 0..18_000 {
+            last = stamper.stamp(200, part % 10 == 0, 0);
+        }
+        assert_eq!(last.target_duration_ms, 2_000);
+        // And another fault, long after the first.
+        for _ in 0..30 {
+            last = stamper.stamp(200, false, 0);
+        }
+        for part in 0..100 {
+            last = stamper.stamp(200, part % 10 == 0, 0);
+        }
+        assert_eq!(last.target_duration_ms, 2_000);
     }
 
     #[test]
