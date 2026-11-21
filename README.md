@@ -267,6 +267,21 @@ Useful endpoints:
   path under `--srt-stream-id` (default `6`).
 - `rtmp://<rtmp-bind>`: accepts RTMP/FLV access units and boxes them
   as fMP4 under `--rtmp-stream-id` (default `7`).
+  A stream key that is a number names the output stream: an encoder that
+  sends a ladder publishes `…/live/11`, `…/live/12` and so on, one rendition
+  each. Video streams that start within a second of each other number their
+  segments from the same instant.
+
+Each part is stamped with its place in the LL-HLS playlist: Media Sequence
+Number, part index, declared part target and declared target duration. The
+caches of the mesh render the playlist from the stamps. `--fmp4-video-part-ms`
+and `--fmp4-video-segment-ms` set the part and segment durations of a video
+stream, for example 200 and 2,000. They default to `--fmp4-part-ms` and
+`--fmp4-segment-ms`, which an audio stream keeps. Set the segment duration to
+the key-frame interval of the encoder. A key
+frame starts a part, and a segment is a whole number of groups of pictures.
+The declared durations follow a duration that recurs: one long part or one
+long segment does not change them.
 
 The stdin senders are kept for local smoke tests and protocol debugging:
 
