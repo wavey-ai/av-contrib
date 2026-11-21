@@ -7103,8 +7103,13 @@ fn needletail_ingest_query(
 }
 
 /// `GET /api/hops`: the journal as NDJSON, oldest first. It reads the ring
-/// only; it creates no demand and opens no session.
-fn hop_journal_response(journal: Option<&HopJournal>, query: Option<&str>) -> HandlerResponse {
+/// only; it creates no demand and opens no session. The copy, sort and
+/// serialization of up to the whole ring (tens of MB) run on the blocking
+/// pool, not on a runtime worker that the publication tasks share.
+async fn hop_journal_response(
+    journal: Option<&'static HopJournal>,
+    query: Option<&str>,
+) -> HandlerResponse {
     let Some(journal) = journal else {
         return response(
             StatusCode::NOT_FOUND,
@@ -7112,15 +7117,21 @@ fn hop_journal_response(journal: Option<&HopJournal>, query: Option<&str>) -> Ha
             Some("text/plain; charset=utf-8"),
         );
     };
-    match journal.respond(query) {
-        Ok(body) => response(
+    let query = query.map(str::to_owned);
+    match tokio::task::spawn_blocking(move || journal.respond(query.as_deref())).await {
+        Ok(Ok(body)) => response(
             StatusCode::OK,
             Some(Bytes::from(body)),
             Some(HOP_JOURNAL_CONTENT_TYPE),
         ),
-        Err(error) => response(
+        Ok(Err(error)) => response(
             StatusCode::BAD_REQUEST,
             Some(Bytes::from(format!("{error}\n"))),
+            Some("text/plain; charset=utf-8"),
+        ),
+        Err(error) => response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(Bytes::from(format!("hop journal query failed: {error}\n"))),
             Some("text/plain; charset=utf-8"),
         ),
     }
@@ -7184,10 +7195,9 @@ impl Router for ContribRouter {
                     Some("application/json"),
                 ))
             }
-            HOP_JOURNAL_PATH => Ok(hop_journal_response(
-                hop_journal::global(),
-                req.uri().query(),
-            )),
+            HOP_JOURNAL_PATH => {
+                Ok(hop_journal_response(hop_journal::global(), req.uri().query()).await)
+            }
             CONTRIB_METRICS_PATH => {
                 let mut metrics = self.status.prometheus_metrics().to_vec();
                 if let Some(gate) = &self.publish_ingress_gate {
@@ -8896,7 +8906,8 @@ mod tests {
         let response = hop_journal_response(
             Some(journal),
             Some(&format!("since_us={before_us}&stream={stream_id}")),
-        );
+        )
+        .await;
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(
             response.content_type.as_deref(),
@@ -8912,11 +8923,13 @@ mod tests {
         assert_eq!(first_line["seq"], 0);
         assert_eq!(first_line["epoch"], 1_234);
         assert_eq!(
-            hop_journal_response(Some(journal), Some("since_us=x")).status,
+            hop_journal_response(Some(journal), Some("since_us=x"))
+                .await
+                .status,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            hop_journal_response(None, None).status,
+            hop_journal_response(None, None).await.status,
             StatusCode::NOT_FOUND
         );
     }

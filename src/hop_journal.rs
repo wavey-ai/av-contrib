@@ -15,7 +15,9 @@
 //!
 //! Recording takes a `std::sync::Mutex` for a few instructions and writes one
 //! fixed slot of a ring allocated up front: no allocation, no logging, no
-//! await. A journal of capacity 0 records nothing.
+//! await. A journal of capacity 0 records nothing. A query copies the ring a
+//! few thousand events at a time and lets go of the lock between copies, so
+//! a reader never holds up the recording paths for longer than one copy.
 
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -31,6 +33,10 @@ pub const HOP_JOURNAL_CONTENT_TYPE: &str = "application/x-ndjson";
 
 /// Path of the journal on a node's HTTP port.
 pub const HOP_JOURNAL_PATH: &str = "/api/hops";
+
+/// Events a query copies under one hold of the ring lock: about 350 KB, a
+/// few tens of microseconds.
+const QUERY_CHUNK_EVENTS: usize = 4_096;
 
 /// Contributor stages of a part, in the order a part passes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,7 +180,20 @@ fn min_option(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 pub struct HopJournal {
     node: String,
     capacity: usize,
-    ring: Mutex<VecDeque<HopEvent>>,
+    ring: Mutex<Ring>,
+}
+
+struct Ring {
+    events: VecDeque<HopEvent>,
+    /// Events ever recorded. The oldest event in the ring is number
+    /// `recorded - events.len()`.
+    recorded: u64,
+}
+
+impl Ring {
+    fn oldest(&self) -> u64 {
+        self.recorded - self.events.len() as u64
+    }
 }
 
 impl HopJournal {
@@ -182,7 +201,10 @@ impl HopJournal {
         Self {
             node: node.into(),
             capacity,
-            ring: Mutex::new(VecDeque::with_capacity(capacity)),
+            ring: Mutex::new(Ring {
+                events: VecDeque::with_capacity(capacity),
+                recorded: 0,
+            }),
         }
     }
 
@@ -203,22 +225,64 @@ impl HopJournal {
             return;
         }
         let mut ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
-        if ring.len() == self.capacity {
-            ring.pop_front();
+        if ring.events.len() == self.capacity {
+            ring.events.pop_front();
         }
-        ring.push_back(event);
+        ring.events.push_back(event);
+        ring.recorded += 1;
     }
 
     /// Events at or after `since_us`, of `stream` when given, oldest first.
     pub fn query(&self, since_us: Option<u64>, stream: Option<u64>) -> Vec<HopEvent> {
-        let mut events = {
-            let ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
-            ring.iter()
-                .filter(|event| since_us.is_none_or(|since| event.t_us >= since))
-                .filter(|event| stream.is_none_or(|stream| event.stream == stream))
-                .copied()
-                .collect::<Vec<_>>()
-        };
+        self.query_in_chunks(since_us, stream, QUERY_CHUNK_EVENTS, || {})
+    }
+
+    /// `query`, copying at most `chunk` events per hold of the lock and
+    /// calling `between` with the lock released after each copy. The events
+    /// are those in the ring when the query starts that are still there when
+    /// their chunk is copied; later events are left for the next query.
+    fn query_in_chunks(
+        &self,
+        since_us: Option<u64>,
+        stream: Option<u64>,
+        chunk: usize,
+        mut between: impl FnMut(),
+    ) -> Vec<HopEvent> {
+        let chunk = chunk.max(1);
+        let mut events = Vec::new();
+        let mut next = 0_u64;
+        let mut stop = None;
+        loop {
+            // Room for a whole chunk, so that nothing allocates under the lock.
+            events.reserve(chunk);
+            {
+                let ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
+                let stop = *stop.get_or_insert(ring.recorded);
+                let oldest = ring.oldest();
+                let start = next.max(oldest);
+                let end = stop.min(start.saturating_add(chunk as u64));
+                if start < end {
+                    let (first, second) = ring.events.as_slices();
+                    let from = (start - oldest) as usize;
+                    let to = (end - oldest) as usize;
+                    let copy = |slice: &[HopEvent], offset: usize, events: &mut Vec<HopEvent>| {
+                        let lo = from.saturating_sub(offset).min(slice.len());
+                        let hi = to.saturating_sub(offset).min(slice.len());
+                        events.extend(slice[lo..hi].iter().copied().filter(|event| {
+                            since_us.is_none_or(|since| event.t_us >= since)
+                                && stream.is_none_or(|stream| event.stream == stream)
+                        }));
+                    };
+                    copy(first, 0, &mut events);
+                    copy(second, first.len(), &mut events);
+                }
+                next = end;
+                if next >= stop {
+                    break;
+                }
+            }
+            between();
+        }
         // Source events are journalled when the part gets its sequence,
         // after the events they describe.
         events.sort_by_key(|event| event.t_us);
@@ -330,7 +394,7 @@ mod tests {
     #[test]
     fn ring_keeps_the_newest_events_without_growing() {
         let journal = HopJournal::new("contrib-lon", 3);
-        let allocated = journal.ring.lock().unwrap().capacity();
+        let allocated = journal.ring.lock().unwrap().events.capacity();
         assert!(allocated >= 3);
         for seq in 0..5 {
             journal.record(HopEvent::new(HopStage::Enqueued, 4001, seq, 100 + seq));
@@ -341,7 +405,7 @@ mod tests {
             vec![2, 3, 4]
         );
         // The ring was allocated once and never grew.
-        assert_eq!(journal.ring.lock().unwrap().capacity(), allocated);
+        assert_eq!(journal.ring.lock().unwrap().events.capacity(), allocated);
 
         let disabled = HopJournal::new("contrib-lon", 0);
         disabled.record(HopEvent::new(HopStage::Sent, 1, 1, 1));
@@ -368,6 +432,58 @@ mod tests {
             since.iter().map(|event| event.t_us).collect::<Vec<_>>(),
             vec![1_100, 1_200]
         );
+    }
+
+    #[test]
+    fn query_copies_the_ring_in_chunks_while_recording_goes_on() {
+        let journal = HopJournal::new("contrib-lon", 10);
+        for seq in 0..10 {
+            journal.record(HopEvent::new(HopStage::Sent, 4001, seq, 1_000 + seq));
+        }
+        // Between chunks of 3 the recording paths run and push 2 events, each
+        // evicting the oldest. The query returns what was in the ring when
+        // it started and was still there when its chunk was read, once each,
+        // and leaves the events recorded during the query for the next one.
+        let mut next_seq = 10;
+        let mut pauses = 0;
+        let events = journal.query_in_chunks(None, Some(4001), 3, || {
+            pauses += 1;
+            for _ in 0..2 {
+                journal.record(HopEvent::new(
+                    HopStage::Sent,
+                    4001,
+                    next_seq,
+                    1_000 + next_seq,
+                ));
+                next_seq += 1;
+            }
+        });
+        let seqs = events.iter().map(|event| event.seq).collect::<Vec<_>>();
+        // Chunk 1 reads 0..3; 10, 11 evict 0, 1. Chunk 2 reads 3..6; 12, 13
+        // evict 2, 3. Chunk 3 reads 6..9; 14, 15 evict 4, 5. Chunk 4 reads 9.
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(pauses, 3);
+
+        // When the recording evicts events before their chunk is read, they
+        // are skipped, not duplicated or read past the end. After 0 is read,
+        // 4, 5 and 6 evict 0, 1 and 2; 3 is read and the query stops there.
+        let journal = HopJournal::new("contrib-lon", 4);
+        for seq in 0..4 {
+            journal.record(HopEvent::new(HopStage::Sent, 1, seq, seq));
+        }
+        let mut next_seq = 4;
+        let events = journal.query_in_chunks(None, None, 1, || {
+            for _ in 0..3 {
+                journal.record(HopEvent::new(HopStage::Sent, 1, next_seq, next_seq));
+                next_seq += 1;
+            }
+        });
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        // The whole query with no interleaving sees the latest ring.
+        assert_eq!(journal.query(None, None).len(), 4);
     }
 
     #[test]
