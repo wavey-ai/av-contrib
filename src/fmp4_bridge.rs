@@ -85,6 +85,9 @@ pub struct PublishedFmp4Part {
     /// Place of the part in the Media Playlist. The publisher that gives the
     /// part its canonical sequence stamps it.
     pub hls: Option<crate::hls_stamp::HlsStamp>,
+    /// AEP1 arrival and recovery times of the part's source, for the hop
+    /// journal. Empty for video and for sources without AEP1.
+    pub source_times: crate::hop_journal::PartSourceTimes,
 }
 
 /// One immutable opaque media part. The bytes are recovered from contributor
@@ -106,6 +109,9 @@ pub struct PublishedOpaquePart {
     pub audio_units: usize,
     /// Place of the part in the Media Playlist.
     pub hls: Option<crate::hls_stamp::HlsStamp>,
+    /// AEP1 arrival and recovery times of the part's source, for the hop
+    /// journal.
+    pub source_times: crate::hop_journal::PartSourceTimes,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -455,6 +461,10 @@ pub struct Fmp4Segmenter {
     /// Distance between the last two video access units: the expected
     /// duration of the last one, whose successor has not arrived yet.
     video_frame_ticks: Option<u64>,
+    /// Source times of the access unit about to be pushed.
+    next_source_times: crate::hop_journal::PartSourceTimes,
+    /// Source times of the buffered part.
+    part_source_times: crate::hop_journal::PartSourceTimes,
 }
 
 impl Fmp4Segmenter {
@@ -563,7 +573,21 @@ impl Fmp4Segmenter {
             flush_on_complete: default_flush_on_complete(),
             last_video_dts: None,
             video_frame_ticks: None,
+            next_source_times: Default::default(),
+            part_source_times: Default::default(),
         }
+    }
+
+    /// Source times of the next access unit pushed, for the hop journal.
+    pub fn set_next_source_times(&mut self, times: crate::hop_journal::PartSourceTimes) {
+        self.next_source_times = times;
+    }
+
+    /// Count the source times of the next access unit into the part that
+    /// takes it.
+    fn take_next_source_times(&mut self) {
+        let times = std::mem::take(&mut self.next_source_times);
+        self.part_source_times.merge(&times);
     }
 
     /// Close a video part as soon as the access unit just pushed brings it to
@@ -675,6 +699,8 @@ impl Fmp4Segmenter {
         self.timestamp_base_input = None;
         self.last_video_dts = None;
         self.video_frame_ticks = None;
+        self.next_source_times = Default::default();
+        self.part_source_times = Default::default();
     }
 
     async fn push_video(&mut self, mut access_unit: AccessUnit) {
@@ -879,6 +905,7 @@ impl Fmp4Segmenter {
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
             self.audio_timestamps.push(access_unit.pts);
             self.audio_buf.push(access_unit);
+            self.take_next_source_times();
             self.extend_audio_buffered_duration(access_unit_duration_ms);
             debug!(
                 output_stream_id = self.output_stream_id,
@@ -913,6 +940,7 @@ impl Fmp4Segmenter {
 
         self.audio_timestamps.push(access_unit.pts);
         self.audio_buf.push(access_unit);
+        self.take_next_source_times();
         self.extend_audio_buffered_duration(access_unit_duration_ms);
 
         // FLAC, ADTS, Opus, and configured PCM describe their sample duration,
@@ -1076,6 +1104,7 @@ impl Fmp4Segmenter {
             boxing_audio_config,
         );
         let boxing_elapsed = boxing_started.elapsed();
+        let source_times = std::mem::take(&mut self.part_source_times);
         self.video_timestamps.clear();
         self.audio_timestamps.clear();
         self.audio_buffered_duration_ms = Some(0);
@@ -1176,6 +1205,7 @@ impl Fmp4Segmenter {
                 audio_codec,
                 audio_units,
                 hls: None,
+                source_times,
             };
             let publish_started = Instant::now();
             let publish_result = publisher.publish_fmp4_part(part).await;
@@ -1239,6 +1269,7 @@ impl Fmp4Segmenter {
         self.audio_buf.clear();
         self.audio_timestamps.clear();
         self.audio_buffered_duration_ms = Some(0);
+        self.part_source_times = Default::default();
     }
 
     fn drop_pending_without_config_if_needed(&mut self) {

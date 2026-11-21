@@ -9,6 +9,10 @@ use av_contrib::fmp4_bridge::{
     PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
 use av_contrib::hls_stamp::StreamStamper;
+use av_contrib::hop_journal::{
+    self, HopEvent, HopJournal, HopStage, DEFAULT_HOP_JOURNAL_CAPACITY, HOP_JOURNAL_CONTENT_TYPE,
+    HOP_JOURNAL_PATH,
+};
 use av_contrib::ingress_authorization::{
     decode_envelope_header_bytes, gate_from_bootstrap_path, parse_bearer_header,
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
@@ -763,6 +767,14 @@ struct Args {
     #[arg(long, default_value_t = 800)]
     playlist_buffer_kb: usize,
 
+    /// Events kept in the hop journal served at /api/hops. 0 disables it.
+    #[arg(
+        long,
+        env = "AV_HOP_JOURNAL_CAPACITY",
+        default_value_t = DEFAULT_HOP_JOURNAL_CAPACITY
+    )]
+    hop_journal_capacity: usize,
+
     /// Give each new stream the next publication worker of its pool, audio
     /// and video in separate pools, instead of `stream_id % 8`. With `false`
     /// the DAW streams 2001, 3001 and 4001 and video stream 1 share a worker.
@@ -1116,14 +1128,36 @@ impl RelaySessionPublisher {
     }
 
     async fn publish_object(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
+        self.publish_part_object(object, None).await
+    }
+
+    /// Publish an object; `part` is the (stream, sequence) of a media part,
+    /// whose encode and sends the hop journal records.
+    async fn publish_part_object(
+        &self,
+        object: &MediaObject,
+        part: Option<(u64, u64)>,
+    ) -> Result<RelayPublishOutcome> {
         let started = Instant::now();
-        let result = self.publish_object_inner(object).await;
+        let result = self.publish_object_inner(object, part).await;
         self.telemetry
             .record_relay_session_stage_duration(RelayPipelineStage::Total, started.elapsed());
         result
     }
 
-    async fn publish_object_inner(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
+    async fn publish_object_inner(
+        &self,
+        object: &MediaObject,
+        part: Option<(u64, u64)>,
+    ) -> Result<RelayPublishOutcome> {
+        let journal = part.and_then(|part| hop_journal::global().map(|journal| (journal, part)));
+        let journal_hop = |stage: HopStage, peer: Option<SocketAddr>| {
+            if let Some((journal, (stream, seq))) = journal {
+                journal.record(
+                    HopEvent::new(stage, stream, seq, hop_journal::now_unix_us()).with_peer(peer),
+                );
+            }
+        };
         let deadline = relay_deadline_for_object(object)?;
         if deadline.is_expired_at(now_unix_us()) {
             self.telemetry
@@ -1163,6 +1197,7 @@ impl RelaySessionPublisher {
                 return Err(error).context("failed to RaptorQ-protect canonical media object");
             }
         };
+        journal_hop(HopStage::Encoded, None);
 
         let schedule_started = Instant::now();
         let source_count = source_symbols.len();
@@ -1183,6 +1218,7 @@ impl RelaySessionPublisher {
                 self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
                     .await?;
             }
+            journal_hop(HopStage::Sent, Some(self.primary.peer_addr()));
             if repair_uses_primary {
                 for symbol in repair_symbols.iter().cloned() {
                     self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
@@ -1198,10 +1234,16 @@ impl RelaySessionPublisher {
                         self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
                             .await?;
                     }
+                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
                 }
                 for symbol in repair_symbols.iter().cloned() {
                     self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
                         .await?;
+                }
+                // A secondary without the source set decodes from its repair
+                // symbols: they are what it needs.
+                if !self.secondary_seed_source {
+                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -1856,6 +1898,7 @@ fn handoff_audio_epoch_hls_datagram(
     tx: Option<&mpsc::Sender<AudioEpochHlsDatagram>>,
     peer: SocketAddr,
     datagram: &[u8],
+    received_unix_us: u64,
 ) {
     let Some(tx) = tx else {
         return;
@@ -1879,6 +1922,7 @@ fn handoff_audio_epoch_hls_datagram(
     if let Err(error) = tx.try_send(AudioEpochHlsDatagram {
         peer,
         bytes: Bytes::copy_from_slice(datagram),
+        received_unix_us,
     }) {
         let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
         AUDIO_EPOCH_HLS_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
@@ -2093,6 +2137,7 @@ async fn run_daw_media_udp_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                let received_unix_us = hop_journal::now_unix_us();
                 if len == 0 {
                     continue;
                 }
@@ -2108,7 +2153,12 @@ async fn run_daw_media_udp_ingest(
                 }
 
                 if is_audio_transport_datagram(datagram) {
-                    handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
+                    handoff_audio_epoch_hls_datagram(
+                        audio_epoch_hls_tx.as_ref(),
+                        peer,
+                        datagram,
+                        received_unix_us,
+                    );
                     handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx.as_ref(), peer, datagram);
                     continue;
                 }
@@ -2295,7 +2345,7 @@ impl Fmp4PartPublisher for MeshForwarder {
 
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_object(&media_object)
+                .publish_part_object(&media_object, Some((part.stream_id, part.sequence)))
                 .await
                 .map_err(|error| error.to_string())?;
             trace!(
@@ -2333,7 +2383,7 @@ impl Fmp4PartPublisher for MeshForwarder {
         }
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_object(&object)
+                .publish_part_object(&object, Some((part.stream_id, part.sequence)))
                 .await
                 .map_err(|error| error.to_string())?;
             trace!(
@@ -2365,6 +2415,13 @@ impl QueuedPublication {
         match self {
             Self::Fmp4 { part, .. } => part.stream_id,
             Self::Opaque { part, .. } => part.stream_id,
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Fmp4 { part, .. } => part.sequence,
+            Self::Opaque { part, .. } => part.sequence,
         }
     }
 
@@ -2574,11 +2631,21 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         ));
         let class = fmp4_publication_class(&part);
         let shard = self.shard_of(stream, stream_id, class);
+        let source_times = part.source_times;
+        let packaged_at_unix_ns = part.packaged_at_unix_ns;
+        let enqueued_us = hop_journal::now_unix_us();
         let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
             part,
             enqueued_at: Instant::now(),
         });
         if result.is_ok() {
+            journal_enqueued(
+                stream_id,
+                sequence,
+                &source_times,
+                packaged_at_unix_ns,
+                enqueued_us,
+            );
             stream.next_sequence = stream.next_sequence.saturating_add(1);
         } else {
             // The part was not published: it has no place in the playlist.
@@ -2619,11 +2686,21 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
         ));
         let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
+        let source_times = part.source_times;
+        let packaged_at_unix_ns = part.packaged_at_unix_ns;
+        let enqueued_us = hop_journal::now_unix_us();
         let result = self.senders[shard].try_send(QueuedPublication::Opaque {
             part,
             enqueued_at: Instant::now(),
         });
         if result.is_ok() {
+            journal_enqueued(
+                stream_id,
+                sequence,
+                &source_times,
+                packaged_at_unix_ns,
+                enqueued_us,
+            );
             stream.next_sequence = stream.next_sequence.saturating_add(1);
         } else {
             stream.stamper = before;
@@ -2637,6 +2714,33 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             &self.telemetry,
         )
     }
+}
+
+/// Journal a part handed to its publication worker, with the source and
+/// packaging times it carried there.
+fn journal_enqueued(
+    stream: u64,
+    seq: u64,
+    source_times: &hop_journal::PartSourceTimes,
+    packaged_at_unix_ns: i64,
+    enqueued_us: u64,
+) {
+    let Some(journal) = hop_journal::global() else {
+        return;
+    };
+    for event in source_times.events(stream, seq) {
+        journal.record(event);
+    }
+    journal.record(
+        HopEvent::new(
+            HopStage::Packaged,
+            stream,
+            seq,
+            hop_journal::unix_ns_to_us(packaged_at_unix_ns),
+        )
+        .with_epoch(source_times.epoch),
+    );
+    journal.record(HopEvent::new(HopStage::Enqueued, stream, seq, enqueued_us));
 }
 
 fn enqueue_publication_result(
@@ -2765,6 +2869,12 @@ async fn process_queued_publication(
             Some(depth.saturating_sub(1))
         })
         .ok();
+    hop_journal::record(HopEvent::new(
+        HopStage::Dequeued,
+        publication.stream_id(),
+        publication.sequence(),
+        hop_journal::now_unix_us(),
+    ));
     publication_queue_age().record(publication.enqueued_at().elapsed());
     let started = Instant::now();
     let stream_id = publication.stream_id();
@@ -6992,6 +7102,30 @@ fn needletail_ingest_query(
     }
 }
 
+/// `GET /api/hops`: the journal as NDJSON, oldest first. It reads the ring
+/// only; it creates no demand and opens no session.
+fn hop_journal_response(journal: Option<&HopJournal>, query: Option<&str>) -> HandlerResponse {
+    let Some(journal) = journal else {
+        return response(
+            StatusCode::NOT_FOUND,
+            Some(Bytes::from_static(b"the hop journal is disabled\n")),
+            Some("text/plain; charset=utf-8"),
+        );
+    };
+    match journal.respond(query) {
+        Ok(body) => response(
+            StatusCode::OK,
+            Some(Bytes::from(body)),
+            Some(HOP_JOURNAL_CONTENT_TYPE),
+        ),
+        Err(error) => response(
+            StatusCode::BAD_REQUEST,
+            Some(Bytes::from(format!("{error}\n"))),
+            Some("text/plain; charset=utf-8"),
+        ),
+    }
+}
+
 fn needletail_ingest_response(status: StatusCode) -> HandlerResponse {
     let body = serde_json::to_vec(&serde_json::json!({
         "error": "needletail_ingest_rejected",
@@ -7050,6 +7184,10 @@ impl Router for ContribRouter {
                     Some("application/json"),
                 ))
             }
+            HOP_JOURNAL_PATH => Ok(hop_journal_response(
+                hop_journal::global(),
+                req.uri().query(),
+            )),
             CONTRIB_METRICS_PATH => {
                 let mut metrics = self.status.prometheus_metrics().to_vec();
                 if let Some(gate) = &self.publish_ingress_gate {
@@ -7181,7 +7319,12 @@ impl Router for ContribRouter {
                     if !is_audio_transport_datagram(datagram) {
                         return Ok(needletail_ingest_response(StatusCode::BAD_REQUEST));
                     }
-                    handoff_audio_epoch_hls_datagram(Some(audio_epoch_hls_tx), peer, datagram);
+                    handoff_audio_epoch_hls_datagram(
+                        Some(audio_epoch_hls_tx),
+                        peer,
+                        datagram,
+                        hop_journal::now_unix_us(),
+                    );
                     handoff_audio_epoch_mesh_datagram(Some(audio_epoch_mesh_tx), peer, datagram);
                     datagrams = datagrams.saturating_add(1);
                     payload_bytes = payload_bytes.saturating_add(length as u64);
@@ -7525,6 +7668,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
+    hop_journal::install(HopJournal::new(
+        args.relay_local_id.clone(),
+        args.hop_journal_capacity,
+    ));
     validate_compiled_ingress_features(&args)?;
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
@@ -8505,6 +8652,7 @@ mod tests {
             audio_codec: (audio_units > 0).then_some("aac"),
             audio_units,
             hls: None,
+            source_times: Default::default(),
         }
     }
 
@@ -8520,6 +8668,7 @@ mod tests {
             bytes: Bytes::from_static(b"pcm"),
             audio_units: 1,
             hls: None,
+            source_times: Default::default(),
         }
     }
 
@@ -8654,6 +8803,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(drain_shards(&mut receivers)[&4001], vec![1]);
+    }
+
+    /// The process journal, installed for tests that read it.
+    fn test_hop_journal() -> &'static HopJournal {
+        hop_journal::install(HopJournal::new("contrib-test", 1 << 16))
+    }
+
+    #[tokio::test]
+    async fn publication_journals_each_part_from_source_to_worker() {
+        let journal = test_hop_journal();
+        // The source and packaging times precede the hand-off.
+        let before_us = hop_journal::now_unix_us() - 100;
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        // A stream id of this test only: other tests share the process journal.
+        let stream_id = 4_000_000_041;
+        let mut part = test_opaque_part(stream_id);
+        part.packaged_at_unix_ns = i64::try_from((before_us + 70) * 1_000).unwrap();
+        part.source_times = hop_journal::PartSourceTimes {
+            epoch: Some(1_234),
+            src_first_us: Some(before_us + 10),
+            src_last_us: Some(before_us + 20),
+            recovered_us: Some(before_us + 25),
+        };
+        publisher.publish_opaque_part(part.clone()).await.unwrap();
+        publisher.publish_opaque_part(part).await.unwrap();
+
+        // The worker side: take both parts as a publication worker would.
+        let inner: Arc<dyn Fmp4PartPublisher> = Arc::new(BlockingPublicationSink {
+            blocked: std::sync::atomic::AtomicBool::new(true),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let telemetry = IngestTelemetry::default();
+        for receiver in receivers.iter_mut() {
+            while let Ok(publication) = receiver.try_recv() {
+                process_queued_publication(
+                    0,
+                    &inner,
+                    &telemetry,
+                    &mut HashMap::new(),
+                    &mut std::collections::HashSet::new(),
+                    publication,
+                )
+                .await;
+            }
+        }
+
+        let events = journal.query(Some(before_us), Some(stream_id));
+        let stages_of = |seq: u64| {
+            events
+                .iter()
+                .filter(|event| event.seq == seq)
+                .map(|event| event.stage)
+                .collect::<Vec<_>>()
+        };
+        for seq in [0, 1] {
+            assert_eq!(
+                stages_of(seq),
+                vec![
+                    HopStage::SrcFirst,
+                    HopStage::SrcLast,
+                    HopStage::Recovered,
+                    HopStage::Packaged,
+                    HopStage::Enqueued,
+                    HopStage::Dequeued,
+                ],
+                "{events:?}"
+            );
+        }
+        let first = events.iter().find(|event| event.seq == 0).unwrap();
+        assert_eq!(first.t_us, before_us + 10);
+        assert_eq!(first.epoch, Some(1_234));
+        let packaged = events
+            .iter()
+            .find(|event| event.stage == HopStage::Packaged)
+            .unwrap();
+        assert_eq!(packaged.t_us, before_us + 70);
+
+        // GET /api/hops serves the same events as NDJSON, oldest first.
+        let response = hop_journal_response(
+            Some(journal),
+            Some(&format!("since_us={before_us}&stream={stream_id}")),
+        );
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some(HOP_JOURNAL_CONTENT_TYPE)
+        );
+        let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert_eq!(body.lines().count(), events.len());
+        let first_line: serde_json::Value =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(first_line["node"], "contrib-test");
+        assert_eq!(first_line["stage"], "src_first");
+        assert_eq!(first_line["stream"], stream_id);
+        assert_eq!(first_line["seq"], 0);
+        assert_eq!(first_line["epoch"], 1_234);
+        assert_eq!(
+            hop_journal_response(Some(journal), Some("since_us=x")).status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            hop_journal_response(None, None).status,
+            StatusCode::NOT_FOUND
+        );
     }
 
     struct BlockingPublicationSink {
@@ -9056,6 +9310,7 @@ mod tests {
                 part_target_ms: 5,
                 target_duration_ms: 1_000,
             }),
+            source_times: Default::default(),
         };
         let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
         // The place of the part in the playlist travels with the object.
@@ -9286,7 +9541,32 @@ mod tests {
         .unwrap();
         let exact_envelope = media_object::encode(&object).unwrap();
 
-        let outcome = relay.publish_object(&object).await.unwrap();
+        let journal = test_hop_journal();
+        let before_us = hop_journal::now_unix_us();
+        // A stream id of this test only: other tests share the process journal.
+        let journal_stream = 77_000_000_077;
+        let outcome = relay
+            .publish_part_object(&object, Some((journal_stream, 42)))
+            .await
+            .unwrap();
+        let stages = journal
+            .query(Some(before_us), Some(journal_stream))
+            .into_iter()
+            .map(|event| (event.stage, event.seq, event.peer))
+            .collect::<Vec<_>>();
+        // The encode comes first; the two lanes send concurrently.
+        assert_eq!(stages.len(), 3, "{stages:?}");
+        assert_eq!(stages[0], (HopStage::Encoded, 42, None));
+        assert!(stages.contains(&(
+            HopStage::Sent,
+            42,
+            Some(primary_receiver.local_addr().unwrap())
+        )));
+        assert!(stages.contains(&(
+            HopStage::SentSecondary,
+            42,
+            Some(secondary_receiver.local_addr().unwrap())
+        )));
         let canonical_deadline_ns =
             u64::try_from(object.deadline().unwrap().unix_time_ns()).unwrap();
         assert_eq!(
@@ -9948,6 +10228,7 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         }
     }
 
@@ -10026,6 +10307,7 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
 
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -10609,6 +10891,7 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
@@ -10827,6 +11110,7 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
@@ -10945,6 +11229,7 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
