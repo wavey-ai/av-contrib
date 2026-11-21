@@ -121,6 +121,10 @@ enum Command {
         repair_percent: u32,
         #[arg(long, default_value_t = 1)]
         min_repair_symbols: u32,
+        /// `precise`: absolute deadlines on a dedicated thread (sleep, then
+        /// spin the last 300 µs). `tokio`: the old 5 ms tokio interval.
+        #[arg(long, value_enum, default_value_t = SendPace::Precise)]
+        pace: SendPace,
     },
     /// Capture immutable codec-valid SoundKit v2 FLAC+Opus records from a live publication.
     CaptureFixture {
@@ -644,6 +648,15 @@ struct SendReport {
     wire_overhead_ratio: f64,
     wire_to_pcm_ratio: f64,
     elapsed_ms: u64,
+    /// `precise` or `tokio` (`--pace`).
+    pace: &'static str,
+    /// First datagram of each epoch handed to the kernel, after the epoch's
+    /// absolute deadline `session_id + 5 ms * epoch`.
+    send_lateness_ms: Percentiles,
+    /// Last datagram of each epoch handed to the kernel, after the deadline.
+    send_complete_lateness_ms: Percentiles,
+    /// Time to make the datagrams of each epoch, included in the lateness.
+    encode_ms: Percentiles,
 }
 
 #[derive(Debug, Serialize)]
@@ -1883,6 +1896,7 @@ async fn main() -> Result<()> {
             group_id,
             repair_percent,
             min_repair_symbols,
+            pace,
         } => {
             let report = send(SendOptions {
                 target,
@@ -1896,6 +1910,7 @@ async fn main() -> Result<()> {
                 group_id,
                 repair_percent,
                 min_repair_symbols,
+                pace,
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2251,6 +2266,7 @@ struct SendOptions<'a> {
     group_id: u16,
     repair_percent: u32,
     min_repair_symbols: u32,
+    pace: SendPace,
 }
 
 async fn send(options: SendOptions<'_>) -> Result<SendReport> {
@@ -2266,89 +2282,295 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         group_id,
         repair_percent,
         min_repair_symbols,
+        pace,
     } = options;
     if duration_seconds == 0 {
         bail!("--duration-seconds must be positive");
     }
-    let group_plan = source_group_plan(group_id, channels, group_channels)?;
-    let pcm_source = PcmSource::new(signal, pcm_s24le_file, channels)?;
     let session_id = session_id.unwrap_or(now_unix_ns()?.saturating_add(1_000_000_000));
     let now_ns = now_unix_ns()?;
     if session_id.saturating_add(60_000_000_000) < now_ns {
         bail!("--session-id is too far in the past to be an origin clock");
     }
-    if session_id > now_ns {
-        sleep_until(TokioInstant::now() + Duration::from_nanos(session_id - now_ns)).await;
-    }
-
-    let transport = MultichannelAudioTransportAdapter::udp(MAX_DATAGRAM_BYTES);
-    let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
-    let source_payload_budget = fec
-        .max_fragment_payload()
-        .context("invalid AEP1 geometry")?;
-    let max_pcm_bytes_per_group = group_plan
-        .iter()
-        .map(|group| usize::from(group.channel_count) * FRAME_COUNT as usize * 3)
-        .max()
-        .unwrap_or(0);
-    let source_symbols = max_pcm_bytes_per_group
-        .div_ceil(source_payload_budget)
-        .max(1);
-    let proportional = (source_symbols as u64)
-        .saturating_mul(u64::from(repair_percent.min(100)))
-        .div_ceil(100) as u32;
-    fec.repair_symbols = proportional.max(min_repair_symbols.max(1));
-    let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
-        fec,
-        ..MultichannelAudioSessionConfig::default()
-    });
-    let socket = UdpSocket::bind(if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .await?;
-    let mut flac_encoders = if matches!(payload_kind, ProbePayload::Flac) {
-        group_plan
-            .iter()
-            .map(|group| {
-                FlacFrameConfig::new(
-                    SAMPLE_RATE,
-                    group.channel_count,
-                    24,
-                    FRAME_COUNT,
-                    FlacProfile::Realtime,
-                )
-                .and_then(FlacFrameEncoder::new)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        Vec::new()
+    let source = EpochSourceOptions {
+        session_id,
+        payload_kind,
+        channels,
+        group_channels,
+        signal,
+        pcm_s24le_file: pcm_s24le_file.map(Path::to_path_buf),
+        group_id,
+        repair_percent,
+        min_repair_symbols,
     };
     let epochs = duration_seconds.saturating_mul(1_000) / 5;
     let started = Instant::now();
-    let mut ticker = interval_at(TokioInstant::now(), FRAME_DURATION);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut source_datagrams = 0_u64;
-    let mut repair_datagrams = 0_u64;
-    let mut wire_bytes = 0_u64;
-    let mut lossless_payload_bytes = 0_u64;
+    let (encoder, stats) = match pace {
+        SendPace::Tokio => send_tokio_paced(source, target, epochs).await?,
+        SendPace::Precise => {
+            // The pacer owns an OS thread: a tokio timer fires on 1 ms ticks
+            // and shares its worker with the rest of the runtime.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("aep1-pacer".into())
+                .spawn(move || {
+                    let _ = done_tx.send(send_precise_paced(source, target, epochs));
+                })
+                .context("failed to start the AEP1 pacing thread")?;
+            done_rx
+                .await
+                .context("the AEP1 pacing thread stopped without a result")??
+        }
+    };
 
-    for epoch_id in 0..epochs {
-        ticker.tick().await;
+    let pcm_reference_bytes = epochs
+        .saturating_mul(u64::from(FRAME_COUNT))
+        .saturating_mul(u64::from(channels))
+        .saturating_mul(3);
+    Ok(SendReport {
+        schema: "needletail.aep1-48k-probe.send.v3",
+        lane: "source",
+        payload: payload_kind.as_str(),
+        signal: encoder.pcm_source.label(),
+        input_pcm_frames: encoder.pcm_source.input_frames(),
+        session_id,
+        group_id,
+        group_count: encoder.group_plan.len() as u16,
+        group_channels: group_channels.min(FLAC_MAX_CHANNELS),
+        group_ids: encoder
+            .group_plan
+            .iter()
+            .map(|group| group.group_id)
+            .collect(),
+        sample_rate: SAMPLE_RATE,
+        channels,
+        frame_count: FRAME_COUNT,
+        duration_seconds,
+        epochs,
+        source_datagrams: encoder.source_datagrams,
+        repair_datagrams: encoder.repair_datagrams,
+        wire_bytes: encoder.wire_bytes,
+        lossless_payload_bytes: encoder.lossless_payload_bytes,
+        pcm_reference_bytes,
+        wire_overhead_ratio: encoder.wire_bytes as f64
+            / encoder.lossless_payload_bytes.max(1) as f64,
+        wire_to_pcm_ratio: encoder.wire_bytes as f64 / pcm_reference_bytes.max(1) as f64,
+        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        pace: pace.as_str(),
+        send_lateness_ms: percentiles_ms(stats.first_datagram_ns),
+        send_complete_lateness_ms: percentiles_ms(stats.last_datagram_ns),
+        encode_ms: percentiles_ms(stats.encode_ns),
+    })
+}
+
+/// How the sender waits for the instant each epoch leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SendPace {
+    /// A dedicated OS thread sleeps to 300 µs before each absolute deadline
+    /// and spins the rest. A stall delays only the epochs it covers.
+    Precise,
+    /// A tokio interval in MissedTickBehavior::Delay: 1 ms timer ticks, and a
+    /// stall over 5 ms shifts every later epoch.
+    Tokio,
+}
+
+impl SendPace {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Precise => "precise",
+            Self::Tokio => "tokio",
+        }
+    }
+}
+
+/// The precise pacer sleeps until this long before a deadline and spins the
+/// rest, so that a late wake-up from the kernel does not make the epoch late.
+const PRECISE_PACE_SPIN_NS: u64 = 300_000;
+
+/// The Unix time at which epoch `epoch_id` leaves the sender.
+///
+/// Epoch k carries samples [240 k, 240 (k + 1)) and its capture time, as the
+/// receivers count it, is `session_id + pts` = `session_id + 5 k ms`. The
+/// harness passes a session id 5 ms after the start of the audio loop, so this
+/// is the instant the last sample of the epoch has been spoken. The sender has
+/// always sent epoch k then (epoch 0 at the session id); only the precision
+/// changes.
+fn epoch_deadline_ns(session_id: u64, epoch_id: u64) -> u64 {
+    session_id.saturating_add(epoch_id.saturating_mul(FRAME_DURATION.as_nanos() as u64))
+}
+
+/// What the precise pacer does next, `now_ns` before a deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaceStep {
+    /// Sleep this long, then look again.
+    Sleep(Duration),
+    /// Close enough to spin.
+    Spin,
+    /// The deadline has come (or passed): send now.
+    Send,
+}
+
+fn pace_step(now_ns: u64, deadline_ns: u64) -> PaceStep {
+    if now_ns >= deadline_ns {
+        PaceStep::Send
+    } else if deadline_ns - now_ns > PRECISE_PACE_SPIN_NS {
+        PaceStep::Sleep(Duration::from_nanos(
+            deadline_ns - now_ns - PRECISE_PACE_SPIN_NS,
+        ))
+    } else {
+        PaceStep::Spin
+    }
+}
+
+/// Block the calling thread until the Unix time reaches `deadline_ns`.
+fn wait_until_unix_ns(deadline_ns: u64) -> Result<()> {
+    loop {
+        match pace_step(now_unix_ns()?, deadline_ns) {
+            PaceStep::Send => return Ok(()),
+            PaceStep::Sleep(duration) => std::thread::sleep(duration),
+            PaceStep::Spin => std::hint::spin_loop(),
+        }
+    }
+}
+
+/// How late each epoch left, against its absolute deadline.
+#[derive(Debug, Default)]
+struct SendLateness {
+    /// First datagram of the epoch handed to the kernel.
+    first_datagram_ns: Vec<u64>,
+    /// Last datagram of the epoch handed to the kernel.
+    last_datagram_ns: Vec<u64>,
+    /// Time to make the datagrams of the epoch (codec, framing, RaptorQ).
+    encode_ns: Vec<u64>,
+}
+
+impl SendLateness {
+    fn with_capacity(epochs: u64) -> Self {
+        let capacity = usize::try_from(epochs).unwrap_or(0).min(1 << 22);
+        Self {
+            first_datagram_ns: Vec::with_capacity(capacity),
+            last_datagram_ns: Vec::with_capacity(capacity),
+            encode_ns: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn record(&mut self, deadline_ns: u64, first_sent_ns: u64, last_sent_ns: u64) {
+        self.first_datagram_ns
+            .push(first_sent_ns.saturating_sub(deadline_ns));
+        self.last_datagram_ns
+            .push(last_sent_ns.saturating_sub(deadline_ns));
+    }
+}
+
+struct EpochSourceOptions {
+    session_id: u64,
+    payload_kind: ProbePayload,
+    channels: u16,
+    group_channels: u16,
+    signal: ProbeSignal,
+    pcm_s24le_file: Option<PathBuf>,
+    group_id: u16,
+    repair_percent: u32,
+    min_repair_symbols: u32,
+}
+
+/// Makes the AEP1 datagrams of each epoch and counts what was sent.
+struct EpochEncoder {
+    session_id: u64,
+    payload_kind: ProbePayload,
+    group_plan: Vec<SourceGroupPlan>,
+    pcm_source: PcmSource,
+    transport: MultichannelAudioTransportAdapter,
+    sender: MultichannelAudioSender,
+    flac_encoders: Vec<FlacFrameEncoder>,
+    source_datagrams: u64,
+    repair_datagrams: u64,
+    wire_bytes: u64,
+    lossless_payload_bytes: u64,
+}
+
+impl EpochEncoder {
+    fn new(options: &EpochSourceOptions) -> Result<Self> {
+        let group_plan =
+            source_group_plan(options.group_id, options.channels, options.group_channels)?;
+        let pcm_source = PcmSource::new(
+            options.signal,
+            options.pcm_s24le_file.as_deref(),
+            options.channels,
+        )?;
+        let transport = MultichannelAudioTransportAdapter::udp(MAX_DATAGRAM_BYTES);
+        let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        let source_payload_budget = fec
+            .max_fragment_payload()
+            .context("invalid AEP1 geometry")?;
+        let max_pcm_bytes_per_group = group_plan
+            .iter()
+            .map(|group| usize::from(group.channel_count) * FRAME_COUNT as usize * 3)
+            .max()
+            .unwrap_or(0);
+        let source_symbols = max_pcm_bytes_per_group
+            .div_ceil(source_payload_budget)
+            .max(1);
+        let proportional = (source_symbols as u64)
+            .saturating_mul(u64::from(options.repair_percent.min(100)))
+            .div_ceil(100) as u32;
+        fec.repair_symbols = proportional.max(options.min_repair_symbols.max(1));
+        let sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let flac_encoders = if matches!(options.payload_kind, ProbePayload::Flac) {
+            group_plan
+                .iter()
+                .map(|group| {
+                    FlacFrameConfig::new(
+                        SAMPLE_RATE,
+                        group.channel_count,
+                        24,
+                        FRAME_COUNT,
+                        FlacProfile::Realtime,
+                    )
+                    .and_then(FlacFrameEncoder::new)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            session_id: options.session_id,
+            payload_kind: options.payload_kind,
+            group_plan,
+            pcm_source,
+            transport,
+            sender,
+            flac_encoders,
+            source_datagrams: 0,
+            repair_datagrams: 0,
+            wire_bytes: 0,
+            lossless_payload_bytes: 0,
+        })
+    }
+
+    /// The datagrams of one epoch, in send order.
+    fn encode(&mut self, epoch_id: u64) -> Result<Vec<(Bytes, bool)>> {
         let first_sample = epoch_id.saturating_mul(u64::from(FRAME_COUNT));
-        let mut payloads = Vec::with_capacity(group_plan.len());
-        for (index, group) in group_plan.iter().enumerate() {
+        let mut payloads = Vec::with_capacity(self.group_plan.len());
+        for (index, group) in self.group_plan.iter().enumerate() {
             let pcm =
-                pcm_source.group_s24le(first_sample, group.channel_start, group.channel_count);
-            let payload = match payload_kind {
-                ProbePayload::Flac => flac_encoders[index].encode_s24le(&pcm)?.payload,
+                self.pcm_source
+                    .group_s24le(first_sample, group.channel_start, group.channel_count);
+            let payload = match self.payload_kind {
+                ProbePayload::Flac => self.flac_encoders[index].encode_s24le(&pcm)?.payload,
                 ProbePayload::Pcm => pcm,
             };
-            lossless_payload_bytes = lossless_payload_bytes.saturating_add(payload.len() as u64);
+            self.lossless_payload_bytes = self
+                .lossless_payload_bytes
+                .saturating_add(payload.len() as u64);
             payloads.push(payload);
         }
-        let framed_payloads = group_plan
+        let payload_kind = self.payload_kind;
+        let framed_payloads = self
+            .group_plan
             .iter()
             .zip(payloads.iter())
             .map(|(group, payload)| {
@@ -2380,7 +2602,8 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
                 framed
             })
             .collect::<Vec<_>>();
-        let groups = group_plan
+        let groups = self
+            .group_plan
             .iter()
             .zip(framed_payloads.iter())
             .map(|(group, framed)| MultichannelAudioGroup {
@@ -2393,8 +2616,8 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
                 payload: framed,
             })
             .collect::<Vec<_>>();
-        let encoded = sender.encode_epoch(MultichannelAudioEpoch {
-            session_id,
+        let encoded = self.sender.encode_epoch(MultichannelAudioEpoch {
+            session_id: self.session_id,
             config_generation: 1,
             epoch_id,
             pts_samples: epoch_id.saturating_mul(u64::from(FRAME_COUNT)),
@@ -2402,56 +2625,124 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             frame_count: FRAME_COUNT,
             groups: &groups,
         })?;
-        let wrapped = transport.wrap_epoch(encoded)?;
-        for datagram in wrapped.datagrams {
-            let sent = socket.send_to(&datagram.payload, target).await?;
-            if sent != datagram.payload.len() {
-                bail!(
-                    "partial AEP1 datagram send: {sent} of {}",
-                    datagram.payload.len()
+        let wrapped = self.transport.wrap_epoch(encoded)?;
+        Ok(wrapped
+            .datagrams
+            .into_iter()
+            .map(|datagram| {
+                let source = matches!(
+                    datagram.role,
+                    raptorq_datagram_fec::MultichannelAudioDatagramRole::Source { .. }
                 );
-            }
-            wire_bytes = wire_bytes.saturating_add(sent as u64);
-            match datagram.role {
-                raptorq_datagram_fec::MultichannelAudioDatagramRole::Source { .. } => {
-                    source_datagrams = source_datagrams.saturating_add(1)
-                }
-                raptorq_datagram_fec::MultichannelAudioDatagramRole::Repair { .. } => {
-                    repair_datagrams = repair_datagrams.saturating_add(1)
-                }
-            }
-        }
+                (datagram.payload, source)
+            })
+            .collect())
     }
 
-    let pcm_reference_bytes = epochs
-        .saturating_mul(u64::from(FRAME_COUNT))
-        .saturating_mul(u64::from(channels))
-        .saturating_mul(3);
-    Ok(SendReport {
-        schema: "needletail.aep1-48k-probe.send.v3",
-        lane: "source",
-        payload: payload_kind.as_str(),
-        signal: pcm_source.label(),
-        input_pcm_frames: pcm_source.input_frames(),
-        session_id,
-        group_id,
-        group_count: group_plan.len() as u16,
-        group_channels: group_channels.min(FLAC_MAX_CHANNELS),
-        group_ids: group_plan.iter().map(|group| group.group_id).collect(),
-        sample_rate: SAMPLE_RATE,
-        channels,
-        frame_count: FRAME_COUNT,
-        duration_seconds,
-        epochs,
-        source_datagrams,
-        repair_datagrams,
-        wire_bytes,
-        lossless_payload_bytes,
-        pcm_reference_bytes,
-        wire_overhead_ratio: wire_bytes as f64 / lossless_payload_bytes.max(1) as f64,
-        wire_to_pcm_ratio: wire_bytes as f64 / pcm_reference_bytes.max(1) as f64,
-        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    fn count_sent(&mut self, bytes: usize, source: bool) {
+        self.wire_bytes = self.wire_bytes.saturating_add(bytes as u64);
+        if source {
+            self.source_datagrams = self.source_datagrams.saturating_add(1);
+        } else {
+            self.repair_datagrams = self.repair_datagrams.saturating_add(1);
+        }
+    }
+}
+
+fn check_full_send(sent: usize, expected: usize) -> Result<()> {
+    if sent != expected {
+        bail!("partial AEP1 datagram send: {sent} of {expected}");
+    }
+    Ok(())
+}
+
+/// The sender as it was: a tokio interval from the session id.
+async fn send_tokio_paced(
+    options: EpochSourceOptions,
+    target: SocketAddr,
+    epochs: u64,
+) -> Result<(EpochEncoder, SendLateness)> {
+    let session_id = options.session_id;
+    let now_ns = now_unix_ns()?;
+    if session_id > now_ns {
+        sleep_until(TokioInstant::now() + Duration::from_nanos(session_id - now_ns)).await;
+    }
+    let mut encoder = EpochEncoder::new(&options)?;
+    let socket = UdpSocket::bind(if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
     })
+    .await?;
+    let mut lateness = SendLateness::with_capacity(epochs);
+    let mut ticker = interval_at(TokioInstant::now(), FRAME_DURATION);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    for epoch_id in 0..epochs {
+        ticker.tick().await;
+        let encode_started = Instant::now();
+        let datagrams = encoder.encode(epoch_id)?;
+        lateness
+            .encode_ns
+            .push(encode_started.elapsed().as_nanos() as u64);
+        let mut first_sent_ns = None;
+        let mut last_sent_ns = 0;
+        for (payload, source) in datagrams {
+            let sent = socket.send_to(&payload, target).await?;
+            last_sent_ns = now_unix_ns()?;
+            first_sent_ns.get_or_insert(last_sent_ns);
+            check_full_send(sent, payload.len())?;
+            encoder.count_sent(sent, source);
+        }
+        lateness.record(
+            epoch_deadline_ns(session_id, epoch_id),
+            first_sent_ns.unwrap_or(last_sent_ns),
+            last_sent_ns,
+        );
+    }
+    Ok((encoder, lateness))
+}
+
+/// The sender on absolute wall-clock deadlines: epoch k leaves at
+/// `epoch_deadline_ns(session_id, k)` whatever happened to epoch k - 1.
+fn send_precise_paced(
+    options: EpochSourceOptions,
+    target: SocketAddr,
+    epochs: u64,
+) -> Result<(EpochEncoder, SendLateness)> {
+    let session_id = options.session_id;
+    let mut encoder = EpochEncoder::new(&options)?;
+    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })?;
+    let mut lateness = SendLateness::with_capacity(epochs);
+    for epoch_id in 0..epochs {
+        let deadline_ns = epoch_deadline_ns(session_id, epoch_id);
+        wait_until_unix_ns(deadline_ns)?;
+        // The epoch is encoded when its last sample has been spoken, as a
+        // live source would, so the encode is part of the measured lateness.
+        let encode_started = Instant::now();
+        let datagrams = encoder.encode(epoch_id)?;
+        lateness
+            .encode_ns
+            .push(encode_started.elapsed().as_nanos() as u64);
+        let mut first_sent_ns = None;
+        let mut last_sent_ns = 0;
+        for (payload, source) in datagrams {
+            let sent = socket.send_to(&payload, target)?;
+            last_sent_ns = now_unix_ns()?;
+            first_sent_ns.get_or_insert(last_sent_ns);
+            check_full_send(sent, payload.len())?;
+            encoder.count_sent(sent, source);
+        }
+        lateness.record(
+            deadline_ns,
+            first_sent_ns.unwrap_or(last_sent_ns),
+            last_sent_ns,
+        );
+    }
+    Ok((encoder, lateness))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6574,6 +6865,94 @@ mod tests {
         let mut wrong_sequence = entries;
         wrong_sequence[1].end_sequence = 11;
         assert!(validate_tail_bundle_entries(&[77, 78], &wrong_sequence, Some(9), 0, 1).is_err());
+    }
+
+    #[test]
+    fn epochs_leave_on_absolute_five_millisecond_deadlines() {
+        let session_id = 1_700_000_000_005_000_000;
+        assert_eq!(epoch_deadline_ns(session_id, 0), session_id);
+        assert_eq!(epoch_deadline_ns(session_id, 1), session_id + 5_000_000);
+        // The deadline of an epoch is the capture time the receivers count:
+        // session id plus the epoch's pts.
+        for epoch_id in [0, 1, 7, 200, 379_999] {
+            let pts_samples = epoch_id * u64::from(FRAME_COUNT);
+            assert_eq!(
+                epoch_deadline_ns(session_id, epoch_id),
+                session_id + pts_samples * 1_000_000_000 / u64::from(SAMPLE_RATE)
+            );
+        }
+    }
+
+    #[test]
+    fn precise_pacing_sleeps_then_spins_and_never_carries_lateness() {
+        let deadline = 10_000_000_000;
+        assert_eq!(
+            pace_step(deadline - 5_000_000, deadline),
+            PaceStep::Sleep(Duration::from_nanos(5_000_000 - PRECISE_PACE_SPIN_NS))
+        );
+        assert_eq!(
+            pace_step(deadline - PRECISE_PACE_SPIN_NS, deadline),
+            PaceStep::Spin
+        );
+        assert_eq!(pace_step(deadline - 1, deadline), PaceStep::Spin);
+        assert_eq!(pace_step(deadline, deadline), PaceStep::Send);
+        assert_eq!(pace_step(deadline + 1, deadline), PaceStep::Send);
+
+        // A stall of 23 ms during epoch 3: epochs 4..=7 are due at once and
+        // epoch 8 is on its own deadline again, not 23 ms later.
+        let session_id = 1_000_000_000;
+        let woke_at = epoch_deadline_ns(session_id, 3) + 23_000_000;
+        for epoch_id in 4..=7 {
+            assert_eq!(
+                pace_step(woke_at, epoch_deadline_ns(session_id, epoch_id)),
+                PaceStep::Send
+            );
+        }
+        assert_eq!(
+            pace_step(woke_at, epoch_deadline_ns(session_id, 8)),
+            PaceStep::Sleep(Duration::from_nanos(2_000_000 - PRECISE_PACE_SPIN_NS))
+        );
+
+        let mut lateness = SendLateness::default();
+        lateness.record(100, 90, 130);
+        lateness.record(100, 150, 170);
+        assert_eq!(lateness.first_datagram_ns, vec![0, 50]);
+        assert_eq!(lateness.last_datagram_ns, vec![30, 70]);
+    }
+
+    #[test]
+    fn precise_sender_sends_every_epoch_on_its_deadline() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let target = receiver.local_addr().unwrap();
+        let epochs = 20;
+        let options = EpochSourceOptions {
+            session_id: now_unix_ns().unwrap() + 20_000_000,
+            payload_kind: ProbePayload::Pcm,
+            channels: 2,
+            group_channels: 8,
+            signal: ProbeSignal::Sine,
+            pcm_s24le_file: None,
+            group_id: 0,
+            repair_percent: 12,
+            min_repair_symbols: 1,
+        };
+        let session_id = options.session_id;
+        let (encoder, lateness) = send_precise_paced(options, target, epochs).unwrap();
+        let finished = now_unix_ns().unwrap();
+        assert_eq!(lateness.first_datagram_ns.len(), epochs as usize);
+        // The run ends with the last deadline, not later by the sum of the
+        // per-epoch lateness.
+        assert!(finished >= epoch_deadline_ns(session_id, epochs - 1));
+        assert!(finished < epoch_deadline_ns(session_id, epochs - 1) + 50_000_000);
+        let datagrams = encoder.source_datagrams + encoder.repair_datagrams;
+        assert!(encoder.source_datagrams >= epochs);
+        let mut buffer = [0_u8; 2_048];
+        for _ in 0..datagrams {
+            receiver.recv_from(&mut buffer).unwrap();
+        }
     }
 
     #[test]
