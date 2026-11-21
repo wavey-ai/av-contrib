@@ -135,6 +135,80 @@ pub async fn send_all_per_target(
     }
 }
 
+/// The outcome of [`try_send_all`]: how far a batch got without waiting.
+#[derive(Debug, Default)]
+pub struct TrySent {
+    /// Datagrams handed to the kernel, from the first.
+    pub sent: usize,
+    /// System calls made.
+    pub calls: usize,
+    /// The error that stopped the batch: `None` when every datagram was
+    /// sent, `WouldBlock` when the socket's buffer was full (the rest is the
+    /// caller's to send later), any other kind when the kernel refused the
+    /// datagram at index `sent`.
+    pub error: Option<io::Error>,
+}
+
+impl TrySent {
+    /// The socket's buffer filled before the batch was through.
+    pub fn would_block(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+    }
+}
+
+/// Hand as much of `messages` to the kernel as it takes now, in order,
+/// without ever waiting for the socket: `sendmmsg` calls of up to
+/// [`MESSAGES_PER_CALL`] datagrams (Linux), else one send each. The calls go
+/// straight to the (non-blocking) socket, not through the runtime's cached
+/// readiness, which a socket only gets once the reactor has polled it: the
+/// kernel alone says whether its buffer has room. A full buffer stops the
+/// batch with `WouldBlock` in [`TrySent::error`]; the datagrams from
+/// [`TrySent::sent`] on were not sent.
+pub fn try_send_all(socket: &UdpSocket, messages: &[Outbound<'_>]) -> TrySent {
+    let mut outcome = TrySent::default();
+    while outcome.sent < messages.len() {
+        #[cfg(target_os = "linux")]
+        let result = linux::sendmmsg(socket, &messages[outcome.sent..]);
+        #[cfg(not(target_os = "linux"))]
+        let result = {
+            let message = &messages[outcome.sent];
+            let socket = socket2::SockRef::from(socket);
+            match message.target {
+                Some(target) => socket.send_to(message.bytes, &target.into()),
+                None => socket.send(message.bytes),
+            }
+            .and_then(|sent| {
+                if sent == message.bytes.len() {
+                    Ok(1)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "partial UDP datagram send",
+                    ))
+                }
+            })
+        };
+        outcome.calls += 1;
+        match result {
+            Ok(0) => {
+                outcome.error = Some(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "sendmmsg took no datagram",
+                ));
+                return outcome;
+            }
+            Ok(count) => outcome.sent += count,
+            Err(error) => {
+                outcome.error = Some(error);
+                return outcome;
+            }
+        }
+    }
+    outcome
+}
+
 /// One awaited send per datagram: the behaviour without batching.
 pub async fn send_each(socket: &UdpSocket, messages: &[Outbound<'_>]) -> io::Result<usize> {
     send_each_until_refused(socket, messages)
@@ -220,7 +294,7 @@ mod linux {
 
     /// One `sendmmsg` call for up to [`MESSAGES_PER_CALL`] messages. Returns
     /// how many the kernel took.
-    fn sendmmsg(socket: &UdpSocket, messages: &[Outbound<'_>]) -> io::Result<usize> {
+    pub(super) fn sendmmsg(socket: &UdpSocket, messages: &[Outbound<'_>]) -> io::Result<usize> {
         let count = messages.len().min(MESSAGES_PER_CALL);
         if count == 0 {
             return Ok(0);
@@ -410,5 +484,39 @@ mod tests {
             .await
             .unwrap_err();
         assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn try_send_all_sends_on_a_new_socket_without_waiting() {
+        let receiver = receiver().await;
+        // A socket that the reactor has not polled yet: its cached
+        // readiness is not writable, the kernel's buffer is empty.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = receiver.local_addr().unwrap();
+        let data = payloads(MESSAGES_PER_CALL + 3);
+        let messages = data
+            .iter()
+            .map(|bytes| Outbound::to(target, bytes))
+            .collect::<Vec<_>>();
+        let outcome = try_send_all(&sender, &messages);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert!(!outcome.would_block());
+        assert_eq!(outcome.sent, data.len());
+        if cfg!(target_os = "linux") {
+            assert_eq!(outcome.calls, 2);
+        }
+        let received = receive(&receiver, data.len()).await;
+        for (index, (bytes, _)) in received.into_iter().enumerate() {
+            assert_eq!(bytes, data[index]);
+        }
+        // A refused datagram stops the batch at its index.
+        let refused: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let messages = [
+            Outbound::to(target, &data[0]),
+            Outbound::to(refused, &data[1]),
+        ];
+        let outcome = try_send_all(&sender, &messages);
+        assert_eq!(outcome.sent, 1);
+        assert!(outcome.error.is_some() && !outcome.would_block());
     }
 }

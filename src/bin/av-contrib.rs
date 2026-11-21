@@ -4,6 +4,7 @@ use av_contrib::audio_epoch_hls::{
     worker_stats as audio_epoch_hls_worker_stats, AudioEpochHlsConfig, AudioEpochHlsDatagram,
     AudioEpochHlsPackaging, RecoveredAudioEpoch, DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
 };
+use av_contrib::class_lanes::{self, ClassSocketOptions};
 use av_contrib::fmp4_bridge::{
     AccessUnitSink, Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop,
     PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge,
@@ -127,6 +128,8 @@ static PUBLICATION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static PUBLICATION_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 static PUBLICATION_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PUBLICATION_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Audio parts published on the packager's task (`--relay-audio-inline`).
+static PUBLICATION_INLINE: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -894,6 +897,107 @@ struct Args {
     )]
     relay_direct_repair: bool,
 
+    /// Class lanes: each RelaySession lane is a socket pair on its source
+    /// endpoint (SO_REUSEPORT), so the parent's binding of the contributor
+    /// is unchanged. Audio streams leave on one socket (SO_PRIORITY
+    /// --relay-audio-socket-priority) to the parent's port P, video streams
+    /// on the other to P + --relay-class-port-offset, and a 4K part's
+    /// hundreds of symbols never sit ahead of an audio part in a socket
+    /// buffer. A stream is video from its first part with video. With
+    /// `false` every stream shares one socket and goes to P.
+    #[arg(
+        long,
+        env = "AV_RELAY_CLASS_LANES",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_class_lanes: bool,
+
+    /// Port offset of the video class: a parent that receives audio on P
+    /// receives video on P + this (the av-mesh receiver's convention).
+    #[arg(
+        long,
+        env = "AV_RELAY_CLASS_PORT_OFFSET",
+        default_value_t = class_lanes::DEFAULT_CLASS_PORT_OFFSET
+    )]
+    relay_class_port_offset: u16,
+
+    /// SO_PRIORITY of the audio class sockets (0 leaves it alone). 6 puts
+    /// them in band 0 of a `prio` qdisc's default priomap.
+    #[arg(
+        long,
+        env = "AV_RELAY_AUDIO_SOCKET_PRIORITY",
+        default_value_t = class_lanes::DEFAULT_AUDIO_SOCKET_PRIORITY
+    )]
+    relay_audio_socket_priority: u32,
+
+    /// SO_MAX_PACING_RATE of the video class sockets in Mbit/s (0: not
+    /// paced). It takes effect under the `fq` qdisc; set it to about 1.3
+    /// times the 4K peak rate.
+    #[arg(long, env = "AV_RELAY_VIDEO_PACING_MBPS", default_value_t = 0)]
+    relay_video_pacing_mbps: u64,
+
+    /// The contributor audio hot path: audio parts are published on the
+    /// packager's own task (no hop through a publication worker's queue),
+    /// and each lane is handed an audio part's symbols with non-blocking
+    /// `sendmmsg`, one lane after the other with no join: what a full
+    /// socket buffer does not take waits, in order, in that lane's backlog.
+    /// With `false` audio parts queue for a worker and the lanes are joined
+    /// per part, as video parts are.
+    #[arg(
+        long,
+        env = "AV_RELAY_AUDIO_INLINE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_audio_inline: bool,
+
+    /// The primary lane carries the repair symbols as well as the source
+    /// set, so that the primary parent alone can recover a lost source.
+    /// The parent must accept repair on that lane (av-mesh
+    /// --relay-primary-promoted, a source_and_repair carrier link).
+    #[arg(
+        long,
+        env = "AV_RELAY_REPAIR_BOTH_LANES",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_repair_both_lanes: bool,
+
+    /// Run the AEP1 audio packagers (and, with --relay-audio-inline, the
+    /// audio publication) on a thread of their own, with SCHED_FIFO
+    /// --audio-hot-fifo-priority and pinned to --audio-hot-cpu where the
+    /// host allows it (CAP_SYS_NICE, or root). A thread refused SCHED_FIFO
+    /// is not pinned either, and says so in one info line. With `false`
+    /// they are tasks of the main runtime.
+    #[arg(
+        long,
+        env = "AV_AUDIO_HOT_THREAD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    audio_hot_thread: bool,
+
+    /// CPU of the audio thread (negative: not pinned).
+    #[arg(
+        long,
+        env = "AV_AUDIO_HOT_CPU",
+        default_value_t = 2,
+        allow_negative_numbers = true
+    )]
+    audio_hot_cpu: i32,
+
+    /// SCHED_FIFO priority of the audio thread (0: normal scheduling).
+    #[arg(long, env = "AV_AUDIO_HOT_FIFO_PRIORITY", default_value_t = 10)]
+    audio_hot_fifo_priority: u8,
+
+    /// Threads of the audio hot runtime. With more than one, worker `i`
+    /// is pinned to --audio-hot-cpu + `i`. One thread holds about 1,000
+    /// 1 ms parts a second with room to spare (the RaptorQ encode of a part
+    /// is most of its cost); give a 0.25 ms sweep more.
+    #[arg(long, env = "AV_AUDIO_HOT_WORKERS", default_value_t = 1)]
+    audio_hot_workers: usize,
+
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     #[command(flatten)]
     quadra: QuadraCliArgs,
@@ -1195,22 +1299,121 @@ enum RelayPipelineStage {
 /// the parent. It carries RLS1 datagrams exactly as
 /// `relay_session::PrivateUdpTransport` does, and can hand the symbols of a
 /// part to the kernel in one batch.
+///
+/// With `--relay-class-lanes` the lane is a socket pair on the same source
+/// endpoint (`SO_REUSEPORT`): `socket` carries the audio streams to the
+/// parent's port P with `SO_PRIORITY` 6, `video` carries the video streams
+/// to P + `--relay-class-port-offset`. The parent's binding of the
+/// contributor (its source address and port) is the same for both.
 struct RelayLane {
-    socket: UdpSocket,
+    /// Audio streams, or every stream without class lanes; connected to
+    /// `peer_addr`.
+    socket: Arc<UdpSocket>,
+    /// Video streams with class lanes; connected to `video_peer_addr`.
+    video: Option<Arc<UdpSocket>>,
     peer_addr: SocketAddr,
+    video_peer_addr: SocketAddr,
     limits: RelayLimits,
     path_metrics: std::sync::RwLock<PathMetrics>,
+    /// Audio parts whose symbols the socket's buffer could not take at once
+    /// (`--relay-audio-inline`): sent, in order, by a task of the lane.
+    backlog: LaneBacklog,
+}
+
+/// The class lane settings: `--relay-class-lanes` and its socket options.
+#[derive(Debug, Clone, Copy)]
+struct ClassLaneSettings {
+    /// `0` when class lanes are off.
+    port_offset: u16,
+    audio_priority: Option<u32>,
+    video_pacing_bytes_per_second: Option<u64>,
+}
+
+impl ClassLaneSettings {
+    fn from_args(args: &Args) -> Result<Self> {
+        if !args.relay_class_lanes {
+            return Ok(Self::off());
+        }
+        if args.relay_class_port_offset == 0 {
+            bail!("--relay-class-lanes needs a non-zero --relay-class-port-offset");
+        }
+        Ok(Self {
+            port_offset: args.relay_class_port_offset,
+            audio_priority: (args.relay_audio_socket_priority > 0)
+                .then_some(args.relay_audio_socket_priority),
+            video_pacing_bytes_per_second: (args.relay_video_pacing_mbps > 0)
+                .then(|| args.relay_video_pacing_mbps.saturating_mul(1_000_000) / 8),
+        })
+    }
+
+    const fn off() -> Self {
+        Self {
+            port_offset: 0,
+            audio_priority: None,
+            video_pacing_bytes_per_second: None,
+        }
+    }
+
+    const fn enabled(&self) -> bool {
+        self.port_offset > 0
+    }
+
+    fn audio_options(&self) -> ClassSocketOptions {
+        ClassSocketOptions {
+            reuse_port: true,
+            priority: self.audio_priority,
+            max_pacing_rate_bytes_per_second: None,
+        }
+    }
+
+    fn video_options(&self) -> ClassSocketOptions {
+        ClassSocketOptions {
+            reuse_port: true,
+            priority: None,
+            max_pacing_rate_bytes_per_second: self.video_pacing_bytes_per_second,
+        }
+    }
+}
+
+/// Bind the class socket pair of one source endpoint: audio connected to
+/// `audio_peer` (when given), video to `video_peer`.
+fn bind_class_pair(
+    bind: SocketAddr,
+    audio_peer: Option<SocketAddr>,
+    video_peer: Option<SocketAddr>,
+    classes: ClassLaneSettings,
+) -> std::io::Result<(UdpSocket, UdpSocket)> {
+    let audio = class_lanes::bind_class_socket(bind, audio_peer, classes.audio_options())?;
+    // An ephemeral bind takes the port that the audio socket got.
+    let bound = audio.local_addr()?;
+    let video = class_lanes::bind_class_socket(bound, video_peer, classes.video_options())?;
+    Ok((UdpSocket::from_std(audio)?, UdpSocket::from_std(video)?))
 }
 
 impl RelayLane {
-    async fn bind(config: PrivateUdpConfig) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(config.bind_addr).await?;
-        socket.connect(config.peer_addr).await?;
+    async fn bind(config: PrivateUdpConfig, classes: ClassLaneSettings) -> std::io::Result<Self> {
+        let (socket, video, video_peer_addr) = if classes.enabled() {
+            let video_peer = class_lanes::video_class_addr(config.peer_addr, classes.port_offset)?;
+            let (audio, video) = bind_class_pair(
+                config.bind_addr,
+                Some(config.peer_addr),
+                Some(video_peer),
+                classes,
+            )?;
+            (audio, Some(Arc::new(video)), video_peer)
+        } else {
+            let socket = UdpSocket::bind(config.bind_addr).await?;
+            socket.connect(config.peer_addr).await?;
+            (socket, None, config.peer_addr)
+        };
         Ok(Self {
-            socket,
+            socket: Arc::new(socket),
+            video,
             peer_addr: config.peer_addr,
+            video_peer_addr,
             limits: config.limits,
             path_metrics: std::sync::RwLock::new(PathMetrics::default()),
+            backlog: LaneBacklog::default(),
         })
     }
 
@@ -1219,8 +1422,12 @@ impl RelayLane {
         self.socket.local_addr()
     }
 
-    const fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+    /// The socket and parent address of parts of `class`.
+    fn class_socket(&self, class: PublicationClass) -> (&Arc<UdpSocket>, SocketAddr) {
+        match (class, &self.video) {
+            (PublicationClass::Video, Some(video)) => (video, self.video_peer_addr),
+            _ => (&self.socket, self.peer_addr),
+        }
     }
 
     fn set_path_metrics(&self, metrics: PathMetrics) {
@@ -1242,14 +1449,32 @@ impl RelayLane {
 /// The direct lanes to the distributors of the contributor's region: one
 /// unconnected socket bound to `--relay-direct-bind`, one target each.
 struct RelayDirectLanes {
+    /// Audio streams (every stream without class lanes).
     socket: UdpSocket,
+    /// Video streams with class lanes, from the same source endpoint, to
+    /// each target's port plus the class port offset.
+    video: Option<UdpSocket>,
     targets: Vec<SocketAddr>,
+    video_targets: Vec<SocketAddr>,
     limits: RelayLimits,
     repair: bool,
 }
 
 impl RelayDirectLanes {
-    async fn bind(args: &Args, limits: RelayLimits, local_id: &str) -> Result<Option<Self>> {
+    /// The socket and targets of parts of `class`.
+    fn class_lane(&self, class: PublicationClass) -> (&UdpSocket, &[SocketAddr]) {
+        match (class, &self.video) {
+            (PublicationClass::Video, Some(video)) => (video, &self.video_targets),
+            _ => (&self.socket, &self.targets),
+        }
+    }
+
+    async fn bind(
+        args: &Args,
+        limits: RelayLimits,
+        local_id: &str,
+        classes: ClassLaneSettings,
+    ) -> Result<Option<Self>> {
         let Some(first) = args.relay_direct_targets.first().copied() else {
             if args.relay_direct_bind.is_some() || !args.relay_direct_ids.is_empty() {
                 bail!("--relay-direct-bind and --relay-direct-id require --relay-direct-target");
@@ -1277,12 +1502,28 @@ impl RelayDirectLanes {
             PrivateUdpConfig::new(bind, *target, local_id, direct_lane_id(args, index), limits)
                 .with_context(|| format!("invalid direct RelaySession lane to {target}"))?;
         }
-        let socket = UdpSocket::bind(bind)
-            .await
-            .with_context(|| format!("failed to bind direct RelaySession UDP carrier on {bind}"))?;
+        let (socket, video, video_targets) = if classes.enabled() {
+            let video_targets = args
+                .relay_direct_targets
+                .iter()
+                .map(|target| class_lanes::video_class_addr(*target, classes.port_offset))
+                .collect::<std::io::Result<Vec<_>>>()
+                .context("invalid video class port of a --relay-direct-target")?;
+            let (audio, video) = bind_class_pair(bind, None, None, classes).with_context(|| {
+                format!("failed to bind direct RelaySession class sockets on {bind}")
+            })?;
+            (audio, Some(video), video_targets)
+        } else {
+            let socket = UdpSocket::bind(bind).await.with_context(|| {
+                format!("failed to bind direct RelaySession UDP carrier on {bind}")
+            })?;
+            (socket, None, args.relay_direct_targets.clone())
+        };
         Ok(Some(Self {
             socket,
+            video,
             targets: args.relay_direct_targets.clone(),
+            video_targets,
             limits,
             repair: args.relay_direct_repair,
         }))
@@ -1302,6 +1543,162 @@ fn direct_lane_id(args: &Args, index: usize) -> String {
         .unwrap_or_else(|| format!("needletail-distributor-{}", index + 1))
 }
 
+/// Parts of a lane's audio socket waiting for room in its buffer.
+///
+/// On the audio hot path (`--relay-audio-inline`) each lane is handed its
+/// symbols with non-blocking `sendmmsg` and nothing ever waits for a socket:
+/// what a full buffer did not take goes, in order, to a task of the lane
+/// that waits for it, and the part's other lanes and the packager go on.
+/// While a lane has a part queued, its next parts queue behind it, so a
+/// lane's datagrams always leave in order.
+#[derive(Default)]
+struct LaneBacklog {
+    /// Parts queued and not yet sent.
+    pending: Arc<AtomicUsize>,
+    sender: std::sync::OnceLock<mpsc::Sender<BacklogPart>>,
+}
+
+/// Parts that one lane's backlog holds before it drops a part.
+const LANE_BACKLOG_PARTS: usize = 256;
+
+/// The rest of one part on one lane.
+struct BacklogPart {
+    wires: Vec<(MediaDatagramRole, Vec<u8>)>,
+    /// Source datagrams at the front of `wires`: `stage` is journalled
+    /// once they are with the kernel.
+    sources: usize,
+    deadline: MediaDeadline,
+    /// The part whose `stage` the backlog journals, when the lane has not
+    /// journalled it yet.
+    journal: Option<(u64, u64)>,
+    /// The part, for `sent_first`.
+    part: Option<(u64, u64)>,
+    /// The part's `sent_first` flag, when this lane had sent none of the
+    /// part's datagrams: the first lane to send one journals `sent_first`.
+    sent_first: Option<Arc<AtomicBool>>,
+    stage: HopStage,
+    peer: SocketAddr,
+}
+
+impl LaneBacklog {
+    fn busy(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+    }
+
+    /// Queue `part` behind the lane's earlier parts. A full queue drops it
+    /// and counts it.
+    fn push(&self, socket: &Arc<UdpSocket>, telemetry: &Arc<IngestTelemetry>, part: BacklogPart) {
+        let sender = self.sender.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel(LANE_BACKLOG_PARTS);
+            tokio::spawn(run_lane_backlog(
+                Arc::clone(socket),
+                Arc::clone(telemetry),
+                Arc::clone(&self.pending),
+                receiver,
+            ));
+            sender
+        });
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        telemetry
+            .relay_lane_backlog_parts
+            .fetch_add(1, Ordering::Relaxed);
+        if sender.try_send(part).is_err() {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            let dropped = telemetry
+                .relay_lane_backlog_dropped
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if dropped <= 16 || dropped.is_power_of_two() {
+                warn!(
+                    dropped,
+                    "RelaySession lane backlog is full; dropped the rest of an audio part"
+                );
+            }
+        }
+    }
+}
+
+async fn run_lane_backlog(
+    socket: Arc<UdpSocket>,
+    telemetry: Arc<IngestTelemetry>,
+    pending: Arc<AtomicUsize>,
+    mut parts: mpsc::Receiver<BacklogPart>,
+) {
+    while let Some(part) = parts.recv().await {
+        send_backlog_part(&socket, &telemetry, part).await;
+        pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: BacklogPart) {
+    if part.deadline.is_expired_at(now_unix_us()) {
+        telemetry
+            .relay_expired_symbols
+            .fetch_add(part.wires.len() as u64, Ordering::Relaxed);
+        for (role, _) in &part.wires {
+            telemetry.record_relay_session_send_error(*role);
+        }
+        return;
+    }
+    let messages = part
+        .wires
+        .iter()
+        .map(|(_, wire)| udp_batch::Outbound::connected(wire))
+        .collect::<Vec<_>>();
+    let (sources, rest) = messages.split_at(part.sources.min(messages.len()));
+    let mut result = udp_batch::send_all(socket, sources, true).await;
+    let journal_sent_first = |sent: bool| {
+        if let Some(flag) = part.sent_first.as_ref() {
+            if sent && !flag.swap(true, Ordering::AcqRel) {
+                journal_part_hop(part.part, HopStage::SentFirst, Some(part.peer));
+            }
+        }
+    };
+    journal_sent_first(result.is_ok() && !sources.is_empty());
+    if result.is_ok() {
+        if part.sources > 0 {
+            journal_part_hop(part.journal, part.stage, Some(part.peer));
+        }
+        result = udp_batch::send_all(socket, rest, true).await;
+        journal_sent_first(result.is_ok() && !rest.is_empty());
+        if part.sources == 0 && result.is_ok() {
+            journal_part_hop(part.journal, part.stage, Some(part.peer));
+        }
+    }
+    match result {
+        Ok(_) => {
+            for (role, wire) in &part.wires {
+                telemetry.record_relay_session_send_success(*role, wire.len() as u64);
+            }
+        }
+        Err(error) => {
+            let role = part
+                .wires
+                .first()
+                .map_or(MediaDatagramRole::Source, |(role, _)| *role);
+            telemetry.record_relay_session_send_error(role);
+            debug!(error = %error, peer = %part.peer, "RelaySession lane backlog send failed");
+        }
+    }
+}
+
+/// Journal `stage` of the part `journal` (stream, sequence), now.
+fn journal_part_hop(journal: Option<(u64, u64)>, stage: HopStage, peer: Option<SocketAddr>) {
+    if let Some((stream, seq)) = journal {
+        hop_journal::record(
+            HopEvent::new(stage, stream, seq, hop_journal::now_unix_us()).with_peer(peer),
+        );
+    }
+}
+
+/// What one lane did with one part on the audio hot path.
+enum LaneHandOff {
+    /// Every datagram is with the kernel.
+    Sent,
+    /// The rest waits in the lane's backlog.
+    Queued,
+}
+
 struct RelaySessionPublisher {
     /// One RaptorQ encoder, or with `--publication-shard-mix` one for audio
     /// parts and one for video parts, so that an audio part never waits for
@@ -1318,6 +1715,16 @@ struct RelaySessionPublisher {
     /// `--relay-send-batch`: the symbols of a part leave each lane in one
     /// `sendmmsg` call.
     send_batch: bool,
+    /// `--relay-audio-inline`: an audio part's lanes are each handed their
+    /// symbols without waiting, one after the other, with no join.
+    audio_inline: bool,
+    /// `--relay-repair-both-lanes`: the primary lane carries the repair
+    /// symbols too, not only the source set.
+    repair_both_lanes: bool,
+    /// Streams that have published a video part: they stay on the video
+    /// class (a muxed stream's audio-only parts before its first video
+    /// access unit are the only ones of it on the audio class).
+    video_streams: std::sync::Mutex<HashSet<u64>>,
     generation: TopologyGeneration,
     subscription_id: SubscriptionId,
     telemetry: Arc<IngestTelemetry>,
@@ -1391,15 +1798,33 @@ impl RelaySessionPublisher {
                 }
             }
         }
+        let classes = ClassLaneSettings::from_args(args)?;
+        if classes.enabled() {
+            // A parent's video class port must not be another endpoint.
+            for (label, target) in [
+                ("primary target", Some(primary_target)),
+                ("secondary target", args.relay_secondary_target),
+            ] {
+                let Some(target) = target else { continue };
+                let video = class_lanes::video_class_addr(target, classes.port_offset)
+                    .with_context(|| format!("no video class port for the relay {label}"))?;
+                if let Some((other, _)) = endpoints.iter().find(|(_, addr)| *addr == video) {
+                    bail!("the video class port {video} of the relay {label} is the relay {other}");
+                }
+            }
+        }
         let primary_path_metrics = relay_path_metrics(args)?;
         let secondary_path_metrics = relay_secondary_path_metrics(args)?;
-        let primary = RelayLane::bind(PrivateUdpConfig::new(
-            primary_bind,
-            primary_target,
-            args.relay_local_id.clone(),
-            args.relay_primary_id.clone(),
-            limits,
-        )?)
+        let primary = RelayLane::bind(
+            PrivateUdpConfig::new(
+                primary_bind,
+                primary_target,
+                args.relay_local_id.clone(),
+                args.relay_primary_id.clone(),
+                limits,
+            )?,
+            classes,
+        )
         .await
         .with_context(|| {
             format!("failed to bind primary RelaySession UDP carrier for {primary_target}")
@@ -1408,13 +1833,16 @@ impl RelaySessionPublisher {
         let secondary = if let (Some(secondary_target), Some(secondary_bind)) =
             (args.relay_secondary_target, secondary_bind)
         {
-            let transport = RelayLane::bind(PrivateUdpConfig::new(
-                secondary_bind,
-                secondary_target,
-                args.relay_local_id.clone(),
-                args.relay_secondary_id.clone(),
-                limits,
-            )?)
+            let transport = RelayLane::bind(
+                PrivateUdpConfig::new(
+                    secondary_bind,
+                    secondary_target,
+                    args.relay_local_id.clone(),
+                    args.relay_secondary_id.clone(),
+                    limits,
+                )?,
+                classes,
+            )
             .await
             .with_context(|| {
                 format!("failed to bind secondary RelaySession UDP carrier for {secondary_target}")
@@ -1424,7 +1852,7 @@ impl RelaySessionPublisher {
         } else {
             None
         };
-        let direct = RelayDirectLanes::bind(args, limits, &args.relay_local_id).await?;
+        let direct = RelayDirectLanes::bind(args, limits, &args.relay_local_id, classes).await?;
 
         let mut policy = AdaptiveFecPolicy::default();
         if args.relay_min_repair_symbols > policy.max_repair_symbols {
@@ -1455,18 +1883,44 @@ impl RelaySessionPublisher {
             secondary_seed_source: args.relay_secondary_seed_source,
             direct,
             send_batch: args.relay_send_batch,
+            audio_inline: args.relay_audio_inline,
+            repair_both_lanes: args.relay_repair_both_lanes,
+            video_streams: std::sync::Mutex::new(HashSet::new()),
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
             subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
             telemetry,
         }))
     }
 
+    /// Publish an object of stream `stream_id` that is not a media part
+    /// (an initialization).
     async fn publish_object(
         &self,
         object: &MediaObject,
+        stream_id: u64,
         class: PublicationClass,
     ) -> Result<RelayPublishOutcome> {
-        self.publish_part_object(object, None, class).await
+        let class = self.stream_class(stream_id, class);
+        self.publish_classed_object(object, None, class).await
+    }
+
+    /// The class of a part of `stream_id` whose own class is `class`: a
+    /// stream that has published video stays video.
+    fn stream_class(&self, stream_id: u64, class: PublicationClass) -> PublicationClass {
+        let mut video_streams = self
+            .video_streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match class {
+            PublicationClass::Video => {
+                video_streams.insert(stream_id);
+                PublicationClass::Video
+            }
+            PublicationClass::Audio if video_streams.contains(&stream_id) => {
+                PublicationClass::Video
+            }
+            PublicationClass::Audio => PublicationClass::Audio,
+        }
     }
 
     /// The encoder of parts of `class`.
@@ -1480,6 +1934,19 @@ impl RelaySessionPublisher {
     /// Publish an object; `part` is the (stream, sequence) of a media part,
     /// whose encode and sends the hop journal records.
     async fn publish_part_object(
+        &self,
+        object: &MediaObject,
+        part: Option<(u64, u64)>,
+        class: PublicationClass,
+    ) -> Result<RelayPublishOutcome> {
+        let class = match part {
+            Some((stream_id, _)) => self.stream_class(stream_id, class),
+            None => class,
+        };
+        self.publish_classed_object(object, part, class).await
+    }
+
+    async fn publish_classed_object(
         &self,
         object: &MediaObject,
         part: Option<(u64, u64)>,
@@ -1550,8 +2017,10 @@ impl RelaySessionPublisher {
         let schedule_started = Instant::now();
         let source_count = source_symbols.len();
         let repair_count = repair_symbols.len();
-        let repair_uses_primary = self.secondary.is_none();
-        if repair_uses_primary && repair_count > 0 {
+        // Without a secondary the primary is the only lane for the repair
+        // symbols; with --relay-repair-both-lanes it carries them anyway.
+        let repair_uses_primary = self.secondary.is_none() || self.repair_both_lanes;
+        if self.secondary.is_none() && repair_count > 0 {
             self.telemetry
                 .relay_repair_primary_fallback_objects
                 .fetch_add(1, Ordering::Relaxed);
@@ -1560,77 +2029,164 @@ impl RelaySessionPublisher {
             RelayPipelineStage::Schedule,
             schedule_started.elapsed(),
         );
-
-        let primary_lane = async {
-            if self.send_batch {
-                // Source and repair in one batch: the source symbols lead it,
-                // so they are with the kernel when `sent` is journalled.
-                let symbols = if repair_uses_primary {
-                    vec![source_symbols.as_slice(), repair_symbols.as_slice()]
-                } else {
-                    vec![source_symbols.as_slice()]
-                };
-                self.send_symbol_batch(&self.primary, RelayCarrierPath::Primary, &symbols)
-                    .await?;
-                journal_hop(HopStage::Sent, Some(self.primary.peer_addr()));
-                return Ok::<(), anyhow::Error>(());
+        // Shared with the lanes' backlogs: a lane whose socket buffer was
+        // full may send the part's first datagram after the call returns.
+        let sent_first = Arc::new(AtomicBool::new(false));
+        let journal_sent_first = |peer: SocketAddr| {
+            if !sent_first.swap(true, Ordering::AcqRel) {
+                journal_hop(HopStage::SentFirst, Some(peer));
             }
-            for symbol in &source_symbols {
-                self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
-                    .await?;
-            }
-            journal_hop(HopStage::Sent, Some(self.primary.peer_addr()));
-            if repair_uses_primary {
-                for symbol in &repair_symbols {
-                    self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
-                        .await?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
         };
-        let secondary_lane = async {
-            if let Some(secondary) = self.secondary.as_ref() {
-                if self.send_batch {
-                    let symbols = if self.secondary_seed_source {
+        let secondary_configured = self.secondary.is_some();
+
+        let (primary_result, secondary_result) = if self.audio_inline
+            && self.send_batch
+            && class == PublicationClass::Audio
+        {
+            // The audio hot path: each lane in turn is handed its symbols
+            // without waiting; what a full socket buffer does not take
+            // waits in that lane's backlog, and nothing joins the lanes.
+            let primary_groups = if repair_uses_primary {
+                vec![source_symbols.as_slice(), repair_symbols.as_slice()]
+            } else {
+                vec![source_symbols.as_slice()]
+            };
+            let primary_result = self
+                .hand_lane_its_symbols(
+                    &self.primary,
+                    RelayCarrierPath::Primary,
+                    &primary_groups,
+                    part,
+                    HopStage::Sent,
+                    &sent_first,
+                )
+                .map(|_| ());
+            let secondary_result = match self.secondary.as_ref() {
+                Some(secondary) => {
+                    let groups = if self.secondary_seed_source {
                         vec![source_symbols.as_slice(), repair_symbols.as_slice()]
                     } else {
                         vec![repair_symbols.as_slice()]
                     };
-                    self.send_symbol_batch(secondary, RelayCarrierPath::Secondary, &symbols)
-                        .await?;
-                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
+                    self.hand_lane_its_symbols(
+                        secondary,
+                        RelayCarrierPath::Secondary,
+                        &groups,
+                        part,
+                        HopStage::SentSecondary,
+                        &sent_first,
+                    )
+                    .map(|_| ())
+                }
+                None => Ok(()),
+            };
+            if let Some(direct) = self.direct.as_ref() {
+                self.send_direct(
+                    direct,
+                    class,
+                    &source_symbols,
+                    &repair_symbols,
+                    &journal_hop,
+                )
+                .await;
+            }
+            (primary_result, secondary_result)
+        } else {
+            let primary_lane = async {
+                let (_, primary_peer) = self.primary.class_socket(class);
+                if self.send_batch {
+                    // Source and repair in one batch: the source symbols lead
+                    // it, so they are with the kernel when `sent` is
+                    // journalled.
+                    let symbols = if repair_uses_primary {
+                        vec![source_symbols.as_slice(), repair_symbols.as_slice()]
+                    } else {
+                        vec![source_symbols.as_slice()]
+                    };
+                    self.send_symbol_batch(
+                        &self.primary,
+                        class,
+                        RelayCarrierPath::Primary,
+                        &symbols,
+                    )
+                    .await?;
+                    journal_sent_first(primary_peer);
+                    journal_hop(HopStage::Sent, Some(primary_peer));
                     return Ok::<(), anyhow::Error>(());
                 }
-                if self.secondary_seed_source {
-                    for symbol in &source_symbols {
-                        self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
+                for symbol in &source_symbols {
+                    self.send_symbol(&self.primary, class, RelayCarrierPath::Primary, symbol)
+                        .await?;
+                    journal_sent_first(primary_peer);
+                }
+                journal_hop(HopStage::Sent, Some(primary_peer));
+                if repair_uses_primary {
+                    for symbol in &repair_symbols {
+                        self.send_symbol(&self.primary, class, RelayCarrierPath::Primary, symbol)
                             .await?;
                     }
-                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
                 }
-                for symbol in &repair_symbols {
-                    self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
+                Ok::<(), anyhow::Error>(())
+            };
+            let secondary_lane = async {
+                if let Some(secondary) = self.secondary.as_ref() {
+                    let (_, secondary_peer) = secondary.class_socket(class);
+                    if self.send_batch {
+                        let symbols = if self.secondary_seed_source {
+                            vec![source_symbols.as_slice(), repair_symbols.as_slice()]
+                        } else {
+                            vec![repair_symbols.as_slice()]
+                        };
+                        self.send_symbol_batch(
+                            secondary,
+                            class,
+                            RelayCarrierPath::Secondary,
+                            &symbols,
+                        )
                         .await?;
+                        journal_sent_first(secondary_peer);
+                        journal_hop(HopStage::SentSecondary, Some(secondary_peer));
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    if self.secondary_seed_source {
+                        for symbol in &source_symbols {
+                            self.send_symbol(secondary, class, RelayCarrierPath::Secondary, symbol)
+                                .await?;
+                            journal_sent_first(secondary_peer);
+                        }
+                        journal_hop(HopStage::SentSecondary, Some(secondary_peer));
+                    }
+                    for symbol in &repair_symbols {
+                        self.send_symbol(secondary, class, RelayCarrierPath::Secondary, symbol)
+                            .await?;
+                        journal_sent_first(secondary_peer);
+                    }
+                    // A secondary without the source set decodes from its
+                    // repair symbols: they are what it needs.
+                    if !self.secondary_seed_source {
+                        journal_hop(HopStage::SentSecondary, Some(secondary_peer));
+                    }
                 }
-                // A secondary without the source set decodes from its repair
-                // symbols: they are what it needs.
-                if !self.secondary_seed_source {
-                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        };
-        let direct_lane = async {
-            if let Some(direct) = self.direct.as_ref() {
-                self.send_direct(direct, &source_symbols, &repair_symbols, &journal_hop)
+                Ok::<(), anyhow::Error>(())
+            };
+            let direct_lane = async {
+                if let Some(direct) = self.direct.as_ref() {
+                    self.send_direct(
+                        direct,
+                        class,
+                        &source_symbols,
+                        &repair_symbols,
+                        &journal_hop,
+                    )
                     .await;
-            }
+                }
+            };
+            // In this order: the backbone primary, the region's
+            // distributors, then the warm secondary.
+            let (primary_result, (), secondary_result) =
+                tokio::join!(primary_lane, direct_lane, secondary_lane);
+            (primary_result, secondary_result)
         };
-        let secondary_configured = self.secondary.is_some();
-        // In this order: the backbone primary, the region's distributors,
-        // then the warm secondary.
-        let (primary_result, (), secondary_result) =
-            tokio::join!(primary_lane, direct_lane, secondary_lane);
         self.telemetry
             .record_relay_session_lane_object(RelayCarrierPath::Primary, primary_result.is_ok());
         if secondary_configured {
@@ -1698,10 +2254,12 @@ impl RelaySessionPublisher {
     async fn send_direct(
         &self,
         direct: &RelayDirectLanes,
+        class: PublicationClass,
         source_symbols: &[relay_session::RelayDatagram],
         repair_symbols: &[relay_session::RelayDatagram],
         journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
     ) {
+        let (socket, targets) = direct.class_lane(class);
         let symbols = if direct.repair {
             source_symbols.len() + repair_symbols.len()
         } else {
@@ -1717,29 +2275,28 @@ impl RelaySessionPublisher {
                 Err(error) => {
                     self.telemetry
                         .relay_direct_lane_objects_failed
-                        .fetch_add(direct.targets.len() as u64, Ordering::Relaxed);
+                        .fetch_add(targets.len() as u64, Ordering::Relaxed);
                     debug!(error = %error, "failed to encode a direct RelaySession datagram");
                     return;
                 }
             }
         }
-        let mut messages = Vec::with_capacity(wires.len() * direct.targets.len());
+        let mut messages = Vec::with_capacity(wires.len() * targets.len());
         for wire in &wires {
-            for target in &direct.targets {
+            for target in targets {
                 messages.push(udp_batch::Outbound::to(*target, wire));
             }
         }
         let started = Instant::now();
         // One distributor that the kernel refuses (no route, a firewall
         // rule) stops only its own datagrams: the others still get theirs.
-        let outcome =
-            udp_batch::send_all_per_target(&direct.socket, &messages, self.send_batch).await;
+        let outcome = udp_batch::send_all_per_target(socket, &messages, self.send_batch).await;
         self.telemetry
             .relay_direct_send_duration
             .record(started.elapsed());
         let part_bytes = wires.iter().map(Vec::len).sum::<usize>() as u64;
         let mut succeeded = 0_u64;
-        for target in &direct.targets {
+        for target in targets {
             if !outcome.refused(*target) {
                 journal_hop(HopStage::SentDirect, Some(*target));
                 succeeded += 1;
@@ -1771,12 +2328,122 @@ impl RelaySessionPublisher {
         }
     }
 
+    /// The audio hot path of one lane: hand the lane the symbols of
+    /// `groups` with non-blocking `sendmmsg`, never waiting for the socket.
+    /// What its buffer does not take (or everything, while earlier parts
+    /// wait there) goes to the lane's backlog. `stage` is journalled when
+    /// the leading group (the source set, or the only group) is with the
+    /// kernel; `sent_first` when the first datagram is.
+    fn hand_lane_its_symbols(
+        &self,
+        lane: &RelayLane,
+        path: RelayCarrierPath,
+        groups: &[&[relay_session::RelayDatagram]],
+        part: Option<(u64, u64)>,
+        stage: HopStage,
+        sent_first: &Arc<AtomicBool>,
+    ) -> Result<LaneHandOff> {
+        let Some(first) = groups.iter().find_map(|group| group.first()) else {
+            return Ok(LaneHandOff::Sent);
+        };
+        let started = Instant::now();
+        let send_stage = relay_send_stage(path, first.role);
+        let deadline = first.deadline;
+        let (socket, peer) = lane.class_socket(PublicationClass::Audio);
+        let leading = groups
+            .iter()
+            .find(|group| !group.is_empty())
+            .map_or(0, |group| group.len());
+        let now_us = now_unix_us();
+        let mut wires = Vec::with_capacity(groups.iter().map(|group| group.len()).sum());
+        for symbol in groups.iter().flat_map(|group| group.iter()) {
+            if symbol.deadline.is_expired_at(now_us) {
+                self.telemetry.record_relay_session_send_error(symbol.role);
+                self.telemetry
+                    .relay_expired_symbols
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("RelaySession symbol expired before carrier send");
+            }
+            match encode_relay_datagram(symbol, lane.limits) {
+                Ok(wire) => wires.push((symbol.role, wire)),
+                Err(error) => {
+                    self.telemetry.record_relay_session_send_error(symbol.role);
+                    return Err(error).context("failed to encode RelaySession datagram");
+                }
+            }
+        }
+        let backlog_part = |wires, sources, journal, sent_first| BacklogPart {
+            wires,
+            sources,
+            deadline,
+            journal,
+            part,
+            sent_first,
+            stage,
+            peer,
+        };
+        if lane.backlog.busy() {
+            lane.backlog.push(
+                socket,
+                &self.telemetry,
+                backlog_part(wires, leading, part, Some(Arc::clone(sent_first))),
+            );
+            self.telemetry
+                .record_relay_session_stage_duration(send_stage, started.elapsed());
+            return Ok(LaneHandOff::Queued);
+        }
+        let messages = wires
+            .iter()
+            .map(|(_, wire)| udp_batch::Outbound::connected(wire))
+            .collect::<Vec<_>>();
+        let outcome = udp_batch::try_send_all(socket, &messages);
+        drop(messages);
+        if outcome.sent > 0 && !sent_first.swap(true, Ordering::AcqRel) {
+            journal_part_hop(part, HopStage::SentFirst, Some(peer));
+        }
+        let journalled = outcome.sent >= leading;
+        if journalled {
+            journal_part_hop(part, stage, Some(peer));
+        }
+        for (role, wire) in &wires[..outcome.sent] {
+            self.telemetry
+                .record_relay_session_send_success(*role, wire.len() as u64);
+        }
+        let result = if outcome.would_block() {
+            let rest = wires.split_off(outcome.sent);
+            let sources = leading.saturating_sub(outcome.sent);
+            lane.backlog.push(
+                socket,
+                &self.telemetry,
+                backlog_part(
+                    rest,
+                    sources,
+                    (!journalled).then_some(part).flatten(),
+                    (outcome.sent == 0).then(|| Arc::clone(sent_first)),
+                ),
+            );
+            Ok(LaneHandOff::Queued)
+        } else if let Some(error) = outcome.error {
+            let role = wires
+                .get(outcome.sent)
+                .map_or(MediaDatagramRole::Source, |(role, _)| *role);
+            self.telemetry.record_relay_session_send_error(role);
+            Err(error).with_context(|| format!("failed to send RelaySession datagrams to {peer}"))
+        } else {
+            Ok(LaneHandOff::Sent)
+        };
+        self.telemetry
+            .record_relay_session_stage_duration(send_stage, started.elapsed());
+        result
+    }
+
     /// Send the symbols of `groups`, in order, in as few `sendmmsg` calls as
     /// the kernel allows. Every symbol of an object carries the object's
     /// deadline, so one check covers the batch.
     async fn send_symbol_batch(
         &self,
         lane: &RelayLane,
+        class: PublicationClass,
         path: RelayCarrierPath,
         groups: &[&[relay_session::RelayDatagram]],
     ) -> Result<()> {
@@ -1786,7 +2453,9 @@ impl RelaySessionPublisher {
         let started = Instant::now();
         let stage = relay_send_stage(path, first.role);
         let count = groups.iter().map(|group| group.len()).sum::<usize>();
-        let result = self.send_symbol_batch_inner(lane, groups, count).await;
+        let result = self
+            .send_symbol_batch_inner(lane, class, groups, count)
+            .await;
         self.telemetry
             .record_relay_session_stage_duration(stage, started.elapsed());
         result
@@ -1795,9 +2464,11 @@ impl RelaySessionPublisher {
     async fn send_symbol_batch_inner(
         &self,
         lane: &RelayLane,
+        class: PublicationClass,
         groups: &[&[relay_session::RelayDatagram]],
         count: usize,
     ) -> Result<()> {
+        let (socket, peer) = lane.class_socket(class);
         let now_us = now_unix_us();
         let mut wires = Vec::with_capacity(count);
         for symbol in groups.iter().flat_map(|group| group.iter()) {
@@ -1820,17 +2491,13 @@ impl RelaySessionPublisher {
             .iter()
             .map(|(_, wire)| udp_batch::Outbound::connected(wire))
             .collect::<Vec<_>>();
-        if let Err(error) = udp_batch::send_all(&lane.socket, &messages, true).await {
+        if let Err(error) = udp_batch::send_all(socket, &messages, true).await {
             let role = wires
                 .first()
                 .map_or(MediaDatagramRole::Source, |(role, _)| *role);
             self.telemetry.record_relay_session_send_error(role);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to send RelaySession datagrams to {}",
-                    lane.peer_addr()
-                )
-            });
+            return Err(error)
+                .with_context(|| format!("failed to send RelaySession datagrams to {peer}"));
         }
         for (role, wire) in &wires {
             self.telemetry
@@ -1842,9 +2509,11 @@ impl RelaySessionPublisher {
     async fn send_symbol(
         &self,
         transport: &RelayLane,
+        class: PublicationClass,
         path: RelayCarrierPath,
         symbol: &relay_session::RelayDatagram,
     ) -> Result<()> {
+        let (socket, peer) = transport.class_socket(class);
         let started = Instant::now();
         let role = symbol.role;
         let result = if symbol.deadline.is_expired_at(now_unix_us()) {
@@ -1869,16 +2538,11 @@ impl RelaySessionPublisher {
             };
             let wire_bytes = wire.len() as u64;
             if let Err(error) =
-                udp_batch::send_each(&transport.socket, &[udp_batch::Outbound::connected(&wire)])
-                    .await
+                udp_batch::send_each(socket, &[udp_batch::Outbound::connected(&wire)]).await
             {
                 self.telemetry.record_relay_session_send_error(role);
-                Err(error).with_context(|| {
-                    format!(
-                        "failed to send RelaySession datagram to {}",
-                        transport.peer_addr()
-                    )
-                })
+                Err(error)
+                    .with_context(|| format!("failed to send RelaySession datagram to {peer}"))
             } else {
                 self.telemetry
                     .record_relay_session_send_success(role, wire_bytes);
@@ -2849,7 +3513,7 @@ impl Fmp4PartPublisher for MeshForwarder {
                 }
                 if let Some(relay) = &self.relay {
                     let outcome = relay
-                        .publish_object(&object, class)
+                        .publish_object(&object, part.stream_id, class)
                         .await
                         .map_err(|error| error.to_string())?;
                     trace!(
@@ -3180,9 +3844,45 @@ struct BoundedFmp4Publisher {
     streams: Mutex<HashMap<u64, StreamPublication>>,
     shards: std::sync::Mutex<PublicationShards>,
     durations: StampDurations,
+    /// `--relay-audio-inline`: the publisher that audio parts go to on the
+    /// packager's own task, without a worker's queue.
+    inline_audio: Option<Arc<dyn Fmp4PartPublisher>>,
+    inline_initializations: std::sync::Mutex<InitializationMemory>,
 }
 
 impl BoundedFmp4Publisher {
+    /// Whether the stream's next part, of class `class`, is published on
+    /// the caller's task: an audio part of a stream that is not video and
+    /// has no part waiting for a worker (its parts stay in order).
+    fn publishes_inline(&self, stream: &StreamPublication, class: PublicationClass) -> bool {
+        self.inline_audio.is_some()
+            && class == PublicationClass::Audio
+            && stream.class != Some(PublicationClass::Video)
+            && stream.in_flight.load(Ordering::Acquire) == 0
+    }
+
+    /// Publish `publication` on this task: the audio hot path.
+    async fn publish_inline(&self, publication: QueuedPublication) {
+        let Some(inner) = self.inline_audio.as_ref() else {
+            return;
+        };
+        hop_journal::record(HopEvent::new(
+            HopStage::Dequeued,
+            publication.stream_id(),
+            publication.sequence(),
+            hop_journal::now_unix_us(),
+        ));
+        PUBLICATION_INLINE.fetch_add(1, Ordering::Relaxed);
+        publish_publication(
+            None,
+            inner,
+            &self.telemetry,
+            InitializationsRef::Shared(&self.inline_initializations),
+            publication,
+        )
+        .await;
+    }
+
     /// The worker of the stream's next part, of class `class`.
     ///
     /// A stream keeps the worker of its first part, so that its parts leave
@@ -3265,6 +3965,27 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             started_unix_us,
         ));
         let class = fmp4_publication_class(&part);
+        if self.publishes_inline(stream, class) {
+            stream.class.get_or_insert(PublicationClass::Audio);
+            let publication = QueuedPublication::Fmp4 {
+                in_flight: InFlight::new(&stream.in_flight),
+                enqueued_at: Instant::now(),
+                part,
+            };
+            if let QueuedPublication::Fmp4 { part, .. } = &publication {
+                journal_enqueued(
+                    stream_id,
+                    sequence,
+                    &part.source_times,
+                    part.packaged_at_unix_ns,
+                    hop_journal::now_unix_us(),
+                );
+            }
+            stream.next_sequence = stream.next_sequence.saturating_add(1);
+            drop(streams);
+            self.publish_inline(publication).await;
+            return Ok(());
+        }
         let shard = self.shard_of(stream, stream_id, class);
         let source_times = part.source_times;
         let packaged_at_unix_ns = part.packaged_at_unix_ns;
@@ -3321,6 +4042,25 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             true,
             u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0),
         ));
+        if self.publishes_inline(stream, PublicationClass::Audio) {
+            stream.class.get_or_insert(PublicationClass::Audio);
+            journal_enqueued(
+                stream_id,
+                sequence,
+                &part.source_times,
+                part.packaged_at_unix_ns,
+                hop_journal::now_unix_us(),
+            );
+            let publication = QueuedPublication::Opaque {
+                in_flight: InFlight::new(&stream.in_flight),
+                enqueued_at: Instant::now(),
+                part,
+            };
+            stream.next_sequence = stream.next_sequence.saturating_add(1);
+            drop(streams);
+            self.publish_inline(publication).await;
+            return Ok(());
+        }
         let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
         let source_times = part.source_times;
         let packaged_at_unix_ns = part.packaged_at_unix_ns;
@@ -3421,6 +4161,7 @@ fn start_bounded_publication_pipeline(
     telemetry: Arc<IngestTelemetry>,
     durations: StampDurations,
     shard_mix: bool,
+    audio_inline: bool,
     shutdown_rx: watch::Receiver<()>,
 ) -> (Arc<dyn Fmp4PartPublisher>, Vec<tokio::task::JoinHandle<()>>) {
     assert!(PUBLICATION_WORKERS > 0);
@@ -3450,9 +4191,92 @@ fn start_bounded_publication_pipeline(
             streams: Mutex::new(HashMap::new()),
             shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, shard_mix)),
             durations,
+            inline_audio: audio_inline.then(|| Arc::clone(&inner)),
+            inline_initializations: std::sync::Mutex::new(InitializationMemory::default()),
         }),
         tasks,
     )
+}
+
+/// Pin the calling thread and give it SCHED_FIFO, as far as the host
+/// allows; one info line either way.
+fn make_audio_hot_thread_realtime(cpu: Option<usize>, fifo_priority: u8, what: &str) {
+    let outcome = class_lanes::make_current_thread_realtime(cpu, fifo_priority);
+    if outcome.refused.is_empty() {
+        info!(
+            cpu = ?outcome.pinned_cpu,
+            fifo_priority = ?outcome.fifo_priority,
+            "{what} started"
+        );
+    } else {
+        info!(
+            cpu = ?outcome.pinned_cpu,
+            fifo_priority = ?outcome.fifo_priority,
+            refused = ?outcome.refused,
+            "{what} started without part of its real-time settings \
+             (--audio-hot-cpu, --audio-hot-fifo-priority); it runs on with normal scheduling"
+        );
+    }
+}
+
+/// Run `work` (the AEP1 packagers, and with --relay-audio-inline the audio
+/// publication) on the audio hot thread: a thread of its own with a
+/// single-threaded runtime (or --audio-hot-workers workers), with SCHED_FIFO
+/// --audio-hot-fifo-priority and pinned to --audio-hot-cpu where the host
+/// allows it. A refusal (a rootless lab) is one info line, and the thread
+/// runs on with normal scheduling, unpinned. With --audio-hot-thread false the work
+/// is a task of the main runtime. The returned handle completes when the
+/// work does.
+fn spawn_audio_hot_task<F>(args: &Args, work: F) -> Result<tokio::task::JoinHandle<()>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if !args.audio_hot_thread {
+        return Ok(tokio::spawn(work));
+    }
+    let cpu = usize::try_from(args.audio_hot_cpu).ok();
+    let fifo_priority = args.audio_hot_fifo_priority;
+    let workers = args.audio_hot_workers.max(1);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::Builder::new()
+        .name("audio-hot".into())
+        .spawn(move || {
+            make_audio_hot_thread_realtime(cpu, fifo_priority, "audio hot thread");
+            let runtime = if workers == 1 {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+            } else {
+                let next = Arc::new(AtomicUsize::new(1));
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .thread_name("audio-hot-worker")
+                    .on_thread_start(move || {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        // The workers start with the runtime; a later thread
+                        // is the blocking pool's and stays as it is.
+                        if index > workers {
+                            return;
+                        }
+                        make_audio_hot_thread_realtime(
+                            cpu.map(|cpu| cpu + index - 1),
+                            fifo_priority,
+                            "audio hot worker",
+                        );
+                    })
+                    .enable_all()
+                    .build()
+            };
+            match runtime {
+                Ok(runtime) => runtime.block_on(work),
+                Err(error) => warn!(error = %error, "audio hot thread could not build its runtime"),
+            }
+            let _ = done_tx.send(());
+        })
+        .context("failed to start the audio hot thread")?;
+    Ok(tokio::spawn(async move {
+        let _ = done_rx.await;
+    }))
 }
 
 async fn run_publication_worker(
@@ -3513,15 +4337,72 @@ async fn process_queued_publication(
         hop_journal::now_unix_us(),
     ));
     publication_queue_age().record(publication.enqueued_at().elapsed());
+    publish_publication(
+        Some(shard),
+        inner,
+        telemetry,
+        InitializationsRef::Worker(initializations, force_initialization),
+        publication,
+    )
+    .await;
+}
+
+/// Initialization payloads that a publisher re-attaches to a stream's next
+/// part after a part of the stream failed to publish.
+#[derive(Default)]
+struct InitializationMemory {
+    payloads: HashMap<u64, Bytes>,
+    force: HashSet<u64>,
+}
+
+/// The initialization memory of a publication worker (its own), or of the
+/// inline audio path (shared by the packagers' tasks, locked only around
+/// each update).
+enum InitializationsRef<'a> {
+    Worker(&'a mut HashMap<u64, Bytes>, &'a mut HashSet<u64>),
+    Shared(&'a std::sync::Mutex<InitializationMemory>),
+}
+
+impl InitializationsRef<'_> {
+    fn update<R>(
+        &mut self,
+        update: impl FnOnce(&mut HashMap<u64, Bytes>, &mut HashSet<u64>) -> R,
+    ) -> R {
+        match self {
+            Self::Worker(payloads, force) => update(payloads, force),
+            Self::Shared(memory) => {
+                let mut memory = memory
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let memory = &mut *memory;
+                update(&mut memory.payloads, &mut memory.force)
+            }
+        }
+    }
+}
+
+/// Publish one part through `inner`: the work of a publication worker
+/// (`shard`), or of the packager's own task on the audio hot path (`None`).
+/// A failure is counted and logged, never returned: the part has left the
+/// packager either way.
+async fn publish_publication(
+    shard: Option<usize>,
+    inner: &Arc<dyn Fmp4PartPublisher>,
+    telemetry: &IngestTelemetry,
+    mut initializations: InitializationsRef<'_>,
+    publication: QueuedPublication,
+) {
     let started = Instant::now();
     let stream_id = publication.stream_id();
     let result = match publication {
         QueuedPublication::Fmp4 { mut part, .. } => {
-            if let Some(init) = part.init.as_ref() {
-                initializations.insert(stream_id, init.clone());
-            } else if force_initialization.contains(&stream_id) {
-                part.init = initializations.get(&stream_id).cloned();
-            }
+            initializations.update(|payloads, force| {
+                if let Some(init) = part.init.as_ref() {
+                    payloads.insert(stream_id, init.clone());
+                } else if force.contains(&stream_id) {
+                    part.init = payloads.get(&stream_id).cloned();
+                }
+            });
             let stream_idx = part.stream_idx;
             let sequence = part.sequence;
             let bytes = part.bytes.len() as u64;
@@ -3539,13 +4420,13 @@ async fn process_queued_publication(
             match inner.publish_fmp4_part(part).await {
                 Ok(()) => {
                     if carried_initialization {
-                        force_initialization.remove(&stream_id);
+                        initializations.update(|_, force| force.remove(&stream_id));
                     }
                     telemetry.record_fmp4_part(stream_id, stream_idx, sequence, bytes, init_bytes);
                     Ok(())
                 }
                 Err(error) => {
-                    force_initialization.insert(stream_id);
+                    initializations.update(|_, force| force.insert(stream_id));
                     telemetry.record_fmp4_publish_error(stream_id, stream_idx, sequence, &error);
                     Err(error)
                 }
@@ -3561,7 +4442,8 @@ async fn process_queued_publication(
         Err(error) => {
             let errors = PUBLICATION_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
             warn!(
-                shard,
+                shard = ?shard,
+                inline = shard.is_none(),
                 stream_id,
                 errors,
                 error = %error,
@@ -4341,6 +5223,12 @@ struct IngestTelemetry {
     relay_repair_datagram_bytes: AtomicU64,
     relay_repair_errors: AtomicU64,
     relay_repair_primary_fallback_objects: AtomicU64,
+    /// Audio parts (on one lane) whose symbols waited in the lane's
+    /// backlog for room in the socket buffer.
+    relay_lane_backlog_parts: AtomicU64,
+    /// Audio parts (on one lane) dropped because the lane's backlog was
+    /// full.
+    relay_lane_backlog_dropped: AtomicU64,
     relay_primary_lane_objects_succeeded: AtomicU64,
     relay_primary_lane_objects_failed: AtomicU64,
     relay_primary_lane_last_success_unix_ms: AtomicU64,
@@ -5158,6 +6046,8 @@ impl IngestTelemetry {
                 repair_primary_fallback_objects: self
                     .relay_repair_primary_fallback_objects
                     .load(Ordering::Relaxed),
+                lane_backlog_parts: self.relay_lane_backlog_parts.load(Ordering::Relaxed),
+                lane_backlog_dropped: self.relay_lane_backlog_dropped.load(Ordering::Relaxed),
                 primary_lane_objects_succeeded: self
                     .relay_primary_lane_objects_succeeded
                     .load(Ordering::Relaxed),
@@ -5580,6 +6470,11 @@ impl ContribStatusConfig {
                 relay_direct_bind: args.relay_direct_bind.map(|bind| bind.to_string()),
                 relay_direct_repair: args.relay_direct_repair,
                 relay_send_batch: args.relay_send_batch,
+                relay_class_lanes: args.relay_class_lanes,
+                relay_class_port_offset: args.relay_class_port_offset,
+                relay_audio_inline: args.relay_audio_inline,
+                relay_repair_both_lanes: args.relay_repair_both_lanes,
+                audio_hot_thread: args.audio_hot_thread,
                 aep1_shared_recovery: args.aep1_shared_recovery,
                 relay_exclusive: args.relay_exclusive,
                 relay_topology_generation: args.relay_topology_generation,
@@ -5776,6 +6671,12 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "Media parts completed by asynchronous publication workers.",
             "counter",
             PUBLICATION_COMPLETED.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_inline_total",
+            "Audio parts published on the packager's own task, without a publication queue.",
+            "counter",
+            PUBLICATION_INLINE.load(Ordering::Relaxed),
         ),
         (
             "av_contrib_publication_errors_total",
@@ -6516,6 +7417,16 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "RelaySession objects whose repair symbols used the primary carrier fallback.",
             runtime.relay_session.repair_primary_fallback_objects,
         ),
+        (
+            "av_contrib_relay_session_lane_backlog_parts_total",
+            "Audio parts on one RelaySession lane that waited for room in the socket buffer.",
+            runtime.relay_session.lane_backlog_parts,
+        ),
+        (
+            "av_contrib_relay_session_lane_backlog_dropped_total",
+            "Audio parts on one RelaySession lane dropped because the lane backlog was full.",
+            runtime.relay_session.lane_backlog_dropped,
+        ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
         output.push_str(&format!("{name} {value}\n"));
@@ -7196,6 +8107,8 @@ struct RelaySessionRuntimeSnapshot {
     repair_datagram_bytes: u64,
     repair_errors: u64,
     repair_primary_fallback_objects: u64,
+    lane_backlog_parts: u64,
+    lane_backlog_dropped: u64,
     primary_lane_objects_succeeded: u64,
     primary_lane_objects_failed: u64,
     primary_lane_state: &'static str,
@@ -7502,6 +8415,15 @@ struct MeshTargetStatus {
     relay_direct_repair: bool,
     /// `--relay-send-batch`.
     relay_send_batch: bool,
+    /// `--relay-class-lanes` and `--relay-class-port-offset`.
+    relay_class_lanes: bool,
+    relay_class_port_offset: u16,
+    /// `--relay-audio-inline`.
+    relay_audio_inline: bool,
+    /// `--relay-repair-both-lanes`.
+    relay_repair_both_lanes: bool,
+    /// `--audio-hot-thread`.
+    audio_hot_thread: bool,
     /// `--aep1-shared-recovery`.
     aep1_shared_recovery: bool,
     relay_topology_generation: u64,
@@ -8434,6 +9356,7 @@ async fn main() -> Result<()> {
         telemetry.clone(),
         args.stamp_durations(),
         args.publication_shard_mix,
+        args.relay_audio_inline,
         publication_shutdown_rx,
     );
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
@@ -8615,11 +9538,14 @@ async fn main() -> Result<()> {
             ));
             (task, Some(audio_epoch_mesh_tx))
         };
-        let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
-            audio_epoch_hls_config,
-            audio_epoch_hls_rx,
-            shutdown_rx.clone(),
-        ));
+        let audio_epoch_hls_task = spawn_audio_hot_task(
+            &args,
+            run_audio_epoch_hls_worker(
+                audio_epoch_hls_config,
+                audio_epoch_hls_rx,
+                shutdown_rx.clone(),
+            ),
+        )?;
         let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
             forwarder.clone(),
             audio_epoch_mesh_send_rx,
@@ -9593,6 +10519,8 @@ mod tests {
                     audio_part_us: 5_000,
                     audio_segment_us: 1_000_000,
                 },
+                inline_audio: None,
+                inline_initializations: std::sync::Mutex::default(),
             },
             receivers,
         )
@@ -9703,6 +10631,8 @@ mod tests {
                 streams: Mutex::new(HashMap::new()),
                 shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, true)),
                 durations,
+                inline_audio: None,
+                inline_initializations: std::sync::Mutex::default(),
             },
             receivers,
         )
@@ -10164,6 +11094,7 @@ mod tests {
                 audio_segment_us: 1_000_000,
             },
             true,
+            false,
             shutdown_rx,
         );
         let first = test_fmp4_part(
@@ -10984,6 +11915,10 @@ mod tests {
         args.relay_secondary_bind = Some(secondary_bind);
         args.relay_secondary_seed_source = true;
         args.relay_send_batch = send_batch;
+        // Today's lanes: one socket per lane, no repair on the primary.
+        // The class lanes and repair on both lanes have their own tests.
+        args.relay_class_lanes = false;
+        args.relay_repair_both_lanes = false;
         args.relay_topology_generation = 7;
         args.relay_subscription_id = 19;
         args.relay_deadline_ms = 5_000;
@@ -11060,9 +11995,20 @@ mod tests {
             .into_iter()
             .map(|event| (event.stage, event.seq, event.peer))
             .collect::<Vec<_>>();
-        // The encode comes first; the two lanes send concurrently.
-        assert_eq!(stages.len(), 3, "{stages:?}");
+        // The encode comes first; the two lanes send concurrently, and the
+        // first of them to hand the kernel a datagram is `sent_first`.
+        assert_eq!(stages.len(), 4, "{stages:?}");
         assert_eq!(stages[0], (HopStage::Encoded, 42, None));
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|(stage, seq, peer)| *stage == HopStage::SentFirst
+                    && *seq == 42
+                    && peer.is_some())
+                .count(),
+            1,
+            "{stages:?}"
+        );
         assert!(stages.contains(&(
             HopStage::Sent,
             42,
@@ -11549,7 +12495,7 @@ mod tests {
         .unwrap();
 
         let error = relay
-            .publish_object(&object, PublicationClass::Video)
+            .publish_object(&object, 1, PublicationClass::Video)
             .await
             .unwrap_err();
         assert!(error
@@ -11569,6 +12515,8 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut args = contrib_status_args();
         args.relay_primary_target = Some(receiver.local_addr().unwrap());
+        // A video part, on the one socket of the lane (class lanes off).
+        args.relay_class_lanes = false;
         let telemetry = Arc::new(IngestTelemetry::default());
         let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
             .await
@@ -11599,7 +12547,7 @@ mod tests {
         .unwrap();
 
         let outcome = relay
-            .publish_object(&object, PublicationClass::Video)
+            .publish_object(&object, 1, PublicationClass::Video)
             .await
             .unwrap();
         assert!(outcome.repair_symbols > 0);
@@ -11813,6 +12761,16 @@ mod tests {
             relay_direct_bind: None,
             relay_direct_ids: Vec::new(),
             relay_direct_repair: false,
+            relay_class_lanes: true,
+            relay_class_port_offset: class_lanes::DEFAULT_CLASS_PORT_OFFSET,
+            relay_audio_socket_priority: class_lanes::DEFAULT_AUDIO_SOCKET_PRIORITY,
+            relay_video_pacing_mbps: 0,
+            relay_audio_inline: true,
+            relay_repair_both_lanes: true,
+            audio_hot_thread: false,
+            audio_hot_cpu: -1,
+            audio_hot_fifo_priority: 0,
+            audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         }
     }
@@ -11900,6 +12858,16 @@ mod tests {
             relay_direct_bind: None,
             relay_direct_ids: Vec::new(),
             relay_direct_repair: false,
+            relay_class_lanes: true,
+            relay_class_port_offset: class_lanes::DEFAULT_CLASS_PORT_OFFSET,
+            relay_audio_socket_priority: class_lanes::DEFAULT_AUDIO_SOCKET_PRIORITY,
+            relay_video_pacing_mbps: 0,
+            relay_audio_inline: true,
+            relay_repair_both_lanes: true,
+            audio_hot_thread: false,
+            audio_hot_cpu: -1,
+            audio_hot_fifo_priority: 0,
+            audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
 
@@ -12492,6 +13460,16 @@ mod tests {
             relay_direct_bind: None,
             relay_direct_ids: Vec::new(),
             relay_direct_repair: false,
+            relay_class_lanes: true,
+            relay_class_port_offset: class_lanes::DEFAULT_CLASS_PORT_OFFSET,
+            relay_audio_socket_priority: class_lanes::DEFAULT_AUDIO_SOCKET_PRIORITY,
+            relay_video_pacing_mbps: 0,
+            relay_audio_inline: true,
+            relay_repair_both_lanes: true,
+            audio_hot_thread: false,
+            audio_hot_cpu: -1,
+            audio_hot_fifo_priority: 0,
+            audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -12719,6 +13697,16 @@ mod tests {
             relay_direct_bind: None,
             relay_direct_ids: Vec::new(),
             relay_direct_repair: false,
+            relay_class_lanes: true,
+            relay_class_port_offset: class_lanes::DEFAULT_CLASS_PORT_OFFSET,
+            relay_audio_socket_priority: class_lanes::DEFAULT_AUDIO_SOCKET_PRIORITY,
+            relay_video_pacing_mbps: 0,
+            relay_audio_inline: true,
+            relay_repair_both_lanes: true,
+            audio_hot_thread: false,
+            audio_hot_cpu: -1,
+            audio_hot_fifo_priority: 0,
+            audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -12846,6 +13834,16 @@ mod tests {
             relay_direct_bind: None,
             relay_direct_ids: Vec::new(),
             relay_direct_repair: false,
+            relay_class_lanes: true,
+            relay_class_port_offset: class_lanes::DEFAULT_CLASS_PORT_OFFSET,
+            relay_audio_socket_priority: class_lanes::DEFAULT_AUDIO_SOCKET_PRIORITY,
+            relay_video_pacing_mbps: 0,
+            relay_audio_inline: true,
+            relay_repair_both_lanes: true,
+            audio_hot_thread: false,
+            audio_hot_cpu: -1,
+            audio_hot_fifo_priority: 0,
+            audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -12955,5 +13953,557 @@ mod tests {
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
         mesh_task.await.unwrap();
+    }
+
+    // Class lanes, repair on both lanes and the audio hot path.
+
+    /// A loopback receiver pair on P and P + the default class offset.
+    async fn class_port_receivers() -> (UdpSocket, UdpSocket) {
+        for _ in 0..64 {
+            let audio = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = audio.local_addr().unwrap().port();
+            let Some(video_port) = port.checked_add(class_lanes::DEFAULT_CLASS_PORT_OFFSET) else {
+                continue;
+            };
+            if let Ok(video) = UdpSocket::bind(("127.0.0.1", video_port)).await {
+                for socket in [&audio, &video] {
+                    SockRef::from(socket).set_recv_buffer_size(4 << 20).unwrap();
+                }
+                return (audio, video);
+            }
+        }
+        panic!("no free loopback port pair P, P+1000");
+    }
+
+    async fn assert_silent(socket: &UdpSocket) {
+        let mut wire = [0_u8; 2_048];
+        assert!(
+            timeout(Duration::from_millis(50), socket.recv_from(&mut wire))
+                .await
+                .is_err(),
+            "unexpected datagram on {}",
+            socket.local_addr().unwrap()
+        );
+    }
+
+    fn test_video_object(stream_id: u64, sequence: u64, video_units: usize) -> MediaObject {
+        let payload = vec![0x5a; 12_000];
+        let (initialization, configuration_epoch) =
+            build_fmp4_initialization_object(stream_id, TEST_SOURCE_EPOCH, b"class-lane-init")
+                .unwrap();
+        let part = test_fmp4_part(
+            stream_id,
+            sequence,
+            true,
+            video_units,
+            1,
+            None,
+            Bytes::copy_from_slice(&payload),
+            i64::try_from(now_unix_us().saturating_mul(1_000)).unwrap(),
+        );
+        build_fmp4_media_object(
+            &part,
+            &payload,
+            initialization.key().clone(),
+            configuration_epoch,
+            TEST_SOURCE_EPOCH,
+            5_000,
+            1_000_000,
+        )
+        .unwrap()
+    }
+
+    fn test_audio_object(stream_id: u64, bytes: usize) -> MediaObject {
+        let mut part = test_opaque_part(stream_id);
+        part.bytes = Bytes::from(
+            (0..bytes)
+                .map(|index| (index * 7 + 3) as u8)
+                .collect::<Vec<_>>(),
+        );
+        build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 5_000, 1_000).unwrap()
+    }
+
+    #[tokio::test]
+    async fn class_lanes_send_audio_to_p_and_video_to_p_plus_the_offset_from_one_endpoint() {
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let (secondary_audio, secondary_video) = class_port_receivers().await;
+        let primary_bind = reserved_loopback_addr();
+        let secondary_bind = reserved_loopback_addr();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(primary_bind);
+        args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+        args.relay_secondary_bind = Some(secondary_bind);
+        args.relay_secondary_seed_source = true;
+        args.relay_deadline_ms = 5_000;
+        args.relay_min_repair_symbols = 1;
+        assert!(args.relay_class_lanes && args.relay_repair_both_lanes);
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                class_lanes::socket_priority(&*relay.primary.socket).unwrap(),
+                6
+            );
+            let video = relay.primary.video.as_ref().unwrap();
+            assert_eq!(class_lanes::socket_priority(&**video).unwrap(), 0);
+            assert_eq!(video.local_addr().unwrap(), primary_bind);
+        }
+
+        // An audio part: both lanes, the audio ports, the source set and
+        // the repair symbols each.
+        let audio = test_audio_object(91_000_000_001, 64);
+        let outcome = relay
+            .publish_part_object(&audio, Some((91_000_000_001, 0)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        let all = outcome.source_symbols + outcome.repair_symbols;
+        assert!(outcome.repair_symbols >= 1);
+        for (receiver, bind) in [
+            (&primary_audio, primary_bind),
+            (&secondary_audio, secondary_bind),
+        ] {
+            let symbols = receive_relay_datagrams(receiver, all).await;
+            assert!(symbols
+                .iter()
+                .all(|(symbol, from)| *from == bind && symbol.object_key == *audio.key()));
+        }
+
+        // A video part: the video ports.
+        let video_stream = 91_000_000_002;
+        let video = test_video_object(video_stream, 0, 3);
+        let outcome = relay
+            .publish_part_object(&video, Some((video_stream, 0)), PublicationClass::Video)
+            .await
+            .unwrap();
+        let all = outcome.source_symbols + outcome.repair_symbols;
+        for (receiver, bind) in [
+            (&primary_video, primary_bind),
+            (&secondary_video, secondary_bind),
+        ] {
+            let symbols = receive_relay_datagrams(receiver, all).await;
+            assert!(symbols
+                .iter()
+                .all(|(symbol, from)| *from == bind && symbol.object_key == *video.key()));
+        }
+
+        // An audio-only part of the video stream (a muxed delta) stays on
+        // the video class.
+        let delta = test_video_object(video_stream, 1, 0);
+        let outcome = relay
+            .publish_part_object(&delta, Some((video_stream, 1)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        let all = outcome.source_symbols + outcome.repair_symbols;
+        for receiver in [&primary_video, &secondary_video] {
+            let symbols = receive_relay_datagrams(receiver, all).await;
+            assert!(symbols
+                .iter()
+                .all(|(symbol, _)| symbol.object_key == *delta.key()));
+        }
+        for receiver in [
+            &primary_audio,
+            &primary_video,
+            &secondary_audio,
+            &secondary_video,
+        ] {
+            assert_silent(receiver).await;
+        }
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.relay_session.primary_lane_objects_succeeded, 3);
+        assert_eq!(snapshot.relay_session.secondary_lane_objects_succeeded, 3);
+        assert_eq!(snapshot.relay_session.repair_primary_fallback_objects, 0);
+    }
+
+    #[tokio::test]
+    async fn without_class_lanes_every_stream_goes_to_the_one_port() {
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_deadline_ms = 5_000;
+        args.relay_class_lanes = false;
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(relay.primary.video.is_none());
+        let video = test_video_object(91_000_000_010, 0, 3);
+        let outcome = relay
+            .publish_part_object(&video, Some((91_000_000_010, 0)), PublicationClass::Video)
+            .await
+            .unwrap();
+        receive_relay_datagrams(
+            &primary_audio,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        assert_silent(&primary_video).await;
+    }
+
+    #[tokio::test]
+    async fn class_lane_settings_are_checked() {
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some("127.0.0.1:22001".parse().unwrap());
+        args.relay_class_port_offset = 0;
+        let error = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("class-port-offset"),
+            "{error:#}"
+        );
+
+        // The primary's video port is the secondary's audio port.
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some("127.0.0.1:22001".parse().unwrap());
+        args.relay_secondary_target = Some("127.0.0.1:23001".parse().unwrap());
+        let error = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("video class port"),
+            "{error:#}"
+        );
+
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert!(parsed.relay_class_lanes);
+        assert_eq!(parsed.relay_class_port_offset, 1_000);
+        assert_eq!(parsed.relay_audio_socket_priority, 6);
+        assert_eq!(parsed.relay_video_pacing_mbps, 0);
+        assert!(parsed.relay_audio_inline);
+        assert!(parsed.relay_repair_both_lanes);
+        assert!(parsed.audio_hot_thread);
+        assert_eq!(parsed.audio_hot_cpu, 2);
+        assert_eq!(parsed.audio_hot_fifo_priority, 10);
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--relay-class-lanes",
+            "false",
+            "--relay-audio-inline",
+            "false",
+            "--relay-repair-both-lanes",
+            "false",
+            "--audio-hot-thread",
+            "false",
+            "--audio-hot-cpu",
+            "-1",
+            "--relay-class-port-offset",
+            "2000",
+        ])
+        .unwrap();
+        assert!(!parsed.relay_class_lanes);
+        assert!(!parsed.relay_audio_inline);
+        assert!(!parsed.relay_repair_both_lanes);
+        assert!(!parsed.audio_hot_thread);
+        assert_eq!(parsed.audio_hot_cpu, -1);
+        assert_eq!(parsed.relay_class_port_offset, 2_000);
+    }
+
+    /// The audio hot path with repair on both lanes: the primary alone
+    /// recovers a part whose source symbol it lost, both lanes carry the
+    /// same packet sequences, and `sent_first` leads `sent`.
+    #[tokio::test]
+    async fn repair_on_both_lanes_lets_the_primary_alone_recover_a_lost_source() {
+        let (primary_audio, _primary_video) = class_port_receivers().await;
+        let (secondary_audio, _secondary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+        args.relay_secondary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_seed_source = true;
+        args.relay_deadline_ms = 5_000;
+        args.relay_min_repair_symbols = 2;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        let journal = test_hop_journal();
+        let before_us = hop_journal::now_unix_us();
+        let stream = 91_000_000_020;
+        let object = test_audio_object(stream, 3_000);
+        let outcome = relay
+            .publish_part_object(&object, Some((stream, 4)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        assert!(outcome.source_symbols >= 2, "{}", outcome.source_symbols);
+        let all = outcome.source_symbols + outcome.repair_symbols;
+        let primary = receive_relay_datagrams(&primary_audio, all).await;
+        let secondary = receive_relay_datagrams(&secondary_audio, all).await;
+        let sequences = |symbols: &[(relay_session::RelayDatagram, SocketAddr)]| {
+            symbols
+                .iter()
+                .map(|(symbol, _)| {
+                    DatagramFecHeader::decode(&symbol.fec_datagram)
+                        .unwrap()
+                        .packet_sequence
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sequences(&primary), sequences(&secondary));
+        let repairs = primary
+            .iter()
+            .filter(|(symbol, _)| symbol.role == MediaDatagramRole::Repair)
+            .count();
+        assert_eq!(repairs, outcome.repair_symbols);
+
+        // The first source symbol is lost on the way to the primary.
+        let mut assembler =
+            relay_session::ObjectAssembler::new(outcome.announcement, RelayLimits::default())
+                .unwrap();
+        let mut recovered = None;
+        for (symbol, _) in primary.iter().skip(1) {
+            if recovered.is_none() {
+                recovered = assembler.push_symbol(symbol).unwrap();
+            }
+        }
+        assert_eq!(
+            recovered.expect("primary repair recovers the source"),
+            object
+        );
+
+        let events = journal.query(Some(before_us), Some(stream));
+        let at = |stage: HopStage| {
+            let matching = events
+                .iter()
+                .filter(|event| event.stage == stage && event.seq == 4)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{stage:?}: {events:?}");
+            matching[0].t_us
+        };
+        let first = events
+            .iter()
+            .find(|event| event.stage == HopStage::SentFirst)
+            .unwrap_or_else(|| panic!("no sent_first: {events:?}"));
+        assert_eq!(first.peer, Some(primary_audio.local_addr().unwrap()));
+        assert!(at(HopStage::Encoded) <= at(HopStage::SentFirst));
+        assert!(at(HopStage::SentFirst) <= at(HopStage::Sent));
+        assert!(at(HopStage::Sent) <= at(HopStage::SentSecondary));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.relay_session.lane_backlog_parts, 0);
+        assert_eq!(
+            snapshot.relay_session.repair_datagrams,
+            (outcome.repair_symbols * 2) as u64
+        );
+    }
+
+    /// While a lane has a part waiting for room in its socket buffer, the
+    /// lane's next audio part queues behind it and leaves after it.
+    #[tokio::test]
+    async fn an_audio_part_queues_behind_a_waiting_part_of_its_lane() {
+        let (primary_audio, _primary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_deadline_ms = 5_000;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        // A part of the lane is waiting (as after a full socket buffer).
+        relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
+        let journal = test_hop_journal();
+        let before_us = hop_journal::now_unix_us();
+        let stream = 91_000_000_030;
+        let object = test_audio_object(stream, 64);
+        let outcome = relay
+            .publish_part_object(&object, Some((stream, 2)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        // The publish returned without sending: the backlog task sends it.
+        let all = outcome.source_symbols + outcome.repair_symbols;
+        let symbols = receive_relay_datagrams(&primary_audio, all).await;
+        assert!(symbols
+            .iter()
+            .all(|(symbol, _)| symbol.object_key == *object.key()));
+        assert_eq!(
+            symbols
+                .iter()
+                .take(outcome.source_symbols)
+                .filter(|(symbol, _)| symbol.role == MediaDatagramRole::Source)
+                .count(),
+            outcome.source_symbols,
+            "the source set leads"
+        );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.relay_session.lane_backlog_parts, 1);
+        assert_eq!(snapshot.relay_session.lane_backlog_dropped, 0);
+        // `sent` is journalled by the backlog once the sources are out.
+        let mut sent = Vec::new();
+        for _ in 0..100 {
+            sent = journal
+                .query(Some(before_us), Some(stream))
+                .into_iter()
+                .filter(|event| event.stage == HopStage::Sent)
+                .collect::<Vec<_>>();
+            if !sent.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].peer, Some(primary_audio.local_addr().unwrap()));
+        // The backlog sent the part's first datagram: it journals
+        // `sent_first` too.
+        let first = journal
+            .query(Some(before_us), Some(stream))
+            .into_iter()
+            .filter(|event| event.stage == HopStage::SentFirst)
+            .collect::<Vec<_>>();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].t_us <= sent[0].t_us);
+        // Only the part's own (simulated) predecessor is still counted.
+        for _ in 0..100 {
+            if relay.primary.backlog.pending.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(relay.primary.backlog.pending.load(Ordering::Acquire), 1);
+    }
+
+    #[derive(Default)]
+    struct RecordingPublicationSink {
+        published: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Fmp4PartPublisher for RecordingPublicationSink {
+        async fn publish_fmp4_part(
+            &self,
+            part: PublishedFmp4Part,
+        ) -> std::result::Result<(), String> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((part.stream_id, part.sequence));
+            Ok(())
+        }
+
+        async fn publish_opaque_part(
+            &self,
+            part: PublishedOpaquePart,
+        ) -> std::result::Result<(), String> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((part.stream_id, part.sequence));
+            Ok(())
+        }
+    }
+
+    /// `--relay-audio-inline`: an audio part is published before the
+    /// packager's call returns, without a worker queue; a video part still
+    /// queues for its worker.
+    #[tokio::test]
+    async fn audio_parts_are_published_on_the_packagers_task() {
+        let sink = Arc::new(RecordingPublicationSink::default());
+        let inner: Arc<dyn Fmp4PartPublisher> = sink.clone();
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        let publisher = BoundedFmp4Publisher {
+            inline_audio: Some(inner),
+            ..publisher
+        };
+        let journal = test_hop_journal();
+        let before_us = hop_journal::now_unix_us() - 1;
+        let audio_stream = 91_000_000_040;
+        for _ in 0..3 {
+            publisher
+                .publish_opaque_part(test_opaque_part(audio_stream))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *sink.published.lock().unwrap(),
+            [(audio_stream, 0), (audio_stream, 1), (audio_stream, 2)]
+        );
+        let audio_fmp4 = test_fmp4_part(
+            91_000_000_041,
+            0,
+            true,
+            0,
+            1,
+            Some(Bytes::from_static(b"init")),
+            Bytes::from_static(b"aac"),
+            now_unix_ns(),
+        );
+        publisher.publish_fmp4_part(audio_fmp4).await.unwrap();
+        assert_eq!(sink.published.lock().unwrap().len(), 4);
+        let video = test_fmp4_part(
+            91_000_000_042,
+            0,
+            true,
+            3,
+            1,
+            Some(Bytes::from_static(b"init")),
+            Bytes::from_static(b"h264"),
+            now_unix_ns(),
+        );
+        publisher.publish_fmp4_part(video).await.unwrap();
+        assert_eq!(sink.published.lock().unwrap().len(), 4);
+        let queued = receivers
+            .iter_mut()
+            .filter_map(|receiver| receiver.try_recv().ok())
+            .map(|publication| publication.stream_id())
+            .collect::<Vec<_>>();
+        assert_eq!(queued, [91_000_000_042]);
+
+        // The hop journal still has packaged, enqueued and dequeued.
+        let stages = journal
+            .query(Some(before_us), Some(audio_stream))
+            .into_iter()
+            .filter(|event| event.seq == 1)
+            .map(|event| event.stage)
+            .collect::<Vec<_>>();
+        for stage in [HopStage::Packaged, HopStage::Enqueued, HopStage::Dequeued] {
+            assert!(stages.contains(&stage), "{stage:?}: {stages:?}");
+        }
+    }
+
+    /// A stream with a part still in a worker's queue keeps queueing, so
+    /// that its parts leave in order.
+    #[tokio::test]
+    async fn an_audio_stream_with_a_queued_part_stays_queued() {
+        let sink = Arc::new(RecordingPublicationSink::default());
+        let inner: Arc<dyn Fmp4PartPublisher> = sink.clone();
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        let stream = 91_000_000_050;
+        // The first part queues (inline off), the second must follow it.
+        publisher
+            .publish_opaque_part(test_opaque_part(stream))
+            .await
+            .unwrap();
+        let publisher = BoundedFmp4Publisher {
+            inline_audio: Some(inner),
+            ..publisher
+        };
+        publisher
+            .publish_opaque_part(test_opaque_part(stream))
+            .await
+            .unwrap();
+        assert!(sink.published.lock().unwrap().is_empty());
+        let queued = receivers
+            .iter_mut()
+            .flat_map(|receiver| std::iter::from_fn(move || receiver.try_recv().ok()))
+            .map(|publication| publication.sequence())
+            .collect::<Vec<_>>();
+        assert_eq!(queued, [0, 1]);
+        // Both are published: the next part is inline.
+        drop(queued);
+        publisher
+            .publish_opaque_part(test_opaque_part(stream))
+            .await
+            .unwrap();
+        assert_eq!(*sink.published.lock().unwrap(), [(stream, 2)]);
     }
 }

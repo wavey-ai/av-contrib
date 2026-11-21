@@ -39,8 +39,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DEFAULT_HOP_JOURNAL_CAPACITY: usize = 1 << 20;
 
 /// Events that one part leaves in the contributor's journal, about: the
-/// nine stages from `src_first` to `sent_secondary`, and a `sent_direct`.
-pub const EVENTS_PER_PART: u64 = 10;
+/// ten stages from `src_first` to `sent_secondary` (with `sent_first`),
+/// and a `sent_direct`.
+pub const EVENTS_PER_PART: u64 = 11;
 
 /// Seconds of parts that a ring of `capacity` events holds at
 /// `parts_per_second`.
@@ -78,6 +79,10 @@ pub enum HopStage {
     Dequeued,
     /// RaptorQ encode of the object finished.
     Encoded,
+    /// First datagram of the part handed to the kernel, on whichever lane
+    /// sent first (`peer` is that lane's parent): the reference for
+    /// `packaged -> sent`.
+    SentFirst,
     /// Last source symbol of the part handed to the kernel on the primary lane.
     Sent,
     /// The same for the secondary lane.
@@ -97,6 +102,7 @@ impl HopStage {
             Self::Enqueued => "enqueued",
             Self::Dequeued => "dequeued",
             Self::Encoded => "encoded",
+            Self::SentFirst => "sent_first",
             Self::Sent => "sent",
             Self::SentSecondary => "sent_secondary",
             Self::SentDirect => "sent_direct",

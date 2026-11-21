@@ -1,4 +1,5 @@
 pub mod audio_epoch_hls;
+pub mod class_lanes;
 pub mod fixture_replay;
 pub mod fmp4_bridge;
 pub mod hls_stamp;

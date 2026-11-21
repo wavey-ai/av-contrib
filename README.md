@@ -336,6 +336,36 @@ of its two backbone parents (`--relay-primary-peer`,
 parents may not share a role. Until av-mesh accepts a third, direct parent,
 leave the direct targets unset.
 
+Audio is kept apart from video on the way out, so that a 4K part's
+hundreds of symbols never hold an audio part back:
+
+- `--relay-class-lanes` (default `true`): each lane is a socket pair on its
+  source endpoint (`SO_REUSEPORT`; the parent's binding of the contributor
+  does not change). Audio streams leave on one socket with `SO_PRIORITY`
+  `--relay-audio-socket-priority` (6: band 0 of a `prio` qdisc) to the
+  parent's port P; video streams leave on the other to
+  P + `--relay-class-port-offset` (1000, the av-mesh receiver's convention),
+  optionally paced with `--relay-video-pacing-mbps` (`SO_MAX_PACING_RATE`,
+  under `fq`). A stream is video from its first part with video. With
+  `false` every stream shares one socket and goes to P.
+- `--relay-audio-inline` (default `true`): audio parts are published on the
+  packager's own task, without a publication worker's queue, and each lane
+  is handed an audio part's symbols with non-blocking `sendmmsg`, one lane
+  after the other with no join; what a full socket buffer does not take
+  waits, in order, in that lane's backlog (counted as
+  `lane_backlog_parts`). The journal's `sent_first` is the first datagram of
+  a part handed to the kernel on any lane.
+- `--relay-repair-both-lanes` (default `true`): the primary lane carries the
+  repair symbols too, so the primary parent alone recovers a lost source.
+  The parent must accept repair on that lane (av-mesh
+  `--relay-primary-promoted`, a `source_and_repair` carrier link); a parent
+  that does not counts them as unauthorized and drops them.
+- `--audio-hot-thread` (default `true`): the AEP1 packagers and the inline
+  audio publication run on a thread of their own, with `SCHED_FIFO`
+  `--audio-hot-fifo-priority` (10) and pinned to `--audio-hot-cpu` (2) where
+  the host allows it (`CAP_SYS_NICE` or root). Refused, the thread runs
+  with normal scheduling and unpinned, and says so in one info line.
+
 The stdin senders are kept for local smoke tests and protocol debugging:
 
 ```sh
