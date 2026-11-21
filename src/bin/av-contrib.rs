@@ -706,13 +706,16 @@ struct Args {
     )]
     daw_hls_packaging: DawHlsPackaging,
 
-    /// AEP1 audio formats that this LL-HLS view publishes.
+    /// AEP1 audio formats that this LL-HLS view publishes. FLAC stays in
+    /// the default beside PCM and Opus: a source that sends FLAC (the
+    /// probe's default payload) keeps its rendition, and a format that the
+    /// source does not send costs nothing.
     #[arg(
         long,
         env = "AV_DAW_HLS_FORMATS",
         value_enum,
         value_delimiter = ',',
-        default_value = "pcm,opus"
+        default_value = "flac,pcm,opus"
     )]
     daw_hls_formats: Vec<DawHlsFormat>,
 
@@ -9555,7 +9558,11 @@ mod tests {
                 .copied()
                 .map(AudioPayloadKind::from)
                 .collect::<Vec<_>>(),
-            vec![AudioPayloadKind::Pcm, AudioPayloadKind::Opus]
+            vec![
+                AudioPayloadKind::Flac,
+                AudioPayloadKind::Pcm,
+                AudioPayloadKind::Opus
+            ]
         );
         let durations = args.stamp_durations();
         assert_eq!(durations.audio_part_us, 0);

@@ -295,9 +295,12 @@ starts a part, and a segment is a whole number of groups of pictures. One
 long segment, or one part longer than twice the target, does not change the
 declared durations.
 
-`--daw-hls-formats` defaults to `pcm,opus`: below 64 samples FLAC is written
-as verbatim frames, larger than PCM, so the lossless rendition of the
-smallest parts is PCM. fMP4 audio packaging (`--daw-hls-packaging fmp4`)
+`--daw-hls-formats` defaults to `flac,pcm,opus`: PCM and Opus were added
+to the old default of `flac`, which stays, so a source that sends FLAC (the
+default payload of `aep1-48k-probe send`) still gets its rendition. Below
+64 samples FLAC is written as verbatim frames, larger than PCM, so the
+lossless rendition of the smallest parts is PCM; a source that sends all
+three formats can leave FLAC out with `--daw-hls-formats pcm,opus`. fMP4 audio packaging (`--daw-hls-packaging fmp4`)
 still goes through wavey-boxer's millisecond timeline: FLAC and PCM tracks
 use a timescale of 1,000 and Opus decode times are taken from milliseconds,
 so 2.5 ms Opus and sub-millisecond PCM are exact only on the default opaque
