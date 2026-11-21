@@ -75,4 +75,11 @@ xcoder-quadra = { git = "https://github.com/wavey-ai/av-rs.git", rev = "fe134245
 ed25519-dalek = "2.2"
 
 [patch.crates-io]
-raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+# The packet sequence tracker of 0.1.6 grows without limit after the first
+# lost or reordered datagram of a flow. The fix is on the branch
+# `bounded-sequence-tracker` of raptor-fec until a release has it.
+raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", rev = "68a1840acd6158111738253a1ae71f54642d1ac3" }
+# wavey-boxer 0.1.0 drops the first two bytes of every RTMP AAC frame. The
+# fix is 0.1.1 on the branch `fix-rtmp-aac-frame-start` of boxer, which is
+# not published.
+wavey-boxer = { git = "https://github.com/wavey-ai/boxer.git", rev = "ee90c8fe4cdb5e15c462f4532348e59e53bbe06e" }

@@ -239,7 +239,7 @@ dependencies = [
  "socket2 0.6.5",
  "soundkit",
  "soundkit-flac",
- "soundkit-opus",
+ "soundkit-opus 0.12.3",
  "synchronized-stems-media",
  "talkback-media",
  "tokio",
@@ -1659,7 +1659,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2515,7 +2515,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.42",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2554,7 +2554,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -2712,6 +2712,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 [[package]]
 name = "raptorq-datagram-fec"
 version = "0.1.6"
+source = "git+https://github.com/wavey-ai/raptor-fec.git?rev=68a1840acd6158111738253a1ae71f54642d1ac3#68a1840acd6158111738253a1ae71f54642d1ac3"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2943,6 +2944,16 @@ dependencies = [
  "rml_amf0",
  "sha2 0.9.9",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ropus"
+version = "0.12.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80804dadbfa2851c95fe45ff9ae8f4328d6371fdc0d51b14740d49a8b41d3758"
+dependencies = [
+ "cc",
+ "wide",
 ]
 
 [[package]]
@@ -3474,6 +3485,19 @@ dependencies = [
  "libopus-rs",
  "soundkit",
  "tracing",
+]
+
+[[package]]
+name = "soundkit-opus"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4beb90c88bb899ca949686f9f43c4605a9e09e76055ffd5c8f9cc5013435eda5"
+dependencies = [
+ "frame-header",
+ "ropus",
+ "soundkit",
+ "tracing",
+ "wide",
 ]
 
 [[package]]
@@ -4252,13 +4276,12 @@ dependencies = [
 
 [[package]]
 name = "wavey-boxer"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08ade634d8b5d26d475c3d2ccc6a582479f97d988fe697a8de4060d08c95ac9d"
+version = "0.1.1"
+source = "git+https://github.com/wavey-ai/boxer.git?rev=ee90c8fe4cdb5e15c462f4532348e59e53bbe06e#ee90c8fe4cdb5e15c462f4532348e59e53bbe06e"
 dependencies = [
  "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",
- "libopus-rs",
+ "soundkit-opus 0.13.0",
 ]
 
 [[package]]
