@@ -246,6 +246,11 @@ enum Command {
         deadline_ms: u64,
         #[arg(long, default_value_t = 3)]
         tail_seconds: u64,
+        /// Samples per epoch of the sender, for the expected epoch count.
+        /// By default the frame count of the first epoch received (and 240,
+        /// 5 ms, if none arrives).
+        #[arg(long)]
+        epoch_samples: Option<u32>,
     },
     ReceiveHls {
         #[arg(long)]
@@ -820,9 +825,45 @@ struct ReceiveFormatState {
     received_pcm_frames: u64,
     latencies_ns: Vec<u64>,
     latency_buckets: BTreeMap<(u8, u64), UdpLatencyBucketSamples>,
+    /// Frame count of the first selected epoch received: the sender's
+    /// epoch size (`send --epoch-samples`).
+    epoch_frames: Option<u32>,
+}
+
+/// The epoch of the old fixed sender, 5 ms: what a receiver assumes when it
+/// has neither a setting nor an epoch to go by.
+const LEGACY_EPOCH_SAMPLES: u32 = 240;
+
+/// A note for the sender's stderr when its epochs are not 5 ms: receivers
+/// that still count 5 ms epochs report wrong expected and missing counts.
+fn receiver_epoch_note(epoch_samples: u32) -> Option<String> {
+    (epoch_samples != LEGACY_EPOCH_SAMPLES).then(|| {
+        format!(
+            "note: epochs of {epoch_samples} samples. receive-udp still counts expected and \
+             missing epochs (and its per-second buckets) for 240-sample (5 ms) epochs, so its \
+             loss figures are wrong for this run; receive-webtransport counts from the epochs \
+             it receives (or --epoch-samples); receive-hls tracks parts of whole milliseconds \
+             only (--part-ms)."
+        )
+    })
 }
 
 impl ReceiveFormatState {
+    /// Epochs of one format that the sender makes in `duration_seconds`:
+    /// from `epoch_samples` if given, else from the epochs received, else
+    /// 5 ms epochs. A fixed 5 ms hid loss once the sender's default epoch
+    /// became 1 ms: 1,000 epochs a second arrived against 200 expected, so
+    /// the missing count read 0 at 50% loss.
+    fn expected_epochs(&self, duration_seconds: u64, epoch_samples: Option<u32>) -> u64 {
+        let epoch_samples = epoch_samples
+            .or(self.epoch_frames)
+            .filter(|samples| *samples > 0)
+            .unwrap_or(LEGACY_EPOCH_SAMPLES);
+        duration_seconds
+            .saturating_mul(u64::from(SAMPLE_RATE))
+            .saturating_div(u64::from(epoch_samples))
+    }
+
     fn new(formats: &[ReceiveAudioFormat]) -> Result<Self> {
         let formats = formats
             .iter()
@@ -850,6 +891,7 @@ impl ReceiveFormatState {
             received_pcm_frames: 0,
             latencies_ns: Vec::new(),
             latency_buckets: BTreeMap::new(),
+            epoch_frames: None,
         })
     }
 
@@ -883,6 +925,9 @@ impl ReceiveFormatState {
         if !self.formats.contains(&format) {
             return;
         }
+        if self.epoch_frames.is_none() && group.frame_count > 0 {
+            self.epoch_frames = Some(group.frame_count);
+        }
         if !self.selected_epochs.insert((format, group.epoch_id)) {
             self.duplicate_or_late_epochs = self.duplicate_or_late_epochs.saturating_add(1);
             return;
@@ -910,7 +955,10 @@ impl ReceiveFormatState {
             .saturating_add(u64::from(group.raptorq_recovered_fragments));
         self.latencies_ns.push(latency_ns);
         self.latency_buckets
-            .entry((receive_audio_format_order(format), window.second_of(capture_ns)))
+            .entry((
+                receive_audio_format_order(format),
+                window.second_of(capture_ns),
+            ))
             .or_default()
             .record(latency_ns, deadline_missed, erasure, discontinuity);
     }
@@ -1453,6 +1501,7 @@ struct WebTransportReceiveOptions<'a> {
     duration_seconds: u64,
     deadline_ms: u64,
     tail_seconds: u64,
+    epoch_samples: Option<u32>,
 }
 
 struct UdpReceiveOptions<'a> {
@@ -2095,6 +2144,7 @@ async fn main() -> Result<()> {
             duration_seconds,
             deadline_ms,
             tail_seconds,
+            epoch_samples,
         } => {
             let report = timeout(
                 receive_command_timeout(session_id, duration_seconds, tail_seconds)?,
@@ -2108,6 +2158,7 @@ async fn main() -> Result<()> {
                     duration_seconds,
                     deadline_ms,
                     tail_seconds,
+                    epoch_samples,
                 }),
             )
             .await
@@ -2408,6 +2459,9 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         bail!("--duration-seconds must be positive");
     }
     let epoch_samples = payload_kind.epoch_samples(epoch_samples)?;
+    if let Some(note) = receiver_epoch_note(epoch_samples) {
+        eprintln!("{note}");
+    }
     let epoch = EpochGeometry::new(epoch_samples);
     if pace == SendPace::Tokio && epoch.duration_ns() < 1_000_000 {
         bail!("--pace tokio needs epochs of at least 1 ms: tokio timers tick in milliseconds");
@@ -3360,6 +3414,7 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
         duration_seconds,
         deadline_ms,
         tail_seconds,
+        epoch_samples,
     } = options;
     let crypto = tls_client_config(tls_ca, b"h3")?;
     let client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
@@ -3465,9 +3520,8 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
 
     let stats = receiver.stats();
     let selected_formats = format_state.formats.len() as u64;
-    let expected_epochs = duration_seconds
-        .saturating_mul(1_000)
-        .saturating_div(5)
+    let expected_epochs = format_state
+        .expected_epochs(duration_seconds, epoch_samples)
         .saturating_mul(selected_formats);
     let expected_pcm_frames = duration_seconds
         .saturating_mul(u64::from(SAMPLE_RATE))
@@ -7660,6 +7714,23 @@ mod tests {
         assert_eq!(coverage.first_pts_ms(), Some(0));
         assert_eq!(coverage.last_pts_ms(), Some((expected_parts - 1) * 5));
         assert_eq!(coverage.non_contiguous_pts(), 1);
+    }
+
+    #[test]
+    fn expected_epochs_follow_the_sender_epoch() {
+        let mut state = ReceiveFormatState::new(&[ReceiveAudioFormat::Pcm]).unwrap();
+        // Nothing to go by: the old 5 ms epochs.
+        assert_eq!(state.expected_epochs(10, None), 2_000);
+        // 1 ms epochs: 1,000 a second, so 50% loss is 5,000 missing in 10 s,
+        // where 5 ms counting read 0.
+        state.epoch_frames = Some(48);
+        assert_eq!(state.expected_epochs(10, None), 10_000);
+        // 0.25 ms and 2.5 ms epochs, and a setting that wins.
+        state.epoch_frames = Some(12);
+        assert_eq!(state.expected_epochs(10, None), 40_000);
+        assert_eq!(state.expected_epochs(10, Some(120)), 4_000);
+        assert!(receiver_epoch_note(240).is_none());
+        assert!(receiver_epoch_note(48).is_some_and(|note| note.contains("receive-udp")));
     }
 
     #[test]
