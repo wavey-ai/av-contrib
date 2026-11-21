@@ -572,7 +572,8 @@ impl OpaquePartSegmenter {
     }
 
     /// Add one recovered epoch of `frame_count` samples at `sample_rate`.
-    /// With one epoch per part (the default) the part leaves at once.
+    /// With one epoch per part (the default) the part leaves at once, as
+    /// the epoch's own bytes: no copy and no allocation.
     async fn push(
         &mut self,
         packet: Bytes,
@@ -580,11 +581,10 @@ impl OpaquePartSegmenter {
         sample_rate: u32,
         source_times: PartSourceTimes,
     ) -> Result<(), String> {
-        if self.sample_rate != sample_rate && !self.bytes.is_empty() {
+        if self.sample_rate != sample_rate && self.audio_units > 0 {
             self.flush().await?;
         }
         self.sample_rate = sample_rate;
-        self.bytes.extend_from_slice(&packet);
         self.source_times.merge(&source_times);
         self.samples = self.samples.saturating_add(u64::from(frame_count));
         self.audio_units = self.audio_units.saturating_add(1);
@@ -592,6 +592,12 @@ impl OpaquePartSegmenter {
             None => true,
             Some(target) => self.samples >= target,
         };
+        if complete && self.audio_units == 1 {
+            // A part of this one epoch: the recovered payload is already
+            // a refcounted buffer of its own.
+            return self.publish(packet).await;
+        }
+        self.bytes.extend_from_slice(&packet);
         if complete {
             self.flush().await?;
         }
@@ -609,10 +615,17 @@ impl OpaquePartSegmenter {
         self.source_times = PartSourceTimes::default();
     }
 
+    /// Publish the epochs gathered so far.
     async fn flush(&mut self) -> Result<(), String> {
-        if self.bytes.is_empty() {
+        if self.audio_units == 0 {
             return Ok(());
         }
+        let bytes = self.bytes.split().freeze();
+        self.publish(bytes).await
+    }
+
+    /// Publish `bytes` as the part of the epochs counted so far.
+    async fn publish(&mut self, bytes: Bytes) -> Result<(), String> {
         let packaged_at_unix_ns = now_unix_ns();
         let duration_us = samples_to_us(self.samples, self.sample_rate);
         let part = PublishedOpaquePart {
@@ -626,7 +639,7 @@ impl OpaquePartSegmenter {
             sample_rate: Some(self.sample_rate),
             packaged_at_unix_ns,
             published_at_unix_ns: now_unix_ns(),
-            bytes: self.bytes.split().freeze(),
+            bytes,
             audio_units: std::mem::take(&mut self.audio_units),
             hls: None,
             source_times: std::mem::take(&mut self.source_times),
@@ -2234,6 +2247,35 @@ mod tests {
                 assert_eq!(part.duration_us, 250);
                 assert_eq!(part.duration_ms, 1);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_one_epoch_part_is_the_epoch_payload_without_a_copy() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        let mut payloads = Vec::new();
+        for epoch_id in 0..3_u64 {
+            let group = sized_group(
+                epoch_id,
+                48,
+                AudioPayloadKind::Pcm,
+                vec![epoch_id as u8; 288],
+            );
+            payloads.push(group.payload.clone());
+            package_group(&config, &mut renditions, group)
+                .await
+                .unwrap();
+        }
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 3);
+        for (part, payload) in parts.iter().zip(&payloads) {
+            // The same buffer, not a copy of it.
+            assert_eq!(part.bytes.as_ptr(), payload.as_ptr());
+            assert_eq!(part.bytes, *payload);
+            assert_eq!(part.audio_units, 1);
+            assert_eq!(part.duration_samples, Some(48));
         }
     }
 
