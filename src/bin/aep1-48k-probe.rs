@@ -2170,6 +2170,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The interval in which a receiver listens and counts epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiveWindow {
+    /// First capture time that is counted.
+    start_ns: u64,
+    /// Capture times at or after this are not counted.
+    media_end_ns: u64,
+    /// The receiver stops listening here.
+    stop_ns: u64,
+}
+
+impl ReceiveWindow {
+    fn new(session_id: u64, _now_ns: u64, duration_seconds: u64, tail_seconds: u64) -> Self {
+        let start_ns = session_id;
+        let media_end_ns = start_ns.saturating_add(duration_seconds.saturating_mul(1_000_000_000));
+        let stop_ns = media_end_ns.saturating_add(tail_seconds.saturating_mul(1_000_000_000));
+        Self {
+            start_ns,
+            media_end_ns,
+            stop_ns,
+        }
+    }
+}
+
 fn receive_command_timeout(
     session_id: u64,
     duration_seconds: u64,
@@ -2543,8 +2567,8 @@ async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput>
 
     let transport = MultichannelAudioTransportAdapter::udp(65_535);
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
-    let stop_ns =
-        session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
+    let window = ReceiveWindow::new(session_id, now_unix_ns()?, duration_seconds, tail_seconds);
+    let stop_ns = window.stop_ns;
     let refresh = Duration::from_secs(5);
     let mut next_refresh = TokioInstant::now() + refresh;
     let mut format_states = group_ids
@@ -2774,9 +2798,9 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
 
     let transport = MultichannelAudioTransportAdapter::udp(65_535);
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
-    let stop_ns =
-        session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
-    let media_end_ns = session_id.saturating_add(duration_seconds.saturating_mul(1_000_000_000));
+    let window = ReceiveWindow::new(session_id, now_unix_ns()?, duration_seconds, tail_seconds);
+    let stop_ns = window.stop_ns;
+    let media_end_ns = window.media_end_ns;
     let mut format_state = ReceiveFormatState::new(formats)?;
     let mut wire_bytes = 0_u64;
     let mut source_datagrams_received = 0_u64;
@@ -6279,6 +6303,30 @@ fn now_unix_ns() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_receiver_that_joins_a_running_session_listens_for_its_whole_duration() {
+        // The session started a minute ago; the listener joins now and asks
+        // for ten seconds. It must listen for ten seconds and a tail from
+        // now, not stop at once because the session's first ten seconds are
+        // over (the zero of the 21 November comparison).
+        let now_ns = 1_795_272_252_000_000_000_u64;
+        let session_id = now_ns - 60_000_000_000;
+        let window = super::ReceiveWindow::new(session_id, now_ns, 10, 3);
+        assert_eq!(window.start_ns, now_ns);
+        assert_eq!(window.media_end_ns, now_ns + 10_000_000_000);
+        assert_eq!(window.stop_ns, now_ns + 13_000_000_000);
+    }
+
+    #[test]
+    fn a_receiver_that_subscribes_before_the_session_starts_counts_from_its_start() {
+        let now_ns = 1_795_272_252_000_000_000_u64;
+        let session_id = now_ns + 2_000_000_000;
+        let window = super::ReceiveWindow::new(session_id, now_ns, 10, 3);
+        assert_eq!(window.start_ns, session_id);
+        assert_eq!(window.media_end_ns, session_id + 10_000_000_000);
+        assert_eq!(window.stop_ns, session_id + 13_000_000_000);
+    }
+
     use super::*;
 
     fn test_soundkit_opus_part(id: u8) -> Vec<u8> {
