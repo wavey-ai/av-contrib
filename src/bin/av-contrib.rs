@@ -3136,11 +3136,22 @@ async fn run_rtmp_hls_bridge(
     }
 }
 
+/// Slots of the ring between an SRT or RIST listener and the fMP4 bridge.
+///
+/// The bridge reads the ring every few milliseconds, so the ring holds the
+/// stream for the bridge and for nothing else. A live stream never ends, and
+/// the ring keeps every slot until it wraps: with 32,768 slots of up to 47 KB
+/// a 16 Mbit/s stream grew the contributor by 2 MB/s until the kernel killed
+/// it at the 1 GB of a small node. 256 slots are 12 MB at most, and several
+/// seconds of a 40 Mbit/s stream.
+const UPLOAD_RING_SLOTS: usize = 256;
+const UPLOAD_RING_SLOT_KB: usize = 47;
+
 fn upload_response_config() -> UploadResponseConfig {
     UploadResponseConfig {
         num_streams: 8,
-        slot_size_kb: 47,
-        slots_per_stream: 32768,
+        slot_size_kb: UPLOAD_RING_SLOT_KB,
+        slots_per_stream: UPLOAD_RING_SLOTS,
         response_timeout_ms: 60_000,
     }
 }
@@ -8364,6 +8375,18 @@ mod tests {
         assert!(response.body.is_empty());
         assert!(response.headers.is_empty());
         stream.close().await;
+    }
+
+    #[test]
+    fn the_ingest_ring_of_a_live_stream_fits_a_small_node() {
+        let config = upload_response_config();
+        let bytes_per_stream = config.slots_per_stream * config.slot_size_kb * 1024;
+        // Every stream of the listener at once stays far below 1 GB.
+        assert!(bytes_per_stream <= 16 * 1024 * 1024, "{bytes_per_stream}");
+        assert!(bytes_per_stream * config.num_streams <= 128 * 1024 * 1024);
+        // The ring still holds two seconds of a 40 Mbit/s stream for the
+        // bridge, which reads it every few milliseconds.
+        assert!(bytes_per_stream >= 2 * 40_000_000 / 8);
     }
 
     #[test]
