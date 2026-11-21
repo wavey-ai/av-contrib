@@ -776,8 +776,11 @@ struct Args {
     hop_journal_capacity: usize,
 
     /// Give each new stream the next publication worker of its pool, audio
-    /// and video in separate pools, instead of `stream_id % 8`. With `false`
-    /// the DAW streams 2001, 3001 and 4001 and video stream 1 share a worker.
+    /// and video in separate pools, instead of `stream_id % 8`, and give
+    /// audio and video parts their own RaptorQ encoder, so that an audio part
+    /// never waits behind a video part's queue or encode. With `false` the
+    /// DAW streams 2001, 3001 and 4001 and video stream 1 share a worker and
+    /// every part shares one encoder.
     #[arg(
         long,
         env = "AV_PUBLICATION_SHARD_MIX",
@@ -996,7 +999,12 @@ enum RelayPipelineStage {
 }
 
 struct RelaySessionPublisher {
-    encoder: Mutex<RaptorQObjectEncoder>,
+    /// One RaptorQ encoder, or with `--publication-shard-mix` one for audio
+    /// parts and one for video parts, so that an audio part never waits for
+    /// the encoder while a video part of hundreds of KB is encoded. The
+    /// encoders' block ids and packet sequences are their own; a relay
+    /// decodes each object, keyed by its object key, on its own.
+    encoders: Vec<Mutex<RaptorQObjectEncoder>>,
     primary: PrivateUdpTransport,
     secondary: Option<PrivateUdpTransport>,
     secondary_seed_source: bool,
@@ -1116,8 +1124,13 @@ impl RelaySessionPublisher {
             secondary_path_metrics,
         ));
 
+        let encoders = if args.publication_shard_mix {
+            vec![Mutex::new(encoder.clone()), Mutex::new(encoder)]
+        } else {
+            vec![Mutex::new(encoder)]
+        };
         Ok(Some(Self {
-            encoder: Mutex::new(encoder),
+            encoders,
             primary,
             secondary,
             secondary_seed_source: args.relay_secondary_seed_source,
@@ -1127,8 +1140,20 @@ impl RelaySessionPublisher {
         }))
     }
 
-    async fn publish_object(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
-        self.publish_part_object(object, None).await
+    async fn publish_object(
+        &self,
+        object: &MediaObject,
+        class: PublicationClass,
+    ) -> Result<RelayPublishOutcome> {
+        self.publish_part_object(object, None, class).await
+    }
+
+    /// The encoder of parts of `class`.
+    fn encoder(&self, class: PublicationClass) -> &Mutex<RaptorQObjectEncoder> {
+        match class {
+            PublicationClass::Audio => &self.encoders[0],
+            PublicationClass::Video => self.encoders.last().unwrap_or(&self.encoders[0]),
+        }
     }
 
     /// Publish an object; `part` is the (stream, sequence) of a media part,
@@ -1137,9 +1162,10 @@ impl RelaySessionPublisher {
         &self,
         object: &MediaObject,
         part: Option<(u64, u64)>,
+        class: PublicationClass,
     ) -> Result<RelayPublishOutcome> {
         let started = Instant::now();
-        let result = self.publish_object_inner(object, part).await;
+        let result = self.publish_object_inner(object, part, class).await;
         self.telemetry
             .record_relay_session_stage_duration(RelayPipelineStage::Total, started.elapsed());
         result
@@ -1149,6 +1175,7 @@ impl RelaySessionPublisher {
         &self,
         object: &MediaObject,
         part: Option<(u64, u64)>,
+        class: PublicationClass,
     ) -> Result<RelayPublishOutcome> {
         let journal = part.and_then(|part| hop_journal::global().map(|journal| (journal, part)));
         let journal_hop = |stage: HopStage, peer: Option<SocketAddr>| {
@@ -1169,7 +1196,7 @@ impl RelaySessionPublisher {
             bail!("canonical media object expired before RelaySession encoding");
         }
         let encode_wait_started = Instant::now();
-        let mut encoder = self.encoder.lock().await;
+        let mut encoder = self.encoder(class).lock().await;
         self.telemetry.record_relay_session_stage_duration(
             RelayPipelineStage::EncodeWait,
             encode_wait_started.elapsed(),
@@ -2240,6 +2267,7 @@ async fn bind_daw_media_udp_socket(bind: SocketAddr) -> Result<UdpSocket> {
 #[async_trait::async_trait]
 impl Fmp4PartPublisher for MeshForwarder {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
+        let class = fmp4_publication_class(&part);
         let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
         self.telemetry
             .media_object_source_epoch
@@ -2271,7 +2299,7 @@ impl Fmp4PartPublisher for MeshForwarder {
                 }
                 if let Some(relay) = &self.relay {
                     let outcome = relay
-                        .publish_object(&object)
+                        .publish_object(&object, class)
                         .await
                         .map_err(|error| error.to_string())?;
                     trace!(
@@ -2345,7 +2373,7 @@ impl Fmp4PartPublisher for MeshForwarder {
 
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_part_object(&media_object, Some((part.stream_id, part.sequence)))
+                .publish_part_object(&media_object, Some((part.stream_id, part.sequence)), class)
                 .await
                 .map_err(|error| error.to_string())?;
             trace!(
@@ -2383,7 +2411,11 @@ impl Fmp4PartPublisher for MeshForwarder {
         }
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_part_object(&object, Some((part.stream_id, part.sequence)))
+                .publish_part_object(
+                    &object,
+                    Some((part.stream_id, part.sequence)),
+                    PublicationClass::Audio,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             trace!(
@@ -9686,7 +9718,7 @@ mod tests {
         // A stream id of this test only: other tests share the process journal.
         let journal_stream = 77_000_000_077;
         let outcome = relay
-            .publish_part_object(&object, Some((journal_stream, 42)))
+            .publish_part_object(&object, Some((journal_stream, 42)), PublicationClass::Video)
             .await
             .unwrap();
         let stages = journal
@@ -10046,6 +10078,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audio_part_encode_does_not_wait_for_a_video_encode_in_flight() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let object =
+            build_opaque_media_object(&test_opaque_part(4001), TEST_SOURCE_EPOCH, 5_000, 1_000_000)
+                .unwrap();
+        for shard_mix in [true, false] {
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(receiver.local_addr().unwrap());
+            args.publication_shard_mix = shard_mix;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            // A video part's encode holds its encoder, as a 4K part's does
+            // for milliseconds.
+            let video_encode = relay.encoder(PublicationClass::Video).lock().await;
+            let audio = timeout(
+                Duration::from_millis(500),
+                relay.publish_part_object(&object, Some((4001, 7)), PublicationClass::Audio),
+            )
+            .await;
+            if shard_mix {
+                // The audio part has its own encoder and leaves at once.
+                let outcome = audio.expect("audio waited for the video encode").unwrap();
+                assert!(outcome.source_symbols > 0);
+            } else {
+                // One encoder for all: the audio part waits behind the video.
+                assert!(
+                    audio.is_err(),
+                    "the shared encoder did not hold the audio part"
+                );
+            }
+            drop(video_encode);
+        }
+    }
+
+    #[tokio::test]
     async fn relay_session_applies_and_bounds_the_initial_repair_floor() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut args = contrib_status_args();
@@ -10056,16 +10125,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            relay
-                .encoder
-                .lock()
-                .await
-                .controller()
-                .policy()
-                .min_repair_symbols,
-            3
-        );
+        for class in [PublicationClass::Audio, PublicationClass::Video] {
+            assert_eq!(
+                relay
+                    .encoder(class)
+                    .lock()
+                    .await
+                    .controller()
+                    .policy()
+                    .min_repair_symbols,
+                3
+            );
+        }
 
         args.relay_min_repair_symbols = AdaptiveFecPolicy::default().max_repair_symbols + 1;
         let error = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
@@ -10117,7 +10188,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = relay.publish_object(&object).await.unwrap_err();
+        let error = relay
+            .publish_object(&object, PublicationClass::Video)
+            .await
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("expired before RelaySession encoding"));
@@ -10164,7 +10238,10 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = relay.publish_object(&object).await.unwrap();
+        let outcome = relay
+            .publish_object(&object, PublicationClass::Video)
+            .await
+            .unwrap();
         assert!(outcome.repair_symbols > 0);
         let expected = outcome.source_symbols + outcome.repair_symbols;
         let limits = RelayLimits::default();
