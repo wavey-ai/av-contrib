@@ -210,6 +210,91 @@ pub fn make_current_thread_realtime(cpu: Option<usize>, fifo_priority: u8) -> Re
     outcome
 }
 
+/// Put the calling thread back to normal scheduling (`SCHED_OTHER`) on
+/// the CPUs of the process's main thread. A thread started by a pinned
+/// `SCHED_FIFO` thread inherits both (glibc's `PTHREAD_INHERIT_SCHED`):
+/// a runtime's blocking pool under an audio hot thread would otherwise run
+/// at real-time priority on the audio CPU. Best effort: the outcome lists
+/// what was refused.
+pub fn reset_current_thread_scheduling() -> RealtimeOutcome {
+    let mut outcome = RealtimeOutcome::default();
+    if let Err(error) = set_current_thread_normal() {
+        outcome.refused.push(format!("SCHED_OTHER: {error}"));
+    }
+    if let Err(error) = unpin_current_thread() {
+        outcome.refused.push(format!("CPU mask: {error}"));
+    }
+    outcome
+}
+
+/// Whether the calling thread runs with `SCHED_FIFO`.
+#[cfg(target_os = "linux")]
+pub fn current_thread_is_fifo() -> bool {
+    // SAFETY: 0 is the calling thread.
+    unsafe { libc::sched_getscheduler(0) == libc::SCHED_FIFO }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_thread_is_fifo() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn set_current_thread_normal() -> io::Result<()> {
+    let param = libc::sched_param { sched_priority: 0 };
+    // SAFETY: `param` outlives the call; 0 is the calling thread. Leaving
+    // a real-time policy needs no privilege.
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Give the calling thread the CPU mask of the process's main thread
+/// (whose thread id is the process id), which nothing here pins.
+#[cfg(target_os = "linux")]
+fn unpin_current_thread() -> io::Result<()> {
+    // SAFETY: a zeroed cpu_set_t is a valid (empty) set; both calls get
+    // its true size, and the set outlives them.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(
+            libc::getpid(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut set,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_current_thread_normal() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unpin_current_thread() -> io::Result<()> {
+    Ok(())
+}
+
+/// Audio hot threads for `formats` renditions when the first is pinned to
+/// `first_cpu` of a host with `cpus` CPUs: one per format, as many as the
+/// CPUs from `first_cpu` on hold (each thread has a CPU of its own), at
+/// least one.
+pub fn auto_audio_hot_threads(formats: usize, first_cpu: Option<usize>, cpus: usize) -> usize {
+    let formats = formats.max(1);
+    match first_cpu {
+        Some(cpu) if cpu < cpus => formats.min(cpus - cpu),
+        _ => formats,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn pin_current_thread(cpu: usize) -> io::Result<()> {
     if cpu >= libc::CPU_SETSIZE as usize {
@@ -345,6 +430,42 @@ mod tests {
                 assert!(outcome.pinned_cpu.is_none());
                 assert_eq!(outcome.refused.len(), 2, "{:?}", outcome.refused);
                 assert!(outcome.refused[1].contains("not pinned"));
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn audio_hot_threads_are_one_per_format_within_the_cpus_left() {
+        // flac, pcm and opus on a 4-CPU contributor from CPU 2: CPUs 2, 3.
+        assert_eq!(auto_audio_hot_threads(3, Some(2), 4), 2);
+        assert_eq!(auto_audio_hot_threads(3, Some(2), 8), 3);
+        assert_eq!(auto_audio_hot_threads(1, Some(2), 8), 1);
+        assert_eq!(auto_audio_hot_threads(0, Some(2), 8), 1);
+        // Not pinned, or pinned beyond the CPUs: one per format.
+        assert_eq!(auto_audio_hot_threads(3, None, 2), 3);
+        assert_eq!(auto_audio_hot_threads(3, Some(9), 4), 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reset_thread_runs_normally_on_the_process_cpus() {
+        std::thread::spawn(|| {
+            // Whatever the host grants (a pin to CPU 0, FIFO as root), the
+            // reset undoes it.
+            let _ = make_current_thread_realtime(Some(0), 1);
+            let outcome = reset_current_thread_scheduling();
+            assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+            assert!(!current_thread_is_fifo());
+            // SAFETY: zeroed sets are valid; the calls get their size.
+            unsafe {
+                let mut own: libc::cpu_set_t = std::mem::zeroed();
+                let mut main: libc::cpu_set_t = std::mem::zeroed();
+                let size = std::mem::size_of::<libc::cpu_set_t>();
+                assert_eq!(libc::sched_getaffinity(0, size, &mut own), 0);
+                assert_eq!(libc::sched_getaffinity(libc::getpid(), size, &mut main), 0);
+                assert_eq!(libc::CPU_COUNT(&own), libc::CPU_COUNT(&main));
             }
         })
         .join()

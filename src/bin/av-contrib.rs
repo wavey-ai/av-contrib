@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use av_contrib::audio_epoch_hls::{
     channel as audio_epoch_hls_channel, run_audio_epoch_hls_worker,
     worker_stats as audio_epoch_hls_worker_stats, AudioEpochHlsConfig, AudioEpochHlsDatagram,
-    AudioEpochHlsPackaging, RecoveredAudioEpoch, DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+    AudioEpochHlsPackaging, RecoveredAudioEpoch, RenditionRuntimes,
+    DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
 };
 use av_contrib::class_lanes::{self, ClassSocketOptions};
 use av_contrib::fmp4_bridge::{
@@ -905,10 +906,15 @@ struct Args {
     /// hundreds of symbols never sit ahead of an audio part in a socket
     /// buffer. A stream is video from its first part with video. With
     /// `false` every stream shares one socket and goes to P.
+    ///
+    /// Off by default: only a parent that listens on P + the offset (av-mesh
+    /// --relay-class-threads with --relay-controlled-local, on Linux) takes
+    /// the video class, and any other parent would lose every video part.
+    /// The deploy and the lab render it on together with their parents.
     #[arg(
         long,
         env = "AV_RELAY_CLASS_LANES",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set
     )]
     relay_class_lanes: bool,
@@ -952,14 +958,17 @@ struct Args {
     )]
     relay_audio_inline: bool,
 
-    /// The primary lane carries the repair symbols as well as the source
-    /// set, so that the primary parent alone can recover a lost source.
-    /// The parent must accept repair on that lane (av-mesh
-    /// --relay-primary-promoted, a source_and_repair carrier link).
+    /// The primary lane carries the repair symbols of audio parts as well
+    /// as their source set, so that the primary parent alone can recover a
+    /// lost audio source (video parts keep today's rule: repair on the
+    /// secondary only). The parent must accept repair on that lane (av-mesh
+    /// --relay-primary-promoted, a source_and_repair carrier link), which
+    /// av-mesh does not by default: off by default, and the deploy renders
+    /// it on together with the parent's flag.
     #[arg(
         long,
         env = "AV_RELAY_REPAIR_BOTH_LANES",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set
     )]
     relay_repair_both_lanes: bool,
@@ -968,8 +977,10 @@ struct Args {
     /// audio publication) on a thread of their own, with SCHED_FIFO
     /// --audio-hot-fifo-priority and pinned to --audio-hot-cpu where the
     /// host allows it (CAP_SYS_NICE, or root). A thread refused SCHED_FIFO
-    /// is not pinned either, and says so in one info line. With `false`
-    /// they are tasks of the main runtime.
+    /// is not pinned either, and says so in one info line. The DAW media
+    /// UDP receive runs there too, so an AEP1 datagram never waits for a
+    /// worker of the main runtime. With `false` they are tasks of the main
+    /// runtime.
     #[arg(
         long,
         env = "AV_AUDIO_HOT_THREAD",
@@ -991,11 +1002,14 @@ struct Args {
     #[arg(long, env = "AV_AUDIO_HOT_FIFO_PRIORITY", default_value_t = 10)]
     audio_hot_fifo_priority: u8,
 
-    /// Threads of the audio hot runtime. With more than one, worker `i`
-    /// is pinned to --audio-hot-cpu + `i`. One thread holds about 1,000
-    /// 1 ms parts a second with room to spare (the RaptorQ encode of a part
-    /// is most of its cost); give a 0.25 ms sweep more.
-    #[arg(long, env = "AV_AUDIO_HOT_WORKERS", default_value_t = 1)]
+    /// Audio hot threads, each with a single-threaded runtime of its own,
+    /// SCHED_FIFO and thread `i` pinned to --audio-hot-cpu + `i`. The first
+    /// runs the AEP1 receive and recovery; the rendition workers (one per
+    /// source, group and format: the encode and the sends of its parts) go
+    /// to the threads in turn from the second, so formats do not wait for
+    /// each other's encodes. 0 (default): one per --daw-hls-formats format,
+    /// at most as many as there are CPUs from --audio-hot-cpu on.
+    #[arg(long, env = "AV_AUDIO_HOT_WORKERS", default_value_t = 0)]
     audio_hot_workers: usize,
 
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
@@ -1547,19 +1561,29 @@ fn direct_lane_id(args: &Args, index: usize) -> String {
 ///
 /// On the audio hot path (`--relay-audio-inline`) each lane is handed its
 /// symbols with non-blocking `sendmmsg` and nothing ever waits for a socket:
-/// what a full buffer did not take goes, in order, to a task of the lane
-/// that waits for it, and the part's other lanes and the packager go on.
-/// While a lane has a part queued, its next parts queue behind it, so a
-/// lane's datagrams always leave in order.
+/// what a full buffer did not take goes, in order, to the lane's backlog
+/// thread, and the part's other lanes and the packager go on. While a lane
+/// has a part queued, its next parts queue behind it, so a lane's datagrams
+/// always leave in order.
+///
+/// The backlog is a thread of its own, not a task: it waits for room with
+/// `poll(2)` on the socket, so it neither runs on whichever runtime happened
+/// to queue the first part (the audio hot thread, where it would drain only
+/// when the inline publishes yield) nor waits for the main runtime's I/O
+/// driver (busy with 4K encodes) to report the socket writable.
 #[derive(Default)]
 struct LaneBacklog {
     /// Parts queued and not yet sent.
     pending: Arc<AtomicUsize>,
-    sender: std::sync::OnceLock<mpsc::Sender<BacklogPart>>,
+    sender: std::sync::OnceLock<std::sync::mpsc::SyncSender<BacklogPart>>,
 }
 
 /// Parts that one lane's backlog holds before it drops a part.
 const LANE_BACKLOG_PARTS: usize = 256;
+
+/// Longest single wait of a backlog for room in its socket's buffer; it
+/// looks at the part's deadline again after each.
+const LANE_BACKLOG_POLL_MS: u64 = 100;
 
 /// The rest of one part on one lane.
 struct BacklogPart {
@@ -1578,6 +1602,9 @@ struct BacklogPart {
     sent_first: Option<Arc<AtomicBool>>,
     stage: HopStage,
     peer: SocketAddr,
+    /// The lane, whose object outcome the backlog records when the part is
+    /// sent, dropped or expired.
+    path: RelayCarrierPath,
 }
 
 impl LaneBacklog {
@@ -1585,25 +1612,27 @@ impl LaneBacklog {
         self.pending.load(Ordering::Acquire) > 0
     }
 
-    /// Queue `part` behind the lane's earlier parts. A full queue drops it
-    /// and counts it.
+    /// Queue `part` behind the lane's earlier parts. A full queue drops it,
+    /// counts it and records the lane's part as failed.
     fn push(&self, socket: &Arc<UdpSocket>, telemetry: &Arc<IngestTelemetry>, part: BacklogPart) {
         let sender = self.sender.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel(LANE_BACKLOG_PARTS);
-            tokio::spawn(run_lane_backlog(
+            start_lane_backlog(
                 Arc::clone(socket),
                 Arc::clone(telemetry),
                 Arc::clone(&self.pending),
-                receiver,
-            ));
-            sender
+            )
         });
         self.pending.fetch_add(1, Ordering::AcqRel);
         telemetry
             .relay_lane_backlog_parts
             .fetch_add(1, Ordering::Relaxed);
-        if sender.try_send(part).is_err() {
+        if let Err(error) = sender.try_send(part) {
             self.pending.fetch_sub(1, Ordering::AcqRel);
+            let part = match error {
+                std::sync::mpsc::TrySendError::Full(part)
+                | std::sync::mpsc::TrySendError::Disconnected(part) => part,
+            };
+            telemetry.record_relay_session_lane_object(part.path, false);
             let dropped = telemetry
                 .relay_lane_backlog_dropped
                 .fetch_add(1, Ordering::Relaxed)
@@ -1611,6 +1640,7 @@ impl LaneBacklog {
             if dropped <= 16 || dropped.is_power_of_two() {
                 warn!(
                     dropped,
+                    peer = %part.peer,
                     "RelaySession lane backlog is full; dropped the rest of an audio part"
                 );
             }
@@ -1618,26 +1648,46 @@ impl LaneBacklog {
     }
 }
 
-async fn run_lane_backlog(
+/// Start the backlog thread of one lane's socket.
+fn start_lane_backlog(
     socket: Arc<UdpSocket>,
     telemetry: Arc<IngestTelemetry>,
     pending: Arc<AtomicUsize>,
-    mut parts: mpsc::Receiver<BacklogPart>,
-) {
-    while let Some(part) = parts.recv().await {
-        send_backlog_part(&socket, &telemetry, part).await;
-        pending.fetch_sub(1, Ordering::AcqRel);
+) -> std::sync::mpsc::SyncSender<BacklogPart> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<BacklogPart>(LANE_BACKLOG_PARTS);
+    let started = std::thread::Builder::new()
+        .name("lane-backlog".into())
+        .spawn(move || {
+            // Started from an audio hot thread it would inherit that
+            // thread's SCHED_FIFO and CPU: it runs normally, on any CPU.
+            let _ = class_lanes::reset_current_thread_scheduling();
+            while let Ok(part) = receiver.recv() {
+                send_backlog_part(&socket, &telemetry, part);
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+    if let Err(error) = started {
+        // The receiver is gone with the closure: every part is dropped and
+        // counted.
+        warn!(error = %error, "failed to start a RelaySession lane backlog thread");
     }
+    sender
 }
 
-async fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: BacklogPart) {
-    if part.deadline.is_expired_at(now_unix_us()) {
+/// Send the rest of one part: the source set first, then the repair,
+/// waiting for room in the socket's buffer until the part's deadline.
+fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: BacklogPart) {
+    let expire = |unsent: &[(MediaDatagramRole, Vec<u8>)]| {
         telemetry
             .relay_expired_symbols
-            .fetch_add(part.wires.len() as u64, Ordering::Relaxed);
-        for (role, _) in &part.wires {
+            .fetch_add(unsent.len() as u64, Ordering::Relaxed);
+        for (role, _) in unsent {
             telemetry.record_relay_session_send_error(*role);
         }
+        telemetry.record_relay_session_lane_object(part.path, false);
+    };
+    if part.deadline.is_expired_at(now_unix_us()) {
+        expire(&part.wires);
         return;
     }
     let messages = part
@@ -1645,8 +1695,7 @@ async fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part
         .iter()
         .map(|(_, wire)| udp_batch::Outbound::connected(wire))
         .collect::<Vec<_>>();
-    let (sources, rest) = messages.split_at(part.sources.min(messages.len()));
-    let mut result = udp_batch::send_all(socket, sources, true).await;
+    let sources = part.sources.min(messages.len());
     let journal_sent_first = |sent: bool| {
         if let Some(flag) = part.sent_first.as_ref() {
             if sent && !flag.swap(true, Ordering::AcqRel) {
@@ -1654,32 +1703,75 @@ async fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part
             }
         }
     };
-    journal_sent_first(result.is_ok() && !sources.is_empty());
-    if result.is_ok() {
-        if part.sources > 0 {
-            journal_part_hop(part.journal, part.stage, Some(part.peer));
+    let mut sent = 0;
+    let mut result = Ok(());
+    for (from, to) in [(0, sources), (sources, messages.len())] {
+        if from == to {
+            continue;
         }
-        result = udp_batch::send_all(socket, rest, true).await;
-        journal_sent_first(result.is_ok() && !rest.is_empty());
-        if part.sources == 0 && result.is_ok() {
+        let outcome = send_until_taken(socket, &messages[from..to], part.deadline);
+        sent += outcome.sent;
+        journal_sent_first(outcome.sent > 0);
+        if let Some(error) = outcome.error {
+            result = Err(error);
+            break;
+        }
+        if to == sources || sources == 0 {
             journal_part_hop(part.journal, part.stage, Some(part.peer));
         }
     }
+    for (role, wire) in &part.wires[..sent] {
+        telemetry.record_relay_session_send_success(*role, wire.len() as u64);
+    }
     match result {
-        Ok(_) => {
-            for (role, wire) in &part.wires {
-                telemetry.record_relay_session_send_success(*role, wire.len() as u64);
-            }
+        Ok(()) => telemetry.record_relay_session_lane_object(part.path, true),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            expire(&part.wires[sent..]);
         }
         Err(error) => {
             let role = part
                 .wires
-                .first()
+                .get(sent)
                 .map_or(MediaDatagramRole::Source, |(role, _)| *role);
             telemetry.record_relay_session_send_error(role);
+            telemetry.record_relay_session_lane_object(part.path, false);
             debug!(error = %error, peer = %part.peer, "RelaySession lane backlog send failed");
         }
     }
+}
+
+/// Hand `messages` to the kernel in order, waiting with `poll(2)` for room
+/// in the socket's buffer, until `deadline` (then `TimedOut`).
+fn send_until_taken(
+    socket: &UdpSocket,
+    messages: &[udp_batch::Outbound<'_>],
+    deadline: MediaDeadline,
+) -> udp_batch::TrySent {
+    let mut total = udp_batch::TrySent::default();
+    while total.sent < messages.len() {
+        let outcome = udp_batch::try_send_all(socket, &messages[total.sent..]);
+        total.sent += outcome.sent;
+        total.calls += outcome.calls;
+        if !outcome.would_block() {
+            total.error = outcome.error;
+            return total;
+        }
+        let now_us = now_unix_us();
+        if deadline.is_expired_at(now_us) {
+            total.error = Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "RelaySession part expired waiting for room in the socket buffer",
+            ));
+            return total;
+        }
+        let wait_ms =
+            (deadline.expires_at_us.saturating_sub(now_us) / 1_000).clamp(1, LANE_BACKLOG_POLL_MS);
+        if let Err(error) = udp_batch::wait_writable(socket, Duration::from_millis(wait_ms)) {
+            total.error = Some(error);
+            return total;
+        }
+    }
+    total
 }
 
 /// Journal `stage` of the part `journal` (stream, sequence), now.
@@ -1688,6 +1780,82 @@ fn journal_part_hop(journal: Option<(u64, u64)>, stage: HopStage, peer: Option<S
         hop_journal::record(
             HopEvent::new(stage, stream, seq, hop_journal::now_unix_us()).with_peer(peer),
         );
+    }
+}
+
+/// How long a stream stays on the video class after its last video part.
+/// A muxed stream sends video many times a second; one whose video stopped
+/// this long ago (or a stream id reused by an audio-only source) goes back
+/// to the audio class.
+const VIDEO_CLASS_HOLD_US: u64 = 10_000_000;
+
+/// Streams remembered on the video class before the stale ones are dropped.
+const VIDEO_CLASS_STREAMS_MAX: usize = 4_096;
+
+/// The streams that are on the video class (`--relay-class-lanes`): a
+/// stream is video from its first part with video, for its source epoch,
+/// and while it keeps sending video (see [`VIDEO_CLASS_HOLD_US`]).
+///
+/// Audio parts only read it, through an `ArcSwap` snapshot: the audio hot
+/// path takes no lock that a video publication holds. Video parts refresh
+/// their stream's time with an atomic store, and only a stream's first
+/// video part (or its first in a new epoch) writes a new snapshot.
+#[derive(Default)]
+struct VideoStreamClasses {
+    streams: arc_swap::ArcSwap<HashMap<u64, Arc<VideoStreamMark>>>,
+}
+
+struct VideoStreamMark {
+    epoch: u64,
+    last_video_unix_us: AtomicU64,
+}
+
+impl VideoStreamClasses {
+    fn class_of(
+        &self,
+        stream_id: u64,
+        epoch: u64,
+        class: PublicationClass,
+        now_us: u64,
+    ) -> PublicationClass {
+        let current = self.streams.load();
+        let mark = current.get(&stream_id).filter(|mark| mark.epoch == epoch);
+        match class {
+            PublicationClass::Video => {
+                if let Some(mark) = mark {
+                    mark.last_video_unix_us.store(now_us, Ordering::Relaxed);
+                    return PublicationClass::Video;
+                }
+                drop(current);
+                self.streams.rcu(|streams| {
+                    let mut streams = HashMap::clone(streams);
+                    if streams.len() >= VIDEO_CLASS_STREAMS_MAX {
+                        streams.retain(|_, mark| {
+                            now_us.saturating_sub(mark.last_video_unix_us.load(Ordering::Relaxed))
+                                < VIDEO_CLASS_HOLD_US
+                        });
+                    }
+                    streams.insert(
+                        stream_id,
+                        Arc::new(VideoStreamMark {
+                            epoch,
+                            last_video_unix_us: AtomicU64::new(now_us),
+                        }),
+                    );
+                    streams
+                });
+                PublicationClass::Video
+            }
+            PublicationClass::Audio
+                if mark.is_some_and(|mark| {
+                    now_us.saturating_sub(mark.last_video_unix_us.load(Ordering::Relaxed))
+                        < VIDEO_CLASS_HOLD_US
+                }) =>
+            {
+                PublicationClass::Video
+            }
+            PublicationClass::Audio => PublicationClass::Audio,
+        }
     }
 }
 
@@ -1721,10 +1889,14 @@ struct RelaySessionPublisher {
     /// `--relay-repair-both-lanes`: the primary lane carries the repair
     /// symbols too, not only the source set.
     repair_both_lanes: bool,
+    /// `--relay-class-lanes`: the class of a part's stream picks its
+    /// socket and port. Without class lanes a part's own class is used, as
+    /// before.
+    class_lanes: bool,
     /// Streams that have published a video part: they stay on the video
     /// class (a muxed stream's audio-only parts before its first video
     /// access unit are the only ones of it on the audio class).
-    video_streams: std::sync::Mutex<HashSet<u64>>,
+    video_streams: VideoStreamClasses,
     generation: TopologyGeneration,
     subscription_id: SubscriptionId,
     telemetry: Arc<IngestTelemetry>,
@@ -1885,7 +2057,8 @@ impl RelaySessionPublisher {
             send_batch: args.relay_send_batch,
             audio_inline: args.relay_audio_inline,
             repair_both_lanes: args.relay_repair_both_lanes,
-            video_streams: std::sync::Mutex::new(HashSet::new()),
+            class_lanes: classes.enabled(),
+            video_streams: VideoStreamClasses::default(),
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
             subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
             telemetry,
@@ -1900,27 +2073,25 @@ impl RelaySessionPublisher {
         stream_id: u64,
         class: PublicationClass,
     ) -> Result<RelayPublishOutcome> {
-        let class = self.stream_class(stream_id, class);
+        let class = self.stream_class(stream_id, object.key().epoch(), class);
         self.publish_classed_object(object, None, class).await
     }
 
-    /// The class of a part of `stream_id` whose own class is `class`: a
-    /// stream that has published video stays video.
-    fn stream_class(&self, stream_id: u64, class: PublicationClass) -> PublicationClass {
-        let mut video_streams = self
-            .video_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match class {
-            PublicationClass::Video => {
-                video_streams.insert(stream_id);
-                PublicationClass::Video
-            }
-            PublicationClass::Audio if video_streams.contains(&stream_id) => {
-                PublicationClass::Video
-            }
-            PublicationClass::Audio => PublicationClass::Audio,
+    /// The class of an object of `stream_id` (source epoch `epoch`) whose
+    /// own class is `class`. With class lanes a stream that has published
+    /// video stays video (see [`VideoStreamClasses`]); without them the
+    /// object's own class is used, as before class lanes.
+    fn stream_class(
+        &self,
+        stream_id: u64,
+        epoch: u64,
+        class: PublicationClass,
+    ) -> PublicationClass {
+        if !self.class_lanes {
+            return class;
         }
+        self.video_streams
+            .class_of(stream_id, epoch, class, now_unix_us())
     }
 
     /// The encoder of parts of `class`.
@@ -1940,7 +2111,7 @@ impl RelaySessionPublisher {
         class: PublicationClass,
     ) -> Result<RelayPublishOutcome> {
         let class = match part {
-            Some((stream_id, _)) => self.stream_class(stream_id, class),
+            Some((stream_id, _)) => self.stream_class(stream_id, object.key().epoch(), class),
             None => class,
         };
         self.publish_classed_object(object, part, class).await
@@ -2018,8 +2189,12 @@ impl RelaySessionPublisher {
         let source_count = source_symbols.len();
         let repair_count = repair_symbols.len();
         // Without a secondary the primary is the only lane for the repair
-        // symbols; with --relay-repair-both-lanes it carries them anyway.
-        let repair_uses_primary = self.secondary.is_none() || self.repair_both_lanes;
+        // symbols; with --relay-repair-both-lanes it carries an audio part's
+        // anyway. A 4K part keeps today's rule (source on the primary,
+        // repair from the secondary): its repair on the primary would add
+        // R/K of 4K load at every hop.
+        let repair_uses_primary = self.secondary.is_none()
+            || (self.repair_both_lanes && class == PublicationClass::Audio);
         if self.secondary.is_none() && repair_count > 0 {
             self.telemetry
                 .relay_repair_primary_fallback_objects
@@ -2051,16 +2226,14 @@ impl RelaySessionPublisher {
             } else {
                 vec![source_symbols.as_slice()]
             };
-            let primary_result = self
-                .hand_lane_its_symbols(
-                    &self.primary,
-                    RelayCarrierPath::Primary,
-                    &primary_groups,
-                    part,
-                    HopStage::Sent,
-                    &sent_first,
-                )
-                .map(|_| ());
+            let primary_result = self.hand_lane_its_symbols(
+                &self.primary,
+                RelayCarrierPath::Primary,
+                &primary_groups,
+                part,
+                HopStage::Sent,
+                &sent_first,
+            );
             let secondary_result = match self.secondary.as_ref() {
                 Some(secondary) => {
                     let groups = if self.secondary_seed_source {
@@ -2076,9 +2249,8 @@ impl RelaySessionPublisher {
                         HopStage::SentSecondary,
                         &sent_first,
                     )
-                    .map(|_| ())
                 }
-                None => Ok(()),
+                None => Ok(LaneHandOff::Sent),
             };
             if let Some(direct) = self.direct.as_ref() {
                 self.send_direct(
@@ -2185,16 +2357,29 @@ impl RelaySessionPublisher {
             // distributors, then the warm secondary.
             let (primary_result, (), secondary_result) =
                 tokio::join!(primary_lane, direct_lane, secondary_lane);
-            (primary_result, secondary_result)
+            (
+                primary_result.map(|()| LaneHandOff::Sent),
+                secondary_result.map(|()| LaneHandOff::Sent),
+            )
         };
-        self.telemetry
-            .record_relay_session_lane_object(RelayCarrierPath::Primary, primary_result.is_ok());
-        if secondary_configured {
+        // A lane that left part of the part in its backlog records the
+        // part's outcome when the backlog has sent it, dropped it or let it
+        // expire: queued is not yet delivered.
+        let queued = |result: &Result<LaneHandOff>| matches!(result, Ok(LaneHandOff::Queued));
+        if !queued(&primary_result) {
+            self.telemetry.record_relay_session_lane_object(
+                RelayCarrierPath::Primary,
+                primary_result.is_ok(),
+            );
+        }
+        if secondary_configured && !queued(&secondary_result) {
             self.telemetry.record_relay_session_lane_object(
                 RelayCarrierPath::Secondary,
                 secondary_result.is_ok(),
             );
         }
+        let primary_result = primary_result.map(|_| ());
+        let secondary_result = secondary_result.map(|_| ());
         let survived_lane_failure = match resolve_relay_lane_results(
             primary_result,
             secondary_configured.then_some(secondary_result),
@@ -2381,6 +2566,7 @@ impl RelaySessionPublisher {
             sent_first,
             stage,
             peer,
+            path,
         };
         if lane.backlog.busy() {
             lane.backlog.push(
@@ -2693,8 +2879,11 @@ struct MeshForwarder {
     audio_epoch_ingress_targets: Arc<Vec<SocketAddr>>,
     next_media_sequence: Arc<AtomicU64>,
     source_epoch: u64,
-    fmp4_initializations: Arc<Mutex<Fmp4InitializationIndex>>,
-    fmp4_initialization_payloads: Arc<Mutex<Fmp4InitializationPayloadIndex>>,
+    /// Read lock-free (`ArcSwap`): an audio part on the audio hot thread
+    /// never waits for a video part's update. Written only when a part
+    /// carries an initialization.
+    fmp4_initializations: Arc<arc_swap::ArcSwap<Fmp4InitializationIndex>>,
+    fmp4_initialization_payloads: Arc<arc_swap::ArcSwap<Fmp4InitializationPayloadIndex>>,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
     relay: Option<Arc<RelaySessionPublisher>>,
@@ -2786,8 +2975,8 @@ impl MeshForwarder {
             audio_epoch_ingress_targets: Arc::new(audio_epoch_ingress_targets),
             next_media_sequence: Arc::new(AtomicU64::new(0)),
             source_epoch,
-            fmp4_initializations: Arc::new(Mutex::new(HashMap::new())),
-            fmp4_initialization_payloads: Arc::new(Mutex::new(HashMap::new())),
+            fmp4_initializations: Arc::default(),
+            fmp4_initialization_payloads: Arc::default(),
             delivery_budget_ms: args.relay_deadline_ms,
             estimated_clock_error_ns,
             relay,
@@ -3525,23 +3714,24 @@ impl Fmp4PartPublisher for MeshForwarder {
                     );
                 }
                 let key = object.key().clone();
-                self.fmp4_initializations
-                    .lock()
-                    .await
-                    .insert(stream_epoch, (key.clone(), epoch));
+                self.fmp4_initializations.rcu(|index| {
+                    let mut index = HashMap::clone(index);
+                    index.insert(stream_epoch, (key.clone(), epoch));
+                    index
+                });
                 let init = part.init.clone().ok_or_else(|| {
                     "fMP4 initialization object was built without bytes".to_string()
                 })?;
-                self.fmp4_initialization_payloads
-                    .lock()
-                    .await
-                    .insert(stream_epoch, init.clone());
+                self.fmp4_initialization_payloads.rcu(|index| {
+                    let mut index = HashMap::clone(index);
+                    index.insert(stream_epoch, init.clone());
+                    index
+                });
                 (key, epoch, init)
             } else {
                 let (key, epoch) = self
                     .fmp4_initializations
-                    .lock()
-                    .await
+                    .load()
                     .get(&stream_epoch)
                     .cloned()
                     .ok_or_else(|| {
@@ -3552,8 +3742,7 @@ impl Fmp4PartPublisher for MeshForwarder {
                     })?;
                 let init = self
                     .fmp4_initialization_payloads
-                    .lock()
-                    .await
+                    .load()
                     .get(&stream_epoch)
                     .cloned()
                     .ok_or_else(|| {
@@ -3838,16 +4027,82 @@ fn shared_video_start(own_unix_us: u64, others: impl Iterator<Item = u64>) -> u6
         .map_or(own_unix_us, |earliest| earliest.min(own_unix_us))
 }
 
+/// The publication state of every stream, without a lock that the streams
+/// share: an audio part (on the audio hot thread) never waits for a video
+/// part's stamping.
+///
+/// The index is an `ArcSwap` snapshot, written only when a stream appears;
+/// each stream's state has a lock of its own, which only that stream's
+/// packager takes. The first-segment clocks of the video streams, which a
+/// new video stream reads across streams, have a lock that only a video
+/// stream's first part takes.
+#[derive(Default)]
+struct StreamTable {
+    index: arc_swap::ArcSwap<HashMap<u64, Arc<StreamEntry>>>,
+    /// `video_started_unix_us` of every video stream, for
+    /// [`shared_video_start`].
+    video_starts: std::sync::Mutex<HashMap<u64, u64>>,
+}
+
+struct StreamEntry {
+    publication: std::sync::Mutex<StreamPublication>,
+    /// Initialization payloads of the stream's inline (audio hot path)
+    /// publication.
+    inline_initializations: std::sync::Mutex<InitializationMemory>,
+}
+
+impl StreamTable {
+    /// The entry of `stream_id`, made on its first part.
+    fn entry(&self, stream_id: u64) -> Arc<StreamEntry> {
+        if let Some(entry) = self.index.load().get(&stream_id) {
+            return Arc::clone(entry);
+        }
+        self.index.rcu(|index| {
+            if index.contains_key(&stream_id) {
+                return Arc::clone(index);
+            }
+            let mut index = HashMap::clone(index);
+            index.insert(
+                stream_id,
+                Arc::new(StreamEntry {
+                    publication: std::sync::Mutex::new(StreamPublication::new()),
+                    inline_initializations: std::sync::Mutex::default(),
+                }),
+            );
+            Arc::new(index)
+        });
+        Arc::clone(
+            self.index
+                .load()
+                .get(&stream_id)
+                .expect("a stream entry is never removed"),
+        )
+    }
+
+    fn video_starts(&self) -> std::sync::MutexGuard<'_, HashMap<u64, u64>> {
+        self.video_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl StreamEntry {
+    fn publication(&self) -> std::sync::MutexGuard<'_, StreamPublication> {
+        self.publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 struct BoundedFmp4Publisher {
     senders: Vec<mpsc::Sender<QueuedPublication>>,
     telemetry: Arc<IngestTelemetry>,
-    streams: Mutex<HashMap<u64, StreamPublication>>,
+    streams: StreamTable,
     shards: std::sync::Mutex<PublicationShards>,
     durations: StampDurations,
     /// `--relay-audio-inline`: the publisher that audio parts go to on the
     /// packager's own task, without a worker's queue.
     inline_audio: Option<Arc<dyn Fmp4PartPublisher>>,
-    inline_initializations: std::sync::Mutex<InitializationMemory>,
 }
 
 impl BoundedFmp4Publisher {
@@ -3862,7 +4117,7 @@ impl BoundedFmp4Publisher {
     }
 
     /// Publish `publication` on this task: the audio hot path.
-    async fn publish_inline(&self, publication: QueuedPublication) {
+    async fn publish_inline(&self, entry: &StreamEntry, publication: QueuedPublication) {
         let Some(inner) = self.inline_audio.as_ref() else {
             return;
         };
@@ -3877,7 +4132,7 @@ impl BoundedFmp4Publisher {
             None,
             inner,
             &self.telemetry,
-            InitializationsRef::Shared(&self.inline_initializations),
+            InitializationsRef::Shared(&entry.inline_initializations),
             publication,
         )
         .await;
@@ -3923,94 +4178,101 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
         let stream_idx = part.stream_idx;
-        let mut streams = self.streams.lock().await;
-        let has_video = part.video_units > 0;
-        let published_unix_us = u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0);
-        let known = streams
-            .get(&stream_id)
-            .is_some_and(|stream| stream.stamper.is_some());
-        let started_unix_us = if has_video && !known {
-            shared_video_start(
-                published_unix_us,
-                streams
-                    .values()
-                    .filter_map(|stream| stream.video_started_unix_us),
-            )
-        } else {
-            published_unix_us
-        };
-        let stream = streams
-            .entry(stream_id)
-            .or_insert_with(StreamPublication::new);
-        part.sequence = stream.next_sequence;
-        let sequence = part.sequence;
-        // A stream with video cuts its segments at key frames. An audio
-        // stream has fixed segments, and every part of it can start one.
-        let durations = self.durations;
-        let before = stream.stamper.clone();
-        let started_before = stream.video_started_unix_us;
-        if has_video && stream.stamper.is_none() {
-            stream.video_started_unix_us = Some(started_unix_us);
-        }
-        let stamper = stream.stamper.get_or_insert_with(|| {
-            if has_video {
-                StreamStamper::new(durations.video_part_us, durations.video_segment_us)
+        let entry = self.streams.entry(stream_id);
+        // The stream's lock is held only here, never across an await.
+        let publication = 'inline: {
+            let mut guard = entry.publication();
+            let stream = &mut *guard;
+            let has_video = part.video_units > 0;
+            let published_unix_us = u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0);
+            let known = stream.stamper.is_some();
+            let started_unix_us = if has_video && !known {
+                let mut starts = self.streams.video_starts();
+                let started = shared_video_start(published_unix_us, starts.values().copied());
+                starts.insert(stream_id, started);
+                started
             } else {
-                StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
-            }
-        });
-        part.hls = Some(stamper.stamp(
-            part.duration_us,
-            part.keyframe || !has_video,
-            started_unix_us,
-        ));
-        let class = fmp4_publication_class(&part);
-        if self.publishes_inline(stream, class) {
-            stream.class.get_or_insert(PublicationClass::Audio);
-            let publication = QueuedPublication::Fmp4 {
-                in_flight: InFlight::new(&stream.in_flight),
-                enqueued_at: Instant::now(),
-                part,
+                published_unix_us
             };
-            if let QueuedPublication::Fmp4 { part, .. } = &publication {
+            part.sequence = stream.next_sequence;
+            let sequence = part.sequence;
+            // A stream with video cuts its segments at key frames. An audio
+            // stream has fixed segments, and every part of it can start one.
+            let durations = self.durations;
+            let before = stream.stamper.clone();
+            let started_before = stream.video_started_unix_us;
+            if has_video && stream.stamper.is_none() {
+                stream.video_started_unix_us = Some(started_unix_us);
+            }
+            let stamper = stream.stamper.get_or_insert_with(|| {
+                if has_video {
+                    StreamStamper::new(durations.video_part_us, durations.video_segment_us)
+                } else {
+                    StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
+                }
+            });
+            part.hls = Some(stamper.stamp(
+                part.duration_us,
+                part.keyframe || !has_video,
+                started_unix_us,
+            ));
+            let class = fmp4_publication_class(&part);
+            if self.publishes_inline(stream, class) {
+                stream.class.get_or_insert(PublicationClass::Audio);
+                let publication = QueuedPublication::Fmp4 {
+                    in_flight: InFlight::new(&stream.in_flight),
+                    enqueued_at: Instant::now(),
+                    part,
+                };
+                if let QueuedPublication::Fmp4 { part, .. } = &publication {
+                    journal_enqueued(
+                        stream_id,
+                        sequence,
+                        &part.source_times,
+                        part.packaged_at_unix_ns,
+                        hop_journal::now_unix_us(),
+                    );
+                }
+                stream.next_sequence = stream.next_sequence.saturating_add(1);
+                break 'inline publication;
+            }
+            let shard = self.shard_of(stream, stream_id, class);
+            let source_times = part.source_times;
+            let packaged_at_unix_ns = part.packaged_at_unix_ns;
+            let enqueued_us = hop_journal::now_unix_us();
+            let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
+                part,
+                enqueued_at: Instant::now(),
+                in_flight: InFlight::new(&stream.in_flight),
+            });
+            if result.is_ok() {
                 journal_enqueued(
                     stream_id,
                     sequence,
-                    &part.source_times,
-                    part.packaged_at_unix_ns,
-                    hop_journal::now_unix_us(),
+                    &source_times,
+                    packaged_at_unix_ns,
+                    enqueued_us,
                 );
+                stream.next_sequence = stream.next_sequence.saturating_add(1);
+            } else {
+                // The part was not published: it has no place in the playlist.
+                stream.stamper = before;
+                if started_before.is_none() && stream.video_started_unix_us.is_some() {
+                    self.streams.video_starts().remove(&stream_id);
+                }
+                stream.video_started_unix_us = started_before;
             }
-            stream.next_sequence = stream.next_sequence.saturating_add(1);
-            drop(streams);
-            self.publish_inline(publication).await;
-            return Ok(());
-        }
-        let shard = self.shard_of(stream, stream_id, class);
-        let source_times = part.source_times;
-        let packaged_at_unix_ns = part.packaged_at_unix_ns;
-        let enqueued_us = hop_journal::now_unix_us();
-        let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
-            part,
-            enqueued_at: Instant::now(),
-            in_flight: InFlight::new(&stream.in_flight),
-        });
-        if result.is_ok() {
-            journal_enqueued(
+            drop(guard);
+            return enqueue_publication_result(
+                result,
                 stream_id,
+                stream_idx,
                 sequence,
-                &source_times,
-                packaged_at_unix_ns,
-                enqueued_us,
+                &self.telemetry,
             );
-            stream.next_sequence = stream.next_sequence.saturating_add(1);
-        } else {
-            // The part was not published: it has no place in the playlist.
-            stream.stamper = before;
-            stream.video_started_unix_us = started_before;
-        }
-        drop(streams);
-        enqueue_publication_result(result, stream_id, stream_idx, sequence, &self.telemetry)
+        };
+        self.publish_inline(&entry, publication).await;
+        Ok(())
     }
 
     fn record_mpeg_ts_continuity_issue(&self, issue: MpegTsContinuityIssue) {
@@ -4026,70 +4288,72 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         mut part: PublishedOpaquePart,
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
-        let mut streams = self.streams.lock().await;
-        let stream = streams
-            .entry(stream_id)
-            .or_insert_with(StreamPublication::new);
-        part.sequence = stream.next_sequence;
-        let sequence = part.sequence;
-        let durations = self.durations;
-        let before = stream.stamper.clone();
-        let stamper = stream.stamper.get_or_insert_with(|| {
-            StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
-        });
-        part.hls = Some(stamper.stamp(
-            part.duration_us,
-            true,
-            u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0),
-        ));
-        if self.publishes_inline(stream, PublicationClass::Audio) {
-            stream.class.get_or_insert(PublicationClass::Audio);
-            journal_enqueued(
-                stream_id,
-                sequence,
-                &part.source_times,
-                part.packaged_at_unix_ns,
-                hop_journal::now_unix_us(),
-            );
-            let publication = QueuedPublication::Opaque {
-                in_flight: InFlight::new(&stream.in_flight),
-                enqueued_at: Instant::now(),
+        let entry = self.streams.entry(stream_id);
+        // The stream's lock is held only here, never across an await.
+        let publication = 'inline: {
+            let mut guard = entry.publication();
+            let stream = &mut *guard;
+            part.sequence = stream.next_sequence;
+            let sequence = part.sequence;
+            let durations = self.durations;
+            let before = stream.stamper.clone();
+            let stamper = stream.stamper.get_or_insert_with(|| {
+                StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
+            });
+            part.hls = Some(stamper.stamp(
+                part.duration_us,
+                true,
+                u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0),
+            ));
+            if self.publishes_inline(stream, PublicationClass::Audio) {
+                stream.class.get_or_insert(PublicationClass::Audio);
+                journal_enqueued(
+                    stream_id,
+                    sequence,
+                    &part.source_times,
+                    part.packaged_at_unix_ns,
+                    hop_journal::now_unix_us(),
+                );
+                let publication = QueuedPublication::Opaque {
+                    in_flight: InFlight::new(&stream.in_flight),
+                    enqueued_at: Instant::now(),
+                    part,
+                };
+                stream.next_sequence = stream.next_sequence.saturating_add(1);
+                break 'inline publication;
+            }
+            let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
+            let source_times = part.source_times;
+            let packaged_at_unix_ns = part.packaged_at_unix_ns;
+            let enqueued_us = hop_journal::now_unix_us();
+            let result = self.senders[shard].try_send(QueuedPublication::Opaque {
                 part,
-            };
-            stream.next_sequence = stream.next_sequence.saturating_add(1);
-            drop(streams);
-            self.publish_inline(publication).await;
-            return Ok(());
-        }
-        let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
-        let source_times = part.source_times;
-        let packaged_at_unix_ns = part.packaged_at_unix_ns;
-        let enqueued_us = hop_journal::now_unix_us();
-        let result = self.senders[shard].try_send(QueuedPublication::Opaque {
-            part,
-            enqueued_at: Instant::now(),
-            in_flight: InFlight::new(&stream.in_flight),
-        });
-        if result.is_ok() {
-            journal_enqueued(
+                enqueued_at: Instant::now(),
+                in_flight: InFlight::new(&stream.in_flight),
+            });
+            if result.is_ok() {
+                journal_enqueued(
+                    stream_id,
+                    sequence,
+                    &source_times,
+                    packaged_at_unix_ns,
+                    enqueued_us,
+                );
+                stream.next_sequence = stream.next_sequence.saturating_add(1);
+            } else {
+                stream.stamper = before;
+            }
+            drop(guard);
+            return enqueue_publication_result(
+                result,
                 stream_id,
+                stream_id as usize,
                 sequence,
-                &source_times,
-                packaged_at_unix_ns,
-                enqueued_us,
+                &self.telemetry,
             );
-            stream.next_sequence = stream.next_sequence.saturating_add(1);
-        } else {
-            stream.stamper = before;
-        }
-        drop(streams);
-        enqueue_publication_result(
-            result,
-            stream_id,
-            stream_id as usize,
-            sequence,
-            &self.telemetry,
-        )
+        };
+        self.publish_inline(&entry, publication).await;
+        Ok(())
     }
 }
 
@@ -4188,11 +4452,10 @@ fn start_bounded_publication_pipeline(
         Arc::new(BoundedFmp4Publisher {
             senders,
             telemetry,
-            streams: Mutex::new(HashMap::new()),
+            streams: StreamTable::default(),
             shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, shard_mix)),
             durations,
             inline_audio: audio_inline.then(|| Arc::clone(&inner)),
-            inline_initializations: std::sync::Mutex::new(InitializationMemory::default()),
         }),
         tasks,
     )
@@ -4219,64 +4482,135 @@ fn make_audio_hot_thread_realtime(cpu: Option<usize>, fifo_priority: u8, what: &
     }
 }
 
-/// Run `work` (the AEP1 packagers, and with --relay-audio-inline the audio
-/// publication) on the audio hot thread: a thread of its own with a
-/// single-threaded runtime (or --audio-hot-workers workers), with SCHED_FIFO
-/// --audio-hot-fifo-priority and pinned to --audio-hot-cpu where the host
-/// allows it. A refusal (a rootless lab) is one info line, and the thread
-/// runs on with normal scheduling, unpinned. With --audio-hot-thread false the work
-/// is a task of the main runtime. The returned handle completes when the
-/// work does.
-fn spawn_audio_hot_task<F>(args: &Args, work: F) -> Result<tokio::task::JoinHandle<()>>
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    if !args.audio_hot_thread {
-        return Ok(tokio::spawn(work));
-    }
-    let cpu = usize::try_from(args.audio_hot_cpu).ok();
-    let fifo_priority = args.audio_hot_fifo_priority;
-    let workers = args.audio_hot_workers.max(1);
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-    std::thread::Builder::new()
-        .name("audio-hot".into())
-        .spawn(move || {
-            make_audio_hot_thread_realtime(cpu, fifo_priority, "audio hot thread");
-            let runtime = if workers == 1 {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-            } else {
-                let next = Arc::new(AtomicUsize::new(1));
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(workers)
-                    .thread_name("audio-hot-worker")
-                    .on_thread_start(move || {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        // The workers start with the runtime; a later thread
-                        // is the blocking pool's and stays as it is.
-                        if index > workers {
+/// The audio hot threads (`--audio-hot-thread`): threads of their own, each
+/// with a single-threaded runtime, SCHED_FIFO --audio-hot-fifo-priority and
+/// thread `i` pinned to --audio-hot-cpu + `i`, where the host allows it (a
+/// refusal, in a rootless lab, is one info line, and the thread runs on with
+/// normal scheduling, unpinned).
+///
+/// The first thread runs the DAW media receive and the AEP1 recovery; the
+/// rendition workers (the packaging, encode and sends of each format's
+/// parts) go to the threads in turn from the second (see
+/// [`RenditionRuntimes`]). Every thread is the only FIFO thread on its CPU:
+/// no thread waits on a CPU for another of the same priority, which FIFO
+/// does not time-slice. A runtime's blocking-pool threads go back to normal
+/// scheduling on every CPU.
+struct AudioHotRuntime {
+    handles: Vec<tokio::runtime::Handle>,
+    /// `true` (or dropped) stops the threads, once the work on them is done.
+    stop: watch::Sender<bool>,
+}
+
+impl AudioHotRuntime {
+    fn start(args: &Args) -> Result<Option<Self>> {
+        if !args.audio_hot_thread {
+            return Ok(None);
+        }
+        let cpu = usize::try_from(args.audio_hot_cpu).ok();
+        let fifo_priority = args.audio_hot_fifo_priority;
+        let threads = audio_hot_thread_count(args);
+        let (stop, _) = watch::channel(false);
+        let mut handles = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+            let mut stop_rx = stop.subscribe();
+            let cpu = cpu.map(|cpu| cpu + index);
+            std::thread::Builder::new()
+                .name(format!("audio-hot-{index}"))
+                .spawn(move || {
+                    make_audio_hot_thread_realtime(cpu, fifo_priority, "audio hot thread");
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .on_thread_start(|| {
+                            // Only the blocking pool's threads start here;
+                            // they would inherit FIFO and the audio CPU.
+                            let _ = class_lanes::reset_current_thread_scheduling();
+                        })
+                        .build();
+                    let runtime = match runtime {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = handle_tx.send(Err(error));
                             return;
                         }
-                        make_audio_hot_thread_realtime(
-                            cpu.map(|cpu| cpu + index - 1),
-                            fifo_priority,
-                            "audio hot worker",
-                        );
-                    })
-                    .enable_all()
-                    .build()
-            };
-            match runtime {
-                Ok(runtime) => runtime.block_on(work),
-                Err(error) => warn!(error = %error, "audio hot thread could not build its runtime"),
+                    };
+                    let _ = handle_tx.send(Ok(runtime.handle().clone()));
+                    runtime.block_on(async move {
+                        while !*stop_rx.borrow_and_update() {
+                            if stop_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                })
+                .context("failed to start an audio hot thread")?;
+            let handle = handle_rx
+                .recv()
+                .context("an audio hot thread stopped before its runtime was built")?
+                .context("an audio hot thread could not build its runtime")?;
+            handles.push(handle);
+        }
+        info!(
+            threads,
+            cpu = ?cpu,
+            fifo_priority,
+            "audio hot threads started"
+        );
+        Ok(Some(Self { handles, stop }))
+    }
+
+    /// The runtime of the receive and recovery.
+    fn first(&self) -> &tokio::runtime::Handle {
+        &self.handles[0]
+    }
+
+    /// The runtimes of the rendition workers.
+    fn rendition_runtimes(&self) -> Option<RenditionRuntimes> {
+        RenditionRuntimes::new(self.handles.clone())
+    }
+}
+
+impl Drop for AudioHotRuntime {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+/// Audio hot threads: --audio-hot-workers, or with 0 one per configured
+/// DAW HLS format, as many as the CPUs from --audio-hot-cpu on hold.
+fn audio_hot_thread_count(args: &Args) -> usize {
+    if args.audio_hot_workers > 0 {
+        return args.audio_hot_workers;
+    }
+    let formats = args
+        .daw_hls_formats
+        .iter()
+        .map(|format| AudioPayloadKind::from(*format))
+        .fold(Vec::new(), |mut unique, format| {
+            if !unique.contains(&format) {
+                unique.push(format);
             }
-            let _ = done_tx.send(());
+            unique
         })
-        .context("failed to start the audio hot thread")?;
-    Ok(tokio::spawn(async move {
-        let _ = done_rx.await;
-    }))
+        .len();
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    class_lanes::auto_audio_hot_threads(formats, usize::try_from(args.audio_hot_cpu).ok(), cpus)
+}
+
+/// Spawn `work` on the audio hot threads' first runtime, or on the main
+/// runtime without them.
+fn spawn_audio_hot_task<F>(
+    hot: Option<&AudioHotRuntime>,
+    work: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match hot {
+        Some(hot) => hot.first().spawn(work),
+        None => tokio::spawn(work),
+    }
 }
 
 async fn run_publication_worker(
@@ -9487,6 +9821,8 @@ async fn main() -> Result<()> {
         audio_epoch_mesh_task,
         router_audio_epoch_hls_tx,
         router_audio_epoch_mesh_tx,
+        // Kept until the end: its threads stop when it is dropped.
+        _audio_hot,
     ) = if let Some(bind) = args.daw_media_bind {
         let socket = bind_daw_media_udp_socket(bind).await?;
         let local_addr = socket.local_addr()?;
@@ -9538,14 +9874,23 @@ async fn main() -> Result<()> {
             ));
             (task, Some(audio_epoch_mesh_tx))
         };
+        // The DAW receive, the AEP1 recovery and the rendition workers run
+        // on the audio hot threads: no AEP1 datagram or audio part waits for
+        // a worker of the main runtime (4K encodes, the RTMP/TS bridges).
+        let audio_hot = AudioHotRuntime::start(&args)?;
+        let audio_epoch_hls_config = audio_epoch_hls_config.with_rendition_runtimes(
+            audio_hot
+                .as_ref()
+                .and_then(AudioHotRuntime::rendition_runtimes),
+        );
         let audio_epoch_hls_task = spawn_audio_hot_task(
-            &args,
+            audio_hot.as_ref(),
             run_audio_epoch_hls_worker(
                 audio_epoch_hls_config,
                 audio_epoch_hls_rx,
                 shutdown_rx.clone(),
             ),
-        )?;
+        );
         let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
             forwarder.clone(),
             audio_epoch_mesh_send_rx,
@@ -9561,22 +9906,47 @@ async fn main() -> Result<()> {
             aep1_shared_recovery = args.aep1_shared_recovery,
             "DAW media contributor ingest listening"
         );
-        (
-            Some(tokio::spawn(run_daw_media_udp_ingest(
+        let daw_media_task = if audio_hot.is_some() {
+            // The socket moves to the hot runtime's own I/O driver.
+            let socket = socket
+                .into_std()
+                .context("failed to move the DAW media socket to the audio hot thread")?;
+            let forwarder = forwarder.clone();
+            let audio_epoch_hls_tx = Some(audio_epoch_hls_tx.clone());
+            let audio_epoch_mesh_tx = ingest_audio_epoch_mesh_tx.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            spawn_audio_hot_task(audio_hot.as_ref(), async move {
+                let socket = UdpSocket::from_std(socket)
+                    .context("failed to register the DAW media socket on the audio hot thread")?;
+                run_daw_media_udp_ingest(
+                    socket,
+                    forwarder,
+                    audio_epoch_hls_tx,
+                    audio_epoch_mesh_tx,
+                    shutdown_rx,
+                )
+                .await
+            })
+        } else {
+            tokio::spawn(run_daw_media_udp_ingest(
                 socket,
                 forwarder.clone(),
                 Some(audio_epoch_hls_tx.clone()),
                 ingest_audio_epoch_mesh_tx.clone(),
                 shutdown_rx.clone(),
-            ))),
+            ))
+        };
+        (
+            Some(daw_media_task),
             Some(audio_epoch_hls_task),
             Some(audio_epoch_normalizer_task),
             Some(audio_epoch_mesh_task),
             Some(audio_epoch_hls_tx),
             ingest_audio_epoch_mesh_tx,
+            audio_hot,
         )
     } else {
-        (None, None, None, None, None, None)
+        (None, None, None, None, None, None, None)
     };
     let needletail_authorizer = NeedletailSessionAuthorizer::from_environment(args.stream_id)?;
     let router = Box::new(ContribRouter::new(
@@ -10511,7 +10881,7 @@ mod tests {
             BoundedFmp4Publisher {
                 senders,
                 telemetry: Arc::new(IngestTelemetry::default()),
-                streams: Mutex::new(HashMap::new()),
+                streams: StreamTable::default(),
                 shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, mix)),
                 durations: StampDurations {
                     video_part_us: 200_000,
@@ -10520,7 +10890,6 @@ mod tests {
                     audio_segment_us: 1_000_000,
                 },
                 inline_audio: None,
-                inline_initializations: std::sync::Mutex::default(),
             },
             receivers,
         )
@@ -10628,11 +10997,10 @@ mod tests {
             BoundedFmp4Publisher {
                 senders,
                 telemetry: Arc::new(IngestTelemetry::default()),
-                streams: Mutex::new(HashMap::new()),
+                streams: StreamTable::default(),
                 shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, true)),
                 durations,
                 inline_audio: None,
-                inline_initializations: std::sync::Mutex::default(),
             },
             receivers,
         )
@@ -13987,7 +14355,16 @@ mod tests {
     }
 
     fn test_video_object(stream_id: u64, sequence: u64, video_units: usize) -> MediaObject {
-        let payload = vec![0x5a; 12_000];
+        test_video_object_of(stream_id, sequence, video_units, 12_000)
+    }
+
+    fn test_video_object_of(
+        stream_id: u64,
+        sequence: u64,
+        video_units: usize,
+        bytes: usize,
+    ) -> MediaObject {
+        let payload = vec![0x5a; bytes];
         let (initialization, configuration_epoch) =
             build_fmp4_initialization_object(stream_id, TEST_SOURCE_EPOCH, b"class-lane-init")
                 .unwrap();
@@ -14073,7 +14450,7 @@ mod tests {
                 .all(|(symbol, from)| *from == bind && symbol.object_key == *audio.key()));
         }
 
-        // A video part: the video ports.
+        // A video part: the video ports; its repair stays off the primary.
         let video_stream = 91_000_000_002;
         let video = test_video_object(video_stream, 0, 3);
         let outcome = relay
@@ -14081,11 +14458,11 @@ mod tests {
             .await
             .unwrap();
         let all = outcome.source_symbols + outcome.repair_symbols;
-        for (receiver, bind) in [
-            (&primary_video, primary_bind),
-            (&secondary_video, secondary_bind),
+        for (receiver, bind, count) in [
+            (&primary_video, primary_bind, outcome.source_symbols),
+            (&secondary_video, secondary_bind, all),
         ] {
-            let symbols = receive_relay_datagrams(receiver, all).await;
+            let symbols = receive_relay_datagrams(receiver, count).await;
             assert!(symbols
                 .iter()
                 .all(|(symbol, from)| *from == bind && symbol.object_key == *video.key()));
@@ -14099,8 +14476,11 @@ mod tests {
             .await
             .unwrap();
         let all = outcome.source_symbols + outcome.repair_symbols;
-        for receiver in [&primary_video, &secondary_video] {
-            let symbols = receive_relay_datagrams(receiver, all).await;
+        for (receiver, count) in [
+            (&primary_video, outcome.source_symbols),
+            (&secondary_video, all),
+        ] {
+            let symbols = receive_relay_datagrams(receiver, count).await;
             assert!(symbols
                 .iter()
                 .all(|(symbol, _)| symbol.object_key == *delta.key()));
@@ -14174,15 +14554,29 @@ mod tests {
         );
 
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
-        assert!(parsed.relay_class_lanes);
+        // Class lanes and repair on both lanes need a parent configured for
+        // them (the deploy renders both on with the parent's flags): off by
+        // default, so a default contributor works with a default parent.
+        assert!(!parsed.relay_class_lanes);
         assert_eq!(parsed.relay_class_port_offset, 1_000);
         assert_eq!(parsed.relay_audio_socket_priority, 6);
         assert_eq!(parsed.relay_video_pacing_mbps, 0);
         assert!(parsed.relay_audio_inline);
-        assert!(parsed.relay_repair_both_lanes);
+        assert!(!parsed.relay_repair_both_lanes);
         assert!(parsed.audio_hot_thread);
         assert_eq!(parsed.audio_hot_cpu, 2);
         assert_eq!(parsed.audio_hot_fifo_priority, 10);
+        assert_eq!(parsed.audio_hot_workers, 0);
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--relay-class-lanes",
+            "true",
+            "--relay-repair-both-lanes",
+            "true",
+        ])
+        .unwrap();
+        assert!(parsed.relay_class_lanes);
+        assert!(parsed.relay_repair_both_lanes);
         let parsed = Args::try_parse_from([
             "av-contrib",
             "--relay-class-lanes",
@@ -14505,5 +14899,543 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*sink.published.lock().unwrap(), [(stream, 2)]);
+    }
+
+    // Review fixes: the class of a stream, repair on both lanes for audio
+    // only, the lane backlog's outcome, isolation from video, the audio hot
+    // threads.
+
+    #[test]
+    fn a_stream_is_video_for_its_epoch_while_it_sends_video() {
+        let classes = VideoStreamClasses::default();
+        let audio = PublicationClass::Audio;
+        let video = PublicationClass::Video;
+        let t = 1_000_000_000_u64;
+        assert_eq!(classes.class_of(7, 1, audio, t), audio);
+        assert_eq!(classes.class_of(7, 1, video, t), video);
+        // A muxed audio-only delta of the stream rides the video class.
+        assert_eq!(classes.class_of(7, 1, audio, t + 1), video);
+        // The same stream id in a new source epoch (a restart) is audio.
+        assert_eq!(classes.class_of(7, 2, audio, t + 2), audio);
+        // A stream whose video stopped long ago goes back to audio.
+        assert_eq!(
+            classes.class_of(7, 1, audio, t + VIDEO_CLASS_HOLD_US),
+            audio
+        );
+        // A video part refreshes it.
+        assert_eq!(
+            classes.class_of(7, 1, video, t + VIDEO_CLASS_HOLD_US),
+            video
+        );
+        assert_eq!(
+            classes.class_of(7, 1, audio, t + VIDEO_CLASS_HOLD_US + 1),
+            video
+        );
+        // Video in a new epoch replaces the old epoch.
+        assert_eq!(
+            classes.class_of(7, 2, video, t + VIDEO_CLASS_HOLD_US + 2),
+            video
+        );
+        assert_eq!(
+            classes.class_of(7, 1, audio, t + VIDEO_CLASS_HOLD_US + 3),
+            audio
+        );
+        assert_eq!(
+            classes.class_of(7, 2, audio, t + VIDEO_CLASS_HOLD_US + 3),
+            video
+        );
+        // Other streams are not touched.
+        assert_eq!(classes.class_of(8, 2, audio, t), audio);
+    }
+
+    /// With every new flag off, a part goes through the encoder of its own
+    /// class, as before class lanes: the stream's video does not move its
+    /// audio-only parts to the video encoder.
+    #[tokio::test]
+    async fn without_class_lanes_a_part_keeps_its_own_class() {
+        let (primary_audio, _primary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_class_lanes = false;
+        args.relay_audio_inline = false;
+        args.relay_repair_both_lanes = false;
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relay.stream_class(5, 1, PublicationClass::Video),
+            PublicationClass::Video
+        );
+        assert_eq!(
+            relay.stream_class(5, 1, PublicationClass::Audio),
+            PublicationClass::Audio
+        );
+
+        args.relay_class_lanes = true;
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        relay.stream_class(5, 1, PublicationClass::Video);
+        assert_eq!(
+            relay.stream_class(5, 1, PublicationClass::Audio),
+            PublicationClass::Video
+        );
+    }
+
+    /// --relay-repair-both-lanes adds repair to the primary for audio parts
+    /// only: a 4K part's primary lane carries its source set alone.
+    #[tokio::test]
+    async fn repair_on_both_lanes_leaves_video_repair_to_the_secondary() {
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let (secondary_audio, secondary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+        args.relay_secondary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_seed_source = true;
+        args.relay_deadline_ms = 5_000;
+        args.relay_min_repair_symbols = 2;
+        args.relay_class_lanes = true;
+        args.relay_repair_both_lanes = true;
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let stream = 91_000_000_060;
+        let video = test_video_object(stream, 0, 3);
+        let outcome = relay
+            .publish_part_object(&video, Some((stream, 0)), PublicationClass::Video)
+            .await
+            .unwrap();
+        assert!(outcome.repair_symbols > 0);
+        let primary = receive_relay_datagrams(&primary_video, outcome.source_symbols).await;
+        assert!(primary
+            .iter()
+            .all(|(symbol, _)| symbol.role == MediaDatagramRole::Source));
+        assert_silent(&primary_video).await;
+        let secondary = receive_relay_datagrams(
+            &secondary_video,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        assert_eq!(
+            secondary
+                .iter()
+                .filter(|(symbol, _)| symbol.role == MediaDatagramRole::Repair)
+                .count(),
+            outcome.repair_symbols
+        );
+
+        // An audio part of another stream: repair on both.
+        let audio = test_audio_object(stream + 1, 3_000);
+        let outcome = relay
+            .publish_part_object(&audio, Some((stream + 1, 0)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        let primary = receive_relay_datagrams(
+            &primary_audio,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        assert_eq!(
+            primary
+                .iter()
+                .filter(|(symbol, _)| symbol.role == MediaDatagramRole::Repair)
+                .count(),
+            outcome.repair_symbols
+        );
+    }
+
+    async fn inline_audio_publisher(
+        telemetry: &Arc<IngestTelemetry>,
+    ) -> (RelaySessionPublisher, UdpSocket) {
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        drop(primary_video);
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_deadline_ms = 5_000;
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        (relay, primary_audio)
+    }
+
+    /// A part dropped by a full lane backlog is not counted as delivered:
+    /// the lane records it failed.
+    #[tokio::test]
+    async fn a_full_lane_backlog_drops_the_part_and_records_the_lane_failed() {
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
+        // A part of the lane is waiting, and the backlog takes no more.
+        relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
+        let (full, _held) = std::sync::mpsc::sync_channel(0);
+        assert!(relay.primary.backlog.sender.set(full).is_ok());
+        let stream = 91_000_000_070;
+        relay
+            .publish_part_object(
+                &test_audio_object(stream, 64),
+                Some((stream, 0)),
+                PublicationClass::Audio,
+            )
+            .await
+            .unwrap();
+        let snapshot = telemetry.snapshot().relay_session;
+        assert_eq!(snapshot.lane_backlog_parts, 1);
+        assert_eq!(snapshot.lane_backlog_dropped, 1);
+        assert_eq!(snapshot.primary_lane_objects_succeeded, 0);
+        assert_eq!(snapshot.primary_lane_objects_failed, 1);
+        assert_silent(&primary_audio).await;
+    }
+
+    /// A backlog part whose deadline passed is not sent, and the lane
+    /// records it failed and its symbols expired.
+    #[tokio::test]
+    async fn an_expired_backlog_part_is_counted_and_records_the_lane_failed() {
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
+        let (socket, peer) = relay.primary.class_socket(PublicationClass::Audio);
+        let part = BacklogPart {
+            wires: vec![
+                (MediaDatagramRole::Source, vec![1_u8; 32]),
+                (MediaDatagramRole::Repair, vec![2_u8; 32]),
+            ],
+            sources: 1,
+            deadline: MediaDeadline::from_micros(now_unix_us() - 1_000),
+            journal: None,
+            part: None,
+            sent_first: None,
+            stage: HopStage::Sent,
+            peer,
+            path: RelayCarrierPath::Primary,
+        };
+        send_backlog_part(socket, &telemetry, part);
+        let snapshot = telemetry.snapshot().relay_session;
+        assert_eq!(snapshot.primary_lane_objects_failed, 1);
+        assert_eq!(snapshot.primary_lane_objects_succeeded, 0);
+        assert_eq!(telemetry.relay_expired_symbols.load(Ordering::Relaxed), 2);
+        assert_silent(&primary_audio).await;
+
+        // A live part is sent, and the lane records it delivered.
+        let part = BacklogPart {
+            wires: vec![(MediaDatagramRole::Source, vec![3_u8; 32])],
+            sources: 1,
+            deadline: MediaDeadline::from_micros(now_unix_us() + 1_000_000),
+            journal: None,
+            part: None,
+            sent_first: None,
+            stage: HopStage::Sent,
+            peer,
+            path: RelayCarrierPath::Primary,
+        };
+        send_backlog_part(socket, &telemetry, part);
+        let mut wire = [0_u8; 64];
+        let (len, _) = timeout(Duration::from_secs(2), primary_audio.recv_from(&mut wire))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&wire[..len], &[3_u8; 32]);
+        assert_eq!(
+            telemetry
+                .snapshot()
+                .relay_session
+                .primary_lane_objects_succeeded,
+            1
+        );
+    }
+
+    /// A queued part's lane outcome is recorded by the backlog when it has
+    /// sent the part, not when the part was queued.
+    #[tokio::test]
+    async fn a_queued_part_is_recorded_delivered_once_the_backlog_sent_it() {
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
+        relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
+        let stream = 91_000_000_075;
+        let object = test_audio_object(stream, 64);
+        let outcome = relay
+            .publish_part_object(&object, Some((stream, 0)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        receive_relay_datagrams(
+            &primary_audio,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        for _ in 0..200 {
+            if telemetry
+                .snapshot()
+                .relay_session
+                .primary_lane_objects_succeeded
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = telemetry.snapshot().relay_session;
+        assert_eq!(snapshot.primary_lane_objects_succeeded, 1);
+        assert_eq!(snapshot.primary_lane_objects_failed, 0);
+    }
+
+    /// An audio part never waits for the video encoder: the classes have
+    /// encoders of their own, and a 4K encode that holds the video one does
+    /// not hold an audio part back.
+    #[tokio::test]
+    async fn an_audio_part_does_not_wait_for_a_busy_video_encoder() {
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
+        assert!(!std::ptr::eq(
+            relay.encoder(PublicationClass::Audio),
+            relay.encoder(PublicationClass::Video)
+        ));
+        let held = relay.encoder(PublicationClass::Video).lock().await;
+        let stream = 91_000_000_080;
+        let object = test_audio_object(stream, 64);
+        let outcome = timeout(
+            Duration::from_secs(1),
+            relay.publish_part_object(&object, Some((stream, 0)), PublicationClass::Audio),
+        )
+        .await
+        .expect("an audio part waited for the video encoder")
+        .unwrap();
+        receive_relay_datagrams(
+            &primary_audio,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        drop(held);
+        assert_eq!(telemetry.snapshot().relay_session.lane_backlog_parts, 0);
+    }
+
+    /// With class lanes, a 4K part in flight on the same lanes goes to the
+    /// video port from the video socket, and an audio part published beside
+    /// it leaves at once from the audio socket, with nothing queued. (The
+    /// socket-buffer half of the property, a 4K burst filling a send
+    /// buffer, cannot be produced on loopback, whose sends never return
+    /// EAGAIN; the sockets are separate, which the class lane test checks.)
+    #[tokio::test]
+    async fn an_audio_part_leaves_beside_a_4k_part_in_flight() {
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_deadline_ms = 5_000;
+        args.relay_class_lanes = true;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        let video_stream = 91_000_000_090;
+        let video = test_video_object_of(video_stream, 0, 3, 60_000);
+        let audio_stream = 91_000_000_091;
+        let audio = test_audio_object(audio_stream, 64);
+        let primary_video = Arc::new(primary_video);
+        let video_reader = {
+            let primary_video = Arc::clone(&primary_video);
+            tokio::spawn(async move {
+                let mut wire = [0_u8; 2_048];
+                let mut count = 0_usize;
+                while timeout(
+                    Duration::from_millis(300),
+                    primary_video.recv_from(&mut wire),
+                )
+                .await
+                .is_ok()
+                {
+                    count += 1;
+                }
+                count
+            })
+        };
+        let (video_outcome, audio_outcome) = tokio::join!(
+            relay.publish_part_object(&video, Some((video_stream, 0)), PublicationClass::Video),
+            relay.publish_part_object(&audio, Some((audio_stream, 0)), PublicationClass::Audio),
+        );
+        let (video_outcome, audio_outcome) = (video_outcome.unwrap(), audio_outcome.unwrap());
+        let audio_symbols = receive_relay_datagrams(
+            &primary_audio,
+            audio_outcome.source_symbols + audio_outcome.repair_symbols,
+        )
+        .await;
+        assert!(audio_symbols
+            .iter()
+            .all(|(symbol, _)| symbol.object_key == *audio.key()));
+        assert_silent(&primary_audio).await;
+        assert_eq!(telemetry.snapshot().relay_session.lane_backlog_parts, 0);
+        // Only the video port had the 4K part (the primary carries its
+        // source set; without a secondary, its repair too).
+        let video_count = video_reader.await.unwrap();
+        assert_eq!(
+            video_count,
+            video_outcome.source_symbols + video_outcome.repair_symbols
+        );
+    }
+
+    /// The publisher's streams share no lock: an audio part is published
+    /// while another stream's state (or the video start clocks) is locked.
+    #[tokio::test]
+    // The locks are held across the publish on purpose: it must not wait.
+    #[allow(clippy::await_holding_lock)]
+    async fn an_audio_part_does_not_wait_for_another_streams_lock() {
+        let sink = Arc::new(RecordingPublicationSink::default());
+        let inner: Arc<dyn Fmp4PartPublisher> = sink.clone();
+        let (publisher, _receivers) = test_sharded_publisher(true);
+        let publisher = BoundedFmp4Publisher {
+            inline_audio: Some(inner),
+            ..publisher
+        };
+        let video_stream = 91_000_000_100;
+        let video = test_fmp4_part(
+            video_stream,
+            0,
+            true,
+            3,
+            1,
+            Some(Bytes::from_static(b"init")),
+            Bytes::from_static(b"h264"),
+            now_unix_ns(),
+        );
+        publisher.publish_fmp4_part(video).await.unwrap();
+        let entry = publisher.streams.entry(video_stream);
+        let held = entry.publication();
+        let held_starts = publisher.streams.video_starts();
+        let audio_stream = 91_000_000_101;
+        timeout(
+            Duration::from_secs(1),
+            publisher.publish_opaque_part(test_opaque_part(audio_stream)),
+        )
+        .await
+        .expect("an audio part waited for a video stream's lock")
+        .unwrap();
+        drop(held_starts);
+        drop(held);
+        assert_eq!(*sink.published.lock().unwrap(), [(audio_stream, 0)]);
+    }
+
+    fn audio_hot_args(workers: usize) -> Args {
+        let mut args = contrib_status_args();
+        args.audio_hot_thread = true;
+        args.audio_hot_cpu = -1;
+        args.audio_hot_fifo_priority = 0;
+        args.audio_hot_workers = workers;
+        args
+    }
+
+    #[test]
+    fn audio_hot_threads_default_to_one_per_format() {
+        let mut args = audio_hot_args(0);
+        args.daw_hls_formats = vec![
+            DawHlsFormat::Flac,
+            DawHlsFormat::Pcm,
+            DawHlsFormat::Opus,
+            DawHlsFormat::Flac,
+        ];
+        assert_eq!(audio_hot_thread_count(&args), 3);
+        args.audio_hot_workers = 2;
+        assert_eq!(audio_hot_thread_count(&args), 2);
+        args.audio_hot_workers = 0;
+        args.daw_hls_formats = vec![DawHlsFormat::Opus];
+        assert_eq!(audio_hot_thread_count(&args), 1);
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        args.daw_hls_formats = vec![DawHlsFormat::Flac, DawHlsFormat::Pcm, DawHlsFormat::Opus];
+        args.audio_hot_cpu = i32::try_from(cpus - 1).unwrap();
+        assert_eq!(audio_hot_thread_count(&args), 1);
+    }
+
+    /// The receive and recovery run on the first audio hot thread, each
+    /// rendition worker on the next thread in turn from the second, and the
+    /// threads' blocking pools run with normal scheduling.
+    #[tokio::test]
+    async fn audio_hot_threads_spread_the_renditions_over_their_threads() {
+        let thread_name = || async { std::thread::current().name().map(str::to_owned) };
+        assert!(AudioHotRuntime::start(&{
+            let mut args = audio_hot_args(3);
+            args.audio_hot_thread = false;
+            args
+        })
+        .unwrap()
+        .is_none());
+        let hot = AudioHotRuntime::start(&audio_hot_args(3)).unwrap().unwrap();
+        assert_eq!(hot.handles.len(), 3);
+        let first = spawn_audio_hot_task(Some(&hot), thread_name())
+            .await
+            .unwrap();
+        assert_eq!(first.as_deref(), Some("audio-hot-0"));
+        let renditions = hot.rendition_runtimes().unwrap();
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            names.push(renditions.next_handle().spawn(thread_name()).await.unwrap());
+        }
+        assert_eq!(
+            names,
+            [
+                Some("audio-hot-1".to_owned()),
+                Some("audio-hot-2".to_owned()),
+                Some("audio-hot-0".to_owned())
+            ]
+        );
+        let blocking_fifo = spawn_audio_hot_task(Some(&hot), async {
+            tokio::task::spawn_blocking(class_lanes::current_thread_is_fifo)
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(!blocking_fifo);
+        // Without the hot threads the work is a task of the caller's runtime.
+        let name = spawn_audio_hot_task(None, thread_name()).await.unwrap();
+        assert_ne!(name.as_deref(), Some("audio-hot-0"));
+        drop(hot);
+    }
+
+    /// The DAW media receive runs on the audio hot thread from a socket
+    /// moved to its runtime, and hands AEP1 datagrams to the recovery.
+    #[tokio::test]
+    async fn the_daw_receive_runs_on_the_audio_hot_thread() {
+        let hot = AudioHotRuntime::start(&audio_hot_args(1)).unwrap().unwrap();
+        let socket = bind_daw_media_udp_socket("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let bind = socket.local_addr().unwrap();
+        let socket = socket.into_std().unwrap();
+        let args = contrib_status_args();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
+        let (hls_tx, mut hls_rx) = audio_epoch_hls_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = spawn_audio_hot_task(Some(&hot), async move {
+            let socket = UdpSocket::from_std(socket)?;
+            assert_eq!(
+                std::thread::current().name(),
+                Some("audio-hot-0"),
+                "the receive runs on the audio hot thread"
+            );
+            run_daw_media_udp_ingest(socket, forwarder, Some(hls_tx), None, shutdown_rx).await
+        });
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // The receive hands anything with the AEP1 magic to the recovery.
+        let datagram = [MULTICHANNEL_AUDIO_TRANSPORT_MAGIC, &[1, 2, 3, 4]].concat();
+        let received = timeout(Duration::from_secs(2), async {
+            loop {
+                sender.send_to(&datagram, bind).unwrap();
+                if let Ok(Some(received)) = timeout(Duration::from_millis(50), hls_rx.recv()).await
+                {
+                    break received;
+                }
+            }
+        })
+        .await
+        .expect("no AEP1 datagram reached the recovery");
+        assert_eq!(received.bytes.as_ref(), datagram.as_slice());
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
     }
 }

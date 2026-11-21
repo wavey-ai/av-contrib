@@ -156,6 +156,44 @@ pub struct AudioEpochHlsConfig {
     /// recovery is then shared with that consumer. The worker never waits
     /// for it; an epoch that does not fit is counted and dropped.
     pub recovered_epochs: Option<mpsc::Sender<RecoveredAudioEpoch>>,
+    /// Runtimes that the rendition workers run on, in turn (the audio hot
+    /// threads); `None`: the caller's runtime.
+    pub rendition_runtimes: Option<RenditionRuntimes>,
+}
+
+/// The runtimes of the rendition workers: each new worker goes to the next
+/// one, starting with the second, so that with one runtime per format the
+/// recovery loop (on the first) and each format's encode and send run on
+/// threads of their own, and an Opus part never waits for a FLAC or PCM
+/// part's encode.
+#[derive(Clone)]
+pub struct RenditionRuntimes {
+    handles: Arc<[tokio::runtime::Handle]>,
+    next: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RenditionRuntimes {
+    /// `handles` must not be empty.
+    pub fn new(handles: Vec<tokio::runtime::Handle>) -> Option<Self> {
+        (!handles.is_empty()).then(|| Self {
+            handles: handles.into(),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        })
+    }
+
+    /// The runtime of the next rendition worker.
+    pub fn next_handle(&self) -> &tokio::runtime::Handle {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.handles.len();
+        &self.handles[index]
+    }
+
+    fn spawn<F>(&self, work: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.next_handle().spawn(work)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +227,15 @@ impl AudioEpochHlsConfig {
             playlists,
             publisher,
             recovered_epochs: None,
+            rendition_runtimes: None,
         }
+    }
+
+    /// Run the rendition workers on `runtimes`, in turn.
+    #[must_use]
+    pub fn with_rendition_runtimes(mut self, runtimes: Option<RenditionRuntimes>) -> Self {
+        self.rendition_runtimes = runtimes;
+        self
     }
 
     /// Hand every completed epoch to `sink` too (see `recovered_epochs`).
@@ -834,7 +880,11 @@ async fn dispatch_group_to_rendition_worker(
             let capacity = rendition_queue_capacity(group.frame_count, group.sample_rate);
             RENDITION_QUEUE_CAPACITY.fetch_max(capacity as u64, Ordering::Relaxed);
             let (sender, receiver) = mpsc::channel(capacity);
-            let handle = tokio::spawn(run_rendition_worker(config.clone(), key, receiver));
+            let worker = run_rendition_worker(config.clone(), key, receiver);
+            let handle = match config.rendition_runtimes.as_ref() {
+                Some(runtimes) => runtimes.spawn(worker),
+                None => tokio::spawn(worker),
+            };
             ACTIVE_RENDITION_WORKERS.fetch_add(1, Ordering::Relaxed);
             entry
                 .insert(RenditionWorker {
@@ -1534,6 +1584,103 @@ mod tests {
 
         retire_idle_rendition_workers(&mut workers, now).await;
         assert!(workers.is_empty());
+    }
+
+    /// A single-threaded runtime on a thread named `name`, until `stop`.
+    fn runtime_thread(
+        name: &str,
+    ) -> (
+        tokio::runtime::Handle,
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                handle_tx.send(runtime.handle().clone()).unwrap();
+                runtime.block_on(async {
+                    let _ = stop_rx.await;
+                });
+            })
+            .unwrap();
+        (handle_rx.recv().unwrap(), stop_tx, thread)
+    }
+
+    /// Rendition workers go to the runtimes in turn from the second, so that
+    /// with one runtime per format each format's encode has a thread of its
+    /// own and the first runtime (the recovery loop's) takes the last.
+    #[tokio::test]
+    async fn rendition_workers_run_on_the_rendition_runtimes_in_turn() {
+        let threads = (0..3)
+            .map(|index| runtime_thread(&format!("rendition-test-{index}")))
+            .collect::<Vec<_>>();
+        let runtimes = RenditionRuntimes::new(
+            threads
+                .iter()
+                .map(|(handle, _, _)| handle.clone())
+                .collect(),
+        )
+        .unwrap();
+        assert!(RenditionRuntimes::new(Vec::new()).is_none());
+        let mut names = Vec::new();
+        for _ in 0..4 {
+            let name = runtimes
+                .spawn(async { std::thread::current().name().map(str::to_owned) })
+                .await
+                .unwrap();
+            names.push(name.unwrap());
+        }
+        assert_eq!(
+            names,
+            [
+                "rendition-test-1",
+                "rendition-test-2",
+                "rendition-test-0",
+                "rendition-test-1"
+            ]
+        );
+
+        // A dispatched group starts its worker on the next runtime.
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured;
+        let config = test_config(20, 5, AudioEpochHlsPackaging::Opaque, publisher)
+            .with_rendition_runtimes(Some(runtimes.clone()));
+        let mut workers = HashMap::new();
+        let group = decoded_group(
+            0,
+            0,
+            0,
+            0,
+            2,
+            AudioPayloadKind::Pcm,
+            AudioSampleFormat::S24Le,
+            Bytes::from_static(b"pcm"),
+        );
+        dispatch_group_to_rendition_worker(
+            &config,
+            &mut workers,
+            (group, PartSourceTimes::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        // The worker took runtime 2 (the fifth turn): the next is runtime 0.
+        let next = runtimes
+            .spawn(async { std::thread::current().name().map(str::to_owned) })
+            .await
+            .unwrap();
+        assert_eq!(next.as_deref(), Some("rendition-test-0"));
+        stop_rendition_workers(workers).await;
+        for (_, stop, thread) in threads {
+            let _ = stop.send(());
+            thread.join().unwrap();
+        }
     }
 
     #[test]

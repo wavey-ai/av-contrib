@@ -209,6 +209,38 @@ pub fn try_send_all(socket: &UdpSocket, messages: &[Outbound<'_>]) -> TrySent {
     outcome
 }
 
+/// Wait, blocking the calling thread, until the kernel has room in
+/// `socket`'s send buffer or `timeout` has passed (`Ok(false)`). For a
+/// thread of its own (a lane backlog): it asks the kernel, not a runtime's
+/// I/O driver, so no runtime has to be polling for the wake-up to come.
+#[cfg(unix)]
+pub fn wait_writable(socket: &UdpSocket, timeout: std::time::Duration) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut descriptor = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    loop {
+        // SAFETY: one pollfd that outlives the call, and its count.
+        let rc = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if rc >= 0 {
+            return Ok(rc > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn wait_writable(_socket: &UdpSocket, timeout: std::time::Duration) -> io::Result<bool> {
+    std::thread::sleep(timeout.min(std::time::Duration::from_millis(1)));
+    Ok(true)
+}
+
 /// One awaited send per datagram: the behaviour without batching.
 pub async fn send_each(socket: &UdpSocket, messages: &[Outbound<'_>]) -> io::Result<usize> {
     send_each_until_refused(socket, messages)

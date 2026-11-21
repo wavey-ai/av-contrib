@@ -339,32 +339,46 @@ leave the direct targets unset.
 Audio is kept apart from video on the way out, so that a 4K part's
 hundreds of symbols never hold an audio part back:
 
-- `--relay-class-lanes` (default `true`): each lane is a socket pair on its
+- `--relay-class-lanes` (default `false`): each lane is a socket pair on its
   source endpoint (`SO_REUSEPORT`; the parent's binding of the contributor
   does not change). Audio streams leave on one socket with `SO_PRIORITY`
   `--relay-audio-socket-priority` (6: band 0 of a `prio` qdisc) to the
   parent's port P; video streams leave on the other to
   P + `--relay-class-port-offset` (1000, the av-mesh receiver's convention),
   optionally paced with `--relay-video-pacing-mbps` (`SO_MAX_PACING_RATE`,
-  under `fq`). A stream is video from its first part with video. With
-  `false` every stream shares one socket and goes to P.
+  under `fq`). A stream is video from its first part with video, for its
+  source epoch and while it keeps sending video. With `false` every stream
+  shares one socket and goes to P, and each part keeps its own class. It is
+  off by default because only a parent that listens on P + 1000 (av-mesh
+  `--relay-class-threads` with `--relay-controlled-local`, on Linux) takes
+  the video class; the deploy and the lab render it on with their parents.
 - `--relay-audio-inline` (default `true`): audio parts are published on the
   packager's own task, without a publication worker's queue, and each lane
   is handed an audio part's symbols with non-blocking `sendmmsg`, one lane
   after the other with no join; what a full socket buffer does not take
-  waits, in order, in that lane's backlog (counted as
-  `lane_backlog_parts`). The journal's `sent_first` is the first datagram of
-  a part handed to the kernel on any lane.
-- `--relay-repair-both-lanes` (default `true`): the primary lane carries the
-  repair symbols too, so the primary parent alone recovers a lost source.
+  waits, in order, in that lane's backlog thread (counted as
+  `lane_backlog_parts`; the lane's object outcome is recorded when the
+  backlog has sent, dropped or expired the part). The journal's
+  `sent_first` is the first datagram of a part handed to the kernel on any
+  lane.
+- `--relay-repair-both-lanes` (default `false`): the primary lane carries
+  the repair symbols of audio parts too, so the primary parent alone
+  recovers a lost audio source (a 4K part's repair stays on the secondary).
   The parent must accept repair on that lane (av-mesh
   `--relay-primary-promoted`, a `source_and_repair` carrier link); a parent
-  that does not counts them as unauthorized and drops them.
-- `--audio-hot-thread` (default `true`): the AEP1 packagers and the inline
-  audio publication run on a thread of their own, with `SCHED_FIFO`
-  `--audio-hot-fifo-priority` (10) and pinned to `--audio-hot-cpu` (2) where
-  the host allows it (`CAP_SYS_NICE` or root). Refused, the thread runs
-  with normal scheduling and unpinned, and says so in one info line.
+  that does not counts them as unauthorized and drops them, so the deploy
+  renders the two together.
+- `--audio-hot-thread` (default `true`): the DAW media receive, the AEP1
+  recovery and packagers and the inline audio publication run on audio hot
+  threads, each with a single-threaded runtime, `SCHED_FIFO`
+  `--audio-hot-fifo-priority` (10) and thread `i` pinned to
+  `--audio-hot-cpu` (2) + `i` where the host allows it (`CAP_SYS_NICE` or
+  root). Refused, a thread runs with normal scheduling and unpinned, and
+  says so in one info line. The first thread receives and recovers; the
+  rendition workers (one per source, group and format) take the threads in
+  turn from the second. `--audio-hot-workers` sets the number of threads;
+  0 (default) is one per `--daw-hls-formats` format, at most as many as
+  there are CPUs from `--audio-hot-cpu` on.
 
 The stdin senders are kept for local smoke tests and protocol debugging:
 
