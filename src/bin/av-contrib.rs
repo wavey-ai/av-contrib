@@ -807,6 +807,9 @@ struct Args {
     playlist_buffer_kb: usize,
 
     /// Events kept in the hop journal served at /api/hops. 0 disables it.
+    /// The default, 2^20, holds about 75 s of the default parts (a part
+    /// leaves about ten events); the start-up log gives the seconds at the
+    /// configured part.
     #[arg(
         long,
         env = "AV_HOP_JOURNAL_CAPACITY",
@@ -941,6 +944,23 @@ impl Args {
              one AEP1 epoch per part (--audio-part epoch: 1 ms PCM, 2.5 ms Opus). It no longer \
              sets the video part (--video-part)."
         ))
+    }
+
+    /// Parts a second of the DAW formats at the nominal part: a lossless
+    /// rendition (PCM or FLAC) at the nominal epoch, Opus at no less than
+    /// 2.5 ms. For the hop journal's coverage in time.
+    fn nominal_audio_parts_per_second(&self) -> u64 {
+        let part_us = self.nominal_audio_part_us().max(1);
+        let lossless = self
+            .daw_hls_formats
+            .iter()
+            .any(|format| matches!(format, DawHlsFormat::Pcm | DawHlsFormat::Flac));
+        let opus = self
+            .daw_hls_formats
+            .iter()
+            .any(|format| matches!(format, DawHlsFormat::Opus));
+        u64::from(lossless) * (1_000_000 / part_us)
+            + u64::from(opus) * (1_000_000 / part_us.max(2_500))
     }
 
     /// Shortest audio-only part of a segmenter that counts time (the fMP4
@@ -8391,6 +8411,16 @@ async fn main() -> Result<()> {
         args.relay_local_id.clone(),
         args.hop_journal_capacity,
     ));
+    if args.hop_journal_capacity > 0 {
+        let parts_per_second = args.nominal_audio_parts_per_second();
+        info!(
+            capacity = args.hop_journal_capacity,
+            parts_per_second,
+            seconds = hop_journal::covered_seconds(args.hop_journal_capacity, parts_per_second),
+            "hop journal holds this many seconds of the nominal audio parts \
+             (--hop-journal-capacity)"
+        );
+    }
     validate_compiled_ingress_features(&args)?;
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
@@ -9601,6 +9631,8 @@ mod tests {
                 AudioPayloadKind::Opus
             ]
         );
+        // PCM 1 ms and Opus 2.5 ms: what the hop journal is sized for.
+        assert_eq!(args.nominal_audio_parts_per_second(), 1_400);
         let durations = args.stamp_durations();
         assert_eq!(durations.audio_part_us, 0);
         assert_eq!(durations.video_part_us, 0);
@@ -9639,7 +9671,10 @@ mod tests {
         assert_eq!(args.nominal_audio_part_us(), 2_500);
         assert_eq!(args.nominal_audio_part_ms(), 3);
         assert!(args.legacy_audio_part_warning().is_none());
+        // 2.5 ms parts of a lossless rendition and of Opus.
+        assert_eq!(args.nominal_audio_parts_per_second(), 800);
         let args = Args::try_parse_from(["av-contrib", "--fmp4-part-ms", "50"]).unwrap();
+        assert_eq!(args.nominal_audio_parts_per_second(), 40);
         assert!(args
             .legacy_audio_part_warning()
             .is_some_and(|warning| warning.contains("50 ms")));

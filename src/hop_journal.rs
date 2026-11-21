@@ -25,8 +25,31 @@ use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Default ring capacity, in events (`--hop-journal-capacity`).
-pub const DEFAULT_HOP_JOURNAL_CAPACITY: usize = 262_144;
+/// Default ring capacity, in events (`--hop-journal-capacity`): 2^20.
+///
+/// The ring is sized in time. A part leaves about [`EVENTS_PER_PART`]
+/// events. 262,144 events were 26 s of 5 ms parts; with the default parts
+/// of one epoch (PCM 1 ms and Opus 2.5 ms, 1,400 parts a second) they were
+/// 19 s, less than one latency-bench run, and the run's first contributor
+/// hops were gone before hops.py asked for them. 2^20 events hold 75 s of
+/// the default parts, at about 88 bytes an event (92 MB when full; the
+/// pages are touched as the ring fills). The 0.25 ms PCM sweep point (4,400
+/// parts a second with Opus) fills it in 24 s: pass a larger
+/// `--hop-journal-capacity` for long runs of it.
+pub const DEFAULT_HOP_JOURNAL_CAPACITY: usize = 1 << 20;
+
+/// Events that one part leaves in the contributor's journal, about: the
+/// nine stages from `src_first` to `sent_secondary`, and a `sent_direct`.
+pub const EVENTS_PER_PART: u64 = 10;
+
+/// Seconds of parts that a ring of `capacity` events holds at
+/// `parts_per_second`.
+pub fn covered_seconds(capacity: usize, parts_per_second: u64) -> f64 {
+    if parts_per_second == 0 {
+        return f64::INFINITY;
+    }
+    capacity as f64 / (parts_per_second * EVENTS_PER_PART) as f64
+}
 
 /// Content type of `GET /api/hops`.
 pub const HOP_JOURNAL_CONTENT_TYPE: &str = "application/x-ndjson";
@@ -557,5 +580,16 @@ mod tests {
         );
         assert!(PartSourceTimes::default().is_empty());
         assert_eq!(PartSourceTimes::default().events(1, 1).count(), 0);
+    }
+
+    #[test]
+    fn the_default_ring_holds_a_latency_bench_run_of_the_default_parts() {
+        // PCM 1 ms and Opus 2.5 ms parts: 1,400 a second.
+        let seconds = covered_seconds(DEFAULT_HOP_JOURNAL_CAPACITY, 1_000 + 400);
+        assert!(seconds >= 64.0, "{seconds} s");
+        // About 88 bytes an event: the full ring stays near 100 MB.
+        let bytes = DEFAULT_HOP_JOURNAL_CAPACITY * std::mem::size_of::<HopEvent>();
+        assert!(bytes <= 100 << 20, "{bytes} bytes");
+        assert!(covered_seconds(0, 0).is_infinite());
     }
 }
