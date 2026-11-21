@@ -104,7 +104,13 @@ const RELAY_LANE_IMPAIRED_HOLD_MS: u64 = 3_000;
 const AUDIO_EPOCH_MESH_QUEUE_CAPACITY: usize = 32_768;
 const AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY: usize = 32_768;
 const PUBLICATION_WORKERS: usize = 8;
-const PUBLICATION_QUEUE_CAPACITY: usize = 256;
+// Parts that wait for a publication worker. A stream of 5 ms audio parts
+// makes 200 parts a second, and several streams share a worker. With 32
+// places for each worker, a pause of 120 ms of the process (measured on a
+// busy host; a shared CPU pauses a Nanode in the same way) overflowed the
+// queue, and each part that does not fit is a hole in the playlist of every
+// reader. 256 places hold more than half a second of three such streams.
+const PUBLICATION_QUEUE_CAPACITY: usize = 2_048;
 const PUBLICATION_QUEUE_CAPACITY_PER_WORKER: usize =
     PUBLICATION_QUEUE_CAPACITY / PUBLICATION_WORKERS;
 static PUBLICATION_QUEUE_CAPACITY_METRIC: AtomicU64 = AtomicU64::new(0);
@@ -2361,6 +2367,27 @@ struct StampDurations {
 struct StreamPublication {
     next_sequence: u64,
     stamper: Option<StreamStamper>,
+    /// Wall clock that numbers the first segment of a video stream.
+    video_started_unix_ms: Option<u64>,
+}
+
+/// Video streams that start within this time of each other number their
+/// segments from the same instant.
+const LADDER_START_WINDOW_MS: u64 = 1_000;
+
+/// The wall clock that numbers the first segment of a video stream.
+///
+/// An encoder that sends a ladder starts its renditions together, and the
+/// same group of pictures must have the same Media Sequence Number in each
+/// rendition. The number of the first segment comes from the wall clock, so
+/// two renditions that start a few milliseconds apart, on either side of a
+/// segment boundary of the clock, would differ by one for good. A stream
+/// that starts within a second of another takes the start of the earliest.
+fn shared_video_start(own_unix_ms: u64, others: impl Iterator<Item = u64>) -> u64 {
+    others
+        .filter(|other| own_unix_ms.abs_diff(*other) <= LADDER_START_WINDOW_MS)
+        .min()
+        .map_or(own_unix_ms, |earliest| earliest.min(own_unix_ms))
 }
 
 struct BoundedFmp4Publisher {
@@ -2379,17 +2406,36 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let stream_id = part.stream_id;
         let stream_idx = part.stream_idx;
         let mut streams = self.streams.lock().await;
+        let has_video = part.video_units > 0;
+        let published_unix_ms = u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0);
+        let known = streams
+            .get(&stream_id)
+            .is_some_and(|stream| stream.stamper.is_some());
+        let started_unix_ms = if has_video && !known {
+            shared_video_start(
+                published_unix_ms,
+                streams
+                    .values()
+                    .filter_map(|stream| stream.video_started_unix_ms),
+            )
+        } else {
+            published_unix_ms
+        };
         let stream = streams.entry(stream_id).or_insert(StreamPublication {
             next_sequence: 0,
             stamper: None,
+            video_started_unix_ms: None,
         });
         part.sequence = stream.next_sequence;
         let sequence = part.sequence;
         // A stream with video cuts its segments at key frames. An audio
         // stream has fixed segments, and every part of it can start one.
-        let has_video = part.video_units > 0;
         let durations = self.durations;
         let before = stream.stamper.clone();
+        let started_before = stream.video_started_unix_ms;
+        if has_video && stream.stamper.is_none() {
+            stream.video_started_unix_ms = Some(started_unix_ms);
+        }
         let stamper = stream.stamper.get_or_insert_with(|| {
             if has_video {
                 StreamStamper::new(durations.video_part_ms, durations.video_segment_ms)
@@ -2400,7 +2446,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         part.hls = Some(stamper.stamp(
             part.duration_ms,
             part.keyframe || !has_video,
-            u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
+            started_unix_ms,
         ));
         let shard = stream_id as usize % self.senders.len();
         let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
@@ -2412,6 +2458,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         } else {
             // The part was not published: it has no place in the playlist.
             stream.stamper = before;
+            stream.video_started_unix_ms = started_before;
         }
         drop(streams);
         enqueue_publication_result(result, stream_id, stream_idx, sequence, &self.telemetry)
@@ -2434,6 +2481,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let stream = streams.entry(stream_id).or_insert(StreamPublication {
             next_sequence: 0,
             stamper: None,
+            video_started_unix_ms: None,
         });
         part.sequence = stream.next_sequence;
         let sequence = part.sequence;
@@ -8157,6 +8205,24 @@ fn validate_compiled_ingress_features(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renditions_that_start_together_number_their_segments_from_one_instant() {
+        // Four renditions start within 210 ms, across a two-second boundary
+        // of the wall clock (…998 s and …000 s).
+        let first = 1_795_238_327_990_u64;
+        let second = shared_video_start(first + 4, [first].into_iter());
+        let third = shared_video_start(first + 12, [first, second].into_iter());
+        let fourth = shared_video_start(first + 210, [first, second, third].into_iter());
+        assert_eq!([second, third, fourth], [first; 3]);
+        assert_eq!(first / 2_000, fourth / 2_000);
+        assert_ne!(first / 2_000, (first + 210) / 2_000);
+        // A stream that starts a minute later is not a rendition of them.
+        let later = first + 60_000;
+        assert_eq!(shared_video_start(later, [first].into_iter()), later);
+        // The first stream of all keeps its own start.
+        assert_eq!(shared_video_start(first, std::iter::empty()), first);
+    }
 
     #[test]
     fn a_numeric_rtmp_key_names_the_output_stream() {
