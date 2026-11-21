@@ -785,8 +785,15 @@ impl ReceiveFormatState {
         group: &DecodedMultichannelAudioGroup,
         arrival_ns: u64,
         deadline_ms: u64,
+        window: &ReceiveWindow,
     ) {
         if group.payload_kind != AudioPayloadKind::SoundKitV2 {
+            return;
+        }
+        let capture_ns = group.session_id.saturating_add(
+            group.pts_samples.saturating_mul(1_000_000_000) / u64::from(group.sample_rate),
+        );
+        if !window.counts(capture_ns) {
             return;
         }
         let Some(format) = ReceiveAudioFormat::from_soundkit_v2_payload(&group.payload) else {
@@ -808,9 +815,6 @@ impl ReceiveFormatState {
             return;
         }
 
-        let capture_ns = group.session_id.saturating_add(
-            group.pts_samples.saturating_mul(1_000_000_000) / u64::from(group.sample_rate),
-        );
         let latency_ns = arrival_ns.saturating_sub(capture_ns);
         let deadline_missed = latency_ns > deadline_ms.saturating_mul(1_000_000);
         if deadline_missed {
@@ -832,12 +836,8 @@ impl ReceiveFormatState {
             .selected_raptorq_fragments_recovered
             .saturating_add(u64::from(group.raptorq_recovered_fragments));
         self.latencies_ns.push(latency_ns);
-        let pts_ms = group
-            .pts_samples
-            .saturating_mul(1_000)
-            .saturating_div(u64::from(group.sample_rate));
         self.latency_buckets
-            .entry((receive_audio_format_order(format), pts_ms / 1_000))
+            .entry((receive_audio_format_order(format), window.second_of(capture_ns)))
             .or_default()
             .record(latency_ns, deadline_missed, erasure, discontinuity);
     }
@@ -2189,13 +2189,52 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The interval in which a receiver listens and counts epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiveWindow {
+    /// First capture time that is counted.
+    start_ns: u64,
+    /// Capture times at or after this are not counted.
+    media_end_ns: u64,
+    /// The receiver stops listening here.
+    stop_ns: u64,
+}
+
+impl ReceiveWindow {
+    /// A listener counts `duration_seconds` of the session from the moment
+    /// it subscribes, or from the start of the session when it subscribes
+    /// before that. `--session-id` names the session and its clock; it is
+    /// not the start of the measurement.
+    fn new(session_id: u64, now_ns: u64, duration_seconds: u64, tail_seconds: u64) -> Self {
+        let start_ns = session_id.max(now_ns);
+        let media_end_ns = start_ns.saturating_add(duration_seconds.saturating_mul(1_000_000_000));
+        let stop_ns = media_end_ns.saturating_add(tail_seconds.saturating_mul(1_000_000_000));
+        Self {
+            start_ns,
+            media_end_ns,
+            stop_ns,
+        }
+    }
+
+    fn counts(&self, capture_ns: u64) -> bool {
+        capture_ns >= self.start_ns && capture_ns < self.media_end_ns
+    }
+
+    /// Whole seconds of capture time since the start of the window.
+    fn second_of(&self, capture_ns: u64) -> u64 {
+        capture_ns.saturating_sub(self.start_ns) / 1_000_000_000
+    }
+}
+
 fn receive_command_timeout(
     session_id: u64,
     duration_seconds: u64,
     tail_seconds: u64,
 ) -> Result<Duration> {
+    // A UDP or WebTransport listener counts from when it joins (see
+    // ReceiveWindow), so its deadline is too.
     receive_command_timeout_ms(
-        session_id,
+        session_id.max(now_unix_ns()?),
         duration_seconds.saturating_mul(1_000),
         tail_seconds,
     )
@@ -2892,8 +2931,8 @@ async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput>
 
     let transport = MultichannelAudioTransportAdapter::udp(65_535);
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
-    let stop_ns =
-        session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
+    let window = ReceiveWindow::new(session_id, now_unix_ns()?, duration_seconds, tail_seconds);
+    let stop_ns = window.stop_ns;
     let refresh = Duration::from_secs(5);
     let mut next_refresh = TokioInstant::now() + refresh;
     let mut format_states = group_ids
@@ -2932,7 +2971,7 @@ async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput>
                         .iter_mut()
                         .find(|(observed_group_id, _)| *observed_group_id == group.group_id)
                     {
-                        format_state.observe(&group, arrival_ns, deadline_ms);
+                        format_state.observe(&group, arrival_ns, deadline_ms, &window);
                     }
                 }
             }
@@ -2961,7 +3000,7 @@ async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput>
             let received_epochs = format_state.selected_epoch_count();
             let latency_ms = percentiles_ms(std::mem::take(&mut format_state.latencies_ns));
             let latency_time_series =
-                format_state.finish_latency_time_series(session_id, duration_seconds);
+                format_state.finish_latency_time_series(window.start_ns, duration_seconds);
             ReceiveReport {
                 schema: "needletail.aep1-48k-probe.receive.v2",
                 lane: "native_udp_fec",
@@ -3123,9 +3162,9 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
 
     let transport = MultichannelAudioTransportAdapter::udp(65_535);
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
-    let stop_ns =
-        session_id.saturating_add(duration_seconds.saturating_add(tail_seconds) * 1_000_000_000);
-    let media_end_ns = session_id.saturating_add(duration_seconds.saturating_mul(1_000_000_000));
+    let window = ReceiveWindow::new(session_id, now_unix_ns()?, duration_seconds, tail_seconds);
+    let stop_ns = window.stop_ns;
+    let media_end_ns = window.media_end_ns;
     let mut format_state = ReceiveFormatState::new(formats)?;
     let mut wire_bytes = 0_u64;
     let mut source_datagrams_received = 0_u64;
@@ -3171,7 +3210,7 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
             if group.session_id != session_id || group.group_id != group_id {
                 continue;
             }
-            format_state.observe(&group, arrival_ns, deadline_ms);
+            format_state.observe(&group, arrival_ns, deadline_ms, &window);
         }
     }
     endpoint.close(0_u32.into(), b"probe complete");
@@ -6628,6 +6667,30 @@ fn now_unix_ns() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_receiver_that_joins_a_running_session_listens_for_its_whole_duration() {
+        // The session started a minute ago; the listener joins now and asks
+        // for ten seconds. It must listen for ten seconds and a tail from
+        // now, not stop at once because the session's first ten seconds are
+        // over (the zero of the 21 November comparison).
+        let now_ns = 1_795_272_252_000_000_000_u64;
+        let session_id = now_ns - 60_000_000_000;
+        let window = super::ReceiveWindow::new(session_id, now_ns, 10, 3);
+        assert_eq!(window.start_ns, now_ns);
+        assert_eq!(window.media_end_ns, now_ns + 10_000_000_000);
+        assert_eq!(window.stop_ns, now_ns + 13_000_000_000);
+    }
+
+    #[test]
+    fn a_receiver_that_subscribes_before_the_session_starts_counts_from_its_start() {
+        let now_ns = 1_795_272_252_000_000_000_u64;
+        let session_id = now_ns + 2_000_000_000;
+        let window = super::ReceiveWindow::new(session_id, now_ns, 10, 3);
+        assert_eq!(window.start_ns, session_id);
+        assert_eq!(window.media_end_ns, session_id + 10_000_000_000);
+        assert_eq!(window.stop_ns, session_id + 13_000_000_000);
+    }
+
     use super::*;
 
     fn test_soundkit_opus_part(id: u8) -> Vec<u8> {
@@ -7490,6 +7553,7 @@ mod tests {
                 },
                 1_001_000_000,
                 25,
+                &ReceiveWindow::new(1_000_000_000, 0, 10, 0),
             );
         }
 
