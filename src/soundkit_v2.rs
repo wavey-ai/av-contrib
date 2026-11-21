@@ -85,9 +85,7 @@ impl<'a> SoundKitV2StreamRef<'a> {
             match header.packet_crc32_value() {
                 Some(_) => {
                     if !header.verify_packet_crc32(encoded_header, payload)? {
-                        return Err(format!(
-                            "SoundKit v2 packet CRC mismatch at byte {offset}"
-                        ));
+                        return Err(format!("SoundKit v2 packet CRC mismatch at byte {offset}"));
                     }
                 }
                 None if require_crc32 => {
@@ -361,11 +359,9 @@ mod tests {
 
     #[test]
     fn concatenated_opus_packets_keep_individual_boundaries() {
-        let first = frame_soundkit_v2_packet(
-            metadata(EncodingFlag::Opus, 1, 0),
-            &[0x88, 0x11, 0x22],
-        )
-        .unwrap();
+        let first =
+            frame_soundkit_v2_packet(metadata(EncodingFlag::Opus, 1, 0), &[0x88, 0x11, 0x22])
+                .unwrap();
         let second = frame_soundkit_v2_packet(
             metadata(EncodingFlag::Opus, 2, 240),
             &[0x88, 0x33, 0x44, 0x55],
@@ -383,11 +379,9 @@ mod tests {
 
     #[test]
     fn rejects_truncated_or_corrupt_packets() {
-        let packet = frame_soundkit_v2_packet(
-            metadata(EncodingFlag::FLAC, 1, 0),
-            b"lossless-frame",
-        )
-        .unwrap();
+        let packet =
+            frame_soundkit_v2_packet(metadata(EncodingFlag::FLAC, 1, 0), b"lossless-frame")
+                .unwrap();
         assert!(SoundKitV2StreamRef::parse(&packet[..packet.len() - 1], true).is_err());
 
         let mut corrupt = packet.to_vec();

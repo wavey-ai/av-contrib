@@ -1,6 +1,7 @@
 pub mod audio_epoch_hls;
-pub mod fmp4_bridge;
 pub mod fixture_replay;
+pub mod fmp4_bridge;
+pub mod hls_stamp;
 pub mod ingress_authorization;
 pub mod quadra_renditions;
 pub mod soundkit_v2;

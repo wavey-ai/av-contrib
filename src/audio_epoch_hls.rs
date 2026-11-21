@@ -296,6 +296,7 @@ impl OpaquePartSegmenter {
             published_at_unix_ns: now_unix_ns(),
             bytes: self.bytes.split().freeze(),
             audio_units: std::mem::take(&mut self.audio_units),
+            hls: None,
         };
         self.duration_ms = 0;
         self.published_parts = self.published_parts.saturating_add(1);
@@ -578,11 +579,9 @@ async fn run_rendition_worker(
 ) {
     let mut renditions = HashMap::<RenditionKey, RenditionState>::new();
     while let Some(group) = input.recv().await {
-        let _ = RENDITION_QUEUE_DEPTH.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |depth| Some(depth.saturating_sub(1)),
-        );
+        let _ = RENDITION_QUEUE_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+            Some(depth.saturating_sub(1))
+        });
         if let Err(error) = package_group(&config, &mut renditions, group).await {
             WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
             warn!(
@@ -799,12 +798,12 @@ async fn package_group_as_fmp4(
         let pts_ms = samples_to_millis(pts_samples, group.sample_rate)?;
         segmenter
             .push_access_unit(AccessUnit {
-            key: true,
-            pts: pts_ms,
-            dts: pts_ms,
-            data: packet.data,
-            stream_type,
-            id: packet.id,
+                key: true,
+                pts: pts_ms,
+                dts: pts_ms,
+                data: packet.data,
+                stream_type,
+                id: packet.id,
             })
             .await;
         pts_samples = pts_samples
@@ -852,9 +851,9 @@ fn audio_track_config(
                 sample_kind,
             })))
         }
-        AudioPayloadKind::SoundKitV2 => {
-            Err("SoundKit v2 group reached track configuration before terminal decoding".to_string())
-        }
+        AudioPayloadKind::SoundKitV2 => Err(
+            "SoundKit v2 group reached track configuration before terminal decoding".to_string(),
+        ),
     }
 }
 
@@ -868,7 +867,9 @@ fn rendition_stream_id(
         AudioPayloadKind::Opus => OPUS_RENDITION_STREAM_OFFSET,
         AudioPayloadKind::Pcm => PCM_RENDITION_STREAM_OFFSET,
         AudioPayloadKind::SoundKitV2 => {
-            return Err("SoundKit v2 group reached stream routing before terminal decoding".to_string())
+            return Err(
+                "SoundKit v2 group reached stream routing before terminal decoding".to_string(),
+            )
         }
     };
     base_stream_id
@@ -886,9 +887,7 @@ fn raw_opus_packets(
     };
     let packets = if let Some(stream) = stream {
         if stream.total_frame_count != u64::from(group.frame_count) {
-            return Err(
-                "SoundKit Opus frame counts do not add up to the AEP1 group".to_string(),
-            );
+            return Err("SoundKit Opus frame counts do not add up to the AEP1 group".to_string());
         }
         let mut expected_pts = group.pts_samples;
         let mut packets = Vec::with_capacity(stream.packets.len());
@@ -899,7 +898,7 @@ fn raw_opus_packets(
             }
             if header.is_encrypted() {
                 return Err(
-                    "encrypted SoundKit Opus cannot be published as public fMP4".to_string(),
+                    "encrypted SoundKit Opus cannot be published as public fMP4".to_string()
                 );
             }
             if header.sample_rate() != group.sample_rate

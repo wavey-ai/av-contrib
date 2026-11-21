@@ -186,9 +186,12 @@ pub async fn capture_fixture(options: CaptureFixtureOptions) -> Result<CaptureFi
     let transport = MultichannelAudioTransportAdapter::udp(65_535);
     let mut receiver = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
     let wanted_epochs = options.duration_seconds.saturating_mul(200);
-    let stop_ns = options
-        .session_id
-        .saturating_add(options.duration_seconds.saturating_add(options.tail_seconds) * 1_000_000_000);
+    let stop_ns = options.session_id.saturating_add(
+        options
+            .duration_seconds
+            .saturating_add(options.tail_seconds)
+            * 1_000_000_000,
+    );
     let mut records = BTreeMap::<(u64, FixtureCodec), FixtureRecord>::new();
     let mut datagrams_received = 0_u64;
     let mut recovered_fragments = 0_u64;
@@ -196,7 +199,12 @@ pub async fn capture_fixture(options: CaptureFixtureOptions) -> Result<CaptureFi
 
     while now_unix_ns()? < stop_ns {
         let remaining = Duration::from_nanos(stop_ns.saturating_sub(now_unix_ns()?));
-        match timeout(remaining.min(Duration::from_millis(250)), socket.recv_from(&mut datagram)).await {
+        match timeout(
+            remaining.min(Duration::from_millis(250)),
+            socket.recv_from(&mut datagram),
+        )
+        .await
+        {
             Ok(Ok((len, _))) => {
                 let Ok(payload) = transport.payload(&datagram[..len]) else {
                     continue;
@@ -204,7 +212,8 @@ pub async fn capture_fixture(options: CaptureFixtureOptions) -> Result<CaptureFi
                 datagrams_received = datagrams_received.saturating_add(1);
                 let outcome = receiver.push_datagram(payload)?;
                 for group in outcome.completed_groups {
-                    if group.session_id != options.session_id || group.group_id != options.group_id {
+                    if group.session_id != options.session_id || group.group_id != options.group_id
+                    {
                         continue;
                     }
                     if group.payload_kind != AudioPayloadKind::SoundKitV2 {
@@ -213,12 +222,14 @@ pub async fn capture_fixture(options: CaptureFixtureOptions) -> Result<CaptureFi
                     let codec = soundkit_codec(&group.payload)?;
                     recovered_fragments = recovered_fragments
                         .saturating_add(u64::from(group.raptorq_recovered_fragments));
-                    records.entry((group.pts_samples, codec)).or_insert(FixtureRecord {
-                        relative_pts_samples: group.pts_samples,
-                        codec,
-                        channel_count: group.channel_count,
-                        payload: group.payload.to_vec(),
-                    });
+                    records
+                        .entry((group.pts_samples, codec))
+                        .or_insert(FixtureRecord {
+                            relative_pts_samples: group.pts_samples,
+                            codec,
+                            channel_count: group.channel_count,
+                            payload: group.payload.to_vec(),
+                        });
                 }
                 if select_window(&records, wanted_epochs).is_some() {
                     break;
@@ -325,8 +336,8 @@ pub async fn replay_fixture(options: ReplayFixtureOptions) -> Result<ReplayFixtu
     let subscription_id = SubscriptionId::new(options.subscription_id)?;
     let cpu_start = process_cpu_seconds();
     let wall_start = Instant::now();
-    let start = TokioInstant::now()
-        + Duration::from_nanos(session_id.saturating_sub(now_unix_ns()?));
+    let start =
+        TokioInstant::now() + Duration::from_nanos(session_id.saturating_sub(now_unix_ns()?));
     let scheduled_epochs = options.duration_seconds.saturating_mul(200);
     let fixture_pts = by_pts.keys().copied().collect::<Vec<_>>();
     let scheduled_parts = scheduled_epochs.div_ceil(RELAY_PART_EPOCHS);
@@ -371,31 +382,30 @@ pub async fn replay_fixture(options: ReplayFixtureOptions) -> Result<ReplayFixtu
                 &payload,
             )?;
             let capture_timestamp = ClockTimestamp::new(
-                    i64::try_from(capture_ns).context("fixture capture time exceeds i64")?,
-                    "fixture-replay-clock",
-                    ClockConfidence::estimated(5_000_000),
-                )?;
+                i64::try_from(capture_ns).context("fixture capture time exceeds i64")?,
+                "fixture-replay-clock",
+                ClockConfidence::estimated(5_000_000),
+            )?;
             let deadline_timestamp = ClockTimestamp::new(
-                    i64::try_from(deadline_ns).context("fixture deadline exceeds i64")?,
-                    "fixture-replay-clock",
-                    ClockConfidence::estimated(5_000_000),
-                )?;
+                i64::try_from(deadline_ns).context("fixture deadline exceeds i64")?,
+                "fixture-replay-clock",
+                ClockConfidence::estimated(5_000_000),
+            )?;
             let object = MediaObjectBuilder::new(key, ObjectKind::Media, payload)
-                    .with_capture_timestamp(capture_timestamp)
-                    .with_deadline(deadline_timestamp)
-                    .with_metadata("scheduler-class", b"audio".to_vec())
-                    .with_metadata("payload-format", b"soundkit-v2-bundle".to_vec())
-                    .build()?;
+                .with_capture_timestamp(capture_timestamp)
+                .with_deadline(deadline_timestamp)
+                .with_metadata("scheduler-class", b"audio".to_vec())
+                .with_metadata("payload-format", b"soundkit-v2-bundle".to_vec())
+                .build()?;
             let encoded = encoder.encode_object_with_inferred_priority(
-                    &object,
-                    generation,
-                    subscription_id,
-                    deadline,
-                )?;
+                &object,
+                generation,
+                subscription_id,
+                deadline,
+            )?;
             source_datagrams = source_datagrams
                 .saturating_add((encoded.source_symbols.len() as u64).saturating_mul(2));
-            repair_datagrams = repair_datagrams
-                .saturating_add(encoded.repair_symbols.len() as u64);
+            repair_datagrams = repair_datagrams.saturating_add(encoded.repair_symbols.len() as u64);
             for datagram in encoded.source_symbols {
                 paced.push((datagram.clone(), true));
                 paced.push((datagram, false));
@@ -407,7 +417,8 @@ pub async fn replay_fixture(options: ReplayFixtureOptions) -> Result<ReplayFixtu
         let count = paced.len().max(1) as u32;
         for (index, (datagram, primary_lane)) in paced.into_iter().enumerate() {
             let scheduled_at = part_at
-                + FRAME_DURATION.saturating_mul(RELAY_PART_EPOCHS as u32)
+                + FRAME_DURATION
+                    .saturating_mul(RELAY_PART_EPOCHS as u32)
                     .saturating_mul(index as u32)
                     / count;
             sleep_until(scheduled_at).await;
@@ -490,7 +501,10 @@ fn codec_name(codec: FixtureCodec) -> &'static str {
 
 fn soundkit_codec(payload: &[u8]) -> Result<FixtureCodec> {
     let stream = SoundKitV2StreamRef::parse(payload, true).map_err(anyhow::Error::msg)?;
-    let first = stream.packets.first().context("SoundKit v2 stream is empty")?;
+    let first = stream
+        .packets
+        .first()
+        .context("SoundKit v2 stream is empty")?;
     let codec = match first.header.encoding() {
         EncodingFlag::FLAC => FixtureCodec::Flac,
         EncodingFlag::Opus => FixtureCodec::Opus,
@@ -508,11 +522,15 @@ fn soundkit_codec(payload: &[u8]) -> Result<FixtureCodec> {
 
 fn soundkit_geometry(payload: &[u8]) -> Result<(u32, u32, u16)> {
     let stream = SoundKitV2StreamRef::parse(payload, true).map_err(anyhow::Error::msg)?;
-    let first = stream.packets.first().context("SoundKit v2 stream is empty")?;
+    let first = stream
+        .packets
+        .first()
+        .context("SoundKit v2 stream is empty")?;
     let sample_rate = first.header.sample_rate();
     let channels = u16::from(first.header.channels());
     if stream.packets.iter().any(|packet| {
-        packet.header.sample_rate() != sample_rate || u16::from(packet.header.channels()) != channels
+        packet.header.sample_rate() != sample_rate
+            || u16::from(packet.header.channels()) != channels
     }) {
         bail!("fixture record changes SoundKit v2 audio geometry");
     }
@@ -571,7 +589,11 @@ fn select_window(
     Some((sample_rate, frame_count, channel_count, selected))
 }
 
-fn write_fixture(path: &Path, manifest: &FixtureManifest, records: &[FixtureRecord]) -> Result<String> {
+fn write_fixture(
+    path: &Path,
+    manifest: &FixtureManifest,
+    records: &[FixtureRecord],
+) -> Result<String> {
     let manifest_bytes = serde_json::to_vec(manifest)?;
     if manifest_bytes.len() > MAX_MANIFEST_BYTES {
         bail!("fixture manifest exceeds {MAX_MANIFEST_BYTES} bytes");
@@ -595,8 +617,12 @@ fn write_fixture(path: &Path, manifest: &FixtureManifest, records: &[FixtureReco
     let sha256 = hex_digest(&digest);
     bytes.extend_from_slice(&digest);
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&temporary, bytes)
-        .with_context(|| format!("failed to write fixture temporary file {}", temporary.display()))?;
+    std::fs::write(&temporary, bytes).with_context(|| {
+        format!(
+            "failed to write fixture temporary file {}",
+            temporary.display()
+        )
+    })?;
     std::fs::rename(&temporary, path)
         .with_context(|| format!("failed to publish fixture {}", path.display()))?;
     Ok(sha256)
@@ -625,7 +651,9 @@ fn read_fixture(path: &Path) -> Result<Fixture> {
     }
     validate_sha256("fixture producer_sha256", &manifest.producer_sha256)?;
     let record_count = take_u64(&bytes, &mut offset)?;
-    if record_count != manifest.record_count || record_count != manifest.epoch_count.saturating_mul(2) {
+    if record_count != manifest.record_count
+        || record_count != manifest.epoch_count.saturating_mul(2)
+    {
         bail!("fixture record count does not match its manifest");
     }
     let mut records = Vec::with_capacity(
@@ -704,7 +732,12 @@ fn take<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]>
     take_before(bytes, offset, len, bytes.len())
 }
 
-fn take_before<'a>(bytes: &'a [u8], offset: &mut usize, len: usize, limit: usize) -> Result<&'a [u8]> {
+fn take_before<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+    limit: usize,
+) -> Result<&'a [u8]> {
     let end = offset.checked_add(len).context("fixture offset overflow")?;
     if end > limit {
         bail!("fixture is truncated");
@@ -715,15 +748,21 @@ fn take_before<'a>(bytes: &'a [u8], offset: &mut usize, len: usize, limit: usize
 }
 
 fn take_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
-    Ok(u16::from_be_bytes(take(bytes, offset, 2)?.try_into().unwrap()))
+    Ok(u16::from_be_bytes(
+        take(bytes, offset, 2)?.try_into().unwrap(),
+    ))
 }
 
 fn take_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
-    Ok(u32::from_be_bytes(take(bytes, offset, 4)?.try_into().unwrap()))
+    Ok(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ))
 }
 
 fn take_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
-    Ok(u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap()))
+    Ok(u64::from_be_bytes(
+        take(bytes, offset, 8)?.try_into().unwrap(),
+    ))
 }
 
 fn validate_sha256(label: &str, value: &str) -> Result<()> {

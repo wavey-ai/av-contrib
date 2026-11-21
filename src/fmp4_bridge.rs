@@ -65,6 +65,9 @@ pub struct PublishedFmp4Part {
     pub video_units: usize,
     pub audio_codec: Option<&'static str>,
     pub audio_units: usize,
+    /// Place of the part in the Media Playlist. The publisher that gives the
+    /// part its canonical sequence stamps it.
+    pub hls: Option<crate::hls_stamp::HlsStamp>,
 }
 
 /// One immutable opaque media part. The bytes are recovered from contributor
@@ -84,6 +87,8 @@ pub struct PublishedOpaquePart {
     pub published_at_unix_ns: i64,
     pub bytes: Bytes,
     pub audio_units: usize,
+    /// Place of the part in the Media Playlist.
+    pub hls: Option<crate::hls_stamp::HlsStamp>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -938,6 +943,13 @@ impl Fmp4Segmenter {
             } else {
                 "target-duration"
             })
+        } else if access_unit.key && self.video_buf.iter().any(|unit| !unit.key) {
+            // A key frame starts a part, however short the part before it
+            // is. A reader can start from a part only at its first frame, and
+            // a segment starts with a key frame. A part of several frames
+            // would otherwise carry the key frame somewhere inside it. A
+            // stream of key frames only keeps parts of the target duration.
+            Some("keyframe")
         } else if elapsed >= self.max_part_ticks_without_key {
             Some("max-duration-without-key")
         } else {
@@ -1092,6 +1104,7 @@ impl Fmp4Segmenter {
                 video_units,
                 audio_codec,
                 audio_units,
+                hls: None,
             };
             let publish_started = Instant::now();
             let publish_result = publisher.publish_fmp4_part(part).await;
@@ -1684,6 +1697,54 @@ mod tests {
         assert_eq!(segmenter.seg_seq, 43);
         assert_eq!(segmenter.published_parts, 2_401);
         assert!(segmenter.force_next_init);
+    }
+
+    #[test]
+    fn a_key_frame_starts_a_part_of_several_frames() {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        // Parts of 200 ms: five frames at 24 frames a second.
+        let mut segmenter =
+            Fmp4Segmenter::new(77, 0, playlists, TimestampInput::MillisAbsolute, 200);
+        let frame = |index: u64, key: bool| AccessUnit {
+            key,
+            pts: index * 3_750,
+            dts: index * 3_750,
+            data: Bytes::new(),
+            stream_type: PSI_STREAM_H264,
+            id: index,
+        };
+        // A key frame and two more frames are buffered: 125 ms.
+        for (index, key) in [(0, true), (1, false), (2, false)] {
+            let unit = frame(index, key);
+            segmenter.video_timestamps.push(unit.dts);
+            segmenter.video_buf.push(unit);
+        }
+        // The next frame of the group does not end the part.
+        assert_eq!(segmenter.flush_reason_before(&frame(3, false)), None);
+        // A key frame ends it, although the part is shorter than its target.
+        assert_eq!(
+            segmenter.flush_reason_before(&frame(3, true)),
+            Some("keyframe")
+        );
+        // After 200 ms any frame ends it.
+        assert_eq!(
+            segmenter.flush_reason_before(&frame(5, false)),
+            Some("target-duration")
+        );
+
+        // A stream of key frames only is cut by duration, not at each frame.
+        segmenter.video_buf.clear();
+        segmenter.video_timestamps.clear();
+        for index in 0..2 {
+            let unit = frame(index, true);
+            segmenter.video_timestamps.push(unit.dts);
+            segmenter.video_buf.push(unit);
+        }
+        assert_eq!(segmenter.flush_reason_before(&frame(2, true)), None);
+        assert_eq!(
+            segmenter.flush_reason_before(&frame(5, true)),
+            Some("target-keyframe")
+        );
     }
 
     fn h264_access_unit(pts: u64, dts: u64) -> AccessUnit {

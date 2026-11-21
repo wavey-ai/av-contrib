@@ -8,17 +8,18 @@ use av_contrib::fmp4_bridge::{
     AccessUnitSink, Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop,
     PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
+use av_contrib::hls_stamp::StreamStamper;
 use av_contrib::ingress_authorization::{
     decode_envelope_header_bytes, gate_from_bootstrap_path, parse_bearer_header,
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
-use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
     start_quadra_rendition_pipeline, QuadraRenditionConfig, QuadraRenditionSpec,
     QuadraRenditionTarget,
 };
+use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use bytes::{Bytes, BytesMut};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
@@ -348,6 +349,11 @@ fn build_fmp4_media_object(
     if let Some(codec) = part.audio_codec {
         builder = builder.with_metadata("audio-codec", codec.as_bytes().to_vec());
     }
+    if let Some(stamp) = part.hls {
+        for (key, value) in stamp.metadata() {
+            builder = builder.with_metadata(key, value);
+        }
+    }
     builder
         .build()
         .context("invalid canonical fMP4 media object")
@@ -386,7 +392,7 @@ fn build_opaque_media_object(
         .context("canonical media deadline exceeds Unix-nanosecond range")?;
     let deadline = canonical_contributor_timestamp(deadline_ns, estimated_clock_error_ns)?;
 
-    MediaObject::builder(key, ObjectKind::Media, part.bytes.to_vec())
+    let mut builder = MediaObject::builder(key, ObjectKind::Media, part.bytes.to_vec())
         .with_deadline(deadline)
         .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, packaged))
         .with_stage_timestamp(StageTimestamp::new(Stage::Published, published))
@@ -396,7 +402,13 @@ fn build_opaque_media_object(
         .with_metadata("scheduler-class", b"audio".to_vec())
         .with_metadata("track-composition", b"audio".to_vec())
         .with_metadata("content-type", b"application/octet-stream".to_vec())
-        .with_metadata("file-extension", b"bin".to_vec())
+        .with_metadata("file-extension", b"bin".to_vec());
+    if let Some(stamp) = part.hls {
+        for (key, value) in stamp.metadata() {
+            builder = builder.with_metadata(key, value);
+        }
+    }
+    builder
         .build()
         .context("invalid canonical opaque-media object")
 }
@@ -712,6 +724,19 @@ struct Args {
     #[arg(long, env = "AV_LL_HLS_SEGMENT_MS", default_value_t = DEFAULT_SEGMENT_MS)]
     fmp4_segment_ms: u32,
 
+    /// Part duration of a stream with video, from SRT, RIST or RTMP. It
+    /// defaults to `--fmp4-part-ms`. An audio stream of a DAW keeps
+    /// `--fmp4-part-ms`, so one contributor carries 5 ms audio parts beside
+    /// video parts of several frames.
+    #[arg(long, env = "AV_LL_HLS_VIDEO_PART_MS")]
+    fmp4_video_part_ms: Option<u32>,
+
+    /// Shortest segment of a stream with video. A segment ends at the first
+    /// key frame after it. It defaults to `--fmp4-segment-ms`. Set it to the
+    /// key-frame interval of the encoder.
+    #[arg(long, env = "AV_LL_HLS_VIDEO_SEGMENT_MS")]
+    fmp4_video_segment_ms: Option<u32>,
+
     #[arg(long, env = "AV_LL_HLS_TARGET_DURATION_MS", default_value_t = DEFAULT_TARGET_DURATION_MS)]
     hls_target_duration_ms: u32,
 
@@ -724,6 +749,27 @@ struct Args {
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     #[command(flatten)]
     quadra: QuadraCliArgs,
+}
+
+impl Args {
+    /// Part duration of a stream with video.
+    fn video_part_ms(&self) -> u32 {
+        self.fmp4_video_part_ms.unwrap_or(self.fmp4_part_ms)
+    }
+
+    /// The durations that the contributor declares in the playlist stamp of
+    /// each part.
+    fn stamp_durations(&self) -> StampDurations {
+        StampDurations {
+            video_part_ms: self.video_part_ms().max(1),
+            video_segment_ms: self
+                .fmp4_video_segment_ms
+                .unwrap_or(self.fmp4_segment_ms)
+                .max(1),
+            audio_part_ms: self.fmp4_part_ms.max(1),
+            audio_segment_ms: self.fmp4_segment_ms.max(1),
+        }
+    }
 }
 
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
@@ -1898,7 +1944,9 @@ fn handoff_canonical_audio_epoch_datagram(
             if dropped <= 16 || dropped.is_power_of_two() {
                 warn!(%peer, dropped, error = %error, "canonical SoundKit v2 mesh-send queue is full");
             }
-            Err(anyhow::anyhow!("canonical SoundKit v2 mesh-send queue rejected datagram: {error}"))
+            Err(anyhow::anyhow!(
+                "canonical SoundKit v2 mesh-send queue rejected datagram: {error}"
+            ))
         }
     }
 }
@@ -1914,12 +1962,14 @@ async fn run_audio_epoch_soundkit_normalizer(
             _ = shutdown_rx.changed() => break,
             datagram = input.recv() => datagram,
         };
-        let Some(datagram) = datagram else { break; };
-        AUDIO_EPOCH_MESH_QUEUE_DEPTH.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |depth| Some(depth.saturating_sub(1)),
-        ).ok();
+        let Some(datagram) = datagram else {
+            break;
+        };
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .ok();
         match normalizer.push_datagram(datagram.peer, &datagram.bytes) {
             Ok(Some(datagrams)) => {
                 AUDIO_EPOCH_NORMALIZED_EPOCHS.fetch_add(1, Ordering::Relaxed);
@@ -1935,11 +1985,11 @@ async fn run_audio_epoch_soundkit_normalizer(
         }
     }
     while let Some(datagram) = input.recv().await {
-        AUDIO_EPOCH_MESH_QUEUE_DEPTH.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |depth| Some(depth.saturating_sub(1)),
-        ).ok();
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .ok();
         if let Ok(Some(datagrams)) = normalizer.push_datagram(datagram.peer, &datagram.bytes) {
             AUDIO_EPOCH_NORMALIZED_EPOCHS.fetch_add(1, Ordering::Relaxed);
             for bytes in datagrams {
@@ -1977,11 +2027,11 @@ async fn run_audio_epoch_mesh_forward_worker(
     }
 
     while let Some(datagram) = input.recv().await {
-        AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |depth| Some(depth.saturating_sub(1)),
-        ).ok();
+        AUDIO_EPOCH_MESH_SEND_QUEUE_DEPTH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .ok();
         audio_epoch_ingress_queue_age().record(datagram.enqueued_at.elapsed());
         if let Err(error) = forwarder
             .forward_audio_epoch_datagram(&datagram.bytes)
@@ -2297,10 +2347,27 @@ impl QueuedPublication {
     }
 }
 
+/// Part and segment durations that the contributor declares for the parts
+/// that it stamps: one pair for streams with video, one for audio.
+#[derive(Debug, Clone, Copy)]
+struct StampDurations {
+    video_part_ms: u32,
+    video_segment_ms: u32,
+    audio_part_ms: u32,
+    audio_segment_ms: u32,
+}
+
+/// Canonical sequence and playlist stamper of one stream.
+struct StreamPublication {
+    next_sequence: u64,
+    stamper: Option<StreamStamper>,
+}
+
 struct BoundedFmp4Publisher {
     senders: Vec<mpsc::Sender<QueuedPublication>>,
     telemetry: Arc<IngestTelemetry>,
-    canonical_sequences: Mutex<HashMap<u64, u64>>,
+    streams: Mutex<HashMap<u64, StreamPublication>>,
+    durations: StampDurations,
 }
 
 #[async_trait::async_trait]
@@ -2311,19 +2378,42 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
         let stream_idx = part.stream_idx;
-        let mut sequences = self.canonical_sequences.lock().await;
-        let next = sequences.entry(stream_id).or_insert(0);
-        part.sequence = *next;
+        let mut streams = self.streams.lock().await;
+        let stream = streams.entry(stream_id).or_insert(StreamPublication {
+            next_sequence: 0,
+            stamper: None,
+        });
+        part.sequence = stream.next_sequence;
         let sequence = part.sequence;
+        // A stream with video cuts its segments at key frames. An audio
+        // stream has fixed segments, and every part of it can start one.
+        let has_video = part.video_units > 0;
+        let durations = self.durations;
+        let before = stream.stamper.clone();
+        let stamper = stream.stamper.get_or_insert_with(|| {
+            if has_video {
+                StreamStamper::new(durations.video_part_ms, durations.video_segment_ms)
+            } else {
+                StreamStamper::new(durations.audio_part_ms, durations.audio_segment_ms)
+            }
+        });
+        part.hls = Some(stamper.stamp(
+            part.duration_ms,
+            part.keyframe || !has_video,
+            u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
+        ));
         let shard = stream_id as usize % self.senders.len();
         let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
             part,
             enqueued_at: Instant::now(),
         });
         if result.is_ok() {
-            *next = next.saturating_add(1);
+            stream.next_sequence = stream.next_sequence.saturating_add(1);
+        } else {
+            // The part was not published: it has no place in the playlist.
+            stream.stamper = before;
         }
-        drop(sequences);
+        drop(streams);
         enqueue_publication_result(result, stream_id, stream_idx, sequence, &self.telemetry)
     }
 
@@ -2340,20 +2430,41 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         mut part: PublishedOpaquePart,
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
-        let mut sequences = self.canonical_sequences.lock().await;
-        let next = sequences.entry(stream_id).or_insert(0);
-        part.sequence = *next;
+        let mut streams = self.streams.lock().await;
+        let stream = streams.entry(stream_id).or_insert(StreamPublication {
+            next_sequence: 0,
+            stamper: None,
+        });
+        part.sequence = stream.next_sequence;
         let sequence = part.sequence;
+        let durations = self.durations;
+        let before = stream.stamper.clone();
+        let stamper = stream.stamper.get_or_insert_with(|| {
+            StreamStamper::new(durations.audio_part_ms, durations.audio_segment_ms)
+        });
+        part.hls = Some(stamper.stamp(
+            part.duration_ms,
+            true,
+            u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
+        ));
         let shard = stream_id as usize % self.senders.len();
         let result = self.senders[shard].try_send(QueuedPublication::Opaque {
             part,
             enqueued_at: Instant::now(),
         });
         if result.is_ok() {
-            *next = next.saturating_add(1);
+            stream.next_sequence = stream.next_sequence.saturating_add(1);
+        } else {
+            stream.stamper = before;
         }
-        drop(sequences);
-        enqueue_publication_result(result, stream_id, stream_id as usize, sequence, &self.telemetry)
+        drop(streams);
+        enqueue_publication_result(
+            result,
+            stream_id,
+            stream_id as usize,
+            sequence,
+            &self.telemetry,
+        )
     }
 }
 
@@ -2396,11 +2507,9 @@ fn enqueue_publication_result(
 fn start_bounded_publication_pipeline(
     inner: Arc<dyn Fmp4PartPublisher>,
     telemetry: Arc<IngestTelemetry>,
+    durations: StampDurations,
     shutdown_rx: watch::Receiver<()>,
-) -> (
-    Arc<dyn Fmp4PartPublisher>,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
+) -> (Arc<dyn Fmp4PartPublisher>, Vec<tokio::task::JoinHandle<()>>) {
     assert!(PUBLICATION_WORKERS > 0);
     assert!(PUBLICATION_QUEUE_CAPACITY_PER_WORKER > 0);
     let mut senders = Vec::with_capacity(PUBLICATION_WORKERS);
@@ -2425,7 +2534,8 @@ fn start_bounded_publication_pipeline(
         Arc::new(BoundedFmp4Publisher {
             senders,
             telemetry,
-            canonical_sequences: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            durations,
         }),
         tasks,
     )
@@ -2511,23 +2621,12 @@ async fn process_queued_publication(
                     if carried_initialization {
                         force_initialization.remove(&stream_id);
                     }
-                    telemetry.record_fmp4_part(
-                        stream_id,
-                        stream_idx,
-                        sequence,
-                        bytes,
-                        init_bytes,
-                    );
+                    telemetry.record_fmp4_part(stream_id, stream_idx, sequence, bytes, init_bytes);
                     Ok(())
                 }
                 Err(error) => {
                     force_initialization.insert(stream_id);
-                    telemetry.record_fmp4_publish_error(
-                        stream_id,
-                        stream_idx,
-                        sequence,
-                        &error,
-                    );
+                    telemetry.record_fmp4_publish_error(stream_id, stream_idx, sequence, &error);
                     Err(error)
                 }
             }
@@ -7249,6 +7348,7 @@ async fn main() -> Result<()> {
     let (publisher, publication_tasks) = start_bounded_publication_pipeline(
         mesh_publisher,
         telemetry.clone(),
+        args.stamp_durations(),
         publication_shutdown_rx,
     );
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
@@ -7289,7 +7389,7 @@ async fn main() -> Result<()> {
                     targets,
                     playlists.clone(),
                     publisher.clone(),
-                    args.fmp4_part_ms,
+                    args.video_part_ms(),
                 )
                 .await
                 .map_err(|error| {
@@ -7314,7 +7414,7 @@ async fn main() -> Result<()> {
                     profile: args.rist_profile,
                     output_stream_id: args.rist_stream_id,
                     output_stream_idx,
-                    min_part_ms: args.fmp4_part_ms,
+                    min_part_ms: args.video_part_ms(),
                 },
                 playlists.clone(),
                 publisher.clone(),
@@ -7335,7 +7435,7 @@ async fn main() -> Result<()> {
                 SrtIngestConfig {
                     bind,
                     output_stream_id: args.srt_stream_id,
-                    min_part_ms: args.fmp4_part_ms,
+                    min_part_ms: args.video_part_ms(),
                 },
                 playlists.clone(),
                 publisher.clone(),
@@ -7366,7 +7466,7 @@ async fn main() -> Result<()> {
             publisher.clone(),
             telemetry.clone(),
             args.rtmp_stream_id,
-            args.fmp4_part_ms,
+            args.video_part_ms(),
         ));
         (Some(shutdown), Some(finished), Some(task))
     } else {
@@ -8043,6 +8143,7 @@ fn validate_compiled_ingress_features(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use av_contrib::hls_stamp::HlsStamp;
     use music_audio_session::{MultichannelAudioSender, MultichannelAudioSessionConfig};
     use raptorq_datagram_fec::{
         AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch, MultichannelAudioFecConfig,
@@ -8147,11 +8248,9 @@ mod tests {
             .groups
             .iter()
             .all(|group| group.payload_kind == AudioPayloadKind::SoundKitV2));
-        let stream = av_contrib::soundkit_v2::SoundKitV2StreamRef::parse(
-            &canonical.groups[0].payload,
-            true,
-        )
-        .unwrap();
+        let stream =
+            av_contrib::soundkit_v2::SoundKitV2StreamRef::parse(&canonical.groups[0].payload, true)
+                .unwrap();
         assert_eq!(stream.packets[0].payload, pcm);
     }
 
@@ -8183,6 +8282,7 @@ mod tests {
             video_units,
             audio_codec: (audio_units > 0).then_some("aac"),
             audio_units,
+            hls: None,
         }
     }
 
@@ -8216,8 +8316,17 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let inner: Arc<dyn Fmp4PartPublisher> = sink.clone();
         let telemetry = Arc::new(IngestTelemetry::default());
-        let (publisher, tasks) =
-            start_bounded_publication_pipeline(inner, telemetry, shutdown_rx);
+        let (publisher, tasks) = start_bounded_publication_pipeline(
+            inner,
+            telemetry,
+            StampDurations {
+                video_part_ms: 200,
+                video_segment_ms: 2_000,
+                audio_part_ms: 5,
+                audio_segment_ms: 1_000,
+            },
+            shutdown_rx,
+        );
         let first = test_fmp4_part(
             91,
             0,
@@ -8570,8 +8679,22 @@ mod tests {
             published_at_unix_ns: PUBLISHED_NS,
             bytes: payload.clone(),
             audio_units: 1,
+            hls: Some(HlsStamp {
+                msn: 41,
+                part: 7,
+                part_target_ms: 5,
+                target_duration_ms: 1_000,
+            }),
         };
         let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
+        // The place of the part in the playlist travels with the object.
+        assert_eq!(object.metadata().get("hls-msn").unwrap(), b"41");
+        assert_eq!(object.metadata().get("hls-part").unwrap(), b"7");
+        assert_eq!(object.metadata().get("hls-part-target-ms").unwrap(), b"5");
+        assert_eq!(
+            object.metadata().get("hls-target-duration-ms").unwrap(),
+            b"1000"
+        );
 
         assert_eq!(object.key().track(), OPAQUE_AUDIO_TRACK);
         assert_eq!(object.kind(), ObjectKind::Media);
@@ -9447,6 +9570,8 @@ mod tests {
             rtmp_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 19_350))),
             fmp4_part_ms: 50,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            fmp4_video_part_ms: None,
+            fmp4_video_segment_ms: None,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -9521,6 +9646,8 @@ mod tests {
             rtmp_bind: None,
             fmp4_part_ms: 50,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            fmp4_video_part_ms: None,
+            fmp4_video_segment_ms: None,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10100,6 +10227,8 @@ mod tests {
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            fmp4_video_part_ms: None,
+            fmp4_video_segment_ms: None,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10314,6 +10443,8 @@ mod tests {
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            fmp4_video_part_ms: None,
+            fmp4_video_segment_ms: None,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10428,6 +10559,8 @@ mod tests {
             rtmp_bind: None,
             fmp4_part_ms: DEFAULT_MIN_PART_MS,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            fmp4_video_part_ms: None,
+            fmp4_video_segment_ms: None,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
