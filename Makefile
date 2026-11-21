@@ -7,7 +7,10 @@ NEEDLETAIL_ROOT ?= ../needletail
 RUST_LOG ?= info
 HOST ?= local.infidelity.io
 STREAM_ID ?= 1
-PART_MS ?= 50
+# Empty: the Needletail stack's own default. av-contrib takes PART_MS as the
+# old --fmp4-part-ms (an audio part of PART_MS ms), so set it only to ask for
+# that; the default audio part is one AEP1 epoch.
+PART_MS ?=
 AUDIO_PART ?= epoch
 VIDEO_PART ?= frame
 
@@ -42,19 +45,19 @@ help:
 	@printf '%s\n' '  make build-release     Build av-contrib release binaries'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
-	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 AUDIO_PART=epoch VIDEO_PART=frame RUST_LOG=info HOST=local.infidelity.io'
+	@printf '%s\n' 'Common overrides: STREAM_ID=1 AUDIO_PART=epoch VIDEO_PART=frame RUST_LOG=info HOST=local.infidelity.io'
 
 stack:
 	$(MAKE) -C $(NEEDLETAIL_ROOT) local HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
-		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+		$(if $(PART_MS),PART_MS=$(PART_MS)) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 stack-debug:
 	$(MAKE) -C $(NEEDLETAIL_ROOT) local-debug HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
-		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+		$(if $(PART_MS),PART_MS=$(PART_MS)) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 stack-fast:
 	$(MAKE) -C $(NEEDLETAIL_ROOT) local-fast HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
-		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+		$(if $(PART_MS),PART_MS=$(PART_MS)) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 service:
 	RUST_LOG=$(RUST_LOG) \

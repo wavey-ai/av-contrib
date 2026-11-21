@@ -927,6 +927,22 @@ impl Args {
         self.video_part().min_part_ms()
     }
 
+    /// A warning when the old `--fmp4-part-ms` decides the audio part: the
+    /// default is one epoch per part, and a launcher that still passes the
+    /// old flag (the local Needletail stack passes 50) makes audio parts 20
+    /// to 50 times longer than that without saying so.
+    fn legacy_audio_part_warning(&self) -> Option<String> {
+        if self.audio_part.is_some() {
+            return None;
+        }
+        let ms = self.fmp4_part_ms?;
+        Some(format!(
+            "--fmp4-part-ms {ms} (or AV_LL_HLS_PART_MS) sets audio parts of {ms} ms; the default is \
+             one AEP1 epoch per part (--audio-part epoch: 1 ms PCM, 2.5 ms Opus). It no longer \
+             sets the video part (--video-part)."
+        ))
+    }
+
     /// Shortest audio-only part of a segmenter that counts time (the fMP4
     /// segmenters of the video ingests): `0`, one access unit per part, for
     /// one epoch per part. The stamper declares the same size for these
@@ -8365,6 +8381,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
+    if let Some(warning) = args.legacy_audio_part_warning() {
+        warn!("{warning}");
+    }
     // Audio-only parts out of the video ingests (RTMP, SRT, RIST, MPEG-TS)
     // are cut to the audio part, which the stamper declares for them.
     av_contrib::fmp4_bridge::set_default_audio_only_part_us(Some(args.audio_only_part_us()));
@@ -9620,6 +9639,15 @@ mod tests {
         assert_eq!(args.video_part(), VideoPartSize::Frame);
         assert_eq!(args.nominal_audio_part_us(), 2_500);
         assert_eq!(args.nominal_audio_part_ms(), 3);
+        assert!(args.legacy_audio_part_warning().is_none());
+        let args = Args::try_parse_from(["av-contrib", "--fmp4-part-ms", "50"]).unwrap();
+        assert!(args
+            .legacy_audio_part_warning()
+            .is_some_and(|warning| warning.contains("50 ms")));
+        assert!(Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .legacy_audio_part_warning()
+            .is_none());
         assert!(Args::try_parse_from(["av-contrib", "--audio-part", "0us"]).is_err());
         assert!(Args::try_parse_from(["av-contrib", "--video-part", "epoch"]).is_err());
     }
