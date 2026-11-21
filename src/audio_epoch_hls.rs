@@ -255,7 +255,157 @@ struct RenditionState {
 
 enum RenditionPackager {
     Opaque(OpaquePartSegmenter),
-    Fmp4(Box<Fmp4Segmenter>),
+    Fmp4(Box<Fmp4Rendition>),
+}
+
+/// An fMP4 rendition: the segmenter, and PCM epochs gathered into an access
+/// unit of whole milliseconds.
+///
+/// wavey-boxer writes FLAC and PCM tracks at a timescale of 1,000 and gives
+/// each access unit its duration rounded to the millisecond: an access unit
+/// of 12 PCM samples (0.25 ms) is 0 ms and is dropped, one of 24 is 1 ms
+/// and doubles its time. Until the boxer has a timescale of the sample rate
+/// (a boxer change, not made here), PCM epochs that are not whole
+/// milliseconds are joined into one access unit that is: four 12-sample
+/// epochs make one 1 ms unit. PCM bytes of one format join without a
+/// header, so the samples are exact. A FLAC frame cannot be joined; a FLAC
+/// epoch that is not whole milliseconds is published as before, rounded by
+/// the boxer, with a warning.
+struct Fmp4Rendition {
+    segmenter: Fmp4Segmenter,
+    pcm: PendingPcm,
+    warned_fractional_flac: bool,
+}
+
+/// PCM epochs waiting to make an access unit of whole milliseconds.
+#[derive(Default)]
+struct PendingPcm {
+    data: BytesMut,
+    samples: u64,
+    pts_samples: u64,
+    sample_rate: u32,
+    id: u64,
+    times: PartSourceTimes,
+}
+
+/// `samples` at `sample_rate` are a whole number of milliseconds, which
+/// the boxer's timescale of 1,000 carries exactly.
+fn whole_ms(samples: u64, sample_rate: u32) -> bool {
+    sample_rate > 0 && (u128::from(samples) * 1_000).is_multiple_of(u128::from(sample_rate))
+}
+
+/// Most PCM gathered for one access unit: 100 ms. An epoch size whose
+/// samples never add up to whole milliseconds within it is published at
+/// this size, rounded by the boxer.
+fn max_pending_pcm_samples(sample_rate: u32) -> u64 {
+    u64::from(sample_rate / 10).max(1)
+}
+
+impl Fmp4Rendition {
+    fn new(segmenter: Fmp4Segmenter) -> Self {
+        Self {
+            segmenter,
+            pcm: PendingPcm::default(),
+            warned_fractional_flac: false,
+        }
+    }
+
+    /// Add one PCM epoch. An epoch of whole milliseconds with nothing
+    /// pending is one access unit as it is, without a copy.
+    async fn push_pcm(
+        &mut self,
+        payload: Bytes,
+        frame_count: u32,
+        sample_rate: u32,
+        pts_samples: u64,
+        id: u64,
+        times: PartSourceTimes,
+    ) -> Result<(), String> {
+        let samples = u64::from(frame_count);
+        if self.pcm.samples > 0 && self.pcm.sample_rate != sample_rate {
+            self.flush_pcm().await?;
+        }
+        if self.pcm.samples == 0 && whole_ms(samples, sample_rate) {
+            return push_audio_unit(
+                &mut self.segmenter,
+                payload,
+                pts_samples,
+                sample_rate,
+                id,
+                times,
+                PSI_STREAM_PRIVATE_DATA,
+            )
+            .await;
+        }
+        if self.pcm.samples == 0 {
+            self.pcm.pts_samples = pts_samples;
+            self.pcm.sample_rate = sample_rate;
+            self.pcm.id = id;
+        }
+        self.pcm.data.extend_from_slice(&payload);
+        self.pcm.samples = self.pcm.samples.saturating_add(samples);
+        self.pcm.times.merge(&times);
+        if whole_ms(self.pcm.samples, sample_rate)
+            || self.pcm.samples >= max_pending_pcm_samples(sample_rate)
+        {
+            self.flush_pcm().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_pcm(&mut self) -> Result<(), String> {
+        if self.pcm.samples == 0 {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pcm);
+        push_audio_unit(
+            &mut self.segmenter,
+            pending.data.freeze(),
+            pending.pts_samples,
+            pending.sample_rate,
+            pending.id,
+            pending.times,
+            PSI_STREAM_PRIVATE_DATA,
+        )
+        .await
+    }
+
+    async fn finish(&mut self) -> Result<(), String> {
+        let flushed = self.flush_pcm().await;
+        self.segmenter.finish().await;
+        flushed
+    }
+
+    fn reset(&mut self) {
+        self.pcm = PendingPcm::default();
+        self.segmenter.reset();
+    }
+}
+
+/// Push one audio access unit at `pts_samples` into the segmenter, which
+/// takes millisecond timestamps.
+async fn push_audio_unit(
+    segmenter: &mut Fmp4Segmenter,
+    data: Bytes,
+    pts_samples: u64,
+    sample_rate: u32,
+    id: u64,
+    times: PartSourceTimes,
+    stream_type: u8,
+) -> Result<(), String> {
+    segmenter.set_next_source_times(times);
+    let pts_ms = samples_to_millis(pts_samples, sample_rate)?;
+    segmenter
+        .push_access_unit(AccessUnit {
+            key: true,
+            pts: pts_ms,
+            dts: pts_ms,
+            data,
+            stream_type,
+            id,
+        })
+        .await;
+    Ok(())
 }
 
 struct OpaquePartSegmenter {
@@ -370,17 +520,14 @@ impl RenditionPackager {
     async fn finish(&mut self) -> Result<(), String> {
         match self {
             Self::Opaque(segmenter) => segmenter.finish().await,
-            Self::Fmp4(segmenter) => {
-                segmenter.finish().await;
-                Ok(())
-            }
+            Self::Fmp4(rendition) => rendition.finish().await,
         }
     }
 
     fn reset(&mut self) {
         match self {
             Self::Opaque(segmenter) => segmenter.reset(),
-            Self::Fmp4(segmenter) => segmenter.reset(),
+            Self::Fmp4(rendition) => rendition.reset(),
         }
     }
 
@@ -391,9 +538,9 @@ impl RenditionPackager {
         }
     }
 
-    fn fmp4(&mut self) -> Result<&mut Fmp4Segmenter, String> {
+    fn fmp4(&mut self) -> Result<&mut Fmp4Rendition, String> {
         match self {
-            Self::Fmp4(segmenter) => Ok(segmenter),
+            Self::Fmp4(rendition) => Ok(rendition),
             Self::Opaque(_) => Err("fMP4 AEP1 payload reached the opaque packager".to_string()),
         }
     }
@@ -854,7 +1001,7 @@ fn new_rendition_packager(
             );
             segmenter.set_min_part_us(fmp4_min_part_us(config, payload_kind, sample_rate));
             segmenter.set_source_epoch(source_epoch);
-            RenditionPackager::Fmp4(Box::new(segmenter))
+            RenditionPackager::Fmp4(Box::new(Fmp4Rendition::new(segmenter)))
         }
     }
 }
@@ -955,8 +1102,8 @@ async fn package_group_with_times(
         state.packager.finish().await?;
         state.packager.reset();
         state.format = format;
-        if let RenditionPackager::Fmp4(segmenter) = &mut state.packager {
-            segmenter.set_min_part_us(fmp4_min_part_us(
+        if let RenditionPackager::Fmp4(rendition) = &mut state.packager {
+            rendition.segmenter.set_min_part_us(fmp4_min_part_us(
                 config,
                 group.payload_kind,
                 group.sample_rate,
@@ -1007,39 +1154,54 @@ async fn package_group_as_fmp4(
         ),
         AudioPayloadKind::Pcm => {
             validate_pcm_group(&group)?;
-            (
-                vec![ElementaryAudioPacket {
-                    data: group.payload.clone(),
-                    frame_count: group.frame_count,
-                    id: group.epoch_id,
-                }],
-                PSI_STREAM_PRIVATE_DATA,
-            )
+            let rendition = state.packager.fmp4()?;
+            rendition.segmenter.set_audio_track_config(audio_config);
+            return rendition
+                .push_pcm(
+                    group.payload,
+                    group.frame_count,
+                    group.sample_rate,
+                    group.pts_samples,
+                    group.epoch_id,
+                    times,
+                )
+                .await;
         }
         AudioPayloadKind::Opus => (raw_opus_packets(&group)?, PSI_STREAM_AUDIO_OPUS),
         AudioPayloadKind::SoundKitV2 => {
             return Err("SoundKit v2 group reached fMP4 before terminal decoding".to_string())
         }
     };
-    let segmenter = state.packager.fmp4()?;
+    let rendition = state.packager.fmp4()?;
+    if group.payload_kind == AudioPayloadKind::Flac
+        && !whole_ms(u64::from(group.frame_count), group.sample_rate)
+        && !rendition.warned_fractional_flac
+    {
+        rendition.warned_fractional_flac = true;
+        warn!(
+            session_id = group.session_id,
+            group_id = group.group_id,
+            frame_count = group.frame_count,
+            sample_rate = group.sample_rate,
+            "FLAC epochs are not whole milliseconds: the fMP4 boxer (timescale 1,000) rounds \
+             their durations; use opaque packaging for exact sub-millisecond FLAC"
+        );
+    }
+    let segmenter = &mut rendition.segmenter;
     segmenter.set_audio_track_config(audio_config);
     let mut pts_samples = group.pts_samples;
     let mut times = Some(times);
     for packet in packets {
-        if let Some(times) = times.take() {
-            segmenter.set_next_source_times(times);
-        }
-        let pts_ms = samples_to_millis(pts_samples, group.sample_rate)?;
-        segmenter
-            .push_access_unit(AccessUnit {
-                key: true,
-                pts: pts_ms,
-                dts: pts_ms,
-                data: packet.data,
-                stream_type,
-                id: packet.id,
-            })
-            .await;
+        push_audio_unit(
+            segmenter,
+            packet.data,
+            pts_samples,
+            group.sample_rate,
+            packet.id,
+            times.take().unwrap_or_default(),
+            stream_type,
+        )
+        .await?;
         pts_samples = pts_samples
             .checked_add(u64::from(packet.frame_count))
             .ok_or_else(|| "AEP1 audio packet PTS overflow".to_string())?;
@@ -2148,6 +2310,103 @@ mod tests {
             assert_eq!(part.duration_samples, Some(48));
             assert_eq!(part.sample_rate, Some(48_000));
         }
+    }
+
+    #[tokio::test]
+    async fn fmp4_pcm_epochs_under_one_ms_join_into_whole_ms_parts() {
+        // The boxer's timescale is 1,000: an access unit of 12 samples is
+        // 0 ms and was dropped, so 0.25 ms epochs published nothing. Four of
+        // them now make one exact 1 ms part, two of 24 samples one more.
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Fmp4);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..8_u64 {
+            let mut group = sized_group(
+                epoch_id,
+                12,
+                AudioPayloadKind::Pcm,
+                vec![epoch_id as u8; 12 * 2 * 3],
+            );
+            group.pts_samples = epoch_id * 12;
+            let times = PartSourceTimes {
+                src_first_us: Some(1_000 + epoch_id),
+                src_last_us: Some(2_000 + epoch_id),
+                recovered_us: Some(3_000 + epoch_id),
+                ..PartSourceTimes::of_epoch(epoch_id)
+            };
+            package_group_with_times(&config, &mut renditions, group, times)
+                .await
+                .unwrap();
+        }
+        {
+            let parts = captured.fmp4_parts.lock().unwrap();
+            assert_eq!(parts.len(), 2);
+            for (index, part) in parts.iter().enumerate() {
+                assert_eq!(part.audio_units, 1);
+                assert_eq!(part.duration_samples, Some(48));
+                assert_eq!(part.duration_us, 1_000);
+                assert_eq!(part.duration_ms, 1);
+                // The four epochs' samples, in order, whole.
+                let first = index as u8 * 4;
+                let joined = (first..first + 4)
+                    .flat_map(|epoch| vec![epoch; 12 * 2 * 3])
+                    .collect::<Vec<_>>();
+                assert!(part
+                    .bytes
+                    .windows(joined.len())
+                    .any(|window| window == joined.as_slice()));
+                // src_first of the first epoch, the rest of the last.
+                assert_eq!(part.source_times.first_epoch, Some(u64::from(first)));
+                assert_eq!(part.source_times.last_epoch, Some(u64::from(first) + 3));
+                assert_eq!(
+                    part.source_times.src_first_us,
+                    Some(1_000 + u64::from(first))
+                );
+                assert_eq!(
+                    part.source_times.src_last_us,
+                    Some(2_003 + u64::from(first))
+                );
+            }
+        }
+
+        // 24-sample epochs: two make 1 ms (one alone was rounded to 1 ms).
+        // At the end of the stream a partial unit is published, not lost.
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Fmp4);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..5_u64 {
+            let mut group = sized_group(
+                epoch_id,
+                24,
+                AudioPayloadKind::Pcm,
+                vec![epoch_id as u8; 24 * 2 * 3],
+            );
+            group.pts_samples = epoch_id * 24;
+            package_group(&config, &mut renditions, group)
+                .await
+                .unwrap();
+        }
+        assert_eq!(captured.fmp4_parts.lock().unwrap().len(), 2);
+        for rendition in renditions.values_mut() {
+            rendition.packager.finish().await.unwrap();
+        }
+        let parts = captured.fmp4_parts.lock().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[..2]
+            .iter()
+            .all(|part| part.duration_samples == Some(48) && part.duration_us == 1_000));
+        assert_eq!(parts[2].duration_samples, Some(24));
+    }
+
+    #[test]
+    fn whole_milliseconds_of_samples() {
+        assert!(whole_ms(48, 48_000));
+        assert!(!whole_ms(12, 48_000));
+        assert!(!whole_ms(24, 48_000));
+        assert!(whole_ms(441, 44_100));
+        assert!(!whole_ms(48, 44_100));
+        assert!(!whole_ms(48, 0));
+        assert_eq!(max_pending_pcm_samples(48_000), 4_800);
     }
 
     #[test]

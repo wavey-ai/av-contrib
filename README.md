@@ -302,9 +302,14 @@ default payload of `aep1-48k-probe send`) still gets its rendition. Below
 lossless rendition of the smallest parts is PCM; a source that sends all
 three formats can leave FLAC out with `--daw-hls-formats pcm,opus`. fMP4 audio packaging (`--daw-hls-packaging fmp4`)
 still goes through wavey-boxer's millisecond timeline: FLAC and PCM tracks
-use a timescale of 1,000 and Opus decode times are taken from milliseconds,
-so 2.5 ms Opus and sub-millisecond PCM are exact only on the default opaque
-path.
+use a timescale of 1,000 and Opus decode times are taken from milliseconds.
+The boxer drops a PCM access unit of under 1 ms, so the fMP4 rendition joins
+sub-millisecond PCM epochs into access units of whole milliseconds (four
+12-sample epochs make one 1 ms part): the default one-epoch part becomes
+1 ms there. FLAC frames cannot be joined; FLAC epochs that are not whole
+milliseconds (32 samples) are rounded by the boxer, with a warning. Exact
+2.5 ms Opus, sub-millisecond PCM and 32-sample FLAC parts need the default
+opaque path, or a boxer with a timescale of the sample rate.
 
 The per-part send path is short. `--relay-send-batch` (default `true`)
 hands the RelaySession symbols of a part to the kernel in one `sendmmsg`

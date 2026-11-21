@@ -2302,9 +2302,11 @@ mod tests {
             assert!(segmenter.audio_buf.is_empty(), "unit {index} is buffered");
         }
         // The boxer writes PCM at a timescale of 1,000 and drops each
-        // sample of under 1 ms, so it publishes nothing of these parts: a
-        // boxer change (timescale = sample rate). A 48-sample unit is whole,
-        // and its part is exact.
+        // access unit of under 1 ms, so it publishes nothing of these parts
+        // (a boxer change: timescale = sample rate). The AEP1 fMP4 rendition
+        // therefore joins sub-ms PCM epochs into whole-ms access units
+        // before they reach the segmenter (audio_epoch_hls::Fmp4Rendition).
+        // A 48-sample unit is whole, and its part is exact.
         assert!(publisher.parts.lock().unwrap().is_empty());
         segmenter
             .push_access_unit(AccessUnit {
