@@ -10,6 +10,8 @@ use crate::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, PublishedOpaquePart, TimestampInput, DEFAULT_MIN_PART_MS,
 };
 use crate::hop_journal::{now_unix_us, PartSourceTimes};
+pub use crate::part_timing::AudioPartSize;
+use crate::part_timing::{legacy_ms, samples_to_us};
 use crate::soundkit_v2::{terminalize_soundkit_group, SoundKitV2StreamRef};
 use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS, PSI_STREAM_PRIVATE_DATA};
 use boxer::fmp4::{
@@ -23,7 +25,7 @@ use music_audio_session::{
 use playlists::Playlists;
 use raptorq_datagram_fec::{AudioPayloadKind, AudioSampleFormat};
 use raptorq_fec_transport::MultichannelAudioTransportAdapter;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{
@@ -36,8 +38,23 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-pub const DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY: usize = 4_096;
-const RENDITION_WORKER_QUEUE_CAPACITY: usize = 1_024;
+/// Sizes below are set in time for the smallest epoch the sources make:
+/// 12 samples at 48 kHz, 250 µs, 4,000 epochs a second.
+const SMALLEST_EPOCH_US: u64 = 250;
+/// AEP1 datagrams waiting for FEC recovery. At 4,000 epochs a second, with
+/// three formats of one source and four repair datagrams each (15 datagrams
+/// an epoch, 60,000 a second), 32,768 places hold 0.55 s; at 5 ms epochs
+/// they hold 11 s.
+pub const DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY: usize = 32_768;
+/// Recovered groups that wait for one rendition worker: one second of the
+/// rendition's epochs, and never fewer than this.
+const RENDITION_WORKER_QUEUE_MIN_CAPACITY: usize = 1_024;
+const RENDITION_WORKER_QUEUE_TIME_US: u64 = 1_000_000;
+/// Epochs of one source that can wait for their missing datagrams at once:
+/// 320 ms of the smallest epochs. The receiver's default of 64 epochs is
+/// 16 ms of 250 µs epochs, shorter than a repair that is a little late.
+const AEP1_REORDER_WINDOW_US: u64 = 320_000;
+const AEP1_MAX_INFLIGHT_EPOCHS: usize = (AEP1_REORDER_WINDOW_US / SMALLEST_EPOCH_US) as usize;
 const AUDIO_EPOCH_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const AUDIO_EPOCH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUDIO_GROUP_FLAG_DISCONTINUITY: u8 = 1 << 0;
@@ -45,8 +62,9 @@ const AUDIO_GROUP_FLAG_ERASURE: u8 = 1 << 1;
 const OPUS_RENDITION_STREAM_OFFSET: u64 = 1_000;
 const PCM_RENDITION_STREAM_OFFSET: u64 = 2_000;
 /// AEP1 blocks (epochs) of one source whose first arrival is remembered for
-/// the hop journal: a few hundred milliseconds of 5 ms epochs.
-const FIRST_ARRIVAL_BLOCKS: usize = 64;
+/// the hop journal, in a table indexed by block id: 512 ms of the smallest
+/// epochs, 10 s of 5 ms epochs.
+const FIRST_ARRIVAL_BLOCKS: usize = 2_048;
 static WORKER_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 static WORKER_GROUPS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static WORKER_RAPTORQ_FRAGMENTS_RECOVERED: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +77,8 @@ static RENDITION_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static RENDITION_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static RENDITION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RENDITION_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+static RENDITION_QUEUE_CAPACITY: AtomicU64 =
+    AtomicU64::new(RENDITION_WORKER_QUEUE_MIN_CAPACITY as u64);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AudioEpochHlsWorkerStats {
@@ -87,7 +107,7 @@ pub fn worker_stats() -> AudioEpochHlsWorkerStats {
         active_rendition_workers: ACTIVE_RENDITION_WORKERS.load(Ordering::Relaxed),
         retired_receivers: RETIRED_RECEIVERS.load(Ordering::Relaxed),
         retired_rendition_workers: RETIRED_RENDITION_WORKERS.load(Ordering::Relaxed),
-        rendition_queue_capacity_per_worker: RENDITION_WORKER_QUEUE_CAPACITY as u64,
+        rendition_queue_capacity_per_worker: RENDITION_QUEUE_CAPACITY.load(Ordering::Relaxed),
         rendition_queue_enqueued: RENDITION_QUEUE_ENQUEUED.load(Ordering::Relaxed),
         rendition_queue_dropped: RENDITION_QUEUE_DROPPED.load(Ordering::Relaxed),
         rendition_queue_depth: RENDITION_QUEUE_DEPTH.load(Ordering::Relaxed),
@@ -107,7 +127,8 @@ pub struct AudioEpochHlsDatagram {
 pub struct AudioEpochHlsConfig {
     /// LL-HLS id used by FLAC group zero. Opus and PCM use separate id ranges.
     pub base_stream_id: u64,
-    pub min_part_ms: u32,
+    /// Size of a part: one epoch by default.
+    pub part: AudioPartSize,
     pub packaging: AudioEpochHlsPackaging,
     pub formats: Vec<AudioPayloadKind>,
     pub playlists: Arc<Playlists>,
@@ -125,7 +146,7 @@ pub enum AudioEpochHlsPackaging {
 impl AudioEpochHlsConfig {
     pub fn new(
         base_stream_id: u64,
-        min_part_ms: u32,
+        part: AudioPartSize,
         packaging: AudioEpochHlsPackaging,
         formats: Vec<AudioPayloadKind>,
         playlists: Arc<Playlists>,
@@ -139,7 +160,7 @@ impl AudioEpochHlsConfig {
         });
         Self {
             base_stream_id,
-            min_part_ms: min_part_ms.max(1),
+            part,
             packaging,
             formats,
             playlists,
@@ -153,7 +174,7 @@ impl std::fmt::Debug for AudioEpochHlsConfig {
         formatter
             .debug_struct("AudioEpochHlsConfig")
             .field("base_stream_id", &self.base_stream_id)
-            .field("min_part_ms", &self.min_part_ms)
+            .field("part", &self.part)
             .field("packaging", &self.packaging)
             .field("formats", &self.formats)
             .finish_non_exhaustive()
@@ -184,10 +205,14 @@ struct OpaquePartSegmenter {
     output_stream_id: u64,
     output_stream_idx: usize,
     source_epoch: u64,
-    min_part_ms: u32,
+    part: AudioPartSize,
+    /// FLAC parts keep FLAC's floor of 32 samples.
+    flac: bool,
     publisher: Arc<dyn Fmp4PartPublisher>,
     bytes: BytesMut,
-    duration_ms: u32,
+    /// Samples in the part, at `sample_rate`.
+    samples: u64,
+    sample_rate: u32,
     audio_units: usize,
     published_parts: u64,
     source_times: PartSourceTimes,
@@ -205,34 +230,38 @@ struct RenditionWorker {
 struct ReceiverState {
     receiver: MultichannelAudioReceiver,
     last_seen: Instant,
-    /// First arrival of each recent AEP1 block. A block carries one epoch.
-    block_first_us: VecDeque<(u32, u64)>,
+    /// First arrival of each recent AEP1 block, at `block_id %
+    /// FIRST_ARRIVAL_BLOCKS`. A block carries one epoch.
+    block_first_us: Box<[Option<(u32, u64)>]>,
+}
+
+/// The FEC receiver of one source, with its windows set in time.
+fn aep1_session_config() -> MultichannelAudioSessionConfig {
+    MultichannelAudioSessionConfig {
+        max_inflight_epochs: AEP1_MAX_INFLIGHT_EPOCHS,
+        ..MultichannelAudioSessionConfig::default()
+    }
 }
 
 impl ReceiverState {
     fn new(now: Instant) -> Self {
         Self {
-            receiver: MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default()),
+            receiver: MultichannelAudioReceiver::new(aep1_session_config()),
             last_seen: now,
-            block_first_us: VecDeque::with_capacity(FIRST_ARRIVAL_BLOCKS),
+            block_first_us: vec![None; FIRST_ARRIVAL_BLOCKS].into_boxed_slice(),
         }
     }
 
     /// Note a datagram of `block_id` and return the block's first arrival.
     fn observe_block(&mut self, block_id: u32, received_us: u64) -> u64 {
-        if let Some((_, first)) = self
-            .block_first_us
-            .iter()
-            .rev()
-            .find(|(block, _)| *block == block_id)
-        {
-            return *first;
+        let slot = &mut self.block_first_us[block_id as usize % FIRST_ARRIVAL_BLOCKS];
+        match slot {
+            Some((block, first)) if *block == block_id => *first,
+            _ => {
+                *slot = Some((block_id, received_us));
+                received_us
+            }
         }
-        if self.block_first_us.len() == FIRST_ARRIVAL_BLOCKS {
-            self.block_first_us.pop_front();
-        }
-        self.block_first_us.push_back((block_id, received_us));
-        received_us
     }
 
     /// Recover the groups this datagram completes, with their source times.
@@ -312,34 +341,48 @@ impl OpaquePartSegmenter {
         output_stream_id: u64,
         output_stream_idx: usize,
         source_epoch: u64,
-        min_part_ms: u32,
+        part: AudioPartSize,
+        flac: bool,
         publisher: Arc<dyn Fmp4PartPublisher>,
     ) -> Self {
         Self {
             output_stream_id,
             output_stream_idx,
             source_epoch: source_epoch.max(1),
-            min_part_ms: min_part_ms.max(1),
+            part,
+            flac,
             publisher,
             bytes: BytesMut::new(),
-            duration_ms: 0,
+            samples: 0,
+            sample_rate: 0,
             audio_units: 0,
             published_parts: 0,
             source_times: PartSourceTimes::default(),
         }
     }
 
+    /// Add one recovered epoch of `frame_count` samples at `sample_rate`.
+    /// With one epoch per part (the default) the part leaves at once.
     async fn push(
         &mut self,
         packet: Bytes,
-        duration_ms: u32,
+        frame_count: u32,
+        sample_rate: u32,
         source_times: PartSourceTimes,
     ) -> Result<(), String> {
+        if self.sample_rate != sample_rate && !self.bytes.is_empty() {
+            self.flush().await?;
+        }
+        self.sample_rate = sample_rate;
         self.bytes.extend_from_slice(&packet);
         self.source_times.merge(&source_times);
-        self.duration_ms = self.duration_ms.saturating_add(duration_ms);
+        self.samples = self.samples.saturating_add(u64::from(frame_count));
         self.audio_units = self.audio_units.saturating_add(1);
-        if self.duration_ms >= self.min_part_ms {
+        let complete = match self.part.target_samples(sample_rate, self.flac) {
+            None => true,
+            Some(target) => self.samples >= target,
+        };
+        if complete {
             self.flush().await?;
         }
         Ok(())
@@ -351,7 +394,7 @@ impl OpaquePartSegmenter {
 
     fn reset(&mut self) {
         self.bytes.clear();
-        self.duration_ms = 0;
+        self.samples = 0;
         self.audio_units = 0;
         self.source_times = PartSourceTimes::default();
     }
@@ -361,12 +404,16 @@ impl OpaquePartSegmenter {
             return Ok(());
         }
         let packaged_at_unix_ns = now_unix_ns();
+        let duration_us = samples_to_us(self.samples, self.sample_rate);
         let part = PublishedOpaquePart {
             stream_id: self.output_stream_id,
             stream_idx: self.output_stream_idx,
             source_epoch: Some(self.source_epoch),
             sequence: self.published_parts,
-            duration_ms: self.duration_ms.max(1),
+            duration_ms: legacy_ms(duration_us).max(1),
+            duration_us,
+            duration_samples: Some(self.samples),
+            sample_rate: Some(self.sample_rate),
             packaged_at_unix_ns,
             published_at_unix_ns: now_unix_ns(),
             bytes: self.bytes.split().freeze(),
@@ -374,7 +421,7 @@ impl OpaquePartSegmenter {
             hls: None,
             source_times: std::mem::take(&mut self.source_times),
         };
-        self.duration_ms = 0;
+        self.samples = 0;
         self.published_parts = self.published_parts.saturating_add(1);
         self.publisher.publish_opaque_part(part).await
     }
@@ -559,7 +606,9 @@ async fn dispatch_group_to_rendition_worker(
             worker.sender.clone()
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
-            let (sender, receiver) = mpsc::channel(RENDITION_WORKER_QUEUE_CAPACITY);
+            let capacity = rendition_queue_capacity(group.frame_count, group.sample_rate);
+            RENDITION_QUEUE_CAPACITY.fetch_max(capacity as u64, Ordering::Relaxed);
+            let (sender, receiver) = mpsc::channel(capacity);
             let handle = tokio::spawn(run_rendition_worker(config.clone(), key, receiver));
             ACTIVE_RENDITION_WORKERS.fetch_add(1, Ordering::Relaxed);
             entry
@@ -573,6 +622,15 @@ async fn dispatch_group_to_rendition_worker(
         }
     };
     try_handoff_rendition_group(&sender, key, recovered)
+}
+
+/// Places in a rendition worker's queue: one second of its epochs, at least
+/// [`RENDITION_WORKER_QUEUE_MIN_CAPACITY`]. 4,000 for 250 µs epochs.
+fn rendition_queue_capacity(frame_count: u32, sample_rate: u32) -> usize {
+    let epoch_us = samples_to_us(u64::from(frame_count), sample_rate).max(SMALLEST_EPOCH_US);
+    usize::try_from(RENDITION_WORKER_QUEUE_TIME_US.div_ceil(epoch_us))
+        .unwrap_or(usize::MAX)
+        .max(RENDITION_WORKER_QUEUE_MIN_CAPACITY)
 }
 
 fn try_handoff_rendition_group(
@@ -704,31 +762,49 @@ fn new_rendition_packager(
     output_stream_id: u64,
     output_stream_idx: usize,
     session_id: u64,
+    payload_kind: AudioPayloadKind,
+    sample_rate: u32,
 ) -> RenditionPackager {
     let source_epoch = session_id.saturating_div(1_000).max(1);
+    let flac = payload_kind == AudioPayloadKind::Flac;
     match config.packaging {
         AudioEpochHlsPackaging::Opaque => RenditionPackager::Opaque(OpaquePartSegmenter::new(
             output_stream_id,
             output_stream_idx,
             source_epoch,
-            config.min_part_ms,
+            config.part,
+            flac,
             Arc::clone(&config.publisher),
         )),
         AudioEpochHlsPackaging::Fmp4 => {
+            // The boxer takes millisecond timestamps (TimestampInput is
+            // MillisAbsolute); the part is closed on its sample count.
             let mut segmenter = Fmp4Segmenter::new_publish_only(
                 output_stream_id,
                 output_stream_idx,
                 Arc::clone(&config.playlists),
                 TimestampInput::MillisAbsolute,
-                config
-                    .min_part_ms
-                    .max(DEFAULT_MIN_PART_MS.min(config.min_part_ms)),
+                DEFAULT_MIN_PART_MS,
                 Arc::clone(&config.publisher),
             );
+            segmenter.set_min_part_us(fmp4_min_part_us(config, payload_kind, sample_rate));
             segmenter.set_source_epoch(source_epoch);
             RenditionPackager::Fmp4(Box::new(segmenter))
         }
     }
+}
+
+/// Shortest fMP4 part of a rendition: `0`, one access unit per part, for
+/// one epoch per part.
+fn fmp4_min_part_us(
+    config: &AudioEpochHlsConfig,
+    payload_kind: AudioPayloadKind,
+    sample_rate: u32,
+) -> u64 {
+    config
+        .part
+        .target_samples(sample_rate, payload_kind == AudioPayloadKind::Flac)
+        .map_or(0, |samples| samples_to_us(samples, sample_rate))
 }
 
 #[cfg(test)]
@@ -788,6 +864,8 @@ async fn package_group_with_times(
                     output_stream_id,
                     output_stream_idx,
                     group.session_id,
+                    group.payload_kind,
+                    group.sample_rate,
                 ),
             });
             info!(
@@ -812,6 +890,13 @@ async fn package_group_with_times(
         state.packager.finish().await?;
         state.packager.reset();
         state.format = format;
+        if let RenditionPackager::Fmp4(segmenter) = &mut state.packager {
+            segmenter.set_min_part_us(fmp4_min_part_us(
+                config,
+                group.payload_kind,
+                group.sample_rate,
+            ));
+        }
         debug!(
             session_id = group.session_id,
             group_id = group.group_id,
@@ -828,18 +913,12 @@ async fn package_group_with_times(
             .ok_or_else(|| "AEP1 audio PTS overflow".to_string())?,
     );
 
-    let duration_ms = u32::try_from(samples_to_millis(
-        u64::from(group.frame_count),
-        group.sample_rate,
-    )?)
-    .map_err(|_| "AEP1 group duration exceeds u32 milliseconds".to_string())?
-    .max(1);
     match config.packaging {
         AudioEpochHlsPackaging::Opaque => {
             state
                 .packager
                 .opaque()?
-                .push(group.payload, duration_ms, times)
+                .push(group.payload, group.frame_count, group.sample_rate, times)
                 .await
         }
         AudioEpochHlsPackaging::Fmp4 => package_group_as_fmp4(state, group, times).await,
@@ -1129,7 +1208,7 @@ mod tests {
         });
         AudioEpochHlsConfig::new(
             base_stream_id,
-            min_part_ms,
+            AudioPartSize::from_legacy_ms(min_part_ms),
             packaging,
             formats,
             playlists,
@@ -1852,5 +1931,188 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("queue is full"));
         assert_eq!(sender.capacity(), 0);
+    }
+
+    fn epoch_config(
+        part: AudioPartSize,
+        packaging: AudioEpochHlsPackaging,
+    ) -> (AudioEpochHlsConfig, Arc<CapturingPublisher>) {
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let mut config = test_config(30, 5, packaging, publisher);
+        config.part = part;
+        (config, captured)
+    }
+
+    fn sized_group(
+        epoch_id: u64,
+        frame_count: u32,
+        payload_kind: AudioPayloadKind,
+        payload: Vec<u8>,
+    ) -> DecodedMultichannelAudioGroup {
+        let sample_format = match payload_kind {
+            AudioPayloadKind::Opus => AudioSampleFormat::Unspecified,
+            _ => AudioSampleFormat::S24Le,
+        };
+        let mut group = decoded_group(
+            epoch_id,
+            epoch_id * u64::from(frame_count),
+            0,
+            0,
+            2,
+            payload_kind,
+            sample_format,
+            Bytes::from(payload),
+        );
+        group.frame_count = frame_count;
+        group
+    }
+
+    #[tokio::test]
+    async fn one_epoch_is_one_part_by_default_with_its_exact_duration() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Opaque);
+        assert_eq!(config.part, AudioPartSize::Epoch);
+        let mut renditions = HashMap::new();
+        // 2.5 ms Opus epochs (120 samples) and 0.25 ms PCM epochs (12).
+        for epoch_id in 0..4_u64 {
+            for (frame_count, kind) in [(120, AudioPayloadKind::Opus), (12, AudioPayloadKind::Pcm)]
+            {
+                package_group(
+                    &config,
+                    &mut renditions,
+                    sized_group(epoch_id, frame_count, kind, vec![epoch_id as u8; 9]),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 8);
+        let opus = rendition_stream_id(30, 0, AudioPayloadKind::Opus).unwrap();
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(part.sequence, index as u64 / 2);
+            assert_eq!(part.audio_units, 1);
+            assert_eq!(part.sample_rate, Some(48_000));
+            if part.stream_id == opus {
+                assert_eq!(part.duration_samples, Some(120));
+                assert_eq!(part.duration_us, 2_500);
+                assert_eq!(part.duration_ms, 3);
+            } else {
+                assert_eq!(part.duration_samples, Some(12));
+                assert_eq!(part.duration_us, 250);
+                assert_eq!(part.duration_ms, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_part_in_samples_takes_whole_epochs_and_flac_keeps_its_floor() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(48), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..8_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(epoch_id, 12, AudioPayloadKind::Pcm, vec![epoch_id as u8]),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let parts = captured.opaque_parts.lock().unwrap();
+            assert_eq!(parts.len(), 2);
+            for part in parts.iter() {
+                assert_eq!(part.audio_units, 4);
+                assert_eq!(part.duration_samples, Some(48));
+                assert_eq!(part.duration_us, 1_000);
+            }
+            assert_eq!(parts[0].bytes.as_ref(), [0, 1, 2, 3]);
+        }
+
+        // 16-sample FLAC blocks with a 12-sample setting: never under 32.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(12), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..4_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(epoch_id, 16, AudioPayloadKind::Flac, vec![epoch_id as u8]),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts
+            .iter()
+            .all(|part| part.duration_samples == Some(32) && part.duration_us == 667));
+    }
+
+    #[tokio::test]
+    async fn fmp4_pcm_epochs_of_one_ms_are_one_part_each() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Fmp4);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..3_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(
+                    epoch_id,
+                    48,
+                    AudioPayloadKind::Pcm,
+                    vec![epoch_id as u8; 48 * 2 * 3],
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = captured.fmp4_parts.lock().unwrap();
+        assert_eq!(parts.len(), 3);
+        for part in parts.iter() {
+            assert_eq!(part.audio_units, 1);
+            assert_eq!(part.duration_us, 1_000);
+            assert_eq!(part.duration_ms, 1);
+            assert_eq!(part.duration_samples, Some(48));
+            assert_eq!(part.sample_rate, Some(48_000));
+        }
+    }
+
+    #[test]
+    fn queues_and_windows_are_sized_in_time() {
+        // One second of a rendition's epochs, never under 1,024 places.
+        assert_eq!(rendition_queue_capacity(12, 48_000), 4_000);
+        assert_eq!(rendition_queue_capacity(48, 48_000), 1_024);
+        assert_eq!(rendition_queue_capacity(240, 48_000), 1_024);
+        // 320 ms of 250 µs epochs may wait for repair.
+        assert_eq!(aep1_session_config().max_inflight_epochs, 1_280);
+        let queue_us = DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY as u64 * 1_000_000 / 60_000;
+        assert!(queue_us >= 320_000, "{queue_us} µs");
+    }
+
+    #[test]
+    fn block_first_arrivals_survive_interleaved_epochs() {
+        let mut receiver = ReceiverState::new(Instant::now());
+        // Two hundred blocks in flight at once, as 0.25 ms epochs with a
+        // late repair make: each keeps its own first arrival.
+        for block in 0..200_u32 {
+            assert_eq!(
+                receiver.observe_block(block, 1_000 + u64::from(block)),
+                1_000 + u64::from(block)
+            );
+        }
+        for block in 0..200_u32 {
+            assert_eq!(
+                receiver.observe_block(block, 9_999),
+                1_000 + u64::from(block)
+            );
+        }
+        // A block id that reuses a slot much later is a new block.
+        let reused = FIRST_ARRIVAL_BLOCKS as u32;
+        assert_eq!(receiver.observe_block(reused, 5), 5);
+        assert_eq!(receiver.observe_block(0, 7), 7);
     }
 }

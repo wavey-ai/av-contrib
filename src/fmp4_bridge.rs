@@ -72,8 +72,15 @@ pub struct PublishedFmp4Part {
     /// A value of `None` uses the publisher process epoch.
     pub source_epoch: Option<u64>,
     pub sequence: u64,
-    /// Actual duration reported by the fMP4 packager.
+    /// Duration in whole milliseconds, rounded and never 0, for caches that
+    /// do not read `duration_us`.
     pub duration_ms: u32,
+    /// Exact duration in microseconds: from the sample count of an audio
+    /// part, from the 90 kHz decode times of a video part.
+    pub duration_us: u64,
+    /// Sample count and rate of an audio-only part, when known.
+    pub duration_samples: Option<u64>,
+    pub sample_rate: Option<u32>,
     /// Wall-clock time immediately after the immutable fMP4 bytes were boxed.
     pub packaged_at_unix_ns: i64,
     /// Wall-clock time when the immutable part was handed to its publisher.
@@ -107,7 +114,13 @@ pub struct PublishedOpaquePart {
     /// A value of `None` uses the publisher process epoch.
     pub source_epoch: Option<u64>,
     pub sequence: u64,
+    /// Duration in whole milliseconds, rounded and never 0, for caches that
+    /// do not read `duration_us`.
     pub duration_ms: u32,
+    /// Exact duration: `round(duration_samples * 1e6 / sample_rate)`.
+    pub duration_us: u64,
+    pub duration_samples: Option<u64>,
+    pub sample_rate: Option<u32>,
     pub packaged_at_unix_ns: i64,
     pub published_at_unix_ns: i64,
     pub bytes: Bytes,
@@ -436,14 +449,18 @@ pub struct Fmp4Segmenter {
     retain_local_cache: bool,
     audio_config: Option<AudioTrackConfig>,
     min_part_ticks: u64,
+    /// Shortest part, in microseconds. `0` closes a part on every access
+    /// unit (one frame, one audio packet per part).
+    min_part_us: u64,
     max_part_ticks_without_key: u64,
     video_buf: Vec<AccessUnit>,
     video_timestamps: Vec<u64>,
     audio_buf: Vec<AccessUnit>,
     audio_timestamps: Vec<u64>,
-    /// Known encoded duration of the buffered audio. `None` preserves the
+    /// Known encoded duration of the buffered audio, as a sample count and
+    /// its rate (`(0, 0)` when nothing is buffered). `None` preserves the
     /// timestamp-lookahead fallback for an unrecognised audio payload.
-    audio_buffered_duration_ms: Option<u64>,
+    audio_buffered: Option<(u64, u32)>,
     aac_timeline: Option<AacTimeline>,
     config: Config,
     seg_seq: u32,
@@ -556,12 +573,13 @@ impl Fmp4Segmenter {
             retain_local_cache,
             audio_config: None,
             min_part_ticks: ms_to_ticks(min_part_ms),
+            min_part_us: u64::from(min_part_ms) * 1_000,
             max_part_ticks_without_key: ms_to_ticks(MAX_PART_MS_WITHOUT_KEY),
             video_buf: Vec::new(),
             video_timestamps: Vec::new(),
             audio_buf: Vec::new(),
             audio_timestamps: Vec::new(),
-            audio_buffered_duration_ms: Some(0),
+            audio_buffered: Some((0, 0)),
             aac_timeline: None,
             config: Config {
                 width: 0,
@@ -589,6 +607,14 @@ impl Fmp4Segmenter {
             next_source_times: Default::default(),
             part_source_times: Default::default(),
         }
+    }
+
+    /// Set the shortest part in microseconds, finer than the millisecond
+    /// constructors: 2,500 for 120-sample Opus parts. `0` closes a part on
+    /// every access unit. Set it before the first access unit.
+    pub fn set_min_part_us(&mut self, min_part_us: u64) {
+        self.min_part_us = min_part_us;
+        self.min_part_ticks = us_to_ticks(min_part_us);
     }
 
     /// Source times of the next access unit pushed, for the hop journal.
@@ -692,7 +718,7 @@ impl Fmp4Segmenter {
         self.video_timestamps.clear();
         self.audio_buf.clear();
         self.audio_timestamps.clear();
-        self.audio_buffered_duration_ms = Some(0);
+        self.audio_buffered = Some((0, 0));
         self.aac_timeline = None;
         self.config = Config {
             width: 0,
@@ -961,13 +987,12 @@ impl Fmp4Segmenter {
                 self.force_next_init = true;
             }
         }
-        let access_unit_duration_ms =
-            audio_access_unit_duration_ms(&access_unit, self.audio_config);
+        let access_unit_samples = audio_access_unit_samples(&access_unit, self.audio_config);
         if self.seen_video && (self.config.avcc.is_none() || !self.started_video) {
             self.audio_timestamps.push(access_unit.pts);
             self.audio_buf.push(access_unit);
             self.take_next_source_times();
-            self.extend_audio_buffered_duration(access_unit_duration_ms);
+            self.extend_audio_buffered_duration(access_unit_samples);
             debug!(
                 output_stream_id = self.output_stream_id,
                 output_stream_idx = self.output_stream_idx,
@@ -980,7 +1005,7 @@ impl Fmp4Segmenter {
         }
 
         if self.video_buf.is_empty()
-            && self.audio_buffered_duration_ms.is_none()
+            && self.audio_buffered.is_none()
             && self.should_flush_audio_only_before(&access_unit)
         {
             let first_pts = self
@@ -993,7 +1018,7 @@ impl Fmp4Segmenter {
                 output_stream_idx = self.output_stream_idx,
                 buffered_audio = self.audio_buf.len(),
                 elapsed_ms = access_unit.pts.saturating_sub(first_pts),
-                target_ms = ticks_to_ms(self.min_part_ticks),
+                target_us = self.min_part_us,
                 "flushing audio-only fMP4 part before next access unit"
             );
             self.flush_with_next_dts(0).await;
@@ -1002,25 +1027,36 @@ impl Fmp4Segmenter {
         self.audio_timestamps.push(access_unit.pts);
         self.audio_buf.push(access_unit);
         self.take_next_source_times();
-        self.extend_audio_buffered_duration(access_unit_duration_ms);
+        self.extend_audio_buffered_duration(access_unit_samples);
 
         // FLAC, ADTS, Opus, and configured PCM describe their sample duration,
         // so an audio-only part can close as soon as it reaches its target.
         // Waiting for the next timestamp adds one whole audio frame of latency.
+        // The duration is counted in samples: 12 PCM samples are 250 µs, not
+        // 0 ms, so a part of them closes.
         if !self.seen_video
             && self
-                .audio_buffered_duration_ms
-                .is_some_and(|duration_ms| duration_ms >= ticks_to_ms(self.min_part_ticks))
+                .audio_buffered_us()
+                .is_some_and(|duration_us| duration_us >= self.min_part_us)
         {
             self.flush_with_next_dts(0).await;
         }
     }
 
-    fn extend_audio_buffered_duration(&mut self, access_unit_duration_ms: Option<u64>) {
-        self.audio_buffered_duration_ms = self
-            .audio_buffered_duration_ms
-            .zip(access_unit_duration_ms)
-            .map(|(buffered, access_unit)| buffered.saturating_add(access_unit));
+    fn extend_audio_buffered_duration(&mut self, access_unit_samples: Option<(u64, u32)>) {
+        self.audio_buffered = match (self.audio_buffered, access_unit_samples) {
+            (Some((0, _)), Some(unit)) => Some(unit),
+            (Some((buffered, rate)), Some((samples, unit_rate))) if rate == unit_rate => {
+                Some((buffered.saturating_add(samples), rate))
+            }
+            _ => None,
+        };
+    }
+
+    /// Duration of the buffered audio in microseconds, when known.
+    fn audio_buffered_us(&self) -> Option<u64> {
+        self.audio_buffered
+            .map(|(samples, rate)| crate::part_timing::samples_to_us(samples, rate))
     }
 
     fn apply_aac_timeline(&mut self, access_unit: &mut AccessUnit) {
@@ -1086,7 +1122,12 @@ impl Fmp4Segmenter {
                 let prev = self.video_timestamps[self.video_timestamps.len() - 2];
                 last_dts + last_dts.saturating_sub(prev).max(1)
             } else {
-                last_dts + ms_to_ticks(DEFAULT_MIN_PART_MS)
+                // A part of one frame: the frame lasts as long as the frames
+                // before it.
+                last_dts
+                    + self
+                        .video_frame_ticks
+                        .unwrap_or_else(|| ms_to_ticks(DEFAULT_MIN_PART_MS))
             };
             self.flush_with_next_dts(next_dts).await;
         } else if !self.audio_buf.is_empty() {
@@ -1121,7 +1162,11 @@ impl Fmp4Segmenter {
         let Some(first_pts) = self.audio_timestamps.first().copied() else {
             return false;
         };
-        access_unit.pts.saturating_sub(first_pts) >= ticks_to_ms(self.min_part_ticks)
+        access_unit
+            .pts
+            .saturating_sub(first_pts)
+            .saturating_mul(1_000)
+            >= self.min_part_us
     }
 
     async fn flush_with_next_dts(&mut self, next_dts: u64) {
@@ -1148,6 +1193,17 @@ impl Fmp4Segmenter {
         let audio_units = self.audio_buf.len();
         let audio_codec = audio_codec_name(&self.audio_buf, self.audio_config);
 
+        // The exact duration: the decode times of video, the sample count of
+        // audio-only parts. The boxer reports whole milliseconds.
+        let video_duration_ticks = self
+            .video_timestamps
+            .first()
+            .filter(|_| video_units > 0)
+            .and_then(|first| next_dts.checked_sub(*first))
+            .filter(|ticks| *ticks > 0);
+        let audio_buffered = self
+            .audio_buffered
+            .filter(|(samples, rate)| video_units == 0 && *samples > 0 && *rate > 0);
         let boxing_audio_config = match self.known_audio_signature {
             Some(AudioConfigSignature::Aac { .. }) if self.audio_config.is_none() => {
                 Some(AudioTrackConfig::Aac)
@@ -1168,7 +1224,7 @@ impl Fmp4Segmenter {
         let source_times = std::mem::take(&mut self.part_source_times);
         self.video_timestamps.clear();
         self.audio_timestamps.clear();
-        self.audio_buffered_duration_ms = Some(0);
+        self.audio_buffered = Some((0, 0));
 
         if fmp4.data.is_empty() {
             warn!(
@@ -1184,6 +1240,18 @@ impl Fmp4Segmenter {
         let init_for_mesh = fmp4.init.clone();
         let init_published = init_for_mesh.is_some();
         let duration = fmp4.duration;
+        let (duration_us, duration_samples, sample_rate) = if let Some(ticks) = video_duration_ticks
+        {
+            (ticks_to_us(ticks), None, None)
+        } else if let Some((samples, rate)) = audio_buffered {
+            (
+                crate::part_timing::samples_to_us(samples, rate),
+                Some(samples),
+                Some(rate),
+            )
+        } else {
+            (u64::from(duration).saturating_mul(1_000), None, None)
+        };
         let key = fmp4.key;
         let part_bytes = fmp4.data.clone();
         let bytes = part_bytes.len();
@@ -1250,7 +1318,10 @@ impl Fmp4Segmenter {
                 stream_idx: self.output_stream_idx,
                 source_epoch: self.source_epoch,
                 sequence: self.published_parts,
-                duration_ms: duration,
+                duration_ms: crate::part_timing::legacy_ms(duration_us),
+                duration_us,
+                duration_samples,
+                sample_rate,
                 packaged_at_unix_ns,
                 published_at_unix_ns,
                 init: init_for_mesh,
@@ -1329,7 +1400,7 @@ impl Fmp4Segmenter {
         self.video_timestamps.clear();
         self.audio_buf.clear();
         self.audio_timestamps.clear();
-        self.audio_buffered_duration_ms = Some(0);
+        self.audio_buffered = Some((0, 0));
         self.part_source_times = Default::default();
     }
 
@@ -1448,6 +1519,17 @@ fn now_unix_ns() -> i64 {
         Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),
     }
+}
+
+fn us_to_ticks(us: u64) -> u64 {
+    us.saturating_mul(TICKS_PER_SECOND) / 1_000_000
+}
+
+fn ticks_to_us(ticks: u64) -> u64 {
+    ticks
+        .saturating_mul(1_000_000)
+        .saturating_add(TICKS_PER_SECOND / 2)
+        / TICKS_PER_SECOND
 }
 
 fn ms_to_ticks_u64(ms: u64) -> u64 {
@@ -1678,15 +1760,18 @@ fn audio_config_signature(audio_units: &[AccessUnit]) -> Option<AudioConfigSigna
     None
 }
 
-fn audio_access_unit_duration_ms(
+/// Duration of an audio access unit as a sample count and its rate: Opus at
+/// its fixed 48 kHz clock, PCM from its byte count, FLAC from its block
+/// size, AAC 1,024 samples.
+fn audio_access_unit_samples(
     access_unit: &AccessUnit,
     audio_config: Option<AudioTrackConfig>,
-) -> Option<u64> {
+) -> Option<(u64, u32)> {
     match audio_config {
         Some(AudioTrackConfig::Aac) => {
             let header = AdtsHeader::read_from(&access_unit.data)?;
-            let sample_rate = u64::from(header.sampling_frequency.as_u32());
-            return Some((1_024_000_u64.saturating_add(sample_rate / 2)) / sample_rate);
+            let sample_rate = header.sampling_frequency.as_u32();
+            return (sample_rate > 0).then_some((1_024, sample_rate));
         }
         Some(AudioTrackConfig::Pcm(pcm)) => {
             let valid_size = match pcm.sample_kind {
@@ -1704,20 +1789,13 @@ fn audio_access_unit_duration_ms(
                 return None;
             }
             let frames = u64::try_from(access_unit.data.len() / bytes_per_frame).ok()?;
-            return Some(
-                frames
-                    .saturating_mul(1_000)
-                    .saturating_add(u64::from(pcm.sample_rate) / 2)
-                    / u64::from(pcm.sample_rate),
-            );
+            return Some((frames, pcm.sample_rate));
         }
         Some(AudioTrackConfig::Opus(_)) => {
-            return Some(
-                u64::from(opus_packet_info(&access_unit.data)?.duration_samples)
-                    .saturating_mul(1_000)
-                    .saturating_add(24_000)
-                    / 48_000,
-            );
+            return Some((
+                u64::from(opus_packet_info(&access_unit.data)?.duration_samples),
+                48_000,
+            ));
         }
         None => {}
     }
@@ -1731,16 +1809,12 @@ fn audio_access_unit_duration_ms(
                 if header.sample_rate == 0 {
                     return None;
                 }
-                let numerator = u64::from(header.block_size).saturating_mul(1_000);
-                return Some(
-                    numerator.saturating_add(u64::from(header.sample_rate) / 2)
-                        / u64::from(header.sample_rate),
-                );
+                return Some((u64::from(header.block_size), header.sample_rate));
             }
             AudioType::AAC => {
                 let header = AdtsHeader::read_from(data)?;
-                let sample_rate = u64::from(header.sampling_frequency.as_u32());
-                return Some((1_024_000_u64.saturating_add(sample_rate / 2)) / sample_rate);
+                let sample_rate = header.sampling_frequency.as_u32();
+                return (sample_rate > 0).then_some((1_024, sample_rate));
             }
             _ => {}
         }
@@ -2139,8 +2213,8 @@ mod tests {
                 (100, true, 3, 0),
                 (67, false, 2, 9_000),
                 (100, true, 3, 15_000),
-                // The last frame is closed by `finish` at the default length.
-                (DEFAULT_MIN_PART_MS, false, 1, 24_000),
+                // The last frame is closed by `finish` at the frame interval.
+                (33, false, 1, 24_000),
             ]
         );
     }
@@ -2169,6 +2243,87 @@ mod tests {
             vec![0, 3_000, 6_000, 9_000, 12_000]
         );
         assert!(shapes[0].1 && shapes[1..].iter().all(|shape| !shape.1));
+    }
+
+    #[tokio::test]
+    async fn one_unit_per_part_cuts_every_frame_with_its_exact_duration() {
+        // `--video-part frame`: min_part_ms 0. 30000/1001 frames a second:
+        // 3,003 ticks, 33,367 µs.
+        let (mut segmenter, publisher) =
+            video_segmenter(crate::part_timing::ONE_UNIT_PER_PART_MS, true);
+        for index in 0..6_u64 {
+            segmenter
+                .push_access_unit(h264_frame(index * 3_003, index == 0))
+                .await;
+        }
+        let parts = publisher.parts.lock().unwrap();
+        // Every frame is a part. The first two wait for the next frame (no
+        // steady rate yet); the rest leave with themselves.
+        assert_eq!(parts.len(), 6);
+        assert!(parts.iter().all(|part| part.video_units == 1));
+        assert!(parts.iter().all(|part| part.duration_us == 33_367));
+        assert!(parts.iter().all(|part| part.duration_ms == 33));
+        assert!(parts.iter().all(|part| part.duration_samples.is_none()));
+    }
+
+    #[tokio::test]
+    async fn pcm_parts_of_twelve_samples_close_instead_of_growing() {
+        // 12 samples are 0 whole ms; counted in samples, each access unit
+        // completes a part of one unit.
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let publisher = Arc::new(CapturingPublisher::default());
+        let mut segmenter = Fmp4Segmenter::new_publish_only(
+            78,
+            0,
+            playlists,
+            TimestampInput::MillisAbsolute,
+            DEFAULT_MIN_PART_MS,
+            publisher.clone(),
+        );
+        segmenter.set_min_part_us(0);
+        segmenter.set_pcm_audio_config(Some(PcmAudioConfig {
+            sample_rate: 48_000,
+            channel_count: 2,
+            sample_size: 24,
+            little_endian: true,
+            sample_kind: PcmSampleKind::Integer,
+        }));
+        for index in 0..8_u64 {
+            segmenter
+                .push_access_unit(AccessUnit {
+                    key: true,
+                    pts: index / 4,
+                    dts: index / 4,
+                    data: Bytes::from(vec![index as u8; 12 * 2 * 3]),
+                    stream_type: PSI_STREAM_PRIVATE_DATA,
+                    id: index,
+                })
+                .await;
+            assert!(segmenter.audio_buf.is_empty(), "unit {index} is buffered");
+        }
+        // The boxer writes PCM at a timescale of 1,000 and drops each
+        // sample of under 1 ms, so it publishes nothing of these parts: a
+        // boxer change (timescale = sample rate). A 48-sample unit is whole,
+        // and its part is exact.
+        assert!(publisher.parts.lock().unwrap().is_empty());
+        segmenter
+            .push_access_unit(AccessUnit {
+                key: true,
+                pts: 2,
+                dts: 2,
+                data: Bytes::from(vec![7_u8; 48 * 2 * 3]),
+                stream_type: PSI_STREAM_PRIVATE_DATA,
+                id: 100,
+            })
+            .await;
+        assert!(segmenter.audio_buf.is_empty());
+        let parts = publisher.parts.lock().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].audio_units, 1);
+        assert_eq!(parts[0].duration_samples, Some(48));
+        assert_eq!(parts[0].sample_rate, Some(48_000));
+        assert_eq!(parts[0].duration_us, 1_000);
+        assert_eq!(parts[0].duration_ms, 1);
     }
 
     /// (tfdt, duration in ticks, presentation time of the first frame) of

@@ -8,6 +8,8 @@ RUST_LOG ?= info
 HOST ?= local.infidelity.io
 STREAM_ID ?= 1
 PART_MS ?= 50
+AUDIO_PART ?= epoch
+VIDEO_PART ?= frame
 
 TLS_DIR ?= ../tls/$(HOST)
 CERT ?= $(TLS_DIR)/fullchain.pem
@@ -40,7 +42,7 @@ help:
 	@printf '%s\n' '  make build-release     Build av-contrib release binaries'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
-	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.infidelity.io'
+	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 AUDIO_PART=epoch VIDEO_PART=frame RUST_LOG=info HOST=local.infidelity.io'
 
 stack:
 	$(MAKE) -C $(NEEDLETAIL_ROOT) local HOST=$(HOST) STREAM_ID=$(STREAM_ID) \
@@ -55,7 +57,7 @@ stack-fast:
 		PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 service:
-	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) \
+	RUST_LOG=$(RUST_LOG) \
 	$(CARGO) run --bin av-contrib -- \
 		--cert $(CERT) \
 		--key $(KEY) \
@@ -66,7 +68,8 @@ service:
 		--rist-stream-id $(STREAM_ID) \
 		--srt-stream-id $(STREAM_ID) \
 		--rtmp-stream-id $(STREAM_ID) \
-		--fmp4-part-ms $(PART_MS) \
+		--audio-part $(AUDIO_PART) \
+		--video-part $(VIDEO_PART) \
 		--rist-bind $(RIST_BIND) \
 		--srt-bind $(SRT_BIND) \
 		--rtmp-bind $(RTMP_BIND) \

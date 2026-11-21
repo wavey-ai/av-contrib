@@ -6,7 +6,7 @@ use av_contrib::audio_epoch_hls::{
 };
 use av_contrib::fmp4_bridge::{
     AccessUnitSink, Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop,
-    PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
+    PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge,
 };
 use av_contrib::hls_stamp::StreamStamper;
 use av_contrib::hop_journal::{
@@ -18,6 +18,7 @@ use av_contrib::ingress_authorization::{
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
+use av_contrib::part_timing::{AudioPartSize, VideoPartSize};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
     start_quadra_rendition_pipeline, QuadraRenditionConfig, QuadraRenditionSpec,
@@ -108,13 +109,14 @@ const RELAY_LANE_IMPAIRED_HOLD_MS: u64 = 3_000;
 const AUDIO_EPOCH_MESH_QUEUE_CAPACITY: usize = 32_768;
 const AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY: usize = 32_768;
 const PUBLICATION_WORKERS: usize = 8;
-// Parts that wait for a publication worker. A stream of 5 ms audio parts
-// makes 200 parts a second, and several streams share a worker. With 32
-// places for each worker, a pause of 120 ms of the process (measured on a
-// busy host; a shared CPU pauses a Nanode in the same way) overflowed the
-// queue, and each part that does not fit is a hole in the playlist of every
-// reader. 256 places hold more than half a second of three such streams.
-const PUBLICATION_QUEUE_CAPACITY: usize = 2_048;
+// Parts that wait for a publication worker, sized in time. A pause of
+// 120 ms of the process (measured on a busy host; a shared CPU pauses a
+// Nanode in the same way) overflowed 32 places a worker at 5 ms parts, and
+// each part that does not fit is a hole in the playlist of every reader.
+// Parts are now one epoch: 12-sample PCM parts are 4,000 a second, so 4,096
+// places a worker hold one second of such a stream, or 0.36 s of it beside
+// 2.5 ms Opus and 1 ms PCM on the same worker (5,400 parts a second).
+const PUBLICATION_QUEUE_CAPACITY: usize = 32_768;
 const PUBLICATION_QUEUE_CAPACITY_PER_WORKER: usize =
     PUBLICATION_QUEUE_CAPACITY / PUBLICATION_WORKERS;
 static PUBLICATION_QUEUE_CAPACITY_METRIC: AtomicU64 = AtomicU64::new(0);
@@ -338,6 +340,7 @@ fn build_fmp4_media_object(
         .with_dependency(initialization_key)
         .with_metadata("container", b"fmp4".to_vec())
         .with_metadata("duration-ms", part.duration_ms.to_string().into_bytes())
+        .with_metadata("duration-us", part.duration_us.to_string().into_bytes())
         .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
         .with_metadata(
             "scheduler-class",
@@ -359,6 +362,7 @@ fn build_fmp4_media_object(
     if let Some(codec) = part.audio_codec {
         builder = builder.with_metadata("audio-codec", codec.as_bytes().to_vec());
     }
+    builder = with_sample_duration_metadata(builder, part.duration_samples, part.sample_rate);
     if let Some(stamp) = part.hls {
         for (key, value) in stamp.metadata() {
             builder = builder.with_metadata(key, value);
@@ -378,7 +382,7 @@ fn build_opaque_media_object(
     if delivery_budget_ms == 0 {
         bail!("canonical media delivery budget must be positive");
     }
-    if part.bytes.is_empty() || part.audio_units == 0 || part.duration_ms == 0 {
+    if part.bytes.is_empty() || part.audio_units == 0 || part.duration_us == 0 {
         bail!("opaque audio part must contain timed media units");
     }
     let key = ObjectKey::for_payload(
@@ -408,11 +412,13 @@ fn build_opaque_media_object(
         .with_stage_timestamp(StageTimestamp::new(Stage::Published, published))
         .with_metadata("container", b"opaque".to_vec())
         .with_metadata("duration-ms", part.duration_ms.to_string().into_bytes())
+        .with_metadata("duration-us", part.duration_us.to_string().into_bytes())
         .with_metadata("payload-format", b"opaque-part-v1".to_vec())
         .with_metadata("scheduler-class", b"audio".to_vec())
         .with_metadata("track-composition", b"audio".to_vec())
         .with_metadata("content-type", b"application/octet-stream".to_vec())
         .with_metadata("file-extension", b"bin".to_vec());
+    builder = with_sample_duration_metadata(builder, part.duration_samples, part.sample_rate);
     if let Some(stamp) = part.hls {
         for (key, value) in stamp.metadata() {
             builder = builder.with_metadata(key, value);
@@ -421,6 +427,21 @@ fn build_opaque_media_object(
     builder
         .build()
         .context("invalid canonical opaque-media object")
+}
+
+/// `duration-samples` and `sample-rate` of a part whose sample count is
+/// known: caches can then render its duration without rounding.
+fn with_sample_duration_metadata(
+    builder: media_object::MediaObjectBuilder,
+    duration_samples: Option<u64>,
+    sample_rate: Option<u32>,
+) -> media_object::MediaObjectBuilder {
+    match (duration_samples, sample_rate) {
+        (Some(samples), Some(rate)) if samples > 0 && rate > 0 => builder
+            .with_metadata("duration-samples", samples.to_string().into_bytes())
+            .with_metadata("sample-rate", rate.to_string().into_bytes()),
+        _ => builder,
+    }
 }
 
 fn canonical_contributor_timestamp(
@@ -690,7 +711,7 @@ struct Args {
         env = "AV_DAW_HLS_FORMATS",
         value_enum,
         value_delimiter = ',',
-        default_value = "flac"
+        default_value = "pcm,opus"
     )]
     daw_hls_formats: Vec<DawHlsFormat>,
 
@@ -728,16 +749,30 @@ struct Args {
     #[arg(long)]
     rtmp_bind: Option<SocketAddr>,
 
-    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = DEFAULT_MIN_PART_MS)]
-    fmp4_part_ms: u32,
+    /// Size of an audio part: `epoch` (one AEP1 epoch, or one access unit,
+    /// per part, whatever its sample count), `<N>samples` or `<N>us`. A
+    /// larger part is a setting; the default is the smallest the source
+    /// makes. A FLAC part is never under 32 samples.
+    #[arg(long, env = "AV_LL_HLS_AUDIO_PART")]
+    audio_part: Option<AudioPartSize>,
+
+    /// Old form of `--audio-part <N>ms`: an audio part of at least this many
+    /// milliseconds. `--audio-part` wins when both are given. It no longer
+    /// sets the video part.
+    #[arg(long, env = "AV_LL_HLS_PART_MS")]
+    fmp4_part_ms: Option<u32>,
 
     #[arg(long, env = "AV_LL_HLS_SEGMENT_MS", default_value_t = DEFAULT_SEGMENT_MS)]
     fmp4_segment_ms: u32,
 
-    /// Part duration of a stream with video, from SRT, RIST or RTMP. It
-    /// defaults to `--fmp4-part-ms`. An audio stream of a DAW keeps
-    /// `--fmp4-part-ms`, so one contributor carries 5 ms audio parts beside
-    /// video parts of several frames.
+    /// Size of a part of a stream with video, from SRT, RIST or RTMP:
+    /// `frame` (one access unit per part, the default) or `<N>ms`. With
+    /// frame parts the declared PART-TARGET is the longest frame seen.
+    #[arg(long, env = "AV_LL_HLS_VIDEO_PART")]
+    video_part: Option<VideoPartSize>,
+
+    /// Old form of `--video-part <N>ms`. `--video-part` wins when both are
+    /// given.
     #[arg(long, env = "AV_LL_HLS_VIDEO_PART_MS")]
     fmp4_video_part_ms: Option<u32>,
 
@@ -794,23 +829,69 @@ struct Args {
     quadra: QuadraCliArgs,
 }
 
+/// Sample rate at which a part size in samples is read when no stream is at
+/// hand (status, the local playlist options).
+const NOMINAL_SAMPLE_RATE: u32 = 48_000;
+/// The sender's default epoch, 48 samples at 48 kHz: the nominal part of
+/// one epoch per part where a number is needed before a stream starts.
+const NOMINAL_EPOCH_US: u64 = 1_000;
+
 impl Args {
-    /// Part duration of a stream with video.
+    /// Size of an audio part: `--audio-part`, else `--fmp4-part-ms`, else one
+    /// epoch per part.
+    fn audio_part(&self) -> AudioPartSize {
+        self.audio_part
+            .or(self.fmp4_part_ms.map(AudioPartSize::from_legacy_ms))
+            .unwrap_or_default()
+    }
+
+    /// Size of a part of a stream with video: `--video-part`, else
+    /// `--fmp4-video-part-ms`, else one frame per part.
+    fn video_part(&self) -> VideoPartSize {
+        self.video_part
+            .or(self
+                .fmp4_video_part_ms
+                .map(|ms| VideoPartSize::Millis(ms.max(1))))
+            .unwrap_or_default()
+    }
+
+    /// `min_part_ms` of the video segmenters: 0 is one frame per part.
     fn video_part_ms(&self) -> u32 {
-        self.fmp4_video_part_ms.unwrap_or(self.fmp4_part_ms)
+        self.video_part().min_part_ms()
+    }
+
+    /// The audio part in microseconds, with one epoch counted as the
+    /// sender's default epoch.
+    fn nominal_audio_part_us(&self) -> u64 {
+        match self.audio_part() {
+            AudioPartSize::Epoch => NOMINAL_EPOCH_US,
+            part => part.min_part_us(NOMINAL_SAMPLE_RATE),
+        }
+    }
+
+    /// The audio part in whole milliseconds, for the local playlist options
+    /// and the old status field.
+    fn nominal_audio_part_ms(&self) -> u32 {
+        av_contrib::part_timing::ceil_ms(self.nominal_audio_part_us())
     }
 
     /// The durations that the contributor declares in the playlist stamp of
-    /// each part.
+    /// each part. A part of one unit (epoch, frame) or of a number of
+    /// samples declares `0`: the stamper takes the part target from the
+    /// parts it sees.
     fn stamp_durations(&self) -> StampDurations {
         StampDurations {
-            video_part_ms: self.video_part_ms().max(1),
-            video_segment_ms: self
-                .fmp4_video_segment_ms
-                .unwrap_or(self.fmp4_segment_ms)
-                .max(1),
-            audio_part_ms: self.fmp4_part_ms.max(1),
-            audio_segment_ms: self.fmp4_segment_ms.max(1),
+            video_part_us: self.video_part().nominal_us(),
+            video_segment_us: u64::from(
+                self.fmp4_video_segment_ms
+                    .unwrap_or(self.fmp4_segment_ms)
+                    .max(1),
+            ) * 1_000,
+            audio_part_us: match self.audio_part() {
+                AudioPartSize::Micros(us) => us,
+                AudioPartSize::Epoch | AudioPartSize::Samples(_) => 0,
+            },
+            audio_segment_us: u64::from(self.fmp4_segment_ms.max(1)) * 1_000,
         }
     }
 }
@@ -2492,10 +2573,12 @@ impl QueuedPublication {
 /// that it stamps: one pair for streams with video, one for audio.
 #[derive(Debug, Clone, Copy)]
 struct StampDurations {
-    video_part_ms: u32,
-    video_segment_ms: u32,
-    audio_part_ms: u32,
-    audio_segment_ms: u32,
+    /// `0` for one frame per part.
+    video_part_us: u64,
+    video_segment_us: u64,
+    /// `0` for one epoch per part.
+    audio_part_us: u64,
+    audio_segment_us: u64,
 }
 
 /// Canonical sequence and playlist stamper of one stream.
@@ -2503,7 +2586,7 @@ struct StreamPublication {
     next_sequence: u64,
     stamper: Option<StreamStamper>,
     /// Wall clock that numbers the first segment of a video stream.
-    video_started_unix_ms: Option<u64>,
+    video_started_unix_us: Option<u64>,
     /// Publication worker of the stream, chosen when its first part arrives.
     /// A stream keeps its worker so that its parts leave in order.
     shard: Option<usize>,
@@ -2518,7 +2601,7 @@ impl StreamPublication {
         Self {
             next_sequence: 0,
             stamper: None,
-            video_started_unix_ms: None,
+            video_started_unix_us: None,
             shard: None,
             class: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -2601,7 +2684,7 @@ fn fmp4_publication_class(part: &PublishedFmp4Part) -> PublicationClass {
 
 /// Video streams that start within this time of each other number their
 /// segments from the same instant.
-const LADDER_START_WINDOW_MS: u64 = 1_000;
+const LADDER_START_WINDOW_US: u64 = 1_000_000;
 
 /// The wall clock that numbers the first segment of a video stream.
 ///
@@ -2611,11 +2694,11 @@ const LADDER_START_WINDOW_MS: u64 = 1_000;
 /// two renditions that start a few milliseconds apart, on either side of a
 /// segment boundary of the clock, would differ by one for good. A stream
 /// that starts within a second of another takes the start of the earliest.
-fn shared_video_start(own_unix_ms: u64, others: impl Iterator<Item = u64>) -> u64 {
+fn shared_video_start(own_unix_us: u64, others: impl Iterator<Item = u64>) -> u64 {
     others
-        .filter(|other| own_unix_ms.abs_diff(*other) <= LADDER_START_WINDOW_MS)
+        .filter(|other| own_unix_us.abs_diff(*other) <= LADDER_START_WINDOW_US)
         .min()
-        .map_or(own_unix_ms, |earliest| earliest.min(own_unix_ms))
+        .map_or(own_unix_us, |earliest| earliest.min(own_unix_us))
 }
 
 struct BoundedFmp4Publisher {
@@ -2669,19 +2752,19 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let stream_idx = part.stream_idx;
         let mut streams = self.streams.lock().await;
         let has_video = part.video_units > 0;
-        let published_unix_ms = u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0);
+        let published_unix_us = u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0);
         let known = streams
             .get(&stream_id)
             .is_some_and(|stream| stream.stamper.is_some());
-        let started_unix_ms = if has_video && !known {
+        let started_unix_us = if has_video && !known {
             shared_video_start(
-                published_unix_ms,
+                published_unix_us,
                 streams
                     .values()
-                    .filter_map(|stream| stream.video_started_unix_ms),
+                    .filter_map(|stream| stream.video_started_unix_us),
             )
         } else {
-            published_unix_ms
+            published_unix_us
         };
         let stream = streams
             .entry(stream_id)
@@ -2692,21 +2775,21 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         // stream has fixed segments, and every part of it can start one.
         let durations = self.durations;
         let before = stream.stamper.clone();
-        let started_before = stream.video_started_unix_ms;
+        let started_before = stream.video_started_unix_us;
         if has_video && stream.stamper.is_none() {
-            stream.video_started_unix_ms = Some(started_unix_ms);
+            stream.video_started_unix_us = Some(started_unix_us);
         }
         let stamper = stream.stamper.get_or_insert_with(|| {
             if has_video {
-                StreamStamper::new(durations.video_part_ms, durations.video_segment_ms)
+                StreamStamper::new(durations.video_part_us, durations.video_segment_us)
             } else {
-                StreamStamper::new(durations.audio_part_ms, durations.audio_segment_ms)
+                StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
             }
         });
         part.hls = Some(stamper.stamp(
-            part.duration_ms,
+            part.duration_us,
             part.keyframe || !has_video,
-            started_unix_ms,
+            started_unix_us,
         ));
         let class = fmp4_publication_class(&part);
         let shard = self.shard_of(stream, stream_id, class);
@@ -2730,7 +2813,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         } else {
             // The part was not published: it has no place in the playlist.
             stream.stamper = before;
-            stream.video_started_unix_ms = started_before;
+            stream.video_started_unix_us = started_before;
         }
         drop(streams);
         enqueue_publication_result(result, stream_id, stream_idx, sequence, &self.telemetry)
@@ -2758,12 +2841,12 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let durations = self.durations;
         let before = stream.stamper.clone();
         let stamper = stream.stamper.get_or_insert_with(|| {
-            StreamStamper::new(durations.audio_part_ms, durations.audio_segment_ms)
+            StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
         });
         part.hls = Some(stamper.stamp(
-            part.duration_ms,
+            part.duration_us,
             true,
-            u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
+            u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0),
         ));
         let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
         let source_times = part.source_times;
@@ -5062,7 +5145,10 @@ impl ContribStatusConfig {
                     .load(Ordering::Acquire),
             },
             hls: HlsStatus {
-                part_target_ms: args.fmp4_part_ms,
+                part_target_ms: args.nominal_audio_part_ms(),
+                part_target_us: args.nominal_audio_part_us(),
+                audio_part: args.audio_part().to_string(),
+                video_part: args.video_part().to_string(),
                 segment_target_ms: args.fmp4_segment_ms,
                 playlist_target_duration_ms: args.hls_target_duration_ms,
                 playlist_count: args.playlist_count,
@@ -5523,7 +5609,7 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
     );
     output.push_str(&format!(
         "av_contrib_llhls_part_target_seconds {}\n",
-        f64::from(snapshot.hls.part_target_ms) / 1_000.0
+        snapshot.hls.part_target_us as f64 / 1_000_000.0
     ));
 
     push_prometheus_metric_header(
@@ -6894,7 +6980,14 @@ struct MeshTargetStatus {
 
 #[derive(Debug, Clone, Serialize)]
 struct HlsStatus {
+    /// Audio part in whole milliseconds, rounded up; one epoch counts as
+    /// the sender's default epoch of 1 ms.
     part_target_ms: u32,
+    part_target_us: u64,
+    /// `epoch`, `<N>samples` or `<N>us`.
+    audio_part: String,
+    /// `frame` or `<N>ms`.
+    video_part: String,
     segment_target_ms: u32,
     playlist_target_duration_ms: u32,
     playlist_count: usize,
@@ -7926,7 +8019,7 @@ async fn main() -> Result<()> {
         let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
             AudioEpochHlsConfig::new(
                 args.daw_hls_base_stream_id,
-                args.fmp4_part_ms,
+                args.audio_part(),
                 args.daw_hls_packaging.into(),
                 args.daw_hls_formats
                     .iter()
@@ -8352,11 +8445,17 @@ fn playlist_options(args: &Args) -> playlists::Options {
     playlists::Options {
         max_segments: 32,
         num_playlists: args.playlist_count.max(1),
-        max_parts_per_segment: playlist_part_capacity(args.fmp4_segment_ms, args.fmp4_part_ms),
+        max_parts_per_segment: playlist_part_capacity(
+            args.fmp4_segment_ms,
+            args.nominal_audio_part_ms(),
+        ),
         max_parted_segments: 32,
-        segment_min_ms: args.fmp4_segment_ms.max(args.fmp4_part_ms).max(1),
+        segment_min_ms: args
+            .fmp4_segment_ms
+            .max(args.nominal_audio_part_ms())
+            .max(1),
         target_duration_ms: args.hls_target_duration_ms.max(1_000),
-        part_target_ms: args.fmp4_part_ms.max(1),
+        part_target_ms: args.nominal_audio_part_ms(),
         buffer_size_kb: args.playlist_buffer_kb.max(1),
         init_size_kb: 5,
     }
@@ -8574,16 +8673,16 @@ mod tests {
     #[test]
     fn renditions_that_start_together_number_their_segments_from_one_instant() {
         // Four renditions start within 210 ms, across a two-second boundary
-        // of the wall clock (…998 s and …000 s).
-        let first = 1_795_238_327_990_u64;
-        let second = shared_video_start(first + 4, [first].into_iter());
-        let third = shared_video_start(first + 12, [first, second].into_iter());
-        let fourth = shared_video_start(first + 210, [first, second, third].into_iter());
+        // of the wall clock (…998 s and …000 s). Times are microseconds.
+        let first = 1_795_238_327_990_000_u64;
+        let second = shared_video_start(first + 4_000, [first].into_iter());
+        let third = shared_video_start(first + 12_000, [first, second].into_iter());
+        let fourth = shared_video_start(first + 210_000, [first, second, third].into_iter());
         assert_eq!([second, third, fourth], [first; 3]);
-        assert_eq!(first / 2_000, fourth / 2_000);
-        assert_ne!(first / 2_000, (first + 210) / 2_000);
+        assert_eq!(first / 2_000_000, fourth / 2_000_000);
+        assert_ne!(first / 2_000_000, (first + 210_000) / 2_000_000);
         // A stream that starts a minute later is not a rendition of them.
-        let later = first + 60_000;
+        let later = first + 60_000_000;
         assert_eq!(shared_video_start(later, [first].into_iter()), later);
         // The first stream of all keeps its own start.
         assert_eq!(shared_video_start(first, std::iter::empty()), first);
@@ -8731,6 +8830,9 @@ mod tests {
             source_epoch: None,
             sequence,
             duration_ms: 67,
+            duration_us: 66_733,
+            duration_samples: None,
+            sample_rate: None,
             packaged_at_unix_ns: published_at_unix_ns - 2_000_000,
             published_at_unix_ns,
             init,
@@ -8754,6 +8856,9 @@ mod tests {
             source_epoch: None,
             sequence: 0,
             duration_ms: 5,
+            duration_us: 5_000,
+            duration_samples: Some(240),
+            sample_rate: Some(48_000),
             packaged_at_unix_ns: now_unix_ns(),
             published_at_unix_ns: now_unix_ns(),
             bytes: Bytes::from_static(b"pcm"),
@@ -8781,10 +8886,10 @@ mod tests {
                 streams: Mutex::new(HashMap::new()),
                 shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, mix)),
                 durations: StampDurations {
-                    video_part_ms: 200,
-                    video_segment_ms: 2_000,
-                    audio_part_ms: 5,
-                    audio_segment_ms: 1_000,
+                    video_part_us: 200_000,
+                    video_segment_us: 2_000_000,
+                    audio_part_us: 5_000,
+                    audio_segment_us: 1_000_000,
                 },
             },
             receivers,
@@ -8804,6 +8909,157 @@ mod tests {
             }
         }
         shards
+    }
+
+    #[test]
+    fn part_sizes_default_to_the_smallest_unit_and_keep_the_old_flags() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(args.audio_part(), AudioPartSize::Epoch);
+        assert_eq!(args.video_part(), VideoPartSize::Frame);
+        assert_eq!(args.video_part_ms(), 0);
+        assert_eq!(
+            args.daw_hls_formats
+                .iter()
+                .copied()
+                .map(AudioPayloadKind::from)
+                .collect::<Vec<_>>(),
+            vec![AudioPayloadKind::Pcm, AudioPayloadKind::Opus]
+        );
+        let durations = args.stamp_durations();
+        assert_eq!(durations.audio_part_us, 0);
+        assert_eq!(durations.video_part_us, 0);
+        assert_eq!(durations.audio_segment_us, 1_000_000);
+
+        // The old millisecond flags are aliases of a duration.
+        let args = Args::try_parse_from([
+            "av-contrib",
+            "--fmp4-part-ms",
+            "5",
+            "--fmp4-video-part-ms",
+            "200",
+        ])
+        .unwrap();
+        assert_eq!(args.audio_part(), AudioPartSize::Micros(5_000));
+        assert_eq!(args.video_part(), VideoPartSize::Millis(200));
+        assert_eq!(args.stamp_durations().audio_part_us, 5_000);
+        assert_eq!(args.stamp_durations().video_part_us, 200_000);
+        assert_eq!(args.nominal_audio_part_ms(), 5);
+
+        // The new flags win over the old ones.
+        let args = Args::try_parse_from([
+            "av-contrib",
+            "--fmp4-part-ms",
+            "5",
+            "--audio-part",
+            "120samples",
+            "--fmp4-video-part-ms",
+            "200",
+            "--video-part",
+            "frame",
+        ])
+        .unwrap();
+        assert_eq!(args.audio_part(), AudioPartSize::Samples(120));
+        assert_eq!(args.video_part(), VideoPartSize::Frame);
+        assert_eq!(args.nominal_audio_part_us(), 2_500);
+        assert_eq!(args.nominal_audio_part_ms(), 3);
+        assert!(Args::try_parse_from(["av-contrib", "--audio-part", "0us"]).is_err());
+        assert!(Args::try_parse_from(["av-contrib", "--video-part", "epoch"]).is_err());
+    }
+
+    fn stamping_publisher(
+        durations: StampDurations,
+    ) -> (BoundedFmp4Publisher, Vec<mpsc::Receiver<QueuedPublication>>) {
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..PUBLICATION_WORKERS {
+            let (sender, receiver) = mpsc::channel(4_096);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+        (
+            BoundedFmp4Publisher {
+                senders,
+                telemetry: Arc::new(IngestTelemetry::default()),
+                streams: Mutex::new(HashMap::new()),
+                shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, true)),
+                durations,
+            },
+            receivers,
+        )
+    }
+
+    fn drained_stamps(receivers: &mut [mpsc::Receiver<QueuedPublication>]) -> Vec<HlsStamp> {
+        let mut stamps = Vec::new();
+        for receiver in receivers.iter_mut() {
+            while let Ok(publication) = receiver.try_recv() {
+                let stamp = match publication {
+                    QueuedPublication::Fmp4 { part, .. } => part.hls,
+                    QueuedPublication::Opaque { part, .. } => part.hls,
+                };
+                stamps.push(stamp.unwrap());
+            }
+        }
+        stamps
+    }
+
+    #[tokio::test]
+    async fn epoch_parts_of_two_and_a_half_ms_are_stamped_in_microseconds() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let start_ns = 1_721_000_000_000_000_000_i64;
+        for index in 0..801_i64 {
+            let mut part = test_opaque_part(3_001);
+            part.duration_ms = 3;
+            part.duration_us = 2_500;
+            part.duration_samples = Some(120);
+            part.published_at_unix_ns = start_ns + index * 2_500_000;
+            publisher.publish_opaque_part(part).await.unwrap();
+        }
+        let stamps = drained_stamps(&mut receivers);
+        assert_eq!(stamps.len(), 801);
+        assert_eq!(stamps[0].msn, 1_721_000_000);
+        // 400 parts of 2.5 ms are one second: the segment number keeps pace
+        // with the wall clock.
+        assert_eq!((stamps[399].msn, stamps[399].part), (1_721_000_000, 399));
+        assert_eq!((stamps[400].msn, stamps[400].part), (1_721_000_001, 0));
+        assert_eq!((stamps[800].msn, stamps[800].part), (1_721_000_002, 0));
+        assert!(stamps.iter().all(|stamp| stamp.part_target_us == 2_500));
+        assert!(stamps.iter().all(|stamp| stamp.part_target_ms() == 3));
+    }
+
+    #[tokio::test]
+    async fn frame_parts_declare_the_longest_frame_as_part_target() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let start_ns = 1_721_000_000_000_000_000_i64;
+        let mut durations = Vec::new();
+        for index in 0..120_i64 {
+            let mut part = test_fmp4_part(
+                1,
+                0,
+                index % 60 == 0,
+                1,
+                0,
+                None,
+                Bytes::from_static(b"frame"),
+                start_ns + index * 33_366_667,
+            );
+            // A millisecond source clock: frames of 33 and 34 ms.
+            part.duration_us = if index % 3 == 2 { 34_000 } else { 33_000 };
+            part.duration_ms = (part.duration_us / 1_000) as u32;
+            durations.push(part.duration_us);
+            publisher.publish_fmp4_part(part).await.unwrap();
+        }
+        let stamps = drained_stamps(&mut receivers);
+        assert_eq!(stamps.len(), 120);
+        // Every part fits under the target the stamp carries, and the target
+        // is a frame, not twice a 1 ms setting.
+        for (stamp, duration_us) in stamps.iter().zip(&durations) {
+            assert!(*duration_us <= stamp.part_target_us);
+        }
+        assert_eq!(stamps.last().unwrap().part_target_us, 34_000);
+        assert_eq!(stamps[60].part, 0);
+        assert_eq!(stamps[60].msn, stamps[0].msn + 1);
     }
 
     #[test]
@@ -9116,10 +9372,10 @@ mod tests {
             inner,
             telemetry,
             StampDurations {
-                video_part_ms: 200,
-                video_segment_ms: 2_000,
-                audio_part_ms: 5,
-                audio_segment_ms: 1_000,
+                video_part_us: 200_000,
+                video_segment_us: 2_000_000,
+                audio_part_us: 5_000,
+                audio_segment_us: 1_000_000,
             },
             true,
             shutdown_rx,
@@ -9471,7 +9727,10 @@ mod tests {
             stream_idx: 91,
             source_epoch: None,
             sequence: 17,
-            duration_ms: 5,
+            duration_ms: 3,
+            duration_us: 2_500,
+            duration_samples: Some(120),
+            sample_rate: Some(48_000),
             packaged_at_unix_ns: PACKAGED_NS,
             published_at_unix_ns: PUBLISHED_NS,
             bytes: payload.clone(),
@@ -9479,8 +9738,8 @@ mod tests {
             hls: Some(HlsStamp {
                 msn: 41,
                 part: 7,
-                part_target_ms: 5,
-                target_duration_ms: 1_000,
+                part_target_us: 2_500,
+                target_duration_us: 1_000_000,
             }),
             source_times: Default::default(),
         };
@@ -9488,11 +9747,25 @@ mod tests {
         // The place of the part in the playlist travels with the object.
         assert_eq!(object.metadata().get("hls-msn").unwrap(), b"41");
         assert_eq!(object.metadata().get("hls-part").unwrap(), b"7");
-        assert_eq!(object.metadata().get("hls-part-target-ms").unwrap(), b"5");
+        // Old caches read whole milliseconds (the part target rounded up so
+        // that the part fits); new ones the exact microseconds and samples.
+        assert_eq!(object.metadata().get("hls-part-target-ms").unwrap(), b"3");
+        assert_eq!(
+            object.metadata().get("hls-part-target-us").unwrap(),
+            b"2500"
+        );
         assert_eq!(
             object.metadata().get("hls-target-duration-ms").unwrap(),
             b"1000"
         );
+        assert_eq!(
+            object.metadata().get("hls-target-duration-us").unwrap(),
+            b"1000000"
+        );
+        assert_eq!(object.metadata().get("duration-ms").unwrap(), b"3");
+        assert_eq!(object.metadata().get("duration-us").unwrap(), b"2500");
+        assert_eq!(object.metadata().get("duration-samples").unwrap(), b"120");
+        assert_eq!(object.metadata().get("sample-rate").unwrap(), b"48000");
 
         assert_eq!(object.key().track(), OPAQUE_AUDIO_TRACK);
         assert_eq!(object.kind(), ObjectKind::Media);
@@ -10436,8 +10709,10 @@ mod tests {
             rist_profile: RistProfile::Main,
             srt_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_001))),
             rtmp_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 19_350))),
-            fmp4_part_ms: 50,
+            audio_part: None,
+            fmp4_part_ms: Some(50),
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            video_part: None,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
             fmp4_flush_on_complete: true,
@@ -10515,8 +10790,10 @@ mod tests {
             rist_profile: RistProfile::Main,
             srt_bind: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 27_001))),
             rtmp_bind: None,
-            fmp4_part_ms: 50,
+            audio_part: None,
+            fmp4_part_ms: Some(50),
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            video_part: None,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
             fmp4_flush_on_complete: true,
@@ -11099,8 +11376,10 @@ mod tests {
             rist_profile: RistProfile::Main,
             srt_bind: None,
             rtmp_bind: None,
-            fmp4_part_ms: DEFAULT_MIN_PART_MS,
+            audio_part: None,
+            fmp4_part_ms: None,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            video_part: None,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
             fmp4_flush_on_complete: true,
@@ -11318,8 +11597,10 @@ mod tests {
             rist_profile: RistProfile::Main,
             srt_bind: None,
             rtmp_bind: None,
-            fmp4_part_ms: DEFAULT_MIN_PART_MS,
+            audio_part: None,
+            fmp4_part_ms: None,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            video_part: None,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
             fmp4_flush_on_complete: true,
@@ -11437,8 +11718,10 @@ mod tests {
             rist_profile: RistProfile::Main,
             srt_bind: None,
             rtmp_bind: None,
-            fmp4_part_ms: DEFAULT_MIN_PART_MS,
+            audio_part: None,
+            fmp4_part_ms: None,
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
+            video_part: None,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
             fmp4_flush_on_complete: true,

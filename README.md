@@ -274,14 +274,34 @@ Useful endpoints:
 
 Each part is stamped with its place in the LL-HLS playlist: Media Sequence
 Number, part index, declared part target and declared target duration. The
-caches of the mesh render the playlist from the stamps. `--fmp4-video-part-ms`
-and `--fmp4-video-segment-ms` set the part and segment durations of a video
-stream, for example 200 and 2,000. They default to `--fmp4-part-ms` and
-`--fmp4-segment-ms`, which an audio stream keeps. Set the segment duration to
-the key-frame interval of the encoder. A key
-frame starts a part, and a segment is a whole number of groups of pictures.
-The declared durations follow a duration that recurs: one long part or one
-long segment does not change them.
+caches of the mesh render the playlist from the stamps.
+
+Parts are the smallest unit the source makes, by default. `--audio-part`
+is `epoch` (one AEP1 epoch per part, whatever its sample count: 120 samples
+of Opus are a 2.5 ms part, 48 samples of PCM a 1 ms part, 12 samples a
+0.25 ms part), `<N>samples` or `<N>us`; a FLAC part is never under 32
+samples. `--video-part` is `frame` (one access unit per part) or `<N>ms`.
+The old `--fmp4-part-ms` and `--fmp4-video-part-ms` remain as aliases of a
+duration; `--fmp4-part-ms` no longer sets the video part. Audio time is
+counted in samples, so a part's duration is exact: each media object carries
+`duration-us` (and `duration-samples` with `sample-rate` for audio),
+`hls-part-target-us` and `hls-target-duration-us`, beside the old whole
+millisecond keys (`duration-ms` rounded, the targets rounded up) for caches
+that do not read the new ones. With one unit per part the declared part
+target is the longest part seen (the longest frame of a video stream), not
+a configured value. `--fmp4-video-segment-ms` sets the segment duration of a
+video stream; set it to the key-frame interval of the encoder. A key frame
+starts a part, and a segment is a whole number of groups of pictures. One
+long segment, or one part longer than twice the target, does not change the
+declared durations.
+
+`--daw-hls-formats` defaults to `pcm,opus`: below 64 samples FLAC is written
+as verbatim frames, larger than PCM, so the lossless rendition of the
+smallest parts is PCM. fMP4 audio packaging (`--daw-hls-packaging fmp4`)
+still goes through wavey-boxer's millisecond timeline: FLAC and PCM tracks
+use a timescale of 1,000 and Opus decode times are taken from milliseconds,
+so 2.5 ms Opus and sub-millisecond PCM are exact only on the default opaque
+path.
 
 The stdin senders are kept for local smoke tests and protocol debugging:
 
@@ -325,8 +345,9 @@ Any compatible sender can publish SRT to
 `local.infidelity.io:27000` with the main profile. RTMP
 compatibility remains available at `rtmp://local.infidelity.io:19350/live` with
 stream key `live-local`.
-The supervisor defaults the LL-HLS part target to 50 ms. Override it with
-`AV_LL_HLS_PART_MS` or `--part-ms`.
+The supervisor passes its LL-HLS part target as `AV_LL_HLS_PART_MS` or
+`--part-ms`. `make service` runs av-contrib alone with `AUDIO_PART=epoch` and
+`VIDEO_PART=frame`.
 
 Useful overrides:
 
