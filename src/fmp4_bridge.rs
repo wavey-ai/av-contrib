@@ -43,6 +43,11 @@ const MAX_PART_MS_WITHOUT_KEY: u32 = 2_000;
 static DEFAULT_FLUSH_ON_COMPLETE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Two frame intervals that differ by at most this many ticks are the same
+/// frame rate. Millisecond timestamps (RTMP, FLV) of a constant rate differ by
+/// 1 ms (90 ticks) from frame to frame: 33, 33, 34 ms at 30 fps.
+const STEADY_FRAME_TOLERANCE_TICKS: u64 = 180;
+
 /// Set whether segmenters made from now on cut a video part on completion.
 pub fn set_default_flush_on_complete(enabled: bool) {
     DEFAULT_FLUSH_ON_COMPLETE.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -456,11 +461,17 @@ pub struct Fmp4Segmenter {
     timestamp_base_input: Option<u64>,
     /// Close a video part when the access unit just pushed completes it.
     flush_on_complete: bool,
-    /// Decode time of the last video access unit pushed.
+    /// Decode time of the last video access unit pushed, as it arrived.
     last_video_dts: Option<u64>,
-    /// Distance between the last two video access units: the expected
-    /// duration of the last one, whose successor has not arrived yet.
+    /// Distance between the last two video access units.
     video_frame_ticks: Option<u64>,
+    /// The interval before `video_frame_ticks`.
+    previous_video_frame_ticks: Option<u64>,
+    /// End decode time that the last part closed on completion declared for
+    /// its last frame, before the next frame arrived. The next part starts
+    /// its decode timeline there, so that the parts join without a gap or an
+    /// overlap whatever the next frame's own decode time is.
+    declared_video_end: Option<u64>,
     /// Source times of the access unit about to be pushed.
     next_source_times: crate::hop_journal::PartSourceTimes,
     /// Source times of the buffered part.
@@ -573,6 +584,8 @@ impl Fmp4Segmenter {
             flush_on_complete: default_flush_on_complete(),
             last_video_dts: None,
             video_frame_ticks: None,
+            previous_video_frame_ticks: None,
+            declared_video_end: None,
             next_source_times: Default::default(),
             part_source_times: Default::default(),
         }
@@ -699,6 +712,8 @@ impl Fmp4Segmenter {
         self.timestamp_base_input = None;
         self.last_video_dts = None;
         self.video_frame_ticks = None;
+        self.previous_video_frame_ticks = None;
+        self.declared_video_end = None;
         self.next_source_times = Default::default();
         self.part_source_times = Default::default();
     }
@@ -840,10 +855,18 @@ impl Fmp4Segmenter {
 
         let dts = access_unit.dts;
         if let Some(previous) = self.last_video_dts.filter(|previous| dts > *previous) {
+            self.previous_video_frame_ticks = self.video_frame_ticks;
             self.video_frame_ticks = Some(dts - previous);
         }
         self.last_video_dts = Some(dts);
-        self.video_timestamps.push(dts);
+        if self.video_timestamps.is_empty() {
+            if let Some(start) = self.part_decode_start(dts) {
+                // Only the decode time moves; the frame is still presented
+                // at its own pts (trun version 1 carries the signed offset).
+                access_unit.dts = start;
+            }
+        }
+        self.video_timestamps.push(access_unit.dts);
         self.video_buf.push(access_unit);
         self.started_video = true;
 
@@ -858,24 +881,62 @@ impl Fmp4Segmenter {
                 "flushing completed fMP4 part"
             );
             self.flush_with_next_dts(next_dts).await;
+            self.declared_video_end = Some(next_dts);
         }
+    }
+
+    /// The decode time at which the part that starts with a frame of decode
+    /// time `dts` begins, when it is not `dts`: the end that the previous
+    /// part declared when it closed on completion. The next frame can come
+    /// later than declared (a dropped frame, a stall, a millisecond clock
+    /// that gives 33 and 34 ms frames) or, a little, earlier. The part then
+    /// starts at the declared end, its first frame decoded early or late by
+    /// the difference, so that tfdt(n + 1) = tfdt(n) + duration(n) as it was
+    /// when a part waited for the next frame. A jump of more than the
+    /// longest part, or back by more than the tolerance, is a discontinuity
+    /// of the source and keeps its own time.
+    fn part_decode_start(&mut self, dts: u64) -> Option<u64> {
+        let end = self.declared_video_end.take()?;
+        let joins = if dts >= end {
+            dts - end <= self.max_part_ticks_without_key
+        } else {
+            end - dts <= STEADY_FRAME_TOLERANCE_TICKS
+        };
+        (joins && dts != end).then_some(end)
     }
 
     /// The decode time that ends the buffered video part, when the part
     /// already reaches its target with its last access unit counted at the
-    /// last frame interval. The part is then complete: at the usual frame
-    /// interval the next access unit would cut it by `target-duration`, so
-    /// the part leaves now instead of one frame later. When the next access
-    /// unit comes earlier than expected the part was cut at the same frame
-    /// as before; when the estimate is short, the old rule still cuts it.
+    /// steady frame interval. The part is then complete: at that interval
+    /// the next access unit would cut it by `target-duration`, so the part
+    /// leaves now instead of one frame later. When the next access unit
+    /// comes at another time, the next part starts at the declared end
+    /// (`part_decode_start`); when the estimate is short, the old rule still
+    /// cuts the part.
     fn completed_part_next_dts(&self) -> Option<u64> {
         if !self.flush_on_complete {
             return None;
         }
         let first_dts = *self.video_timestamps.first()?;
-        let last_dts = *self.video_timestamps.last()?;
-        let next_dts = last_dts.checked_add(self.video_frame_ticks?)?;
+        // The last frame's own decode time, not the start its part may have
+        // been moved to: the declared ends then follow the source's clock and
+        // do not drift from it part after part.
+        let last_dts = self.last_video_dts?;
+        let next_dts = last_dts.checked_add(self.steady_frame_ticks()?)?;
         (next_dts.saturating_sub(first_dts) >= self.min_part_ticks).then_some(next_dts)
+    }
+
+    /// The expected duration of the last frame, whose successor has not
+    /// arrived, when the frame rate can be trusted: the last two intervals
+    /// agree within the tolerance. The shorter of the two, so that the
+    /// declared end does not pass the next frame of a steady source; a
+    /// frame that comes later moves the next part's start back by at most
+    /// the tolerance. After a dropped frame or a stall the intervals differ,
+    /// and the part waits for the next frame as before.
+    fn steady_frame_ticks(&self) -> Option<u64> {
+        let last = self.video_frame_ticks?;
+        let previous = self.previous_video_frame_ticks?;
+        (last.abs_diff(previous) <= STEADY_FRAME_TOLERANCE_TICKS).then_some(last.min(previous))
     }
 
     fn install_h264_config(&mut self, config: Config, signature: H264ConfigSignature) {
@@ -1984,9 +2045,10 @@ mod tests {
         segmenter.push_access_unit(second).await;
 
         {
-            // The second frame completes its own 50 ms part at once.
+            // Two frames give one interval, not yet a steady rate: the
+            // second frame waits for the next one, as before.
             let parts = publisher.parts.lock().unwrap();
-            assert_eq!(parts.len(), 2);
+            assert_eq!(parts.len(), 1);
             assert!(parts[0].duration_ms > 0);
             assert!(parts[0].published_at_unix_ns >= parts[0].packaged_at_unix_ns);
         }
@@ -2086,15 +2148,17 @@ mod tests {
     #[tokio::test]
     async fn one_frame_parts_leave_with_their_frame() {
         let (mut segmenter, publisher) = video_segmenter(33, true);
-        // The first frame has no interval yet; it waits for the second, as
-        // before. From then on every frame leaves at once.
+        // The first two frames give one interval: not yet a steady rate, so
+        // they wait for the next frame, as before. From the third frame on
+        // the last two intervals agree and every frame leaves at once.
         segmenter.push_access_unit(h264_frame(0, true)).await;
         assert_eq!(publisher.parts.lock().unwrap().len(), 0);
         for index in 1..5_u64 {
             segmenter
                 .push_access_unit(h264_frame(index * 3_000, false))
                 .await;
-            assert_eq!(publisher.parts.lock().unwrap().len() as u64, index + 1);
+            let expected = if index == 1 { 1 } else { index + 1 };
+            assert_eq!(publisher.parts.lock().unwrap().len() as u64, expected);
         }
         let shapes = part_shapes(&publisher);
         assert!(shapes
@@ -2105,6 +2169,159 @@ mod tests {
             vec![0, 3_000, 6_000, 9_000, 12_000]
         );
         assert!(shapes[0].1 && shapes[1..].iter().all(|shape| !shape.1));
+    }
+
+    /// (tfdt, duration in ticks, presentation time of the first frame) of
+    /// each video part.
+    fn video_timeline(publisher: &CapturingPublisher) -> Vec<(u64, u64, i64)> {
+        publisher
+            .parts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                let data = &part.bytes;
+                let tfdt = tfdt_decode_time(data);
+                let trun = box_type_offsets(data, b"trun")[0];
+                let samples = read_u32(&data[trun + 8..trun + 12]) as usize;
+                // Video samples: duration, size, flags, composition offset.
+                let first_offset = read_u32(&data[trun + 28..trun + 32]) as i32;
+                let duration = (0..samples)
+                    .map(|index| u64::from(read_u32(&data[trun + 16 + 16 * index..])))
+                    .sum::<u64>();
+                (tfdt, duration, tfdt as i64 + i64::from(first_offset))
+            })
+            .collect()
+    }
+
+    /// Every part starts where the one before it ends.
+    fn assert_parts_join(timeline: &[(u64, u64, i64)]) {
+        for pair in timeline.windows(2) {
+            assert_eq!(pair[1].0, pair[0].0 + pair[0].1, "{timeline:?}");
+        }
+    }
+
+    /// Push frames of these decode (= presentation) times and return the
+    /// number of parts published after each.
+    async fn push_frames(
+        segmenter: &mut Fmp4Segmenter,
+        publisher: &CapturingPublisher,
+        dts: &[u64],
+    ) -> Vec<usize> {
+        let mut parts_after = Vec::new();
+        for (index, dts) in dts.iter().enumerate() {
+            segmenter
+                .push_access_unit(h264_frame(*dts, index == 0))
+                .await;
+            parts_after.push(publisher.parts.lock().unwrap().len());
+        }
+        parts_after
+    }
+
+    #[tokio::test]
+    async fn completed_parts_join_across_a_dropped_frame() {
+        // One-frame parts at 30 fps; the frame at 12,000 never arrives.
+        let frames = [0, 3_000, 6_000, 9_000, 15_000, 18_000, 21_000, 24_000];
+        for flush_on_complete in [true, false] {
+            let (mut segmenter, publisher) = video_segmenter(33, flush_on_complete);
+            let parts_after = push_frames(&mut segmenter, &publisher, &frames).await;
+            let timeline = video_timeline(&publisher);
+            assert_parts_join(&timeline);
+            // Each frame is presented at its own time.
+            assert_eq!(
+                timeline.iter().map(|part| part.2).collect::<Vec<_>>(),
+                frames[..timeline.len()]
+                    .iter()
+                    .map(|dts| *dts as i64)
+                    .collect::<Vec<_>>()
+            );
+            if flush_on_complete {
+                // The part at 9,000 was closed at once with the end 12,000.
+                // The frame at 15,000 starts the next part at 12,000; the
+                // intervals differ after it, so the parts at 15,000 and
+                // 18,000 wait for their next frame, and from 21,000 the rate
+                // is steady again.
+                assert_eq!(parts_after, vec![0, 1, 3, 4, 4, 5, 7, 8]);
+                assert_eq!(
+                    timeline,
+                    vec![
+                        (0, 3_000, 0),
+                        (3_000, 3_000, 3_000),
+                        (6_000, 3_000, 6_000),
+                        (9_000, 3_000, 9_000),
+                        (12_000, 6_000, 15_000),
+                        (18_000, 3_000, 18_000),
+                        (21_000, 3_000, 21_000),
+                        (24_000, 3_000, 24_000),
+                    ]
+                );
+            } else {
+                assert_eq!(parts_after, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+                // The frame before the hole carries it, as it always did.
+                assert_eq!(timeline[3], (9_000, 6_000, 9_000));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_parts_join_with_millisecond_timestamps() {
+        // 30 fps from a millisecond clock (RTMP, FLV): 33, 33, 34 ms frames.
+        let frames = (0..30_u64)
+            .map(|index| (index * 1_000 + 15) / 30 * 90)
+            .collect::<Vec<_>>();
+        let (mut segmenter, publisher) = video_segmenter(33, true);
+        let parts_after = push_frames(&mut segmenter, &publisher, &frames).await;
+        // From the third frame on every frame leaves with itself.
+        for (index, parts) in parts_after.iter().enumerate().skip(2) {
+            assert_eq!(*parts, index + 1, "{parts_after:?}");
+        }
+        let timeline = video_timeline(&publisher);
+        assert_parts_join(&timeline);
+        for (part, dts) in timeline.iter().zip(&frames) {
+            // Presented at its own time; decoded at most 2 ms from it.
+            assert_eq!(part.2, *dts as i64);
+            assert!(
+                part.0.abs_diff(*dts) <= STEADY_FRAME_TOLERANCE_TICKS,
+                "{timeline:?}"
+            );
+            assert!((2_970..=3_060 + 90).contains(&part.1), "{timeline:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_after_a_stall_is_not_a_part_of_the_whole_stall() {
+        // Steady 30 fps, then the source stalls for one second.
+        let mut frames = (0..5_u64).map(|index| index * 3_000).collect::<Vec<_>>();
+        let resumed = 12_000 + 90_000;
+        frames.extend([resumed, resumed + 3_000, resumed + 6_000, resumed + 9_000]);
+        let (mut segmenter, publisher) = video_segmenter(33, true);
+        let parts_after = push_frames(&mut segmenter, &publisher, &frames).await;
+        // The frame after the stall does not leave at once with the stall as
+        // its duration: it waits for the next frame, as before.
+        assert_eq!(parts_after[4], 5);
+        assert_eq!(parts_after[5], 5);
+        assert_eq!(parts_after[6], 6);
+        let timeline = video_timeline(&publisher);
+        assert_parts_join(&timeline);
+        // The stall is in the decode time of the part that the first frame
+        // after it starts, which is presented at its own time.
+        assert_eq!(
+            timeline[5],
+            (15_000, resumed + 3_000 - 15_000, resumed as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_part_with_a_dropped_frame_keeps_its_target_duration() {
+        // 200 ms parts at 30 fps: the frame at 12,000 is dropped. The part is
+        // not closed early on the doubled interval; it closes at 18,000.
+        let mut frames = vec![0, 3_000, 6_000, 9_000];
+        frames.extend((5..13_u64).map(|index| index * 3_000));
+        let (mut segmenter, publisher) = video_segmenter(200, true);
+        push_frames(&mut segmenter, &publisher, &frames).await;
+        let timeline = video_timeline(&publisher);
+        assert_eq!(timeline[0], (0, 18_000, 0));
+        assert_parts_join(&timeline);
     }
 
     #[tokio::test]
@@ -2163,13 +2380,13 @@ mod tests {
 
         let mut parts = publisher.parts.lock().unwrap().clone();
         if flush_on_complete {
-            // Each 67 ms frame completes its 50 ms part, so the frame at
-            // 6,000 leaves alone, before the audio arrives, and the audio
-            // goes with the next frame.
+            // From the third frame the rate is steady and each 67 ms frame
+            // completes its 50 ms part at once, so the last frame leaves
+            // without waiting for another. The parts before it are the same.
             assert_eq!(parts.len(), 4);
-            assert!(parts[1].init.is_none());
-            assert_eq!(parts[1].audio_units, 0);
-            parts.remove(1);
+            assert!(parts[3].init.is_none());
+            assert_eq!(parts[3].video_units, 1);
+            parts.pop();
         }
         assert_eq!(parts.len(), 3);
         let video_init = parts[0].init.as_ref().expect("video init");
