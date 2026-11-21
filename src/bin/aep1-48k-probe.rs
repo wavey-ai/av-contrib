@@ -768,8 +768,15 @@ impl ReceiveFormatState {
         group: &DecodedMultichannelAudioGroup,
         arrival_ns: u64,
         deadline_ms: u64,
+        window: &ReceiveWindow,
     ) {
         if group.payload_kind != AudioPayloadKind::SoundKitV2 {
+            return;
+        }
+        let capture_ns = group.session_id.saturating_add(
+            group.pts_samples.saturating_mul(1_000_000_000) / u64::from(group.sample_rate),
+        );
+        if !window.counts(capture_ns) {
             return;
         }
         let Some(format) = ReceiveAudioFormat::from_soundkit_v2_payload(&group.payload) else {
@@ -791,9 +798,6 @@ impl ReceiveFormatState {
             return;
         }
 
-        let capture_ns = group.session_id.saturating_add(
-            group.pts_samples.saturating_mul(1_000_000_000) / u64::from(group.sample_rate),
-        );
         let latency_ns = arrival_ns.saturating_sub(capture_ns);
         let deadline_missed = latency_ns > deadline_ms.saturating_mul(1_000_000);
         if deadline_missed {
@@ -815,12 +819,8 @@ impl ReceiveFormatState {
             .selected_raptorq_fragments_recovered
             .saturating_add(u64::from(group.raptorq_recovered_fragments));
         self.latencies_ns.push(latency_ns);
-        let pts_ms = group
-            .pts_samples
-            .saturating_mul(1_000)
-            .saturating_div(u64::from(group.sample_rate));
         self.latency_buckets
-            .entry((receive_audio_format_order(format), pts_ms / 1_000))
+            .entry((receive_audio_format_order(format), window.second_of(capture_ns)))
             .or_default()
             .record(latency_ns, deadline_missed, erasure, discontinuity);
     }
@@ -2182,8 +2182,12 @@ struct ReceiveWindow {
 }
 
 impl ReceiveWindow {
-    fn new(session_id: u64, _now_ns: u64, duration_seconds: u64, tail_seconds: u64) -> Self {
-        let start_ns = session_id;
+    /// A listener counts `duration_seconds` of the session from the moment
+    /// it subscribes, or from the start of the session when it subscribes
+    /// before that. `--session-id` names the session and its clock; it is
+    /// not the start of the measurement.
+    fn new(session_id: u64, now_ns: u64, duration_seconds: u64, tail_seconds: u64) -> Self {
+        let start_ns = session_id.max(now_ns);
         let media_end_ns = start_ns.saturating_add(duration_seconds.saturating_mul(1_000_000_000));
         let stop_ns = media_end_ns.saturating_add(tail_seconds.saturating_mul(1_000_000_000));
         Self {
@@ -2192,6 +2196,15 @@ impl ReceiveWindow {
             stop_ns,
         }
     }
+
+    fn counts(&self, capture_ns: u64) -> bool {
+        capture_ns >= self.start_ns && capture_ns < self.media_end_ns
+    }
+
+    /// Whole seconds of capture time since the start of the window.
+    fn second_of(&self, capture_ns: u64) -> u64 {
+        capture_ns.saturating_sub(self.start_ns) / 1_000_000_000
+    }
 }
 
 fn receive_command_timeout(
@@ -2199,8 +2212,10 @@ fn receive_command_timeout(
     duration_seconds: u64,
     tail_seconds: u64,
 ) -> Result<Duration> {
+    // A UDP or WebTransport listener counts from when it joins (see
+    // ReceiveWindow), so its deadline is too.
     receive_command_timeout_ms(
-        session_id,
+        session_id.max(now_unix_ns()?),
         duration_seconds.saturating_mul(1_000),
         tail_seconds,
     )
@@ -2607,7 +2622,7 @@ async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput>
                         .iter_mut()
                         .find(|(observed_group_id, _)| *observed_group_id == group.group_id)
                     {
-                        format_state.observe(&group, arrival_ns, deadline_ms);
+                        format_state.observe(&group, arrival_ns, deadline_ms, &window);
                     }
                 }
             }
@@ -2636,7 +2651,7 @@ async fn receive_udp(options: UdpReceiveOptions<'_>) -> Result<UdpReceiveOutput>
             let received_epochs = format_state.selected_epoch_count();
             let latency_ms = percentiles_ms(std::mem::take(&mut format_state.latencies_ns));
             let latency_time_series =
-                format_state.finish_latency_time_series(session_id, duration_seconds);
+                format_state.finish_latency_time_series(window.start_ns, duration_seconds);
             ReceiveReport {
                 schema: "needletail.aep1-48k-probe.receive.v2",
                 lane: "native_udp_fec",
@@ -2846,7 +2861,7 @@ async fn receive_webtransport(options: WebTransportReceiveOptions<'_>) -> Result
             if group.session_id != session_id || group.group_id != group_id {
                 continue;
             }
-            format_state.observe(&group, arrival_ns, deadline_ms);
+            format_state.observe(&group, arrival_ns, deadline_ms, &window);
         }
     }
     endpoint.close(0_u32.into(), b"probe complete");
@@ -7023,6 +7038,7 @@ mod tests {
                 },
                 1_001_000_000,
                 25,
+                &ReceiveWindow::new(1_000_000_000, 0, 10, 0),
             );
         }
 
