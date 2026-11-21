@@ -47,26 +47,121 @@ pub async fn send_all(
     messages: &[Outbound<'_>],
     batch: bool,
 ) -> io::Result<usize> {
+    send_until_refused(socket, messages, batch)
+        .await
+        .map_err(|stopped| stopped.error)
+}
+
+/// A batch that stopped at a datagram the kernel refused.
+#[derive(Debug)]
+pub struct Stopped {
+    /// Datagrams sent before the refused one: the refused one's index.
+    pub sent: usize,
+    /// System calls made.
+    pub calls: usize,
+    pub error: io::Error,
+}
+
+async fn send_until_refused(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    batch: bool,
+) -> Result<usize, Stopped> {
     #[cfg(target_os = "linux")]
     if batch {
         return linux::send_all(socket, messages).await;
     }
     let _ = batch;
-    send_each(socket, messages).await
+    send_each_until_refused(socket, messages).await
+}
+
+/// The outcome of [`send_all_per_target`].
+#[derive(Debug, Default)]
+pub struct PerTargetOutcome {
+    /// System calls made.
+    pub calls: usize,
+    /// Datagrams handed to the kernel.
+    pub sent: usize,
+    /// Each target that the kernel refused a datagram for, with the error.
+    /// It was sent none of its later datagrams. `None` is the peer of a
+    /// connected socket.
+    pub refused: Vec<(Option<SocketAddr>, io::Error)>,
+}
+
+impl PerTargetOutcome {
+    pub fn refused(&self, target: SocketAddr) -> bool {
+        self.refused
+            .iter()
+            .any(|(refused, _)| *refused == Some(target))
+    }
+}
+
+/// [`send_all`] for a batch to several targets on one unconnected socket,
+/// with each target's errors kept to that target. A datagram that the
+/// kernel refuses at once (no route to its address, a firewall rule, an
+/// invalid port) stops the datagrams of its target only: the batch goes on
+/// with the datagrams of the other targets, in order. A full socket buffer
+/// is waited for as in [`send_all`], never taken as a refusal.
+pub async fn send_all_per_target(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    batch: bool,
+) -> PerTargetOutcome {
+    let mut outcome = PerTargetOutcome::default();
+    let mut remaining = std::borrow::Cow::Borrowed(messages);
+    loop {
+        match send_until_refused(socket, &remaining, batch).await {
+            Ok(calls) => {
+                outcome.calls += calls;
+                outcome.sent += remaining.len();
+                return outcome;
+            }
+            Err(stopped) => {
+                outcome.calls += stopped.calls;
+                outcome.sent += stopped.sent;
+                let target = remaining[stopped.sent].target;
+                outcome.refused.push((target, stopped.error));
+                // Refusals are rare: a new list of what is left is cheaper
+                // than a check on every datagram of every batch.
+                remaining = std::borrow::Cow::Owned(
+                    remaining[stopped.sent + 1..]
+                        .iter()
+                        .filter(|message| message.target != target)
+                        .copied()
+                        .collect(),
+                );
+            }
+        }
+    }
 }
 
 /// One awaited send per datagram: the behaviour without batching.
 pub async fn send_each(socket: &UdpSocket, messages: &[Outbound<'_>]) -> io::Result<usize> {
-    for message in messages {
-        let sent = match message.target {
-            Some(target) => socket.send_to(message.bytes, target).await?,
-            None => socket.send(message.bytes).await?,
+    send_each_until_refused(socket, messages)
+        .await
+        .map_err(|stopped| stopped.error)
+}
+
+async fn send_each_until_refused(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+) -> Result<usize, Stopped> {
+    for (index, message) in messages.iter().enumerate() {
+        let stopped = |error| Stopped {
+            sent: index,
+            calls: index + 1,
+            error,
         };
+        let sent = match message.target {
+            Some(target) => socket.send_to(message.bytes, target).await,
+            None => socket.send(message.bytes).await,
+        }
+        .map_err(stopped)?;
         if sent != message.bytes.len() {
-            return Err(io::Error::new(
+            return Err(stopped(io::Error::new(
                 io::ErrorKind::WriteZero,
                 "partial UDP datagram send",
-            ));
+            )));
         }
     }
     Ok(messages.len())
@@ -74,7 +169,7 @@ pub async fn send_each(socket: &UdpSocket, messages: &[Outbound<'_>]) -> io::Res
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Outbound, MESSAGES_PER_CALL};
+    use super::{Outbound, Stopped, MESSAGES_PER_CALL};
     use std::io;
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
@@ -83,7 +178,7 @@ mod linux {
     pub(super) async fn send_all(
         socket: &UdpSocket,
         messages: &[Outbound<'_>],
-    ) -> io::Result<usize> {
+    ) -> Result<usize, Stopped> {
         let mut sent = 0;
         let mut calls = 0;
         while sent < messages.len() {
@@ -91,19 +186,33 @@ mod linux {
             // without a trip through the reactor.
             match socket.try_io(Interest::WRITABLE, || sendmmsg(socket, &messages[sent..])) {
                 Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "sendmmsg took no datagram",
-                    ))
+                    return Err(Stopped {
+                        sent,
+                        calls: calls + 1,
+                        error: io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "sendmmsg took no datagram",
+                        ),
+                    })
                 }
                 Ok(count) => {
                     sent += count;
                     calls += 1;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    socket.writable().await?;
+                    if let Err(error) = socket.writable().await {
+                        return Err(Stopped { sent, calls, error });
+                    }
                 }
-                Err(error) => return Err(error),
+                // sendmmsg reports a refused datagram after the ones before
+                // it: as the error of the call that starts with it.
+                Err(error) => {
+                    return Err(Stopped {
+                        sent,
+                        calls: calls + 1,
+                        error,
+                    })
+                }
             }
         }
         Ok(calls)
@@ -250,6 +359,43 @@ mod tests {
             for (index, (bytes, from)) in received.into_iter().enumerate() {
                 assert_eq!(bytes, data[index]);
                 assert_eq!(from, sender.local_addr().unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_target_stops_only_its_own_datagrams() {
+        for batch in [true, false] {
+            let first = receiver().await;
+            let second = receiver().await;
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            // The kernel refuses port 0 at once (EINVAL), as it refuses a
+            // target without a route or behind a firewall rule.
+            let refused: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let data = payloads(MESSAGES_PER_CALL + 7);
+            let mut messages = Vec::new();
+            for bytes in &data {
+                messages.push(Outbound::to(first.local_addr().unwrap(), bytes));
+                messages.push(Outbound::to(refused, bytes));
+                messages.push(Outbound::to(second.local_addr().unwrap(), bytes));
+            }
+            // The plain batch stops at the first refusal: the second target
+            // never gets its first datagram.
+            let error = send_all(&sender, &messages, batch).await.unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+            let _ = receive(&first, 1).await;
+
+            let outcome = send_all_per_target(&sender, &messages, batch).await;
+            assert_eq!(outcome.refused.len(), 1, "batch {batch}");
+            assert_eq!(outcome.refused[0].0, Some(refused));
+            assert!(outcome.refused(refused));
+            assert!(!outcome.refused(first.local_addr().unwrap()));
+            assert_eq!(outcome.sent, data.len() * 2);
+            for receiver in [&first, &second] {
+                let received = receive(receiver, data.len()).await;
+                for (index, (bytes, _)) in received.into_iter().enumerate() {
+                    assert_eq!(bytes, data[index], "datagram {index}, batch {batch}");
+                }
             }
         }
     }

@@ -1686,35 +1686,43 @@ impl RelaySessionPublisher {
             }
         }
         let started = Instant::now();
-        let result = udp_batch::send_all(&direct.socket, &messages, self.send_batch).await;
+        // One distributor that the kernel refuses (no route, a firewall
+        // rule) stops only its own datagrams: the others still get theirs.
+        let outcome =
+            udp_batch::send_all_per_target(&direct.socket, &messages, self.send_batch).await;
         self.telemetry
             .relay_direct_send_duration
             .record(started.elapsed());
-        match result {
-            Ok(_) => {
-                for target in &direct.targets {
-                    journal_hop(HopStage::SentDirect, Some(*target));
-                }
-                let bytes = wires.iter().map(Vec::len).sum::<usize>() * direct.targets.len();
-                self.telemetry
-                    .relay_direct_datagrams
-                    .fetch_add(messages.len() as u64, Ordering::Relaxed);
-                self.telemetry
-                    .relay_direct_datagram_bytes
-                    .fetch_add(bytes as u64, Ordering::Relaxed);
-                self.telemetry
-                    .relay_direct_lane_objects_succeeded
-                    .fetch_add(direct.targets.len() as u64, Ordering::Relaxed);
+        let part_bytes = wires.iter().map(Vec::len).sum::<usize>() as u64;
+        let mut succeeded = 0_u64;
+        for target in &direct.targets {
+            if !outcome.refused(*target) {
+                journal_hop(HopStage::SentDirect, Some(*target));
+                succeeded += 1;
             }
-            Err(error) => {
-                let failed = self
-                    .telemetry
-                    .relay_direct_lane_objects_failed
-                    .fetch_add(direct.targets.len() as u64, Ordering::Relaxed)
-                    + 1;
-                if failed <= 16 || failed.is_power_of_two() {
-                    warn!(error = %error, failed, "direct RelaySession lanes failed; the backbone carries the part");
-                }
+        }
+        self.telemetry
+            .relay_direct_datagrams
+            .fetch_add(outcome.sent as u64, Ordering::Relaxed);
+        self.telemetry
+            .relay_direct_datagram_bytes
+            .fetch_add(part_bytes * succeeded, Ordering::Relaxed);
+        self.telemetry
+            .relay_direct_lane_objects_succeeded
+            .fetch_add(succeeded, Ordering::Relaxed);
+        for (target, error) in &outcome.refused {
+            let failed = self
+                .telemetry
+                .relay_direct_lane_objects_failed
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if failed <= 16 || failed.is_power_of_two() {
+                warn!(
+                    error = %error,
+                    target = ?target,
+                    failed,
+                    "direct RelaySession lane failed; the backbone carries the part"
+                );
             }
         }
     }
@@ -10693,6 +10701,62 @@ mod tests {
             let status = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry)).snapshot();
             assert_eq!(status.mesh.relay_direct_ids, ["lon-dist-a", "lon-dist-b"]);
             assert_eq!(status.mesh.relay_direct_targets.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_direct_target_leaves_the_other_distributors_their_symbols() {
+        for send_batch in [true, false] {
+            let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let distributor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_receiver.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_direct_targets = vec![distributor.local_addr().unwrap()];
+            args.relay_direct_bind = Some(reserved_loopback_addr());
+            args.relay_send_batch = send_batch;
+            args.relay_deadline_ms = 5_000;
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let mut relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap()
+                .unwrap();
+            // A distributor that the kernel refuses at once (port 0 is
+            // EINVAL, as no route is ENETUNREACH), listed first.
+            let refused: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            relay.direct.as_mut().unwrap().targets.insert(0, refused);
+
+            let part = test_opaque_part(4_000_000_190 + u64::from(send_batch));
+            let object =
+                build_opaque_media_object(&part, TEST_SOURCE_EPOCH, args.relay_deadline_ms, 1_000)
+                    .unwrap();
+            let journal = test_hop_journal();
+            let before_us = hop_journal::now_unix_us();
+            let journal_stream = 88_100_000_000 + u64::from(send_batch);
+            let outcome = relay
+                .publish_part_object(&object, Some((journal_stream, 9)), PublicationClass::Audio)
+                .await
+                .unwrap();
+            let primary = receive_relay_datagrams(&primary_receiver, outcome.source_symbols).await;
+            let direct = receive_relay_datagrams(&distributor, outcome.source_symbols).await;
+            for ((symbol, _), (primary, _)) in direct.iter().zip(&primary) {
+                assert_eq!(symbol, primary);
+            }
+            let direct_events = journal
+                .query(Some(before_us), Some(journal_stream))
+                .into_iter()
+                .filter(|event| event.stage == HopStage::SentDirect)
+                .map(|event| event.peer)
+                .collect::<Vec<_>>();
+            assert_eq!(direct_events, vec![Some(distributor.local_addr().unwrap())]);
+            let snapshot = telemetry.snapshot();
+            assert_eq!(snapshot.relay_session.direct_lane_objects_succeeded, 1);
+            assert_eq!(snapshot.relay_session.direct_lane_objects_failed, 1);
+            assert_eq!(
+                snapshot.relay_session.direct_datagrams,
+                outcome.source_symbols as u64
+            );
+            assert_eq!(snapshot.relay_session.primary_lane_objects_succeeded, 1);
         }
     }
 
