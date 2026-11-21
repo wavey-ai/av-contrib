@@ -60,6 +60,11 @@ pub struct StreamStamper {
     segment_elapsed_ms: u64,
     part_target_ms: u32,
     target_duration_ms: u32,
+    /// The segment that is open began with a part that a reader can start
+    /// from.
+    segment_starts_clean: bool,
+    /// Duration of the part before this one.
+    last_part_ms: u32,
 }
 
 impl StreamStamper {
@@ -76,6 +81,8 @@ impl StreamStamper {
             segment_elapsed_ms: 0,
             part_target_ms: part_ms,
             target_duration_ms: segment_ms,
+            segment_starts_clean: true,
+            last_part_ms: part_ms,
         }
     }
 
@@ -85,6 +92,12 @@ impl StreamStamper {
     /// a video part that begins with a key frame, and every audio part. A
     /// segment ends at the first such part after the configured segment
     /// duration, so a video segment is a whole number of groups of pictures.
+    ///
+    /// A segment also ends at such a part in two other cases. The stream
+    /// began in the middle of a group of pictures: its first segment ends at
+    /// the first key frame, and does not grow to the second one and widen
+    /// the target duration for good. And the part before a key frame was cut
+    /// short: a short part is allowed only as the last part of a segment.
     pub fn stamp(
         &mut self,
         duration_ms: u32,
@@ -95,6 +108,7 @@ impl StreamStamper {
             None => {
                 let first = published_unix_ms / u64::from(self.segment_ms);
                 self.msn = Some(first);
+                self.segment_starts_clean = can_start_segment;
                 first
             }
             Some(current) => {
@@ -102,11 +116,14 @@ impl StreamStamper {
                 // 2 s segment.
                 let full = self.segment_elapsed_ms + u64::from(self.part_ms / 2)
                     >= u64::from(self.segment_ms);
-                if can_start_segment && full {
+                let after_short_part =
+                    u64::from(self.last_part_ms) * 100 < u64::from(self.part_target_ms) * 85;
+                if can_start_segment && (full || !self.segment_starts_clean || after_short_part) {
                     let finished = u32::try_from(self.segment_elapsed_ms).unwrap_or(u32::MAX);
                     self.target_duration_ms = self.target_duration_ms.max(finished);
                     self.segment_elapsed_ms = 0;
                     self.part = 0;
+                    self.segment_starts_clean = true;
                     self.msn = Some(current + 1);
                     current + 1
                 } else {
@@ -114,6 +131,7 @@ impl StreamStamper {
                 }
             }
         };
+        self.last_part_ms = duration_ms;
         // A part is as long as its last frame makes it. One that is more
         // than twice the configured duration is a fault of the source, and
         // does not widen the target of every later part.
@@ -181,6 +199,57 @@ mod tests {
         assert_eq!(stamps[29].part_target_ms, 208);
         // A group of 48 frames is 1,997 ms. The target stays at 2 s.
         assert_eq!(stamps[29].target_duration_ms, 2_000);
+    }
+
+    #[test]
+    fn a_stream_that_begins_inside_a_group_ends_its_first_segment_at_the_key_frame() {
+        let mut stamper = StreamStamper::new(200, 2_000);
+        // Three parts of a group whose key frame came before the stream.
+        let lead = [
+            stamper.stamp(208, false, 10_000),
+            stamper.stamp(208, false, 10_208),
+            stamper.stamp(125, false, 10_416),
+        ];
+        // The first key frame starts the second segment, 541 ms in.
+        let first_key = stamper.stamp(208, true, 10_541);
+        assert_eq!(lead[0].msn, 5);
+        assert_eq!(lead[2].part, 2);
+        assert_eq!(first_key.msn, 6);
+        assert_eq!(first_key.part, 0);
+        // The short first segment does not change the target duration, and
+        // the stream goes on in segments of one group.
+        assert_eq!(first_key.target_duration_ms, 2_000);
+        let mut last = first_key;
+        for part in 1..10 {
+            last = stamper.stamp(if part == 9 { 125 } else { 208 }, false, 0);
+        }
+        assert_eq!(last.msn, 6);
+        let next = stamper.stamp(208, true, 0);
+        assert_eq!(next.msn, 7);
+        assert_eq!(next.target_duration_ms, 2_000);
+    }
+
+    #[test]
+    fn a_key_frame_after_a_short_part_starts_a_segment() {
+        // A scene cut puts a key frame 0.7 s into a group. The part before it
+        // is cut short, and a short part is the last part of its segment.
+        let mut stamper = StreamStamper::new(200, 2_000);
+        stamper.stamp(208, true, 0);
+        stamper.stamp(208, false, 0);
+        stamper.stamp(208, false, 0);
+        let short = stamper.stamp(83, false, 0);
+        let cut = stamper.stamp(208, true, 0);
+        assert_eq!(short.msn, 0);
+        assert_eq!(cut.msn, 1);
+        assert_eq!(cut.part, 0);
+        // A key frame after a whole part, early in a segment, does not: the
+        // parts on both sides are whole.
+        let mut stamper = StreamStamper::new(200, 2_000);
+        stamper.stamp(208, true, 0);
+        stamper.stamp(208, false, 0);
+        let key = stamper.stamp(208, true, 0);
+        assert_eq!(key.msn, 0);
+        assert_eq!(key.part, 2);
     }
 
     #[test]
