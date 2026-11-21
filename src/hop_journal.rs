@@ -111,8 +111,11 @@ impl HopEvent {
 /// part carries it to the publisher, which journals it under the sequence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PartSourceTimes {
-    /// First AEP1 epoch of the part.
-    pub epoch: Option<u64>,
+    /// First AEP1 epoch of the part: the epoch of `src_first`.
+    pub first_epoch: Option<u64>,
+    /// Last AEP1 epoch of the part, whose last sample ends it: the epoch of
+    /// `src_last`, `recovered` and `packaged`.
+    pub last_epoch: Option<u64>,
     /// First AEP1 datagram of the part's first epoch arrived.
     pub src_first_us: Option<u64>,
     /// The datagram that completed the part's last epoch arrived.
@@ -122,9 +125,19 @@ pub struct PartSourceTimes {
 }
 
 impl PartSourceTimes {
+    /// The times of a part of the single AEP1 epoch `epoch`.
+    pub fn of_epoch(epoch: u64) -> Self {
+        Self {
+            first_epoch: Some(epoch),
+            last_epoch: Some(epoch),
+            ..Self::default()
+        }
+    }
+
     /// Add a later unit of the same part.
     pub fn merge(&mut self, later: &PartSourceTimes) {
-        self.epoch = self.epoch.or(later.epoch);
+        self.first_epoch = min_option(self.first_epoch, later.first_epoch);
+        self.last_epoch = self.last_epoch.max(later.last_epoch);
         self.src_first_us = min_option(self.src_first_us, later.src_first_us);
         self.src_last_us = self.src_last_us.max(later.src_last_us);
         self.recovered_us = self.recovered_us.max(later.recovered_us);
@@ -134,16 +147,18 @@ impl PartSourceTimes {
         *self == Self::default()
     }
 
-    /// The source events of part `seq` of `stream`.
+    /// The source events of part `seq` of `stream`. `src_first` carries the
+    /// part's first epoch; `src_last` and `recovered` its last, whose last
+    /// sample ends the part.
     pub fn events(&self, stream: u64, seq: u64) -> impl Iterator<Item = HopEvent> + '_ {
         [
-            (HopStage::SrcFirst, self.src_first_us),
-            (HopStage::SrcLast, self.src_last_us),
-            (HopStage::Recovered, self.recovered_us),
+            (HopStage::SrcFirst, self.src_first_us, self.first_epoch),
+            (HopStage::SrcLast, self.src_last_us, self.last_epoch),
+            (HopStage::Recovered, self.recovered_us, self.last_epoch),
         ]
         .into_iter()
-        .filter_map(move |(stage, t_us)| {
-            t_us.map(|t_us| HopEvent::new(stage, stream, seq, t_us).with_epoch(self.epoch))
+        .filter_map(move |(stage, t_us, epoch)| {
+            t_us.map(|t_us| HopEvent::new(stage, stream, seq, t_us).with_epoch(epoch))
         })
     }
 }
@@ -385,31 +400,41 @@ mod tests {
     #[test]
     fn source_times_of_a_part_span_its_units() {
         let mut part = PartSourceTimes {
-            epoch: Some(10),
             src_first_us: Some(100),
             src_last_us: Some(120),
             recovered_us: Some(125),
+            ..PartSourceTimes::of_epoch(10)
         };
         part.merge(&PartSourceTimes {
-            epoch: Some(11),
             src_first_us: Some(105),
             src_last_us: Some(170),
             recovered_us: Some(171),
+            ..PartSourceTimes::of_epoch(11)
         });
         assert_eq!(
             part,
             PartSourceTimes {
-                epoch: Some(10),
+                first_epoch: Some(10),
+                last_epoch: Some(11),
                 src_first_us: Some(100),
                 src_last_us: Some(170),
                 recovered_us: Some(171),
             }
         );
+        // src_first names the first epoch; src_last and recovered the last,
+        // whose last sample ends the part.
         let events = part.events(4001, 3).collect::<Vec<_>>();
-        assert_eq!(events.len(), 3);
-        assert!(events
-            .iter()
-            .all(|event| event.epoch == Some(10) && event.seq == 3));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.stage, event.epoch, event.seq))
+                .collect::<Vec<_>>(),
+            vec![
+                (HopStage::SrcFirst, Some(10), 3),
+                (HopStage::SrcLast, Some(11), 3),
+                (HopStage::Recovered, Some(11), 3),
+            ]
+        );
         assert!(PartSourceTimes::default().is_empty());
         assert_eq!(PartSourceTimes::default().events(1, 1).count(), 0);
     }

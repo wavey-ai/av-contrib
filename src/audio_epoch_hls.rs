@@ -253,10 +253,10 @@ impl ReceiverState {
             .into_iter()
             .map(|group| {
                 let times = PartSourceTimes {
-                    epoch: Some(group.epoch_id),
                     src_first_us: Some(first_us.min(received_us)),
                     src_last_us: Some(received_us),
                     recovered_us: Some(recovered_us),
+                    ..PartSourceTimes::of_epoch(group.epoch_id)
                 };
                 (group, times)
             })
@@ -1644,7 +1644,8 @@ mod tests {
         assert_eq!(completed.len(), 1);
         let (group, times) = &completed[0];
         assert_eq!(group.epoch_id, 7);
-        assert_eq!(times.epoch, Some(7));
+        assert_eq!(times.first_epoch, Some(7));
+        assert_eq!(times.last_epoch, Some(7));
         assert_eq!(times.src_first_us, Some(1_000));
         assert_eq!(times.src_last_us, completed_at);
         assert!(times.recovered_us.unwrap() >= now_unix_us() - 5_000_000);
@@ -1690,10 +1691,10 @@ mod tests {
                     Bytes::from(vec![epoch_id as u8]),
                 ),
                 PartSourceTimes {
-                    epoch: Some(epoch_id),
                     src_first_us: Some(base),
                     src_last_us: Some(base + 300),
                     recovered_us: Some(base + 350),
+                    ..PartSourceTimes::of_epoch(epoch_id)
                 },
             )
             .await
@@ -1708,11 +1709,30 @@ mod tests {
             assert_eq!(
                 part.source_times,
                 PartSourceTimes {
-                    epoch: Some(first_epoch),
+                    first_epoch: Some(first_epoch),
+                    last_epoch: Some(first_epoch + 4),
                     src_first_us: Some(first),
                     src_last_us: Some(last + 300),
                     recovered_us: Some(last + 350),
                 }
+            );
+            // The part's journal events: src_first names its first epoch,
+            // the later stages the last, whose last sample ends the part.
+            let epochs = part
+                .source_times
+                .events(part.stream_id, part.sequence)
+                .map(|event| (event.stage, event.epoch))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                epochs,
+                vec![
+                    (crate::hop_journal::HopStage::SrcFirst, Some(first_epoch)),
+                    (crate::hop_journal::HopStage::SrcLast, Some(first_epoch + 4)),
+                    (
+                        crate::hop_journal::HopStage::Recovered,
+                        Some(first_epoch + 4)
+                    ),
+                ]
             );
         }
     }

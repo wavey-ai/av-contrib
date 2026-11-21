@@ -2738,7 +2738,7 @@ fn journal_enqueued(
             seq,
             hop_journal::unix_ns_to_us(packaged_at_unix_ns),
         )
-        .with_epoch(source_times.epoch),
+        .with_epoch(source_times.last_epoch),
     );
     journal.record(HopEvent::new(HopStage::Enqueued, stream, seq, enqueued_us));
 }
@@ -8820,8 +8820,10 @@ mod tests {
         let stream_id = 4_000_000_041;
         let mut part = test_opaque_part(stream_id);
         part.packaged_at_unix_ns = i64::try_from((before_us + 70) * 1_000).unwrap();
+        // A part of two AEP1 epochs, 1,234 and 1,235.
         part.source_times = hop_journal::PartSourceTimes {
-            epoch: Some(1_234),
+            first_epoch: Some(1_234),
+            last_epoch: Some(1_235),
             src_first_us: Some(before_us + 10),
             src_last_us: Some(before_us + 20),
             recovered_us: Some(before_us + 25),
@@ -8875,6 +8877,15 @@ mod tests {
         let first = events.iter().find(|event| event.seq == 0).unwrap();
         assert_eq!(first.t_us, before_us + 10);
         assert_eq!(first.epoch, Some(1_234));
+        // The stages after src_first name the part's last epoch, whose last
+        // sample ends the part.
+        for stage in [HopStage::SrcLast, HopStage::Recovered, HopStage::Packaged] {
+            let event = events
+                .iter()
+                .find(|event| event.seq == 0 && event.stage == stage)
+                .unwrap();
+            assert_eq!(event.epoch, Some(1_235), "{stage:?}");
+        }
         let packaged = events
             .iter()
             .find(|event| event.stage == HopStage::Packaged)
