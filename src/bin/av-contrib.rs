@@ -743,6 +743,17 @@ struct Args {
     #[arg(long, env = "AV_LL_HLS_VIDEO_SEGMENT_MS")]
     fmp4_video_segment_ms: Option<u32>,
 
+    /// Close a video part as soon as the access unit just pushed brings it to
+    /// the part target, instead of when the next access unit arrives. With
+    /// one-frame parts this removes one frame interval from every part.
+    #[arg(
+        long,
+        env = "AV_FMP4_FLUSH_ON_COMPLETE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    fmp4_flush_on_complete: bool,
+
     #[arg(long, env = "AV_LL_HLS_TARGET_DURATION_MS", default_value_t = DEFAULT_TARGET_DURATION_MS)]
     hls_target_duration_ms: u32,
 
@@ -7513,6 +7524,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
     validate_compiled_ingress_features(&args)?;
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
@@ -9931,6 +9943,7 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10008,6 +10021,7 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10590,6 +10604,7 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10807,6 +10822,7 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
@@ -10924,6 +10940,7 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,

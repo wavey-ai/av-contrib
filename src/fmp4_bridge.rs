@@ -35,6 +35,23 @@ use tracing::{debug, error, info, warn};
 const TICKS_PER_SECOND: u64 = 90_000;
 pub const DEFAULT_MIN_PART_MS: u32 = 50;
 const MAX_PART_MS_WITHOUT_KEY: u32 = 2_000;
+
+/// Whether new segmenters close a video part as soon as its last access unit
+/// brings it to the part target, rather than when the next access unit
+/// arrives. The contributor sets it once at start from
+/// `--fmp4-flush-on-complete`; a segmenter reads it when it is made.
+static DEFAULT_FLUSH_ON_COMPLETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Set whether segmenters made from now on cut a video part on completion.
+pub fn set_default_flush_on_complete(enabled: bool) {
+    DEFAULT_FLUSH_ON_COMPLETE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether segmenters made now cut a video part on completion.
+pub fn default_flush_on_complete() -> bool {
+    DEFAULT_FLUSH_ON_COMPLETE.load(std::sync::atomic::Ordering::Relaxed)
+}
 const MAX_PENDING_AUS_WITHOUT_CONFIG: usize = 180;
 const MAX_PES_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MIN_H264_WIDTH: u16 = 160;
@@ -431,6 +448,13 @@ pub struct Fmp4Segmenter {
     last_packaged_at_unix_ns: Option<i64>,
     warned_no_config: bool,
     timestamp_base_input: Option<u64>,
+    /// Close a video part when the access unit just pushed completes it.
+    flush_on_complete: bool,
+    /// Decode time of the last video access unit pushed.
+    last_video_dts: Option<u64>,
+    /// Distance between the last two video access units: the expected
+    /// duration of the last one, whose successor has not arrived yet.
+    video_frame_ticks: Option<u64>,
 }
 
 impl Fmp4Segmenter {
@@ -536,7 +560,17 @@ impl Fmp4Segmenter {
             last_packaged_at_unix_ns: None,
             warned_no_config: false,
             timestamp_base_input: None,
+            flush_on_complete: default_flush_on_complete(),
+            last_video_dts: None,
+            video_frame_ticks: None,
         }
+    }
+
+    /// Close a video part as soon as the access unit just pushed brings it to
+    /// the part target (`true`), or when the next access unit arrives
+    /// (`false`, one frame interval later).
+    pub fn set_flush_on_complete(&mut self, enabled: bool) {
+        self.flush_on_complete = enabled;
     }
 
     /// Set the canonical source epoch for all parts from this segmenter.
@@ -639,6 +673,8 @@ impl Fmp4Segmenter {
         self.last_packaged_at_unix_ns = None;
         self.warned_no_config = false;
         self.timestamp_base_input = None;
+        self.last_video_dts = None;
+        self.video_frame_ticks = None;
     }
 
     async fn push_video(&mut self, mut access_unit: AccessUnit) {
@@ -776,9 +812,44 @@ impl Fmp4Segmenter {
             self.flush_with_next_dts(access_unit.dts).await;
         }
 
-        self.video_timestamps.push(access_unit.dts);
+        let dts = access_unit.dts;
+        if let Some(previous) = self.last_video_dts.filter(|previous| dts > *previous) {
+            self.video_frame_ticks = Some(dts - previous);
+        }
+        self.last_video_dts = Some(dts);
+        self.video_timestamps.push(dts);
         self.video_buf.push(access_unit);
         self.started_video = true;
+
+        if let Some(next_dts) = self.completed_part_next_dts() {
+            debug!(
+                output_stream_id = self.output_stream_id,
+                output_stream_idx = self.output_stream_idx,
+                buffered_video = self.video_buf.len(),
+                buffered_audio = self.audio_buf.len(),
+                target_ms = ticks_to_ms(self.min_part_ticks),
+                next_dts,
+                "flushing completed fMP4 part"
+            );
+            self.flush_with_next_dts(next_dts).await;
+        }
+    }
+
+    /// The decode time that ends the buffered video part, when the part
+    /// already reaches its target with its last access unit counted at the
+    /// last frame interval. The part is then complete: at the usual frame
+    /// interval the next access unit would cut it by `target-duration`, so
+    /// the part leaves now instead of one frame later. When the next access
+    /// unit comes earlier than expected the part was cut at the same frame
+    /// as before; when the estimate is short, the old rule still cuts it.
+    fn completed_part_next_dts(&self) -> Option<u64> {
+        if !self.flush_on_complete {
+            return None;
+        }
+        let first_dts = *self.video_timestamps.first()?;
+        let last_dts = *self.video_timestamps.last()?;
+        let next_dts = last_dts.checked_add(self.video_frame_ticks?)?;
+        (next_dts.saturating_sub(first_dts) >= self.min_part_ticks).then_some(next_dts)
     }
 
     fn install_h264_config(&mut self, config: Config, signature: H264ConfigSignature) {
@@ -1882,8 +1953,9 @@ mod tests {
         segmenter.push_access_unit(second).await;
 
         {
+            // The second frame completes its own 50 ms part at once.
             let parts = publisher.parts.lock().unwrap();
-            assert_eq!(parts.len(), 1);
+            assert_eq!(parts.len(), 2);
             assert!(parts[0].duration_ms > 0);
             assert!(parts[0].published_at_unix_ns >= parts[0].packaged_at_unix_ns);
         }
@@ -1891,8 +1963,127 @@ mod tests {
         assert!(playlists.chunk_cache.stream_ids().await.is_empty());
     }
 
+    fn h264_frame(dts: u64, key: bool) -> AccessUnit {
+        let mut unit = h264_access_unit(dts, dts);
+        unit.key = key;
+        unit.data = if key {
+            h264_sample(H264_SPS_720P, H264_PPS, H264_IDR)
+        } else {
+            let mut data = BytesMut::new();
+            push_len_prefixed_nalu(&mut data, H264_NON_IDR);
+            data.freeze()
+        };
+        unit
+    }
+
+    /// (duration, key frame, frames, first decode time) of each part.
+    fn part_shapes(publisher: &CapturingPublisher) -> Vec<(u32, bool, usize, u64)> {
+        publisher
+            .parts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                (
+                    part.duration_ms,
+                    part.keyframe,
+                    part.video_units,
+                    tfdt_decode_time(&part.bytes),
+                )
+            })
+            .collect()
+    }
+
+    fn video_segmenter(
+        part_ms: u32,
+        flush_on_complete: bool,
+    ) -> (Fmp4Segmenter, Arc<CapturingPublisher>) {
+        let (playlists, _, _) = Playlists::new(Options::default());
+        let publisher = Arc::new(CapturingPublisher::default());
+        let mut segmenter = Fmp4Segmenter::new_publish_only(
+            77,
+            0,
+            playlists,
+            TimestampInput::Ticks90Khz,
+            part_ms,
+            publisher.clone(),
+        );
+        segmenter.set_flush_on_complete(flush_on_complete);
+        (segmenter, publisher)
+    }
+
+    #[tokio::test]
+    async fn video_part_leaves_when_its_last_frame_completes_it() {
+        // 30 frames a second (3,000 ticks), parts of 100 ms: three frames.
+        // Frames 0..=2 make the first part, a key frame at 5 cuts a short
+        // part 3..=4, and frames 5..=7 make the next full part.
+        let frames: Vec<(u64, bool)> = (0..9_u64)
+            .map(|index| (index * 3_000, index == 0 || index == 5))
+            .collect();
+        let mut shapes = Vec::new();
+        for flush_on_complete in [true, false] {
+            let (mut segmenter, publisher) = video_segmenter(100, flush_on_complete);
+            let mut parts_after = Vec::new();
+            for (dts, key) in &frames {
+                segmenter.push_access_unit(h264_frame(*dts, *key)).await;
+                parts_after.push(publisher.parts.lock().unwrap().len());
+            }
+            segmenter.finish().await;
+            if flush_on_complete {
+                // The part leaves with its third frame, not with the fourth.
+                assert_eq!(parts_after, vec![0, 0, 1, 1, 1, 2, 2, 3, 3]);
+            } else {
+                assert_eq!(parts_after, vec![0, 0, 0, 1, 1, 2, 2, 2, 3]);
+            }
+            shapes.push(part_shapes(&publisher));
+        }
+        // The parts are the same either way: durations, key frames, frame
+        // counts and decode times do not change, only when a part leaves.
+        assert_eq!(shapes[0], shapes[1]);
+        assert_eq!(
+            shapes[0],
+            vec![
+                (100, true, 3, 0),
+                (67, false, 2, 9_000),
+                (100, true, 3, 15_000),
+                // The last frame is closed by `finish` at the default length.
+                (DEFAULT_MIN_PART_MS, false, 1, 24_000),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_frame_parts_leave_with_their_frame() {
+        let (mut segmenter, publisher) = video_segmenter(33, true);
+        // The first frame has no interval yet; it waits for the second, as
+        // before. From then on every frame leaves at once.
+        segmenter.push_access_unit(h264_frame(0, true)).await;
+        assert_eq!(publisher.parts.lock().unwrap().len(), 0);
+        for index in 1..5_u64 {
+            segmenter
+                .push_access_unit(h264_frame(index * 3_000, false))
+                .await;
+            assert_eq!(publisher.parts.lock().unwrap().len() as u64, index + 1);
+        }
+        let shapes = part_shapes(&publisher);
+        assert!(shapes
+            .iter()
+            .all(|(duration, _, frames, _)| *duration == 33 && *frames == 1));
+        assert_eq!(
+            shapes.iter().map(|shape| shape.3).collect::<Vec<_>>(),
+            vec![0, 3_000, 6_000, 9_000, 12_000]
+        );
+        assert!(shapes[0].1 && shapes[1..].iter().all(|shape| !shape.1));
+    }
+
     #[tokio::test]
     async fn muxed_stream_does_not_replace_combined_init_with_video_only_init() {
+        for flush_on_complete in [false, true] {
+            muxed_stream_keeps_combined_init(flush_on_complete).await;
+        }
+    }
+
+    async fn muxed_stream_keeps_combined_init(flush_on_complete: bool) {
         let (playlists, _, _) = Playlists::new(Options::default());
         let publisher = Arc::new(CapturingPublisher::default());
         let mut segmenter = Fmp4Segmenter::new_publish_only(
@@ -1903,6 +2094,7 @@ mod tests {
             DEFAULT_MIN_PART_MS,
             publisher.clone(),
         );
+        segmenter.set_flush_on_complete(flush_on_complete);
 
         let mut first = h264_access_unit(0, 0);
         first.data = h264_sample(H264_SPS_720P, H264_PPS, H264_IDR);
@@ -1938,7 +2130,16 @@ mod tests {
             segmenter.push_access_unit(video).await;
         }
 
-        let parts = publisher.parts.lock().unwrap();
+        let mut parts = publisher.parts.lock().unwrap().clone();
+        if flush_on_complete {
+            // Each 67 ms frame completes its 50 ms part, so the frame at
+            // 6,000 leaves alone, before the audio arrives, and the audio
+            // goes with the next frame.
+            assert_eq!(parts.len(), 4);
+            assert!(parts[1].init.is_none());
+            assert_eq!(parts[1].audio_units, 0);
+            parts.remove(1);
+        }
         assert_eq!(parts.len(), 3);
         let video_init = parts[0].init.as_ref().expect("video init");
         let combined_init = parts[1].init.as_ref().expect("combined init");
