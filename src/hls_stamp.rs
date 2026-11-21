@@ -65,7 +65,16 @@ pub struct StreamStamper {
     segment_starts_clean: bool,
     /// Duration of the part before this one.
     last_part_ms: u32,
+    /// Recent parts that were longer than the declared part target, and the
+    /// number of parts since the first of them.
+    longer_parts: Vec<u32>,
+    parts_since_longer: u32,
 }
+
+/// Parts longer than the declared target that widen it.
+const LONGER_PARTS_TO_WIDEN: usize = 3;
+/// Parts within which they must come.
+const LONGER_PARTS_WINDOW: u32 = 100;
 
 impl StreamStamper {
     /// `part_ms` and `segment_ms` are the configured part and segment
@@ -83,6 +92,8 @@ impl StreamStamper {
             target_duration_ms: segment_ms,
             segment_starts_clean: true,
             last_part_ms: part_ms,
+            longer_parts: Vec::with_capacity(LONGER_PARTS_TO_WIDEN),
+            parts_since_longer: 0,
         }
     }
 
@@ -132,12 +143,31 @@ impl StreamStamper {
             }
         };
         self.last_part_ms = duration_ms;
-        // A part is as long as its last frame makes it. One that is more
-        // than twice the configured duration is a fault of the source, and
-        // does not widen the target of every later part.
-        self.part_target_ms = self
-            .part_target_ms
-            .max(duration_ms.min(self.part_ms.saturating_mul(2)));
+        // A part is as long as its last frame makes it: 208 ms for five
+        // frames at 24 frames a second, when 200 ms is configured. The
+        // declared target follows a duration that recurs. One long part,
+        // such as the first part of a stream, does not widen it: every
+        // later part would then be shorter than 85% of the target, which a
+        // playlist allows only for the last part of a segment. A part of
+        // more than twice the configured duration is a fault of the source.
+        if !self.longer_parts.is_empty() {
+            self.parts_since_longer += 1;
+            if self.parts_since_longer > LONGER_PARTS_WINDOW {
+                self.longer_parts.clear();
+            }
+        }
+        if duration_ms > self.part_target_ms {
+            if self.longer_parts.is_empty() {
+                self.parts_since_longer = 0;
+            }
+            self.longer_parts
+                .push(duration_ms.min(self.part_ms.saturating_mul(2)));
+            if self.longer_parts.len() >= LONGER_PARTS_TO_WIDEN {
+                let recurring = self.longer_parts.iter().copied().min().unwrap_or(0);
+                self.part_target_ms = self.part_target_ms.max(recurring);
+                self.longer_parts.clear();
+            }
+        }
         let stamp = HlsStamp {
             msn,
             part: self.part,
@@ -282,10 +312,34 @@ mod tests {
     }
 
     #[test]
-    fn one_late_part_does_not_widen_the_part_target_without_bound() {
+    fn one_long_part_does_not_widen_the_part_target() {
         let mut stamper = StreamStamper::new(200, 2_000);
-        stamper.stamp(208, true, 0);
+        // The first part of a stream is long, and the parts after it are
+        // five frames each.
+        let first = stamper.stamp(400, true, 0);
+        assert_eq!(first.part_target_ms, 200);
+        let mut last = first;
+        for _ in 0..3 {
+            last = stamper.stamp(208, false, 0);
+        }
+        // The duration that recurs is the target. The long part is not.
+        assert_eq!(last.part_target_ms, 208);
         let late = stamper.stamp(1_500, false, 0);
-        assert_eq!(late.part_target_ms, 400);
+        assert_eq!(late.part_target_ms, 208);
+        for _ in 0..300 {
+            last = stamper.stamp(208, false, 0);
+        }
+        assert_eq!(last.part_target_ms, 208);
+    }
+
+    #[test]
+    fn a_longer_part_that_recurs_widens_the_part_target_within_its_bound() {
+        let mut stamper = StreamStamper::new(200, 2_000);
+        let mut last = stamper.stamp(208, true, 0);
+        for _ in 0..5 {
+            last = stamper.stamp(1_500, false, 0);
+        }
+        // Never more than twice the configured duration.
+        assert_eq!(last.part_target_ms, 400);
     }
 }

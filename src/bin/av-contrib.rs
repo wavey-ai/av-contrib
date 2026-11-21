@@ -3269,11 +3269,25 @@ async fn resolve_output_stream_idx(
     }
 }
 
+/// The output stream of an RTMP publish.
+///
+/// A stream key that is a number names its output stream. An encoder that
+/// sends a ladder publishes each rendition under the key of its stream, so
+/// the stream of a rendition does not depend on the order in which the
+/// encoder connects. Any other key: the first stream is the configured one.
 fn rtmp_output_stream_id(
     stream: &RtmpStreamInfo,
     fallback_output_stream_id: u64,
     is_first_stream: bool,
 ) -> u64 {
+    if let Some(named) = stream
+        .key
+        .parse::<u64>()
+        .ok()
+        .filter(|stream_id| *stream_id > 0)
+    {
+        return named;
+    }
     if is_first_stream || stream.id == 0 {
         fallback_output_stream_id
     } else {
@@ -8143,6 +8157,21 @@ fn validate_compiled_ingress_features(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_numeric_rtmp_key_names_the_output_stream() {
+        let stream = |key: &str, id: u64| RtmpStreamInfo {
+            key: key.to_owned(),
+            id,
+        };
+        // The renditions of a ladder, in any order of arrival.
+        assert_eq!(rtmp_output_stream_id(&stream("12", 991), 1, true), 12);
+        assert_eq!(rtmp_output_stream_id(&stream("11", 992), 1, false), 11);
+        // Any other key keeps the earlier rule.
+        assert_eq!(rtmp_output_stream_id(&stream("show", 993), 1, true), 1);
+        assert_eq!(rtmp_output_stream_id(&stream("show-b", 994), 1, false), 994);
+        assert_eq!(rtmp_output_stream_id(&stream("0", 995), 1, true), 1);
+    }
     use av_contrib::hls_stamp::HlsStamp;
     use music_audio_session::{MultichannelAudioSender, MultichannelAudioSessionConfig};
     use raptorq_datagram_fec::{
