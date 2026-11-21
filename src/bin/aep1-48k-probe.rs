@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -648,6 +649,9 @@ struct SendReport {
     wire_overhead_ratio: f64,
     wire_to_pcm_ratio: f64,
     elapsed_ms: u64,
+    /// SIGTERM or SIGINT stopped the sender before `duration_seconds`;
+    /// `epochs` and the lateness cover the epochs it sent.
+    stopped_by_signal: bool,
     /// `precise` or `tokio` (`--pace`).
     pace: &'static str,
     /// First datagram of each epoch handed to the kernel, after the epoch's
@@ -2305,16 +2309,20 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     };
     let epochs = duration_seconds.saturating_mul(1_000) / 5;
     let started = Instant::now();
+    // A harness that stops the sender with SIGTERM (or SIGINT) still gets
+    // the report of the epochs that were sent.
+    let stop = stop_on_signal();
     let (encoder, stats) = match pace {
-        SendPace::Tokio => send_tokio_paced(source, target, epochs).await?,
+        SendPace::Tokio => send_tokio_paced(source, target, epochs, &stop).await?,
         SendPace::Precise => {
             // The pacer owns an OS thread: a tokio timer fires on 1 ms ticks
             // and shares its worker with the rest of the runtime.
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let pacer_stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("aep1-pacer".into())
                 .spawn(move || {
-                    let _ = done_tx.send(send_precise_paced(source, target, epochs));
+                    let _ = done_tx.send(send_precise_paced(source, target, epochs, &pacer_stop));
                 })
                 .context("failed to start the AEP1 pacing thread")?;
             done_rx
@@ -2322,6 +2330,8 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
                 .context("the AEP1 pacing thread stopped without a result")??
         }
     };
+    let stopped_by_signal = stop.load(AtomicOrdering::Acquire);
+    let epochs = stats.first_datagram_ns.len() as u64;
 
     let pcm_reference_bytes = epochs
         .saturating_mul(u64::from(FRAME_COUNT))
@@ -2356,6 +2366,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             / encoder.lossless_payload_bytes.max(1) as f64,
         wire_to_pcm_ratio: encoder.wire_bytes as f64 / pcm_reference_bytes.max(1) as f64,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        stopped_by_signal,
         pace: pace.as_str(),
         send_lateness_ms: percentiles_ms(stats.first_datagram_ns),
         send_complete_lateness_ms: percentiles_ms(stats.last_datagram_ns),
@@ -2422,12 +2433,45 @@ fn pace_step(now_ns: u64, deadline_ns: u64) -> PaceStep {
     }
 }
 
-/// Block the calling thread until the Unix time reaches `deadline_ns`.
-fn wait_until_unix_ns(deadline_ns: u64) -> Result<()> {
+/// The longest sleep of a pacer between looks at its stop flag.
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// A flag that SIGTERM or SIGINT sets. The pacers stop at the next epoch
+/// and the sender prints the report of what it sent.
+fn stop_on_signal() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+                return;
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        flag.store(true, AtomicOrdering::Release);
+    });
+    stop
+}
+
+/// Block the calling thread until the Unix time reaches `deadline_ns`, or
+/// until `stop` is set (`false`).
+fn wait_until_unix_ns(deadline_ns: u64, stop: &AtomicBool) -> Result<bool> {
     loop {
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(false);
+        }
         match pace_step(now_unix_ns()?, deadline_ns) {
-            PaceStep::Send => return Ok(()),
-            PaceStep::Sleep(duration) => std::thread::sleep(duration),
+            PaceStep::Send => return Ok(true),
+            PaceStep::Sleep(duration) => std::thread::sleep(duration.min(STOP_POLL)),
             PaceStep::Spin => std::hint::spin_loop(),
         }
     }
@@ -2656,17 +2700,17 @@ fn check_full_send(sent: usize, expected: usize) -> Result<()> {
     Ok(())
 }
 
-/// The sender as it was: a tokio interval from the session id.
+/// The sender as it was: a tokio interval from the session id. The source
+/// (the PCM file is read whole) and the socket are made before the wait for
+/// the session id, as they were, so that only the pacing differs from
+/// `--pace precise`.
 async fn send_tokio_paced(
     options: EpochSourceOptions,
     target: SocketAddr,
     epochs: u64,
+    stop: &AtomicBool,
 ) -> Result<(EpochEncoder, SendLateness)> {
     let session_id = options.session_id;
-    let now_ns = now_unix_ns()?;
-    if session_id > now_ns {
-        sleep_until(TokioInstant::now() + Duration::from_nanos(session_id - now_ns)).await;
-    }
     let mut encoder = EpochEncoder::new(&options)?;
     let socket = UdpSocket::bind(if target.is_ipv4() {
         "0.0.0.0:0"
@@ -2675,10 +2719,21 @@ async fn send_tokio_paced(
     })
     .await?;
     let mut lateness = SendLateness::with_capacity(epochs);
+    loop {
+        let now_ns = now_unix_ns()?;
+        if session_id <= now_ns || stop.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let wait = Duration::from_nanos(session_id - now_ns).min(STOP_POLL);
+        sleep_until(TokioInstant::now() + wait).await;
+    }
     let mut ticker = interval_at(TokioInstant::now(), FRAME_DURATION);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     for epoch_id in 0..epochs {
         ticker.tick().await;
+        if stop.load(AtomicOrdering::Acquire) {
+            break;
+        }
         let encode_started = Instant::now();
         let datagrams = encoder.encode(epoch_id)?;
         lateness
@@ -2708,6 +2763,7 @@ fn send_precise_paced(
     options: EpochSourceOptions,
     target: SocketAddr,
     epochs: u64,
+    stop: &AtomicBool,
 ) -> Result<(EpochEncoder, SendLateness)> {
     let session_id = options.session_id;
     let mut encoder = EpochEncoder::new(&options)?;
@@ -2719,7 +2775,9 @@ fn send_precise_paced(
     let mut lateness = SendLateness::with_capacity(epochs);
     for epoch_id in 0..epochs {
         let deadline_ns = epoch_deadline_ns(session_id, epoch_id);
-        wait_until_unix_ns(deadline_ns)?;
+        if !wait_until_unix_ns(deadline_ns, stop)? {
+            break;
+        }
         // The epoch is encoded when its last sample has been spoken, as a
         // live source would, so the encode is part of the measured lateness.
         let encode_started = Instant::now();
@@ -6940,7 +6998,8 @@ mod tests {
             min_repair_symbols: 1,
         };
         let session_id = options.session_id;
-        let (encoder, lateness) = send_precise_paced(options, target, epochs).unwrap();
+        let (encoder, lateness) =
+            send_precise_paced(options, target, epochs, &AtomicBool::new(false)).unwrap();
         let finished = now_unix_ns().unwrap();
         assert_eq!(lateness.first_datagram_ns.len(), epochs as usize);
         // The run ends with the last deadline, not later by the sum of the
@@ -6953,6 +7012,83 @@ mod tests {
         for _ in 0..datagrams {
             receiver.recv_from(&mut buffer).unwrap();
         }
+    }
+
+    fn sine_source(session_id: u64) -> EpochSourceOptions {
+        EpochSourceOptions {
+            session_id,
+            payload_kind: ProbePayload::Pcm,
+            channels: 2,
+            group_channels: 8,
+            signal: ProbeSignal::Sine,
+            pcm_s24le_file: None,
+            group_id: 0,
+            repair_percent: 12,
+            min_repair_symbols: 1,
+        }
+    }
+
+    #[test]
+    fn precise_sender_stops_when_asked_and_keeps_what_it_sent() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = receiver.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let session_id = now_unix_ns().unwrap() + 10_000_000;
+        let flag = Arc::clone(&stop);
+        let stopper = std::thread::spawn(move || {
+            // About ten epochs in, as a SIGTERM from the harness would.
+            std::thread::sleep(Duration::from_millis(60));
+            flag.store(true, AtomicOrdering::Release);
+        });
+        let started = Instant::now();
+        let (_, lateness) =
+            send_precise_paced(sine_source(session_id), target, 200_000, &stop).unwrap();
+        stopper.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let sent = lateness.first_datagram_ns.len();
+        assert!((1..200_000).contains(&sent), "{sent} epochs");
+        assert_eq!(lateness.last_datagram_ns.len(), sent);
+
+        // A stop during the wait for the session id ends the wait.
+        let stop = AtomicBool::new(true);
+        let far = now_unix_ns().unwrap() + 30_000_000_000;
+        let (_, lateness) = send_precise_paced(sine_source(far), target, 10, &stop).unwrap();
+        assert!(lateness.first_datagram_ns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tokio_sender_reads_its_source_before_the_session_starts() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = receiver.local_addr().unwrap();
+        // A missing PCM file fails at once, not after the wait for a session
+        // id 30 s away: the source is read before the wait, as it always was.
+        let mut options = sine_source(now_unix_ns().unwrap() + 30_000_000_000);
+        options.pcm_s24le_file = Some(PathBuf::from("/nonexistent/aep1-probe-audio.s24le"));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_tokio_paced(options, target, 10, &AtomicBool::new(false)),
+        )
+        .await
+        .expect("the tokio sender waited for the session before reading its source");
+        assert!(result.is_err());
+
+        // With the source ready, the stop flag ends the run.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            flag.store(true, AtomicOrdering::Release);
+        });
+        let session_id = now_unix_ns().unwrap() + 10_000_000;
+        let (_, lateness) = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_tokio_paced(sine_source(session_id), target, 200_000, &stop),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sent = lateness.first_datagram_ns.len();
+        assert!((1..200_000).contains(&sent), "{sent} epochs");
     }
 
     #[test]
