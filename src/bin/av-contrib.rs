@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use av_contrib::audio_epoch_hls::{
     channel as audio_epoch_hls_channel, run_audio_epoch_hls_worker,
     worker_stats as audio_epoch_hls_worker_stats, AudioEpochHlsConfig, AudioEpochHlsDatagram,
-    AudioEpochHlsPackaging, DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
+    AudioEpochHlsPackaging, RecoveredAudioEpoch, DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
 };
 use av_contrib::fmp4_bridge::{
     AccessUnitSink, Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop,
@@ -25,6 +25,7 @@ use av_contrib::quadra_renditions::{
     QuadraRenditionTarget,
 };
 use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
+use av_contrib::udp_batch;
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use bytes::{Bytes, BytesMut};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
@@ -45,10 +46,10 @@ use raptorq_datagram_fec::{
     DEFAULT_SYMBOL_SIZE, ENCODING_PACKET_HEADER_LEN, HEADER_LEN, MAX_SOURCE_SYMBOLS_PER_BLOCK,
 };
 use relay_session::{
-    encoded_datagram_len as relay_datagram_len, AdaptiveFecController, AdaptiveFecPolicy,
+    encode_datagram as encode_relay_datagram, AdaptiveFecController, AdaptiveFecPolicy,
     CongestionConfig, EncodedRaptorQObject, MediaDatagramRole, MediaDeadline, ObjectAnnouncement,
-    PathMetrics, PrivateUdpConfig, PrivateUdpTransport, RaptorQObjectEncoder, RelayLimits,
-    RelayTransport, SubscriptionId, TopologyGeneration,
+    PathMetrics, PrivateUdpConfig, RaptorQObjectEncoder, RelayLimits, SubscriptionId,
+    TopologyGeneration,
 };
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
@@ -824,6 +825,29 @@ struct Args {
     )]
     publication_shard_mix: bool,
 
+    /// Hand the RelaySession symbols of one part to the kernel in one
+    /// `sendmmsg` call per lane (Linux) instead of one awaited send per
+    /// symbol. With `false` every symbol is its own `send`.
+    #[arg(
+        long,
+        env = "AV_RELAY_SEND_BATCH",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_send_batch: bool,
+
+    /// Recover each AEP1 epoch once: the LL-HLS worker's FEC receiver hands
+    /// every completed epoch to the SoundKit v2 normaliser of the mesh lane,
+    /// which then only re-frames it. With `false` the normaliser runs its own
+    /// FEC receiver over a second copy of every datagram.
+    #[arg(
+        long,
+        env = "AV_AEP1_SHARED_RECOVERY",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    aep1_shared_recovery: bool,
+
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     #[command(flatten)]
     quadra: QuadraCliArgs,
@@ -1079,6 +1103,55 @@ enum RelayPipelineStage {
     SecondaryRepairSend,
 }
 
+/// The UDP carrier of one RelaySession parent: a socket bound to the source
+/// endpoint that the parent registered for this contributor and connected to
+/// the parent. It carries RLS1 datagrams exactly as
+/// `relay_session::PrivateUdpTransport` does, and can hand the symbols of a
+/// part to the kernel in one batch.
+struct RelayLane {
+    socket: UdpSocket,
+    peer_addr: SocketAddr,
+    limits: RelayLimits,
+    path_metrics: std::sync::RwLock<PathMetrics>,
+}
+
+impl RelayLane {
+    async fn bind(config: PrivateUdpConfig) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind(config.bind_addr).await?;
+        socket.connect(config.peer_addr).await?;
+        Ok(Self {
+            socket,
+            peer_addr: config.peer_addr,
+            limits: config.limits,
+            path_metrics: std::sync::RwLock::new(PathMetrics::default()),
+        })
+    }
+
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    const fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    fn set_path_metrics(&self, metrics: PathMetrics) {
+        *self
+            .path_metrics
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metrics.normalized();
+    }
+
+    #[cfg(test)]
+    fn path_metrics(&self) -> PathMetrics {
+        *self
+            .path_metrics
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 struct RelaySessionPublisher {
     /// One RaptorQ encoder, or with `--publication-shard-mix` one for audio
     /// parts and one for video parts, so that an audio part never waits for
@@ -1086,9 +1159,12 @@ struct RelaySessionPublisher {
     /// encoders' block ids and packet sequences are their own; a relay
     /// decodes each object, keyed by its object key, on its own.
     encoders: Vec<Mutex<RaptorQObjectEncoder>>,
-    primary: PrivateUdpTransport,
-    secondary: Option<PrivateUdpTransport>,
+    primary: RelayLane,
+    secondary: Option<RelayLane>,
     secondary_seed_source: bool,
+    /// `--relay-send-batch`: the symbols of a part leave each lane in one
+    /// `sendmmsg` call.
+    send_batch: bool,
     generation: TopologyGeneration,
     subscription_id: SubscriptionId,
     telemetry: Arc<IngestTelemetry>,
@@ -1156,7 +1232,7 @@ impl RelaySessionPublisher {
         }
         let primary_path_metrics = relay_path_metrics(args)?;
         let secondary_path_metrics = relay_secondary_path_metrics(args)?;
-        let primary = PrivateUdpTransport::bind(PrivateUdpConfig::new(
+        let primary = RelayLane::bind(PrivateUdpConfig::new(
             primary_bind,
             primary_target,
             args.relay_local_id.clone(),
@@ -1171,7 +1247,7 @@ impl RelaySessionPublisher {
         let secondary = if let (Some(secondary_target), Some(secondary_bind)) =
             (args.relay_secondary_target, secondary_bind)
         {
-            let transport = PrivateUdpTransport::bind(PrivateUdpConfig::new(
+            let transport = RelayLane::bind(PrivateUdpConfig::new(
                 secondary_bind,
                 secondary_target,
                 args.relay_local_id.clone(),
@@ -1215,6 +1291,7 @@ impl RelaySessionPublisher {
             primary,
             secondary,
             secondary_seed_source: args.relay_secondary_seed_source,
+            send_batch: args.relay_send_batch,
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
             subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
             telemetry,
@@ -1322,13 +1399,26 @@ impl RelaySessionPublisher {
         );
 
         let primary_lane = async {
-            for symbol in source_symbols.iter().cloned() {
+            if self.send_batch {
+                // Source and repair in one batch: the source symbols lead it,
+                // so they are with the kernel when `sent` is journalled.
+                let symbols = if repair_uses_primary {
+                    vec![source_symbols.as_slice(), repair_symbols.as_slice()]
+                } else {
+                    vec![source_symbols.as_slice()]
+                };
+                self.send_symbol_batch(&self.primary, RelayCarrierPath::Primary, &symbols)
+                    .await?;
+                journal_hop(HopStage::Sent, Some(self.primary.peer_addr()));
+                return Ok::<(), anyhow::Error>(());
+            }
+            for symbol in &source_symbols {
                 self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
                     .await?;
             }
             journal_hop(HopStage::Sent, Some(self.primary.peer_addr()));
             if repair_uses_primary {
-                for symbol in repair_symbols.iter().cloned() {
+                for symbol in &repair_symbols {
                     self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
                         .await?;
                 }
@@ -1337,14 +1427,25 @@ impl RelaySessionPublisher {
         };
         let secondary_lane = async {
             if let Some(secondary) = self.secondary.as_ref() {
+                if self.send_batch {
+                    let symbols = if self.secondary_seed_source {
+                        vec![source_symbols.as_slice(), repair_symbols.as_slice()]
+                    } else {
+                        vec![repair_symbols.as_slice()]
+                    };
+                    self.send_symbol_batch(secondary, RelayCarrierPath::Secondary, &symbols)
+                        .await?;
+                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
+                    return Ok::<(), anyhow::Error>(());
+                }
                 if self.secondary_seed_source {
-                    for symbol in source_symbols.iter().cloned() {
+                    for symbol in &source_symbols {
                         self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
                             .await?;
                     }
                     journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
                 }
-                for symbol in repair_symbols.iter().cloned() {
+                for symbol in &repair_symbols {
                     self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
                         .await?;
                 }
@@ -1418,11 +1519,79 @@ impl RelaySessionPublisher {
         })
     }
 
+    /// Send the symbols of `groups`, in order, in as few `sendmmsg` calls as
+    /// the kernel allows. Every symbol of an object carries the object's
+    /// deadline, so one check covers the batch.
+    async fn send_symbol_batch(
+        &self,
+        lane: &RelayLane,
+        path: RelayCarrierPath,
+        groups: &[&[relay_session::RelayDatagram]],
+    ) -> Result<()> {
+        let Some(first) = groups.iter().find_map(|group| group.first()) else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let stage = relay_send_stage(path, first.role);
+        let count = groups.iter().map(|group| group.len()).sum::<usize>();
+        let result = self.send_symbol_batch_inner(lane, groups, count).await;
+        self.telemetry
+            .record_relay_session_stage_duration(stage, started.elapsed());
+        result
+    }
+
+    async fn send_symbol_batch_inner(
+        &self,
+        lane: &RelayLane,
+        groups: &[&[relay_session::RelayDatagram]],
+        count: usize,
+    ) -> Result<()> {
+        let now_us = now_unix_us();
+        let mut wires = Vec::with_capacity(count);
+        for symbol in groups.iter().flat_map(|group| group.iter()) {
+            if symbol.deadline.is_expired_at(now_us) {
+                self.telemetry.record_relay_session_send_error(symbol.role);
+                self.telemetry
+                    .relay_expired_symbols
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("RelaySession symbol expired before carrier send");
+            }
+            match encode_relay_datagram(symbol, lane.limits) {
+                Ok(wire) => wires.push((symbol.role, wire)),
+                Err(error) => {
+                    self.telemetry.record_relay_session_send_error(symbol.role);
+                    return Err(error).context("failed to encode RelaySession datagram");
+                }
+            }
+        }
+        let messages = wires
+            .iter()
+            .map(|(_, wire)| udp_batch::Outbound::connected(wire))
+            .collect::<Vec<_>>();
+        if let Err(error) = udp_batch::send_all(&lane.socket, &messages, true).await {
+            let role = wires
+                .first()
+                .map_or(MediaDatagramRole::Source, |(role, _)| *role);
+            self.telemetry.record_relay_session_send_error(role);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to send RelaySession datagrams to {}",
+                    lane.peer_addr()
+                )
+            });
+        }
+        for (role, wire) in &wires {
+            self.telemetry
+                .record_relay_session_send_success(*role, wire.len() as u64);
+        }
+        Ok(())
+    }
+
     async fn send_symbol(
         &self,
-        transport: &PrivateUdpTransport,
+        transport: &RelayLane,
         path: RelayCarrierPath,
-        symbol: relay_session::RelayDatagram,
+        symbol: &relay_session::RelayDatagram,
     ) -> Result<()> {
         let started = Instant::now();
         let role = symbol.role;
@@ -1435,18 +1604,22 @@ impl RelaySessionPublisher {
                 "RelaySession symbol expired before carrier send"
             ))
         } else {
-            let wire_bytes = match relay_datagram_len(&symbol) {
-                Ok(bytes) => bytes as u64,
+            let wire = match encode_relay_datagram(symbol, transport.limits) {
+                Ok(wire) => wire,
                 Err(error) => {
                     self.telemetry.record_relay_session_send_error(role);
                     self.telemetry.record_relay_session_stage_duration(
                         relay_send_stage(path, role),
                         started.elapsed(),
                     );
-                    return Err(error).context("failed to measure RelaySession datagram");
+                    return Err(error).context("failed to encode RelaySession datagram");
                 }
             };
-            if let Err(error) = transport.send_datagram(symbol).await {
+            let wire_bytes = wire.len() as u64;
+            if let Err(error) =
+                udp_batch::send_each(&transport.socket, &[udp_batch::Outbound::connected(&wire)])
+                    .await
+            {
                 self.telemetry.record_relay_session_send_error(role);
                 Err(error).with_context(|| {
                     format!(
@@ -2179,6 +2352,50 @@ async fn run_audio_epoch_soundkit_normalizer(
     }
 }
 
+/// The mesh lane's normaliser with `--aep1-shared-recovery`: it takes the
+/// epochs that the LL-HLS worker's FEC receiver recovered, so each AEP1
+/// datagram is decoded once, and only re-frames them as SoundKit v2 AEP1.
+/// The mesh queue gauges then count epochs, not datagrams.
+async fn run_recovered_audio_epoch_normalizer(
+    mut input: mpsc::Receiver<RecoveredAudioEpoch>,
+    output: mpsc::Sender<QueuedAudioEpochIngressDatagram>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut normalizer = SoundKitV2EpochNormalizer::udp(1_200);
+    let mut normalize = |recovered: RecoveredAudioEpoch, waiting: usize| {
+        AUDIO_EPOCH_MESH_QUEUE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        AUDIO_EPOCH_MESH_QUEUE_DEPTH.store(waiting as u64, Ordering::Relaxed);
+        AUDIO_EPOCH_MESH_QUEUE_MAX_DEPTH.fetch_max(waiting as u64 + 1, Ordering::Relaxed);
+        audio_epoch_ingress_queue_age().record(recovered.recovered_at.elapsed());
+        let peer = recovered.peer;
+        match normalizer.push_recovered_epoch(recovered.epoch) {
+            Ok(datagrams) => {
+                AUDIO_EPOCH_NORMALIZED_EPOCHS.fetch_add(1, Ordering::Relaxed);
+                for bytes in datagrams {
+                    let _ = handoff_canonical_audio_epoch_datagram(&output, peer, bytes);
+                }
+            }
+            Err(error) => {
+                AUDIO_EPOCH_NORMALIZATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+                warn!(%peer, error = %error, "rejected recovered AEP1 epoch during SoundKit v2 normalization");
+            }
+        }
+    };
+    loop {
+        let recovered = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            recovered = input.recv() => recovered,
+        };
+        let Some(recovered) = recovered else {
+            return;
+        };
+        normalize(recovered, input.len());
+    }
+    while let Some(recovered) = input.recv().await {
+        normalize(recovered, input.len());
+    }
+}
+
 async fn run_audio_epoch_mesh_forward_worker(
     forwarder: Arc<MeshForwarder>,
     mut input: mpsc::Receiver<QueuedAudioEpochIngressDatagram>,
@@ -2371,9 +2588,9 @@ impl Fmp4PartPublisher for MeshForwarder {
             .map_err(|error| error.to_string())?;
         let (initialization_key, configuration_epoch, slot_init) =
             if let Some((object, epoch)) = initialization {
-                let initialization_envelope =
-                    encode_canonical_media_object(&object).map_err(|error| error.to_string())?;
                 if !self.relay_exclusive {
+                    let initialization_envelope = encode_canonical_media_object(&object)
+                        .map_err(|error| error.to_string())?;
                     self.forward_stream_slot(part.stream_id, &initialization_envelope)
                         .await
                         .map_err(|error| error.to_string())?;
@@ -2444,9 +2661,12 @@ impl Fmp4PartPublisher for MeshForwarder {
             self.estimated_clock_error_ns,
         )
         .map_err(|error| error.to_string())?;
-        let media =
-            encode_canonical_media_object(&media_object).map_err(|error| error.to_string())?;
+        // The envelope is for the byte-FEC cache lane only. With
+        // --relay-exclusive it is not made: encoding it validates the object,
+        // which hashes the whole payload once more.
         if !self.relay_exclusive {
+            let media =
+                encode_canonical_media_object(&media_object).map_err(|error| error.to_string())?;
             self.forward_stream_slot(part.stream_id, &media)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -2484,8 +2704,9 @@ impl Fmp4PartPublisher for MeshForwarder {
             self.estimated_clock_error_ns,
         )
         .map_err(|error| error.to_string())?;
-        let encoded = encode_canonical_media_object(&object).map_err(|error| error.to_string())?;
         if !self.relay_exclusive {
+            let encoded =
+                encode_canonical_media_object(&object).map_err(|error| error.to_string())?;
             self.forward_stream_slot(part.stream_id, &encoded)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -5082,6 +5303,8 @@ impl ContribStatusConfig {
                     .map(|target| target.to_string()),
                 relay_secondary_bind: args.relay_secondary_bind.map(|bind| bind.to_string()),
                 relay_secondary_source_seeded: args.relay_secondary_seed_source,
+                relay_send_batch: args.relay_send_batch,
+                aep1_shared_recovery: args.aep1_shared_recovery,
                 relay_exclusive: args.relay_exclusive,
                 relay_topology_generation: args.relay_topology_generation,
                 relay_subscription_id: args.relay_subscription_id,
@@ -5517,6 +5740,18 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "Maximum recovered AEP1 groups queued across rendition workers since process start.",
             "gauge",
             audio_hls_worker.rendition_queue_max_depth,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_recovered_epochs_shared_total",
+            "Recovered AEP1 epochs that the LL-HLS worker handed to the mesh normaliser (--aep1-shared-recovery).",
+            "counter",
+            audio_hls_worker.recovered_epochs_shared,
+        ),
+        (
+            "av_contrib_audio_epoch_hls_recovered_epochs_dropped_total",
+            "Recovered AEP1 epochs that the full mesh normaliser queue refused (--aep1-shared-recovery).",
+            "counter",
+            audio_hls_worker.recovered_epochs_dropped,
         ),
         (
             "av_contrib_local_playback_cache_enabled",
@@ -6955,6 +7190,10 @@ struct MeshTargetStatus {
     relay_secondary_bind: Option<String>,
     relay_secondary_source_seeded: bool,
     relay_exclusive: bool,
+    /// `--relay-send-batch`.
+    relay_send_batch: bool,
+    /// `--aep1-shared-recovery`.
+    aep1_shared_recovery: bool,
     relay_topology_generation: u64,
     relay_subscription_id: u64,
     relay_deadline_ms: u64,
@@ -7426,9 +7665,9 @@ impl Router for ContribRouter {
             let Some(audio_epoch_hls_tx) = self.audio_epoch_hls_tx.as_ref() else {
                 return Ok(needletail_ingest_response(StatusCode::SERVICE_UNAVAILABLE));
             };
-            let Some(audio_epoch_mesh_tx) = self.audio_epoch_mesh_tx.as_ref() else {
-                return Ok(needletail_ingest_response(StatusCode::SERVICE_UNAVAILABLE));
-            };
+            // Absent with --aep1-shared-recovery: the LL-HLS worker then
+            // feeds the mesh lane with the epochs it recovers.
+            let audio_epoch_mesh_tx = self.audio_epoch_mesh_tx.as_ref();
             if req.headers().get_all(AUTHORIZATION).iter().count() != 1 {
                 return Ok(needletail_ingest_response(StatusCode::UNAUTHORIZED));
             }
@@ -7509,7 +7748,7 @@ impl Router for ContribRouter {
                         datagram,
                         hop_journal::now_unix_us(),
                     );
-                    handoff_audio_epoch_mesh_datagram(Some(audio_epoch_mesh_tx), peer, datagram);
+                    handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx, peer, datagram);
                     datagrams = datagrams.saturating_add(1);
                     payload_bytes = payload_bytes.saturating_add(length as u64);
                 }
@@ -8016,25 +8255,43 @@ async fn main() -> Result<()> {
             audio_epoch_mesh_send_tx.max_capacity() as u64,
             Ordering::Relaxed,
         );
+        let mut audio_epoch_hls_config = AudioEpochHlsConfig::new(
+            args.daw_hls_base_stream_id,
+            args.audio_part(),
+            args.daw_hls_packaging.into(),
+            args.daw_hls_formats
+                .iter()
+                .copied()
+                .map(AudioPayloadKind::from)
+                .collect(),
+            playlists.clone(),
+            publisher.clone(),
+        );
+        // With --aep1-shared-recovery the ingest hands each datagram to the
+        // LL-HLS worker only, and the mesh normaliser takes the epochs that
+        // the worker recovered; else each path decodes its own copy.
+        let (audio_epoch_normalizer_task, ingest_audio_epoch_mesh_tx) = if args.aep1_shared_recovery
+        {
+            drop(audio_epoch_mesh_rx);
+            let (recovered_tx, recovered_rx) = mpsc::channel(AUDIO_EPOCH_MESH_QUEUE_CAPACITY);
+            audio_epoch_hls_config = audio_epoch_hls_config.with_recovered_epoch_sink(recovered_tx);
+            let task = tokio::spawn(run_recovered_audio_epoch_normalizer(
+                recovered_rx,
+                audio_epoch_mesh_send_tx,
+                shutdown_rx.clone(),
+            ));
+            (task, None)
+        } else {
+            let task = tokio::spawn(run_audio_epoch_soundkit_normalizer(
+                audio_epoch_mesh_rx,
+                audio_epoch_mesh_send_tx,
+                shutdown_rx.clone(),
+            ));
+            (task, Some(audio_epoch_mesh_tx))
+        };
         let audio_epoch_hls_task = tokio::spawn(run_audio_epoch_hls_worker(
-            AudioEpochHlsConfig::new(
-                args.daw_hls_base_stream_id,
-                args.audio_part(),
-                args.daw_hls_packaging.into(),
-                args.daw_hls_formats
-                    .iter()
-                    .copied()
-                    .map(AudioPayloadKind::from)
-                    .collect(),
-                playlists.clone(),
-                publisher.clone(),
-            ),
+            audio_epoch_hls_config,
             audio_epoch_hls_rx,
-            shutdown_rx.clone(),
-        ));
-        let audio_epoch_normalizer_task = tokio::spawn(run_audio_epoch_soundkit_normalizer(
-            audio_epoch_mesh_rx,
-            audio_epoch_mesh_send_tx,
             shutdown_rx.clone(),
         ));
         let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
@@ -8049,6 +8306,7 @@ async fn main() -> Result<()> {
             hls_base_stream_id = args.stream_id,
             hls_queue_capacity = args.daw_hls_queue_capacity,
             mesh_queue_capacity = AUDIO_EPOCH_MESH_QUEUE_CAPACITY,
+            aep1_shared_recovery = args.aep1_shared_recovery,
             "DAW media contributor ingest listening"
         );
         (
@@ -8056,14 +8314,14 @@ async fn main() -> Result<()> {
                 socket,
                 forwarder.clone(),
                 Some(audio_epoch_hls_tx.clone()),
-                Some(audio_epoch_mesh_tx.clone()),
+                ingest_audio_epoch_mesh_tx.clone(),
                 shutdown_rx.clone(),
             ))),
             Some(audio_epoch_hls_task),
             Some(audio_epoch_normalizer_task),
             Some(audio_epoch_mesh_task),
             Some(audio_epoch_hls_tx),
-            Some(audio_epoch_mesh_tx),
+            ingest_audio_epoch_mesh_tx,
         )
     } else {
         (None, None, None, None, None, None)
@@ -8811,6 +9069,125 @@ mod tests {
             av_contrib::soundkit_v2::SoundKitV2StreamRef::parse(&canonical.groups[0].payload, true)
                 .unwrap();
         assert_eq!(stream.packets[0].payload, pcm);
+    }
+
+    #[tokio::test]
+    async fn shared_recovery_gives_the_mesh_the_same_datagrams_as_a_second_decode() {
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        let mut source = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let peer: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let mut input = Vec::new();
+        for epoch_id in 0..4_u64 {
+            let pcm = vec![epoch_id as u8 + 1; 48 * 2 * 2];
+            let framed = av_contrib::soundkit_v2::frame_soundkit_v2_packet(
+                av_contrib::soundkit_v2::SoundKitV2PacketMetadata {
+                    encoding: frame_header::EncodingFlag::PCMSigned,
+                    frame_count: 48,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bits_per_sample: 16,
+                    endianness: frame_header::Endianness::LittleEndian,
+                    id: Some(epoch_id),
+                    pts: Some(epoch_id * 48),
+                },
+                &pcm,
+            )
+            .unwrap();
+            let groups = [MultichannelAudioGroup {
+                group_id: 0,
+                channel_start: 0,
+                channel_count: 2,
+                payload_kind: AudioPayloadKind::SoundKitV2,
+                sample_format: AudioSampleFormat::Unspecified,
+                flags: 0,
+                payload: framed.as_ref(),
+            }];
+            let epoch = source
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 92,
+                    config_generation: 1,
+                    epoch_id,
+                    pts_samples: epoch_id * 48,
+                    sample_rate: 48_000,
+                    frame_count: 48,
+                    groups: &groups,
+                })
+                .unwrap();
+            input.extend(
+                transport
+                    .wrap_epoch(epoch)
+                    .unwrap()
+                    .datagrams
+                    .into_iter()
+                    .map(|datagram| datagram.payload),
+            );
+        }
+
+        // Without sharing: the normaliser decodes the datagrams itself.
+        let (input_tx, input_rx) = mpsc::channel(256);
+        let (output_tx, mut output_rx) = mpsc::channel(256);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_audio_epoch_soundkit_normalizer(
+            input_rx,
+            output_tx,
+            shutdown_rx,
+        ));
+        for bytes in &input {
+            input_tx
+                .send(QueuedAudioEpochIngressDatagram {
+                    peer,
+                    bytes: bytes.clone(),
+                    enqueued_at: Instant::now(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(input_tx);
+        worker.await.unwrap();
+        let mut decoded_twice = Vec::new();
+        while let Some(datagram) = output_rx.recv().await {
+            decoded_twice.push(datagram.bytes);
+        }
+
+        // Shared: another receiver (the LL-HLS worker's) recovered them.
+        let mut receiver = music_audio_session::MultichannelAudioReceiver::new(
+            MultichannelAudioSessionConfig::default(),
+        );
+        let (recovered_tx, recovered_rx) = mpsc::channel(16);
+        let (output_tx, mut output_rx) = mpsc::channel(256);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_recovered_audio_epoch_normalizer(
+            recovered_rx,
+            output_tx,
+            shutdown_rx,
+        ));
+        for bytes in &input {
+            let payload = transport.payload(bytes).unwrap();
+            if let Some(epoch) = receiver.push_datagram(payload).unwrap().completed_epoch {
+                recovered_tx
+                    .send(RecoveredAudioEpoch {
+                        peer,
+                        epoch,
+                        recovered_at: std::time::Instant::now(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(recovered_tx);
+        worker.await.unwrap();
+        let mut decoded_once = Vec::new();
+        while let Some(datagram) = output_rx.recv().await {
+            assert_eq!(datagram.peer, peer);
+            decoded_once.push(datagram.bytes);
+        }
+
+        assert!(!decoded_once.is_empty());
+        assert_eq!(decoded_once, decoded_twice);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9910,6 +10287,17 @@ mod tests {
 
     #[tokio::test]
     async fn relay_session_routes_source_and_secondary_repair_and_recovers_exact_object() {
+        relay_session_routes_source_and_secondary_repair(true).await;
+    }
+
+    #[tokio::test]
+    async fn relay_session_without_send_batching_sends_the_same_symbols() {
+        relay_session_routes_source_and_secondary_repair(false).await;
+    }
+
+    /// With `--relay-send-batch` and without it, each lane carries the same
+    /// symbols in the same order; only the number of send calls differs.
+    async fn relay_session_routes_source_and_secondary_repair(send_batch: bool) {
         let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let secondary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let primary_sender_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -9923,6 +10311,7 @@ mod tests {
         args.relay_secondary_target = Some(secondary_receiver.local_addr().unwrap());
         args.relay_secondary_bind = Some(secondary_bind);
         args.relay_secondary_seed_source = true;
+        args.relay_send_batch = send_batch;
         args.relay_topology_generation = 7;
         args.relay_subscription_id = 19;
         args.relay_deadline_ms = 5_000;
@@ -9989,7 +10378,7 @@ mod tests {
         let journal = test_hop_journal();
         let before_us = hop_journal::now_unix_us();
         // A stream id of this test only: other tests share the process journal.
-        let journal_stream = 77_000_000_077;
+        let journal_stream = 77_000_000_077 + u64::from(send_batch);
         let outcome = relay
             .publish_part_object(&object, Some((journal_stream, 42)), PublicationClass::Video)
             .await
@@ -10052,6 +10441,19 @@ mod tests {
             outcome.source_symbols + outcome.repair_symbols,
         )
         .await;
+        // The batch keeps the encoder's order on the wire.
+        let sequences = primary
+            .iter()
+            .map(|symbol| {
+                DatagramFecHeader::decode(&symbol.fec_datagram)
+                    .unwrap()
+                    .packet_sequence
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            "{sequences:?}"
+        );
         let (secondary_source, secondary_repair): (Vec<_>, Vec<_>) = secondary
             .into_iter()
             .partition(|symbol| symbol.role == MediaDatagramRole::Source);
@@ -10130,17 +10532,28 @@ mod tests {
         assert_eq!(snapshot.relay_session.stages.encode_wait.count, 1);
         assert_eq!(snapshot.relay_session.stages.encode.count, 1);
         assert_eq!(snapshot.relay_session.stages.schedule.count, 1);
+        // One send stage per symbol, or one per lane batch (timed under the
+        // role of the batch's first symbol).
+        let (primary_sends, secondary_source_sends, secondary_repair_sends) = if send_batch {
+            (1, 1, 0)
+        } else {
+            (
+                primary.len(),
+                secondary_source.len(),
+                secondary_repair.len(),
+            )
+        };
         assert_eq!(
             snapshot.relay_session.stages.primary_source_send.count,
-            primary.len() as u64
+            primary_sends as u64
         );
         assert_eq!(
             snapshot.relay_session.stages.secondary_source_send.count,
-            secondary_source.len() as u64
+            secondary_source_sends as u64
         );
         assert_eq!(
             snapshot.relay_session.stages.secondary_repair_send.count,
-            secondary_repair.len() as u64
+            secondary_repair_sends as u64
         );
         assert_eq!(snapshot.relay_session.stages.primary_repair_send.count, 0);
         assert!(snapshot
@@ -10199,7 +10612,7 @@ mod tests {
         ));
         assert!(relay_metrics.contains(&format!(
             "av_contrib_relay_session_stage_duration_seconds_count{{stage=\"send_secondary_repair\"}} {}\n",
-            secondary_repair.len()
+            secondary_repair_sends
         )));
         assert!(relay_metrics.contains(
             "av_contrib_relay_session_lane_objects_total{path=\"primary\",outcome=\"success\"} 1\n"
@@ -10222,6 +10635,8 @@ mod tests {
         assert!(status.mesh.relay_secondary_configured);
         assert_eq!(status.mesh.relay_carrier, Some("private-udp"));
         assert!(status.mesh.relay_secondary_source_seeded);
+        assert_eq!(status.mesh.relay_send_batch, send_batch);
+        assert!(status.mesh.aep1_shared_recovery);
         assert_eq!(
             status.mesh.relay_primary_target.as_deref(),
             args.relay_primary_target
@@ -10720,6 +11135,8 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            relay_send_batch: true,
+            aep1_shared_recovery: true,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         }
     }
@@ -10801,6 +11218,8 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            relay_send_batch: true,
+            aep1_shared_recovery: true,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
 
@@ -11387,6 +11806,8 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            relay_send_batch: true,
+            aep1_shared_recovery: true,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -11608,6 +12029,8 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            relay_send_batch: true,
+            aep1_shared_recovery: true,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -11729,6 +12152,8 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
+            relay_send_batch: true,
+            aep1_shared_recovery: true,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());

@@ -20,7 +20,8 @@ use boxer::fmp4::{
 use bytes::{Bytes, BytesMut};
 use frame_header::EncodingFlag;
 use music_audio_session::{
-    DecodedMultichannelAudioGroup, MultichannelAudioReceiver, MultichannelAudioSessionConfig,
+    DecodedMultichannelAudioEpoch, DecodedMultichannelAudioGroup, MultichannelAudioReceiver,
+    MultichannelAudioSessionConfig,
 };
 use playlists::Playlists;
 use raptorq_datagram_fec::{AudioPayloadKind, AudioSampleFormat};
@@ -79,6 +80,8 @@ static RENDITION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RENDITION_QUEUE_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RENDITION_QUEUE_CAPACITY: AtomicU64 =
     AtomicU64::new(RENDITION_WORKER_QUEUE_MIN_CAPACITY as u64);
+static RECOVERED_EPOCHS_SHARED: AtomicU64 = AtomicU64::new(0);
+static RECOVERED_EPOCHS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AudioEpochHlsWorkerStats {
@@ -95,6 +98,11 @@ pub struct AudioEpochHlsWorkerStats {
     pub rendition_queue_dropped: u64,
     pub rendition_queue_depth: u64,
     pub rendition_queue_max_depth: u64,
+    /// Recovered epochs handed to the recovered-epoch sink (the mesh lane's
+    /// SoundKit v2 normaliser with `--aep1-shared-recovery`).
+    pub recovered_epochs_shared: u64,
+    /// Recovered epochs that the sink's full queue refused.
+    pub recovered_epochs_dropped: u64,
 }
 
 pub fn worker_stats() -> AudioEpochHlsWorkerStats {
@@ -112,7 +120,18 @@ pub fn worker_stats() -> AudioEpochHlsWorkerStats {
         rendition_queue_dropped: RENDITION_QUEUE_DROPPED.load(Ordering::Relaxed),
         rendition_queue_depth: RENDITION_QUEUE_DEPTH.load(Ordering::Relaxed),
         rendition_queue_max_depth: RENDITION_QUEUE_MAX_DEPTH.load(Ordering::Relaxed),
+        recovered_epochs_shared: RECOVERED_EPOCHS_SHARED.load(Ordering::Relaxed),
+        recovered_epochs_dropped: RECOVERED_EPOCHS_DROPPED.load(Ordering::Relaxed),
     }
+}
+
+/// An AEP1 epoch whose every group the worker's FEC receiver recovered,
+/// handed on so that a second consumer need not decode the same datagrams.
+#[derive(Debug, Clone)]
+pub struct RecoveredAudioEpoch {
+    pub peer: SocketAddr,
+    pub epoch: DecodedMultichannelAudioEpoch,
+    pub recovered_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +152,10 @@ pub struct AudioEpochHlsConfig {
     pub formats: Vec<AudioPayloadKind>,
     pub playlists: Arc<Playlists>,
     pub publisher: Arc<dyn Fmp4PartPublisher>,
+    /// Where every completed epoch goes as well, whatever its formats: the
+    /// recovery is then shared with that consumer. The worker never waits
+    /// for it; an epoch that does not fit is counted and dropped.
+    pub recovered_epochs: Option<mpsc::Sender<RecoveredAudioEpoch>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +188,40 @@ impl AudioEpochHlsConfig {
             formats,
             playlists,
             publisher,
+            recovered_epochs: None,
+        }
+    }
+
+    /// Hand every completed epoch to `sink` too (see `recovered_epochs`).
+    #[must_use]
+    pub fn with_recovered_epoch_sink(mut self, sink: mpsc::Sender<RecoveredAudioEpoch>) -> Self {
+        self.recovered_epochs = Some(sink);
+        self
+    }
+}
+
+/// Offer a completed epoch to the configured sink without waiting.
+fn share_recovered_epoch(
+    config: &AudioEpochHlsConfig,
+    peer: SocketAddr,
+    epoch: Option<DecodedMultichannelAudioEpoch>,
+) {
+    let (Some(sink), Some(epoch)) = (config.recovered_epochs.as_ref(), epoch) else {
+        return;
+    };
+    match sink.try_send(RecoveredAudioEpoch {
+        peer,
+        epoch,
+        recovered_at: Instant::now(),
+    }) {
+        Ok(()) => {
+            RECOVERED_EPOCHS_SHARED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => {
+            let dropped = RECOVERED_EPOCHS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped <= 16 || dropped.is_power_of_two() {
+                warn!(%peer, dropped, error = %error, "recovered AEP1 epoch sink is full");
+            }
         }
     }
 }
@@ -264,8 +321,13 @@ impl ReceiverState {
         }
     }
 
-    /// Recover the groups this datagram completes, with their source times.
-    fn push(&mut self, payload: &[u8], received_us: u64) -> Result<Vec<RecoveredGroup>, String> {
+    /// Recover the groups this datagram completes, with their source times,
+    /// and the epoch it completes, if it does.
+    fn push(
+        &mut self,
+        payload: &[u8],
+        received_us: u64,
+    ) -> Result<(Vec<RecoveredGroup>, Option<DecodedMultichannelAudioEpoch>), String> {
         let first_us = raptorq_datagram_fec::decode_header(payload)
             .map(|header| self.observe_block(header.block_id, received_us))
             .unwrap_or(received_us);
@@ -274,10 +336,10 @@ impl ReceiverState {
             .push_datagram(payload)
             .map_err(|error| error.to_string())?;
         if outcome.completed_groups.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), outcome.completed_epoch));
         }
         let recovered_us = now_unix_us();
-        Ok(outcome
+        let groups = outcome
             .completed_groups
             .into_iter()
             .map(|group| {
@@ -289,7 +351,8 @@ impl ReceiverState {
                 };
                 (group, times)
             })
-            .collect())
+            .collect();
+        Ok((groups, outcome.completed_epoch))
     }
 }
 
@@ -493,8 +556,9 @@ pub async fn run_audio_epoch_hls_worker(
                 receiver.last_seen = now;
                 let outcome = receiver.push(payload, message.received_unix_us);
                 match outcome {
-                    Ok(completed_groups) => {
+                    Ok((completed_groups, completed_epoch)) => {
                         WORKER_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
+                        share_recovered_epoch(&config, message.peer, completed_epoch);
                         for (group, times) in completed_groups {
                             WORKER_GROUPS_COMPLETED.fetch_add(1, Ordering::Relaxed);
                             WORKER_RAPTORQ_FRAGMENTS_RECOVERED.fetch_add(
@@ -542,8 +606,9 @@ pub async fn run_audio_epoch_hls_worker(
         });
         receiver.last_seen = now;
         let outcome = receiver.push(payload, message.received_unix_us);
-        if let Ok(completed_groups) = outcome {
+        if let Ok((completed_groups, completed_epoch)) = outcome {
             WORKER_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
+            share_recovered_epoch(&config, message.peer, completed_epoch);
             for (group, times) in completed_groups {
                 WORKER_GROUPS_COMPLETED.fetch_add(1, Ordering::Relaxed);
                 WORKER_RAPTORQ_FRAGMENTS_RECOVERED.fetch_add(
@@ -1714,9 +1779,13 @@ mod tests {
         for (index, datagram) in datagrams.iter().enumerate() {
             let payload = transport.payload(datagram).unwrap();
             let received_us = 1_000 + 100 * index as u64;
-            let groups = receiver.push(payload, received_us).unwrap();
+            let (groups, epoch) = receiver.push(payload, received_us).unwrap();
             if !groups.is_empty() {
                 completed_at.get_or_insert(received_us);
+                // One group an epoch: the epoch completes with it.
+                assert_eq!(epoch.map(|epoch| epoch.epoch_id), Some(7));
+            } else {
+                assert!(epoch.is_none());
             }
             completed.extend(groups);
         }
@@ -1736,7 +1805,7 @@ mod tests {
         for (index, datagram) in datagrams.iter().enumerate().skip(1) {
             let payload = transport.payload(datagram).unwrap();
             let received_us = 5_000 + 100 * index as u64;
-            for (group, times) in receiver.push(payload, received_us).unwrap() {
+            for (group, times) in receiver.push(payload, received_us).unwrap().0 {
                 completed.push((group.epoch_id, times, received_us));
             }
         }
@@ -2114,5 +2183,168 @@ mod tests {
         let reused = FIRST_ARRIVAL_BLOCKS as u32;
         assert_eq!(receiver.observe_block(reused, 5), 5);
         assert_eq!(receiver.observe_block(0, 7), 7);
+    }
+
+    /// AEP1 datagrams of one epoch whose one group is canonical SoundKit v2
+    /// PCM: 48 samples, 1 ms.
+    fn soundkit_pcm_epoch(
+        sender: &mut MultichannelAudioSender,
+        transport: &MultichannelAudioTransportAdapter,
+        epoch_id: u64,
+    ) -> Vec<Bytes> {
+        let pcm = vec![epoch_id as u8; 48 * 2 * 2];
+        let framed = crate::soundkit_v2::frame_soundkit_v2_packet(
+            crate::soundkit_v2::SoundKitV2PacketMetadata {
+                encoding: EncodingFlag::PCMSigned,
+                frame_count: 48,
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 16,
+                endianness: frame_header::Endianness::LittleEndian,
+                id: Some(epoch_id),
+                pts: Some(epoch_id * 48),
+            },
+            &pcm,
+        )
+        .unwrap();
+        let groups = [MultichannelAudioGroup {
+            group_id: 0,
+            channel_start: 0,
+            channel_count: 2,
+            payload_kind: AudioPayloadKind::SoundKitV2,
+            sample_format: AudioSampleFormat::Unspecified,
+            flags: 0,
+            payload: framed.as_ref(),
+        }];
+        let encoded = sender
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 77,
+                config_generation: 1,
+                epoch_id,
+                pts_samples: epoch_id * 48,
+                sample_rate: 48_000,
+                frame_count: 48,
+                groups: &groups,
+            })
+            .unwrap();
+        transport
+            .wrap_epoch(encoded)
+            .unwrap()
+            .datagrams
+            .into_iter()
+            .map(|datagram| datagram.payload)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_worker_shares_each_recovered_epoch_and_never_waits_for_its_sink() {
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let peer: SocketAddr = "127.0.0.1:41077".parse().unwrap();
+
+        // The sink takes every epoch, of every format, before the format
+        // filter: FLAC only is published here, the PCM epochs still go on.
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let (sink_tx, mut sink_rx) = mpsc::channel(16);
+        let config = test_config_with_formats(
+            50,
+            5,
+            AudioEpochHlsPackaging::Opaque,
+            vec![AudioPayloadKind::Flac],
+            publisher,
+        )
+        .with_recovered_epoch_sink(sink_tx);
+        let (tx, rx) = channel(256);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_audio_epoch_hls_worker(config, rx, shutdown_rx));
+        let mut sent = Vec::new();
+        for epoch_id in 0..3 {
+            for datagram in soundkit_pcm_epoch(&mut sender, &transport, epoch_id) {
+                sent.push(datagram.clone());
+                tx.send(AudioEpochHlsDatagram {
+                    peer,
+                    bytes: datagram,
+                    received_unix_us: now_unix_us(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        worker.await.unwrap();
+        assert!(captured.opaque_parts.lock().unwrap().is_empty());
+        let mut shared = Vec::new();
+        while let Some(recovered) = sink_rx.recv().await {
+            shared.push(recovered);
+        }
+        assert_eq!(
+            shared
+                .iter()
+                .map(|recovered| recovered.epoch.epoch_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // The same epochs that a receiver of its own recovers from the
+        // datagrams, group bytes included.
+        let mut own = MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
+        let mut expected = Vec::new();
+        for datagram in &sent {
+            if let Some(epoch) = own
+                .push_datagram(transport.payload(datagram).unwrap())
+                .unwrap()
+                .completed_epoch
+            {
+                expected.push(epoch);
+            }
+        }
+        assert_eq!(expected.len(), 3);
+        for (recovered, expected) in shared.iter().zip(&expected) {
+            assert_eq!(recovered.peer, peer);
+            assert_eq!(recovered.epoch, *expected);
+        }
+
+        // A sink that is full does not hold the worker back: PCM parts are
+        // published while two of three epochs are refused by the sink.
+        let dropped_before = worker_stats().recovered_epochs_dropped;
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let (sink_tx, mut sink_rx) = mpsc::channel(1);
+        let mut config = test_config_with_formats(
+            60,
+            5,
+            AudioEpochHlsPackaging::Opaque,
+            vec![AudioPayloadKind::Pcm],
+            publisher,
+        )
+        .with_recovered_epoch_sink(sink_tx);
+        config.part = AudioPartSize::Epoch;
+        let (tx, rx) = channel(256);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let worker = tokio::spawn(run_audio_epoch_hls_worker(config, rx, shutdown_rx));
+        for epoch_id in 3..6 {
+            for datagram in soundkit_pcm_epoch(&mut sender, &transport, epoch_id) {
+                tx.send(AudioEpochHlsDatagram {
+                    peer,
+                    bytes: datagram,
+                    received_unix_us: now_unix_us(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("the worker does not wait for a full sink")
+            .unwrap();
+        assert_eq!(captured.opaque_parts.lock().unwrap().len(), 3);
+        assert_eq!(sink_rx.recv().await.unwrap().epoch.epoch_id, 3);
+        assert!(sink_rx.recv().await.is_none());
+        assert!(worker_stats().recovered_epochs_dropped >= dropped_before + 2);
     }
 }

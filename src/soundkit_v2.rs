@@ -184,6 +184,16 @@ impl SoundKitV2EpochNormalizer {
         self.normalize_epoch(epoch).map(Some)
     }
 
+    /// Re-frame an epoch that another FEC receiver already recovered (the
+    /// LL-HLS worker's, with `--aep1-shared-recovery`): the same output as
+    /// [`Self::push_datagram`] gives for its last datagram.
+    pub fn push_recovered_epoch(
+        &mut self,
+        epoch: DecodedMultichannelAudioEpoch,
+    ) -> Result<Vec<Bytes>, String> {
+        self.normalize_epoch(epoch)
+    }
+
     fn normalize_epoch(
         &mut self,
         epoch: DecodedMultichannelAudioEpoch,

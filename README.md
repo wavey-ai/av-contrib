@@ -303,6 +303,15 @@ use a timescale of 1,000 and Opus decode times are taken from milliseconds,
 so 2.5 ms Opus and sub-millisecond PCM are exact only on the default opaque
 path.
 
+The per-part send path is short. `--relay-send-batch` (default `true`)
+hands the RelaySession symbols of a part to the kernel in one `sendmmsg`
+call per lane instead of one awaited send per symbol. `--aep1-shared-recovery`
+(default `true`) decodes each AEP1 datagram once: the LL-HLS worker's FEC
+receiver hands every completed epoch to the SoundKit v2 normaliser of the
+mesh lane, which only re-frames it; with `false` the normaliser decodes its
+own copy of every datagram. With `--relay-exclusive` the canonical envelope
+of the byte-FEC cache lane is no longer built for each part.
+
 The stdin senders are kept for local smoke tests and protocol debugging:
 
 ```sh
