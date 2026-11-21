@@ -57,6 +57,31 @@ pub fn set_default_flush_on_complete(enabled: bool) {
 pub fn default_flush_on_complete() -> bool {
     DEFAULT_FLUSH_ON_COMPLETE.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Shortest audio-only part of new segmenters, in microseconds, when it is
+/// not their `min_part_ms`; `u64::MAX` for unset. The contributor sets it
+/// once at start from `--audio-part` (or `--fmp4-part-ms`), so that the
+/// audio-only parts of a stream that comes in through a video ingest (RTMP,
+/// SRT, RIST, MPEG-TS) are cut to the audio part size that the stamper
+/// declares, not to the video part size.
+static DEFAULT_AUDIO_ONLY_PART_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Set the shortest audio-only part of segmenters made from now on: `0`
+/// closes a part on every audio access unit. `None` leaves it at the
+/// segmenter's `min_part_ms`.
+pub fn set_default_audio_only_part_us(part_us: Option<u64>) {
+    DEFAULT_AUDIO_ONLY_PART_US.store(
+        part_us.unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The shortest audio-only part of a segmenter made now, if set.
+pub fn default_audio_only_part_us() -> Option<u64> {
+    let part_us = DEFAULT_AUDIO_ONLY_PART_US.load(std::sync::atomic::Ordering::Relaxed);
+    (part_us != u64::MAX).then_some(part_us)
+}
 const MAX_PENDING_AUS_WITHOUT_CONFIG: usize = 180;
 const MAX_PES_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MIN_H264_WIDTH: u16 = 160;
@@ -449,9 +474,11 @@ pub struct Fmp4Segmenter {
     retain_local_cache: bool,
     audio_config: Option<AudioTrackConfig>,
     min_part_ticks: u64,
-    /// Shortest part, in microseconds. `0` closes a part on every access
-    /// unit (one frame, one audio packet per part).
-    min_part_us: u64,
+    /// Shortest part of a stream without video, in microseconds: the audio
+    /// part size, which may differ from the video part size
+    /// (`min_part_ticks`) of a video ingest. `0` closes a part on every
+    /// audio access unit.
+    audio_only_min_part_us: u64,
     max_part_ticks_without_key: u64,
     video_buf: Vec<AccessUnit>,
     video_timestamps: Vec<u64>,
@@ -573,7 +600,8 @@ impl Fmp4Segmenter {
             retain_local_cache,
             audio_config: None,
             min_part_ticks: ms_to_ticks(min_part_ms),
-            min_part_us: u64::from(min_part_ms) * 1_000,
+            audio_only_min_part_us: default_audio_only_part_us()
+                .unwrap_or(u64::from(min_part_ms) * 1_000),
             max_part_ticks_without_key: ms_to_ticks(MAX_PART_MS_WITHOUT_KEY),
             video_buf: Vec::new(),
             video_timestamps: Vec::new(),
@@ -613,8 +641,14 @@ impl Fmp4Segmenter {
     /// constructors: 2,500 for 120-sample Opus parts. `0` closes a part on
     /// every access unit. Set it before the first access unit.
     pub fn set_min_part_us(&mut self, min_part_us: u64) {
-        self.min_part_us = min_part_us;
         self.min_part_ticks = us_to_ticks(min_part_us);
+        self.audio_only_min_part_us = min_part_us;
+    }
+
+    /// Set the shortest part of a stream without video only, in
+    /// microseconds: `0` closes a part on every audio access unit.
+    pub fn set_audio_only_min_part_us(&mut self, min_part_us: u64) {
+        self.audio_only_min_part_us = min_part_us;
     }
 
     /// Source times of the next access unit pushed, for the hop journal.
@@ -1018,7 +1052,7 @@ impl Fmp4Segmenter {
                 output_stream_idx = self.output_stream_idx,
                 buffered_audio = self.audio_buf.len(),
                 elapsed_ms = access_unit.pts.saturating_sub(first_pts),
-                target_us = self.min_part_us,
+                target_us = self.audio_only_min_part_us,
                 "flushing audio-only fMP4 part before next access unit"
             );
             self.flush_with_next_dts(0).await;
@@ -1037,7 +1071,7 @@ impl Fmp4Segmenter {
         if !self.seen_video
             && self
                 .audio_buffered_us()
-                .is_some_and(|duration_us| duration_us >= self.min_part_us)
+                .is_some_and(|duration_us| duration_us >= self.audio_only_min_part_us)
         {
             self.flush_with_next_dts(0).await;
         }
@@ -1166,7 +1200,7 @@ impl Fmp4Segmenter {
             .pts
             .saturating_sub(first_pts)
             .saturating_mul(1_000)
-            >= self.min_part_us
+            >= self.audio_only_min_part_us
     }
 
     async fn flush_with_next_dts(&mut self, next_dts: u64) {

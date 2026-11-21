@@ -927,6 +927,14 @@ impl Args {
         self.video_part().min_part_ms()
     }
 
+    /// Shortest audio-only part of a segmenter that counts time (the fMP4
+    /// segmenters of the video ingests): `0`, one access unit per part, for
+    /// one epoch per part. The stamper declares the same size for these
+    /// parts (`stamp_durations().audio_part_us`), so the two agree.
+    fn audio_only_part_us(&self) -> u64 {
+        self.audio_part().min_part_us(NOMINAL_SAMPLE_RATE)
+    }
+
     /// The audio part in microseconds, with one epoch counted as the
     /// sender's default epoch.
     fn nominal_audio_part_us(&self) -> u64 {
@@ -8357,6 +8365,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
+    // Audio-only parts out of the video ingests (RTMP, SRT, RIST, MPEG-TS)
+    // are cut to the audio part, which the stamper declares for them.
+    av_contrib::fmp4_bridge::set_default_audio_only_part_us(Some(args.audio_only_part_us()));
     hop_journal::install(HopJournal::new(
         args.relay_local_id.clone(),
         args.hop_journal_capacity,
@@ -9707,6 +9718,72 @@ mod tests {
         assert_eq!(stamps.last().unwrap().part_target_us, 34_000);
         assert_eq!(stamps[60].part, 0);
         assert_eq!(stamps[60].msn, stamps[0].msn + 1);
+    }
+
+    /// An ADTS AAC frame of 1,024 samples at 48 kHz (21,333 µs), at 90 kHz
+    /// decode time `index * 1,920`.
+    fn aac_frame(index: u64) -> access_unit::AccessUnit {
+        let payload = [index as u8, 0x22, 0x33, 0x44];
+        let mut data = access_unit::aac::create_adts_header(0x66, 2, 48_000, payload.len(), false);
+        data.extend_from_slice(&payload);
+        access_unit::AccessUnit {
+            key: false,
+            pts: index * 1_920,
+            dts: index * 1_920,
+            data: Bytes::from(data),
+            stream_type: access_unit::PSI_STREAM_AAC,
+            id: index,
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_only_parts_of_a_video_ingest_follow_the_audio_part_size() {
+        // The local stack passes --fmp4-part-ms 50. The RTMP/SRT/RIST
+        // segmenters are sized by the video part (one frame), and cut one
+        // AAC frame of 21 ms per audio-only part, while the stamper declared
+        // 50 ms parts: every part was short, and each one started a segment.
+        for flags in [
+            vec!["av-contrib", "--fmp4-part-ms", "50"],
+            vec!["av-contrib", "--audio-part", "epoch"],
+            vec!["av-contrib"],
+        ] {
+            let args = Args::try_parse_from(&flags).unwrap();
+            let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+            let publisher = Arc::new(publisher);
+            let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+            let mut segmenter = Fmp4Segmenter::new_publish_only(
+                9,
+                0,
+                playlists,
+                TimestampInput::Ticks90Khz,
+                args.video_part_ms(),
+                publisher.clone(),
+            );
+            segmenter.set_audio_only_min_part_us(args.audio_only_part_us());
+            // Three seconds of AAC.
+            for index in 0..141 {
+                segmenter.push_access_unit(aac_frame(index)).await;
+            }
+            segmenter.finish().await;
+            let stamps = drained_stamps(&mut receivers);
+            let segments = stamps
+                .iter()
+                .map(|stamp| stamp.msn)
+                .collect::<HashSet<_>>()
+                .len();
+            assert!(
+                segments <= 4,
+                "{flags:?}: {segments} segments of {} parts",
+                stamps.len()
+            );
+            if args.audio_only_part_us() == 0 {
+                assert_eq!(stamps.len(), 141, "{flags:?}: one frame per part");
+                assert!(stamps.iter().all(|stamp| stamp.part_target_us == 21_333));
+            } else {
+                // Three frames (64 ms) per part reach 50 ms.
+                assert_eq!(stamps.len(), 47, "{flags:?}");
+            }
+        }
     }
 
     #[test]
