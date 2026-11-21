@@ -86,6 +86,10 @@ pub struct StreamStamper {
     segment_elapsed_us: u64,
     /// `0` until the first part of a stream of one unit per part.
     part_target_us: u64,
+    /// With one unit per part: the unit duration that the stream settled
+    /// on (its first part, or a longer duration that recurred). A part
+    /// within the 85% band of it widens the target at once.
+    unit_base_us: u64,
     target_duration_us: u64,
     /// The segment that is open began with a part that a reader can start
     /// from.
@@ -116,6 +120,12 @@ const LONGER_SEGMENTS_WINDOW: u32 = 20;
 /// it is still a segment of the target.
 const SEGMENT_SLACK_US: u64 = 499_999;
 
+/// A part of `unit_us` is at least 85% of a target of `target_us`: the
+/// shortest that a part other than the last of a segment may be.
+fn within_part_band(unit_us: u64, target_us: u64) -> bool {
+    u128::from(target_us) * 85 <= u128::from(unit_us) * 100
+}
+
 impl StreamStamper {
     /// `part_us` and `segment_us` are the configured part and segment
     /// durations of the track. A `part_us` of `0` is one unit per part: the
@@ -130,6 +140,7 @@ impl StreamStamper {
             part: 0,
             segment_elapsed_us: 0,
             part_target_us: part_us,
+            unit_base_us: part_us,
             target_duration_us: segment_us,
             segment_starts_clean: true,
             last_part_us: part_us,
@@ -186,11 +197,16 @@ impl StreamStamper {
     /// last part of a segment. With a configured part, a part of more than
     /// twice the configured duration is a fault of the source.
     ///
-    /// With one unit per part the target is the longest unit seen: a frame
-    /// of 34 ms among frames of 33 ms widens it at once, since a part may
-    /// never be longer than the target. A part of more than twice the
-    /// target (a stall, a dropped run of frames) widens it only when it
-    /// recurs, as above, without a bound.
+    /// With one unit per part the target is the longest unit of the
+    /// stream's steady run: a frame of 34 ms among frames of 33 ms widens
+    /// it at once, since a part may never be longer than the target. Only a
+    /// part that keeps the settled unit within 85% of the new target does:
+    /// up to 1/0.85 of the unit (39.2 ms for 33.4 ms frames). A longer part
+    /// (one dropped frame makes a part of two, an RTMP timestamp gap one of
+    /// 1.5) widens the target only when it recurs, as above, without a
+    /// bound. One such part is a single part over the target; widening for
+    /// it would leave every later part of the stream at about 50% of the
+    /// target, which a playlist allows only for the last part of a segment.
     fn part_finished(&mut self, duration_us: u64) {
         if !self.longer_parts.is_empty() {
             self.since_longer_us = self.since_longer_us.saturating_add(duration_us);
@@ -203,12 +219,15 @@ impl StreamStamper {
                 self.longer_parts.clear();
             }
         }
+        if self.one_unit_per_part() && self.part_target_us == 0 {
+            self.part_target_us = duration_us;
+            self.unit_base_us = duration_us;
+            return;
+        }
         if duration_us <= self.part_target_us {
             return;
         }
-        if self.one_unit_per_part()
-            && (self.part_target_us == 0 || duration_us <= self.part_target_us.saturating_mul(2))
-        {
+        if self.one_unit_per_part() && within_part_band(self.unit_base_us, duration_us) {
             self.part_target_us = duration_us;
             return;
         }
@@ -224,6 +243,9 @@ impl StreamStamper {
         if self.longer_parts.len() >= LONGER_PARTS_TO_WIDEN {
             let recurring = self.longer_parts.iter().copied().min().unwrap_or(0);
             self.part_target_us = self.part_target_us.max(recurring);
+            if self.one_unit_per_part() {
+                self.unit_base_us = self.unit_base_us.max(recurring);
+            }
             self.longer_parts.clear();
         }
     }
@@ -574,6 +596,85 @@ mod tests {
         assert_eq!(stalled.part_target_us, 34_000);
         let next = stamper.stamp(33_367, false, 0);
         assert_eq!(next.part_target_us, 34_000);
+    }
+
+    /// Stamp `durations` as one frame per part, a key frame every 60 frames,
+    /// and check the 85% rule on every part but the last of its segment
+    /// and the parts given as `faults`.
+    fn stamp_frames(durations: &[u64], faults: &[usize]) -> Vec<HlsStamp> {
+        let mut stamper = StreamStamper::new(0, 2_000_000);
+        let stamps = durations
+            .iter()
+            .enumerate()
+            .map(|(index, duration_us)| stamper.stamp(*duration_us, index % 60 == 0, 0))
+            .collect::<Vec<_>>();
+        for (index, stamp) in stamps.iter().enumerate() {
+            let last_of_segment = stamps
+                .get(index + 1)
+                .is_none_or(|next| next.msn != stamp.msn);
+            if last_of_segment || faults.contains(&index) {
+                continue;
+            }
+            assert!(
+                durations[index] * 100 >= stamp.part_target_us * 85,
+                "part {index} of {} µs under 85% of {} µs",
+                durations[index],
+                stamp.part_target_us
+            );
+            assert!(durations[index] <= stamp.part_target_us, "part {index}");
+        }
+        stamps
+    }
+
+    #[test]
+    fn one_dropped_frame_does_not_double_the_part_target() {
+        // 30000/1001 frames a second: 3,003 ticks are 33,367 µs. A dropped
+        // frame makes one part of 6,006 ticks, 66,733 µs: at most twice the
+        // target, which widened it for good and left every later part at
+        // 50% of it.
+        let mut durations = vec![33_367_u64; 200];
+        durations[70] = 66_733;
+        let stamps = stamp_frames(&durations, &[70]);
+        assert!(stamps.iter().all(|stamp| stamp.part_target_us == 33_367));
+
+        // A 50 ms gap of a millisecond clock among 33 ms frames: 1.5 times.
+        let mut durations = vec![33_000_u64; 200];
+        durations[90] = 50_000;
+        let stamps = stamp_frames(&durations, &[90]);
+        assert!(stamps.iter().all(|stamp| stamp.part_target_us == 33_000));
+
+        // Within the band (39 ms among 33.4 ms frames) the target widens at
+        // once and the frames stay above 85% of it.
+        let mut durations = vec![33_367_u64; 200];
+        durations[100] = 39_000;
+        let stamps = stamp_frames(&durations, &[]);
+        assert_eq!(stamps[100].part_target_us, 39_000);
+        assert_eq!(stamps[199].part_target_us, 39_000);
+
+        // Steps of jitter do not creep: each is measured against the
+        // stream's settled frame, not the widened target.
+        let mut durations = vec![33_367_u64; 200];
+        durations[100] = 39_000;
+        durations[120] = 45_000;
+        let stamps = stamp_frames(&durations, &[120]);
+        assert_eq!(stamps[199].part_target_us, 39_000);
+    }
+
+    #[test]
+    fn a_longer_frame_that_recurs_widens_the_part_target() {
+        // A stream that really runs at 15 frames a second after a switch:
+        // the third 66.7 ms frame within the window takes the target.
+        let mut stamper = StreamStamper::new(0, 2_000_000);
+        stamper.stamp(33_367, true, 0);
+        let mut last = stamper.stamp(66_733, false, 0);
+        assert_eq!(last.part_target_us, 33_367);
+        last = stamper.stamp(66_733, false, 0);
+        assert_eq!(last.part_target_us, 33_367);
+        last = stamper.stamp(66_733, false, 0);
+        assert_eq!(last.part_target_us, 66_733);
+        // And a frame of 70 ms is jitter of the new unit.
+        last = stamper.stamp(70_000, false, 0);
+        assert_eq!(last.part_target_us, 70_000);
     }
 
     #[test]
