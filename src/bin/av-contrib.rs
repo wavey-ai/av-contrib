@@ -59,7 +59,7 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::Duration;
@@ -2403,11 +2403,35 @@ enum QueuedPublication {
     Fmp4 {
         part: PublishedFmp4Part,
         enqueued_at: Instant,
+        /// Held for its drop, when the worker is done with the part.
+        #[allow(dead_code)]
+        in_flight: InFlight,
     },
     Opaque {
         part: PublishedOpaquePart,
         enqueued_at: Instant,
+        /// Held for its drop, when the worker is done with the part.
+        #[allow(dead_code)]
+        in_flight: InFlight,
     },
+}
+
+/// A part of a stream between its hand-off to a publication worker and the
+/// end of its publication: dropped when the worker has published it (or
+/// when the queue rejects or drops it).
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl QueuedPublication {
@@ -2451,6 +2475,10 @@ struct StreamPublication {
     /// Publication worker of the stream, chosen when its first part arrives.
     /// A stream keeps its worker so that its parts leave in order.
     shard: Option<usize>,
+    /// Pool of `shard`.
+    class: Option<PublicationClass>,
+    /// Parts of the stream handed to `shard` and not yet published.
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl StreamPublication {
@@ -2460,6 +2488,8 @@ impl StreamPublication {
             stamper: None,
             video_started_unix_ms: None,
             shard: None,
+            class: None,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -2565,18 +2595,35 @@ struct BoundedFmp4Publisher {
 }
 
 impl BoundedFmp4Publisher {
+    /// The worker of the stream's next part, of class `class`.
+    ///
+    /// A stream keeps the worker of its first part, so that its parts leave
+    /// in order, with one exception: a muxed stream can publish audio-only
+    /// parts before its first video access unit (a TS demuxer often has
+    /// audio before the first whole video PES), which would put it in the
+    /// audio pool for good. Its first part with video moves it to the video
+    /// pool once every part it handed to the audio worker has been
+    /// published; until then its parts stay where they are, in order.
     fn shard_of(
         &self,
         stream: &mut StreamPublication,
         stream_id: u64,
         class: PublicationClass,
     ) -> usize {
-        *stream.shard.get_or_insert_with(|| {
-            self.shards
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .assign(stream_id, class)
-        })
+        let to_video_pool = stream.class == Some(PublicationClass::Audio)
+            && class == PublicationClass::Video
+            && stream.in_flight.load(Ordering::Acquire) == 0;
+        if let Some(shard) = stream.shard.filter(|_| !to_video_pool) {
+            return shard;
+        }
+        let shard = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .assign(stream_id, class);
+        stream.shard = Some(shard);
+        stream.class = Some(class);
+        shard
     }
 }
 
@@ -2637,6 +2684,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
             part,
             enqueued_at: Instant::now(),
+            in_flight: InFlight::new(&stream.in_flight),
         });
         if result.is_ok() {
             journal_enqueued(
@@ -2692,6 +2740,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let result = self.senders[shard].try_send(QueuedPublication::Opaque {
             part,
             enqueued_at: Instant::now(),
+            in_flight: InFlight::new(&stream.in_flight),
         });
         if result.is_ok() {
             journal_enqueued(
@@ -8813,6 +8862,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(drain_shards(&mut receivers)[&4001], vec![1]);
+    }
+
+    #[tokio::test]
+    async fn muxed_stream_that_starts_audio_only_moves_to_the_video_pool_in_order() {
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        let audio_pool = PublicationShards::new(PUBLICATION_WORKERS, true).audio_pool();
+        let video_pool = PublicationShards::new(PUBLICATION_WORKERS, true).video_pool();
+        let part = |sequence: u64, video_units: usize| {
+            test_fmp4_part(
+                9,
+                sequence,
+                video_units > 0,
+                video_units,
+                1,
+                None,
+                Bytes::from_static(b"muxed"),
+                now_unix_ns(),
+            )
+        };
+        let queued = |receivers: &mut [mpsc::Receiver<QueuedPublication>]| {
+            let mut queued = Vec::new();
+            for (shard, receiver) in receivers.iter_mut().enumerate() {
+                while let Ok(publication) = receiver.try_recv() {
+                    queued.push((shard, publication));
+                }
+            }
+            queued
+        };
+
+        // The demuxer had audio before the first whole video access unit: the
+        // first part is audio only and goes to the audio pool.
+        publisher.publish_fmp4_part(part(0, 0)).await.unwrap();
+        // The first video part arrives while the audio-only part is still
+        // queued: it stays on the same worker, behind it, so they leave in
+        // order.
+        publisher.publish_fmp4_part(part(1, 1)).await.unwrap();
+        let held = queued(&mut receivers);
+        assert_eq!(held.len(), 2);
+        let audio_shard = held[0].0;
+        assert!(audio_pool.contains(&audio_shard));
+        assert!(held.iter().all(|(shard, _)| *shard == audio_shard));
+
+        // Both still in flight (taken, not yet published): no move.
+        publisher.publish_fmp4_part(part(2, 1)).await.unwrap();
+        let next = queued(&mut receivers);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, audio_shard);
+
+        // Once the worker has published them, the next video part moves the
+        // stream to the video pool, and it stays there, audio-only parts too.
+        drop(held);
+        drop(next);
+        publisher.publish_fmp4_part(part(3, 1)).await.unwrap();
+        publisher.publish_fmp4_part(part(4, 0)).await.unwrap();
+        publisher.publish_fmp4_part(part(5, 1)).await.unwrap();
+        let moved = queued(&mut receivers);
+        assert_eq!(moved.len(), 3);
+        let video_shard = moved[0].0;
+        assert!(video_pool.contains(&video_shard), "{video_shard}");
+        assert!(moved.iter().all(|(shard, _)| *shard == video_shard));
+        assert_eq!(
+            moved
+                .iter()
+                .map(|(_, publication)| publication.sequence())
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     /// The process journal, installed for tests that read it.
