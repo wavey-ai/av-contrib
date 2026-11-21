@@ -141,9 +141,13 @@ enum Command {
         pace: SendPace,
         /// Samples (at 48 kHz) of each AEP1 epoch, and so of each part the
         /// contributor makes from it: 240 is 5 ms, 120 is 2.5 ms (Opus's
-        /// shortest frame), 48 is 1 ms.
-        #[arg(long, default_value_t = FRAME_COUNT)]
-        epoch_samples: u32,
+        /// shortest frame), 48 is 1 ms. By default the smallest frame that
+        /// is carried without loss: 120 (2.5 ms) for Opus, 240 (5 ms) for
+        /// lossless, the smallest lossless block that the distribution tier
+        /// carried at full rate without loss on 21 November 2026 (see the
+        /// lossless curve in needletail's client-udp record).
+        #[arg(long)]
+        epoch_samples: Option<u32>,
         /// Opus bit rate in bit/s, for `--payload opus`.
         #[arg(long, default_value_t = 96_000)]
         opus_bitrate: u32,
@@ -1929,6 +1933,10 @@ async fn main() -> Result<()> {
             epoch_samples,
             opus_bitrate,
         } => {
+            let epoch_samples = epoch_samples.unwrap_or(match payload {
+                ProbePayload::Opus => 120,
+                ProbePayload::Flac | ProbePayload::Pcm => FRAME_COUNT,
+            });
             if !(16..=FRAME_COUNT).contains(&epoch_samples) {
                 bail!("--epoch-samples must be between 16 and {FRAME_COUNT}");
             }

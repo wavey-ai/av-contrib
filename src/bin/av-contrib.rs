@@ -79,6 +79,8 @@ use web_service::{
     WebTransportHandler,
 };
 
+/// The default shortest part: every audio epoch and every video frame is a part.
+const SMALLEST_PART_MS: u32 = 1;
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
 const NEEDLETAIL_AEP1_INGEST_PATH: &str = "/v1/ingest/aep1";
 const NEEDLETAIL_AEP1_CONTENT_TYPE: &str = "application/x-needletail-aep1-stream";
@@ -728,16 +730,20 @@ struct Args {
     #[arg(long)]
     rtmp_bind: Option<SocketAddr>,
 
-    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = DEFAULT_MIN_PART_MS)]
+    /// The shortest part, in ms. By default 1: the smallest frames are the
+    /// default (owner, 21 November 2026). An audio epoch then becomes one part
+    /// (2.5 ms for Opus's shortest frame, the source's block for lossless)
+    /// and a video part closes at each frame. A larger value is a setting for
+    /// HTTP readers that need larger parts.
+    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = SMALLEST_PART_MS)]
     fmp4_part_ms: u32,
 
     #[arg(long, env = "AV_LL_HLS_SEGMENT_MS", default_value_t = DEFAULT_SEGMENT_MS)]
     fmp4_segment_ms: u32,
 
     /// Part duration of a stream with video, from SRT, RIST or RTMP. It
-    /// defaults to `--fmp4-part-ms`. An audio stream of a DAW keeps
-    /// `--fmp4-part-ms`, so one contributor carries 5 ms audio parts beside
-    /// video parts of several frames.
+    /// defaults to `--fmp4-part-ms`, so a video part is one frame by default;
+    /// set it for parts of several frames.
     #[arg(long, env = "AV_LL_HLS_VIDEO_PART_MS")]
     fmp4_video_part_ms: Option<u32>,
 
