@@ -752,6 +752,17 @@ struct Args {
     #[arg(long, default_value_t = 800)]
     playlist_buffer_kb: usize,
 
+    /// Give each new stream the next publication worker of its pool, audio
+    /// and video in separate pools, instead of `stream_id % 8`. With `false`
+    /// the DAW streams 2001, 3001 and 4001 and video stream 1 share a worker.
+    #[arg(
+        long,
+        env = "AV_PUBLICATION_SHARD_MIX",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    publication_shard_mix: bool,
+
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     #[command(flatten)]
     quadra: QuadraCliArgs,
@@ -2369,6 +2380,93 @@ struct StreamPublication {
     stamper: Option<StreamStamper>,
     /// Wall clock that numbers the first segment of a video stream.
     video_started_unix_ms: Option<u64>,
+    /// Publication worker of the stream, chosen when its first part arrives.
+    /// A stream keeps its worker so that its parts leave in order.
+    shard: Option<usize>,
+}
+
+impl StreamPublication {
+    fn new() -> Self {
+        Self {
+            next_sequence: 0,
+            stamper: None,
+            video_started_unix_ms: None,
+            shard: None,
+        }
+    }
+}
+
+/// Kind of a stream for the choice of its publication worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationClass {
+    Audio,
+    Video,
+}
+
+/// Chooses the publication worker of each stream.
+///
+/// Without mixing a stream goes to `stream_id % workers`. The DAW streams
+/// 2001, 3001 and 4001 and the video stream 1 then all land on worker 1, and a
+/// 5 ms audio part waits behind the encode and the sends of a 200 ms video
+/// part. With mixing, the workers form two pools, one for audio and one for
+/// video, and each new stream takes the next worker of its pool in turn, so
+/// the first streams of a pool never share a worker.
+#[derive(Debug)]
+struct PublicationShards {
+    workers: usize,
+    mix: bool,
+    next_audio: usize,
+    next_video: usize,
+}
+
+impl PublicationShards {
+    fn new(workers: usize, mix: bool) -> Self {
+        assert!(workers > 0);
+        Self {
+            workers,
+            mix,
+            next_audio: 0,
+            next_video: 0,
+        }
+    }
+
+    /// Workers of the audio pool: the first half, rounded up.
+    fn audio_pool(&self) -> std::ops::Range<usize> {
+        0..self.workers.div_ceil(2)
+    }
+
+    /// Workers of the video pool: the second half. With a single worker the
+    /// pools are the same.
+    fn video_pool(&self) -> std::ops::Range<usize> {
+        let audio = self.audio_pool();
+        if audio.end >= self.workers {
+            audio
+        } else {
+            audio.end..self.workers
+        }
+    }
+
+    fn assign(&mut self, stream_id: u64, class: PublicationClass) -> usize {
+        if !self.mix {
+            return (stream_id % self.workers as u64) as usize;
+        }
+        let (pool, next) = match class {
+            PublicationClass::Audio => (self.audio_pool(), &mut self.next_audio),
+            PublicationClass::Video => (self.video_pool(), &mut self.next_video),
+        };
+        let shard = pool.start + *next % pool.len();
+        *next = next.wrapping_add(1);
+        shard
+    }
+}
+
+/// Class of an fMP4 part's stream: a part with a video track is video.
+fn fmp4_publication_class(part: &PublishedFmp4Part) -> PublicationClass {
+    if part.video_units > 0 || part.video_codec.is_some() {
+        PublicationClass::Video
+    } else {
+        PublicationClass::Audio
+    }
 }
 
 /// Video streams that start within this time of each other number their
@@ -2394,7 +2492,24 @@ struct BoundedFmp4Publisher {
     senders: Vec<mpsc::Sender<QueuedPublication>>,
     telemetry: Arc<IngestTelemetry>,
     streams: Mutex<HashMap<u64, StreamPublication>>,
+    shards: std::sync::Mutex<PublicationShards>,
     durations: StampDurations,
+}
+
+impl BoundedFmp4Publisher {
+    fn shard_of(
+        &self,
+        stream: &mut StreamPublication,
+        stream_id: u64,
+        class: PublicationClass,
+    ) -> usize {
+        *stream.shard.get_or_insert_with(|| {
+            self.shards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .assign(stream_id, class)
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -2421,11 +2536,9 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         } else {
             published_unix_ms
         };
-        let stream = streams.entry(stream_id).or_insert(StreamPublication {
-            next_sequence: 0,
-            stamper: None,
-            video_started_unix_ms: None,
-        });
+        let stream = streams
+            .entry(stream_id)
+            .or_insert_with(StreamPublication::new);
         part.sequence = stream.next_sequence;
         let sequence = part.sequence;
         // A stream with video cuts its segments at key frames. An audio
@@ -2448,7 +2561,8 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             part.keyframe || !has_video,
             started_unix_ms,
         ));
-        let shard = stream_id as usize % self.senders.len();
+        let class = fmp4_publication_class(&part);
+        let shard = self.shard_of(stream, stream_id, class);
         let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
             part,
             enqueued_at: Instant::now(),
@@ -2478,11 +2592,9 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
         let mut streams = self.streams.lock().await;
-        let stream = streams.entry(stream_id).or_insert(StreamPublication {
-            next_sequence: 0,
-            stamper: None,
-            video_started_unix_ms: None,
-        });
+        let stream = streams
+            .entry(stream_id)
+            .or_insert_with(StreamPublication::new);
         part.sequence = stream.next_sequence;
         let sequence = part.sequence;
         let durations = self.durations;
@@ -2495,7 +2607,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             true,
             u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
         ));
-        let shard = stream_id as usize % self.senders.len();
+        let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
         let result = self.senders[shard].try_send(QueuedPublication::Opaque {
             part,
             enqueued_at: Instant::now(),
@@ -2556,6 +2668,7 @@ fn start_bounded_publication_pipeline(
     inner: Arc<dyn Fmp4PartPublisher>,
     telemetry: Arc<IngestTelemetry>,
     durations: StampDurations,
+    shard_mix: bool,
     shutdown_rx: watch::Receiver<()>,
 ) -> (Arc<dyn Fmp4PartPublisher>, Vec<tokio::task::JoinHandle<()>>) {
     assert!(PUBLICATION_WORKERS > 0);
@@ -2583,6 +2696,7 @@ fn start_bounded_publication_pipeline(
             senders,
             telemetry,
             streams: Mutex::new(HashMap::new()),
+            shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, shard_mix)),
             durations,
         }),
         tasks,
@@ -7411,6 +7525,7 @@ async fn main() -> Result<()> {
         mesh_publisher,
         telemetry.clone(),
         args.stamp_durations(),
+        args.publication_shard_mix,
         publication_shutdown_rx,
     );
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
@@ -8381,6 +8496,154 @@ mod tests {
         }
     }
 
+    fn test_opaque_part(stream_id: u64) -> PublishedOpaquePart {
+        PublishedOpaquePart {
+            stream_id,
+            stream_idx: 0,
+            source_epoch: None,
+            sequence: 0,
+            duration_ms: 5,
+            packaged_at_unix_ns: now_unix_ns(),
+            published_at_unix_ns: now_unix_ns(),
+            bytes: Bytes::from_static(b"pcm"),
+            audio_units: 1,
+            hls: None,
+        }
+    }
+
+    /// A publisher whose shard queues the test reads directly.
+    fn test_sharded_publisher(
+        mix: bool,
+    ) -> (BoundedFmp4Publisher, Vec<mpsc::Receiver<QueuedPublication>>) {
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..PUBLICATION_WORKERS {
+            let (sender, receiver) = mpsc::channel(16);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+        (
+            BoundedFmp4Publisher {
+                senders,
+                telemetry: Arc::new(IngestTelemetry::default()),
+                streams: Mutex::new(HashMap::new()),
+                shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, mix)),
+                durations: StampDurations {
+                    video_part_ms: 200,
+                    video_segment_ms: 2_000,
+                    audio_part_ms: 5,
+                    audio_segment_ms: 1_000,
+                },
+            },
+            receivers,
+        )
+    }
+
+    fn drain_shards(
+        receivers: &mut [mpsc::Receiver<QueuedPublication>],
+    ) -> HashMap<u64, Vec<usize>> {
+        let mut shards = HashMap::<u64, Vec<usize>>::new();
+        for (shard, receiver) in receivers.iter_mut().enumerate() {
+            while let Ok(publication) = receiver.try_recv() {
+                shards
+                    .entry(publication.stream_id())
+                    .or_default()
+                    .push(shard);
+            }
+        }
+        shards
+    }
+
+    #[test]
+    fn publication_shards_separate_audio_from_video_and_spread_new_streams() {
+        let mut shards = PublicationShards::new(PUBLICATION_WORKERS, true);
+        let video = shards.assign(1, PublicationClass::Video);
+        let flac = shards.assign(2001, PublicationClass::Audio);
+        let opus = shards.assign(3001, PublicationClass::Audio);
+        let pcm = shards.assign(4001, PublicationClass::Audio);
+        let all = [video, flac, opus, pcm];
+        for (index, shard) in all.iter().enumerate() {
+            assert!(*shard < PUBLICATION_WORKERS);
+            assert!(!all[index + 1..].contains(shard), "{all:?} share a worker");
+        }
+        // However many streams arrive, audio and video never share a worker.
+        let audio_pool = shards.audio_pool();
+        let video_pool = shards.video_pool();
+        for stream_id in 0..64 {
+            assert!(audio_pool.contains(&shards.assign(stream_id, PublicationClass::Audio)));
+            assert!(video_pool.contains(&shards.assign(stream_id, PublicationClass::Video)));
+        }
+        assert!(audio_pool.end <= video_pool.start);
+
+        // The old rule puts all four on worker 1.
+        let mut modulo = PublicationShards::new(PUBLICATION_WORKERS, false);
+        for stream_id in [1, 2001, 3001, 4001] {
+            assert_eq!(modulo.assign(stream_id, PublicationClass::Audio), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_publication_routes_each_stream_to_one_worker_of_its_pool() {
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        for round in 0..3_u64 {
+            publisher
+                .publish_fmp4_part(test_fmp4_part(
+                    1,
+                    round,
+                    round == 0,
+                    1,
+                    1,
+                    None,
+                    Bytes::from_static(b"video"),
+                    now_unix_ns(),
+                ))
+                .await
+                .unwrap();
+            for stream_id in [2001, 3001, 4001] {
+                publisher
+                    .publish_opaque_part(test_opaque_part(stream_id))
+                    .await
+                    .unwrap();
+            }
+            // An fMP4 audio-only stream (for example AAC) is audio as well.
+            publisher
+                .publish_fmp4_part(test_fmp4_part(
+                    5001,
+                    round,
+                    true,
+                    0,
+                    1,
+                    None,
+                    Bytes::from_static(b"aac"),
+                    now_unix_ns(),
+                ))
+                .await
+                .unwrap();
+        }
+        let routed = drain_shards(&mut receivers);
+        let mut per_stream = HashMap::new();
+        for (stream_id, shards) in &routed {
+            assert_eq!(shards.len(), 3);
+            assert!(
+                shards.iter().all(|shard| *shard == shards[0]),
+                "stream {stream_id} moved between workers: {shards:?}"
+            );
+            per_stream.insert(*stream_id, shards[0]);
+        }
+        let video = per_stream[&1];
+        let audio = [2001, 3001, 4001].map(|stream_id| per_stream[&stream_id]);
+        assert!(!audio.contains(&video));
+        assert!(per_stream[&5001] != video);
+        assert!(audio[0] != audio[1] && audio[1] != audio[2] && audio[0] != audio[2]);
+
+        let (publisher, mut receivers) = test_sharded_publisher(false);
+        publisher
+            .publish_opaque_part(test_opaque_part(4001))
+            .await
+            .unwrap();
+        assert_eq!(drain_shards(&mut receivers)[&4001], vec![1]);
+    }
+
     struct BlockingPublicationSink {
         blocked: std::sync::atomic::AtomicBool,
         started: tokio::sync::Notify,
@@ -8420,6 +8683,7 @@ mod tests {
                 audio_part_ms: 5,
                 audio_segment_ms: 1_000,
             },
+            true,
             shutdown_rx,
         );
         let first = test_fmp4_part(
@@ -9670,6 +9934,7 @@ mod tests {
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
         }
     }
 
@@ -9746,6 +10011,7 @@ mod tests {
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
         };
 
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -10327,6 +10593,7 @@ mod tests {
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
@@ -10543,6 +10810,7 @@ mod tests {
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
@@ -10659,6 +10927,7 @@ mod tests {
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
