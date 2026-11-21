@@ -848,6 +848,46 @@ struct Args {
     )]
     aep1_shared_recovery: bool,
 
+    /// Also send each part straight to a distributor of the contributor's
+    /// own region, beside the two backbone lanes (repeatable). The
+    /// distributor must register --relay-direct-bind as a parent of its own;
+    /// it keeps the first copy of an object from any parent. Every direct
+    /// lane shares one socket, so a part's symbols reach all of them in one
+    /// `sendmmsg` call. A direct lane never fails a part: its errors are
+    /// counted only.
+    #[arg(
+        long = "relay-direct-target",
+        env = "AV_RELAY_DIRECT_TARGETS",
+        value_delimiter = ','
+    )]
+    relay_direct_targets: Vec<SocketAddr>,
+
+    /// Source endpoint of every direct lane: the address that each direct
+    /// distributor registers for this contributor. Defaults to an ephemeral
+    /// port, which a distributor cannot register.
+    #[arg(long, env = "AV_RELAY_DIRECT_BIND")]
+    relay_direct_bind: Option<SocketAddr>,
+
+    /// Node id of each direct distributor, in the order of the targets
+    /// (repeatable; default needletail-distributor-<n>).
+    #[arg(
+        long = "relay-direct-id",
+        env = "AV_RELAY_DIRECT_IDS",
+        value_delimiter = ','
+    )]
+    relay_direct_ids: Vec<String>,
+
+    /// Send the repair symbols on the direct lanes too, not only the source
+    /// symbols. The backbone secondary carries them to the distributor
+    /// either way.
+    #[arg(
+        long,
+        env = "AV_RELAY_DIRECT_REPAIR",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    relay_direct_repair: bool,
+
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     #[command(flatten)]
     quadra: QuadraCliArgs,
@@ -1152,6 +1192,69 @@ impl RelayLane {
     }
 }
 
+/// The direct lanes to the distributors of the contributor's region: one
+/// unconnected socket bound to `--relay-direct-bind`, one target each.
+struct RelayDirectLanes {
+    socket: UdpSocket,
+    targets: Vec<SocketAddr>,
+    limits: RelayLimits,
+    repair: bool,
+}
+
+impl RelayDirectLanes {
+    async fn bind(args: &Args, limits: RelayLimits, local_id: &str) -> Result<Option<Self>> {
+        let Some(first) = args.relay_direct_targets.first().copied() else {
+            if args.relay_direct_bind.is_some() || !args.relay_direct_ids.is_empty() {
+                bail!("--relay-direct-bind and --relay-direct-id require --relay-direct-target");
+            }
+            return Ok(None);
+        };
+        if !args.relay_direct_ids.is_empty()
+            && args.relay_direct_ids.len() != args.relay_direct_targets.len()
+        {
+            bail!(
+                "--relay-direct-id must be given once for each --relay-direct-target ({} ids, {} targets)",
+                args.relay_direct_ids.len(),
+                args.relay_direct_targets.len()
+            );
+        }
+        let bind = relay_bind_addr("--relay-direct-bind", args.relay_direct_bind, first)?;
+        for (index, target) in args.relay_direct_targets.iter().enumerate() {
+            if args.relay_direct_targets[..index].contains(target) {
+                bail!("--relay-direct-target {target} is given twice");
+            }
+            if target.is_ipv4() != bind.is_ipv4() {
+                bail!("--relay-direct-target {target} and --relay-direct-bind must use the same address family");
+            }
+            // The carrier identities are validated as the backbone lanes'.
+            PrivateUdpConfig::new(bind, *target, local_id, direct_lane_id(args, index), limits)
+                .with_context(|| format!("invalid direct RelaySession lane to {target}"))?;
+        }
+        let socket = UdpSocket::bind(bind)
+            .await
+            .with_context(|| format!("failed to bind direct RelaySession UDP carrier on {bind}"))?;
+        Ok(Some(Self {
+            socket,
+            targets: args.relay_direct_targets.clone(),
+            limits,
+            repair: args.relay_direct_repair,
+        }))
+    }
+
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+/// Node id of direct lane `index`.
+fn direct_lane_id(args: &Args, index: usize) -> String {
+    args.relay_direct_ids
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| format!("needletail-distributor-{}", index + 1))
+}
+
 struct RelaySessionPublisher {
     /// One RaptorQ encoder, or with `--publication-shard-mix` one for audio
     /// parts and one for video parts, so that an audio part never waits for
@@ -1162,6 +1265,9 @@ struct RelaySessionPublisher {
     primary: RelayLane,
     secondary: Option<RelayLane>,
     secondary_seed_source: bool,
+    /// `--relay-direct-target`: the distributors of the contributor's own
+    /// region, fed beside the backbone.
+    direct: Option<RelayDirectLanes>,
     /// `--relay-send-batch`: the symbols of a part leave each lane in one
     /// `sendmmsg` call.
     send_batch: bool,
@@ -1176,8 +1282,10 @@ impl RelaySessionPublisher {
             if args.relay_primary_bind.is_some()
                 || args.relay_secondary_target.is_some()
                 || args.relay_secondary_bind.is_some()
+                || !args.relay_direct_targets.is_empty()
+                || args.relay_direct_bind.is_some()
             {
-                bail!("relay bind and secondary settings require --relay-primary-target");
+                bail!("relay bind, secondary and direct settings require --relay-primary-target");
             }
             if relay_path_metrics_configured(args) {
                 bail!("relay path observations require --relay-primary-target");
@@ -1218,6 +1326,12 @@ impl RelaySessionPublisher {
         }
         if let Some(bind) = args.relay_secondary_bind {
             endpoints.push(("secondary bind", bind));
+        }
+        for target in &args.relay_direct_targets {
+            endpoints.push(("direct target", *target));
+        }
+        if let Some(bind) = args.relay_direct_bind {
+            endpoints.push(("direct bind", bind));
         }
         for left in 0..endpoints.len() {
             for right in (left + 1)..endpoints.len() {
@@ -1263,6 +1377,7 @@ impl RelaySessionPublisher {
         } else {
             None
         };
+        let direct = RelayDirectLanes::bind(args, limits, &args.relay_local_id).await?;
 
         let mut policy = AdaptiveFecPolicy::default();
         if args.relay_min_repair_symbols > policy.max_repair_symbols {
@@ -1291,6 +1406,7 @@ impl RelaySessionPublisher {
             primary,
             secondary,
             secondary_seed_source: args.relay_secondary_seed_source,
+            direct,
             send_batch: args.relay_send_batch,
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
             subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
@@ -1457,8 +1573,17 @@ impl RelaySessionPublisher {
             }
             Ok::<(), anyhow::Error>(())
         };
+        let direct_lane = async {
+            if let Some(direct) = self.direct.as_ref() {
+                self.send_direct(direct, &source_symbols, &repair_symbols, &journal_hop)
+                    .await;
+            }
+        };
         let secondary_configured = self.secondary.is_some();
-        let (primary_result, secondary_result) = tokio::join!(primary_lane, secondary_lane);
+        // In this order: the backbone primary, the region's distributors,
+        // then the warm secondary.
+        let (primary_result, (), secondary_result) =
+            tokio::join!(primary_lane, direct_lane, secondary_lane);
         self.telemetry
             .record_relay_session_lane_object(RelayCarrierPath::Primary, primary_result.is_ok());
         if secondary_configured {
@@ -1517,6 +1642,78 @@ impl RelaySessionPublisher {
             source_symbols: source_count,
             repair_symbols: repair_count,
         })
+    }
+
+    /// Send a part's symbols to every direct distributor: each symbol to
+    /// each target in turn, so every distributor has the first source
+    /// symbol before any has the last. A failure is counted, journalled as
+    /// no `sent_direct`, and never fails the part: the backbone carries it.
+    async fn send_direct(
+        &self,
+        direct: &RelayDirectLanes,
+        source_symbols: &[relay_session::RelayDatagram],
+        repair_symbols: &[relay_session::RelayDatagram],
+        journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
+    ) {
+        let symbols = if direct.repair {
+            source_symbols.len() + repair_symbols.len()
+        } else {
+            source_symbols.len()
+        };
+        let mut wires = Vec::with_capacity(symbols);
+        for symbol in source_symbols
+            .iter()
+            .chain(repair_symbols.iter().filter(|_| direct.repair))
+        {
+            match encode_relay_datagram(symbol, direct.limits) {
+                Ok(wire) => wires.push(wire),
+                Err(error) => {
+                    self.telemetry
+                        .relay_direct_lane_objects_failed
+                        .fetch_add(direct.targets.len() as u64, Ordering::Relaxed);
+                    debug!(error = %error, "failed to encode a direct RelaySession datagram");
+                    return;
+                }
+            }
+        }
+        let mut messages = Vec::with_capacity(wires.len() * direct.targets.len());
+        for wire in &wires {
+            for target in &direct.targets {
+                messages.push(udp_batch::Outbound::to(*target, wire));
+            }
+        }
+        let started = Instant::now();
+        let result = udp_batch::send_all(&direct.socket, &messages, self.send_batch).await;
+        self.telemetry
+            .relay_direct_send_duration
+            .record(started.elapsed());
+        match result {
+            Ok(_) => {
+                for target in &direct.targets {
+                    journal_hop(HopStage::SentDirect, Some(*target));
+                }
+                let bytes = wires.iter().map(Vec::len).sum::<usize>() * direct.targets.len();
+                self.telemetry
+                    .relay_direct_datagrams
+                    .fetch_add(messages.len() as u64, Ordering::Relaxed);
+                self.telemetry
+                    .relay_direct_datagram_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                self.telemetry
+                    .relay_direct_lane_objects_succeeded
+                    .fetch_add(direct.targets.len() as u64, Ordering::Relaxed);
+            }
+            Err(error) => {
+                let failed = self
+                    .telemetry
+                    .relay_direct_lane_objects_failed
+                    .fetch_add(direct.targets.len() as u64, Ordering::Relaxed)
+                    + 1;
+                if failed <= 16 || failed.is_power_of_two() {
+                    warn!(error = %error, failed, "direct RelaySession lanes failed; the backbone carries the part");
+                }
+            }
+        }
     }
 
     /// Send the symbols of `groups`, in order, in as few `sendmmsg` calls as
@@ -4099,6 +4296,11 @@ struct IngestTelemetry {
     relay_secondary_lane_last_failure_unix_ms: AtomicU64,
     relay_surviving_lane_objects: AtomicU64,
     relay_all_lanes_failed_objects: AtomicU64,
+    relay_direct_lane_objects_succeeded: AtomicU64,
+    relay_direct_lane_objects_failed: AtomicU64,
+    relay_direct_datagrams: AtomicU64,
+    relay_direct_datagram_bytes: AtomicU64,
+    relay_direct_send_duration: AtomicDurationHistogram,
     relay_expired_objects: AtomicU64,
     relay_expired_symbols: AtomicU64,
     relay_deadline_hits: AtomicU64,
@@ -4933,6 +5135,15 @@ impl IngestTelemetry {
                 all_lanes_failed_objects: self
                     .relay_all_lanes_failed_objects
                     .load(Ordering::Relaxed),
+                direct_lane_objects_succeeded: self
+                    .relay_direct_lane_objects_succeeded
+                    .load(Ordering::Relaxed),
+                direct_lane_objects_failed: self
+                    .relay_direct_lane_objects_failed
+                    .load(Ordering::Relaxed),
+                direct_datagrams: self.relay_direct_datagrams.load(Ordering::Relaxed),
+                direct_datagram_bytes: self.relay_direct_datagram_bytes.load(Ordering::Relaxed),
+                direct_send: self.relay_direct_send_duration.snapshot(),
                 expired_objects: self.relay_expired_objects.load(Ordering::Relaxed),
                 expired_symbols: self.relay_expired_symbols.load(Ordering::Relaxed),
                 deadline_hits: self.relay_deadline_hits.load(Ordering::Relaxed),
@@ -5303,6 +5514,16 @@ impl ContribStatusConfig {
                     .map(|target| target.to_string()),
                 relay_secondary_bind: args.relay_secondary_bind.map(|bind| bind.to_string()),
                 relay_secondary_source_seeded: args.relay_secondary_seed_source,
+                relay_direct_targets: args
+                    .relay_direct_targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                relay_direct_ids: (0..args.relay_direct_targets.len())
+                    .map(|index| direct_lane_id(args, index))
+                    .collect(),
+                relay_direct_bind: args.relay_direct_bind.map(|bind| bind.to_string()),
+                relay_direct_repair: args.relay_direct_repair,
                 relay_send_batch: args.relay_send_batch,
                 aep1_shared_recovery: args.aep1_shared_recovery,
                 relay_exclusive: args.relay_exclusive,
@@ -6335,6 +6556,26 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "Canonical objects for which every complete configured RelaySession lane failed.",
             runtime.relay_session.all_lanes_failed_objects,
         ),
+        (
+            "av_contrib_relay_session_direct_lane_objects_succeeded_total",
+            "Objects handed to the kernel for a direct regional distributor (one per distributor).",
+            runtime.relay_session.direct_lane_objects_succeeded,
+        ),
+        (
+            "av_contrib_relay_session_direct_lane_objects_failed_total",
+            "Objects that a direct regional distributor lane failed to send (one per distributor).",
+            runtime.relay_session.direct_lane_objects_failed,
+        ),
+        (
+            "av_contrib_relay_session_direct_datagrams_total",
+            "RelaySession datagrams sent on the direct regional distributor lanes.",
+            runtime.relay_session.direct_datagrams,
+        ),
+        (
+            "av_contrib_relay_session_direct_datagram_bytes_total",
+            "RelaySession datagram bytes sent on the direct regional distributor lanes.",
+            runtime.relay_session.direct_datagram_bytes,
+        ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
         output.push_str(&format!("{name} {value}\n"));
@@ -6908,6 +7149,12 @@ struct RelaySessionRuntimeSnapshot {
     secondary_lane_state: &'static str,
     surviving_lane_objects: u64,
     all_lanes_failed_objects: u64,
+    /// One count per direct distributor per object.
+    direct_lane_objects_succeeded: u64,
+    direct_lane_objects_failed: u64,
+    direct_datagrams: u64,
+    direct_datagram_bytes: u64,
+    direct_send: DurationHistogramSnapshot,
     expired_objects: u64,
     expired_symbols: u64,
     deadline_hits: u64,
@@ -7190,6 +7437,14 @@ struct MeshTargetStatus {
     relay_secondary_bind: Option<String>,
     relay_secondary_source_seeded: bool,
     relay_exclusive: bool,
+    /// `--relay-direct-target`, with the node ids in the same order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    relay_direct_targets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    relay_direct_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_direct_bind: Option<String>,
+    relay_direct_repair: bool,
     /// `--relay-send-batch`.
     relay_send_batch: bool,
     /// `--aep1-shared-recovery`.
@@ -10295,6 +10550,203 @@ mod tests {
         relay_session_routes_source_and_secondary_repair(false).await;
     }
 
+    fn reserved_loopback_addr() -> SocketAddr {
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        reservation.local_addr().unwrap()
+    }
+
+    async fn receive_relay_datagrams(
+        socket: &UdpSocket,
+        count: usize,
+    ) -> Vec<(relay_session::RelayDatagram, SocketAddr)> {
+        let limits = RelayLimits::default();
+        let mut wire = vec![0u8; limits.max_datagram_bytes];
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (len, from) = timeout(Duration::from_secs(3), socket.recv_from(&mut wire))
+                .await
+                .expect("RelaySession datagram timeout")
+                .expect("RelaySession UDP receive");
+            out.push((
+                relay_session::decode_datagram(&wire[..len], limits).unwrap(),
+                from,
+            ));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn direct_lanes_give_each_regional_distributor_the_primary_source_set() {
+        for (send_batch, direct_repair) in [(true, false), (false, false), (true, true)] {
+            let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let secondary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let distributors = [
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ];
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_receiver.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_target = Some(secondary_receiver.local_addr().unwrap());
+            args.relay_secondary_bind = Some(reserved_loopback_addr());
+            args.relay_direct_targets = distributors
+                .iter()
+                .map(|socket| socket.local_addr().unwrap())
+                .collect();
+            let direct_bind = reserved_loopback_addr();
+            args.relay_direct_bind = Some(direct_bind);
+            args.relay_direct_ids = vec!["lon-dist-a".into(), "lon-dist-b".into()];
+            args.relay_direct_repair = direct_repair;
+            args.relay_send_batch = send_batch;
+            args.relay_deadline_ms = 5_000;
+            args.relay_min_repair_symbols = 2;
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                relay.direct.as_ref().unwrap().local_addr().unwrap(),
+                direct_bind
+            );
+
+            let part = test_opaque_part(4_000_000_090 + u64::from(send_batch));
+            let object =
+                build_opaque_media_object(&part, TEST_SOURCE_EPOCH, args.relay_deadline_ms, 1_000)
+                    .unwrap();
+            let journal = test_hop_journal();
+            let before_us = hop_journal::now_unix_us();
+            let journal_stream =
+                88_000_000_000 + u64::from(send_batch) * 2 + u64::from(direct_repair);
+            let outcome = relay
+                .publish_part_object(&object, Some((journal_stream, 5)), PublicationClass::Audio)
+                .await
+                .unwrap();
+            assert!(outcome.repair_symbols >= 2);
+
+            let primary = receive_relay_datagrams(&primary_receiver, outcome.source_symbols).await;
+            let per_distributor = if direct_repair {
+                outcome.source_symbols + outcome.repair_symbols
+            } else {
+                outcome.source_symbols
+            };
+            for distributor in &distributors {
+                let direct = receive_relay_datagrams(distributor, per_distributor).await;
+                // The same symbols as the primary's, from the one direct
+                // source endpoint that the distributor registers.
+                assert!(direct.iter().all(|(_, from)| *from == direct_bind));
+                for ((symbol, _), (primary, _)) in direct.iter().zip(&primary) {
+                    assert_eq!(symbol, primary);
+                    assert_eq!(
+                        symbol.path_intent,
+                        relay_session::MediaPathIntent::PrimarySource
+                    );
+                }
+                let repairs = direct
+                    .iter()
+                    .filter(|(symbol, _)| symbol.role == MediaDatagramRole::Repair)
+                    .count();
+                assert_eq!(repairs, per_distributor - outcome.source_symbols);
+                // Nothing more arrives: no repair unless asked for.
+                let mut wire = [0_u8; 2048];
+                assert!(
+                    timeout(Duration::from_millis(50), distributor.recv_from(&mut wire))
+                        .await
+                        .is_err()
+                );
+            }
+
+            let direct_events = journal
+                .query(Some(before_us), Some(journal_stream))
+                .into_iter()
+                .filter(|event| event.stage == HopStage::SentDirect)
+                .map(|event| event.peer)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                direct_events,
+                args.relay_direct_targets
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .collect::<Vec<_>>()
+            );
+            let snapshot = telemetry.snapshot();
+            assert_eq!(snapshot.relay_session.direct_lane_objects_succeeded, 2);
+            assert_eq!(snapshot.relay_session.direct_lane_objects_failed, 0);
+            assert_eq!(
+                snapshot.relay_session.direct_datagrams,
+                (per_distributor * 2) as u64
+            );
+            // The canonical lane counters are the backbone's only.
+            assert_eq!(snapshot.relay_session.primary_lane_objects_succeeded, 1);
+            assert_eq!(
+                snapshot.relay_session.source_datagrams,
+                outcome.source_symbols as u64
+            );
+            let status = ContribStatusConfig::from_args(&args, Arc::clone(&telemetry)).snapshot();
+            assert_eq!(status.mesh.relay_direct_ids, ["lon-dist-a", "lon-dist-b"]);
+            assert_eq!(status.mesh.relay_direct_targets.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_lane_settings_are_checked() {
+        let primary = reserved_loopback_addr();
+        let distributor = reserved_loopback_addr();
+        let telemetry = Arc::new(IngestTelemetry::default());
+
+        // Without a primary there is no RelaySession at all.
+        let mut args = contrib_status_args();
+        args.relay_direct_targets = vec![distributor];
+        assert!(RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .is_err());
+
+        // One id for each target.
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary);
+        args.relay_direct_targets = vec![distributor];
+        args.relay_direct_ids = vec!["a".into(), "b".into()];
+        let error = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("once for each"), "{error:#}");
+
+        // A direct target is not a backbone parent.
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary);
+        args.relay_direct_targets = vec![primary];
+        assert!(RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .is_err());
+
+        // A bind or ids without a target.
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary);
+        args.relay_direct_bind = Some(reserved_loopback_addr());
+        assert!(RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .is_err());
+
+        // Repeated --relay-direct-target and the env list both parse.
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--relay-direct-target",
+            "10.77.1.11:22200",
+            "--relay-direct-target",
+            "10.77.1.12:22210",
+            "--relay-direct-id",
+            "lon-dist-a,lon-dist-b",
+        ])
+        .unwrap();
+        assert_eq!(parsed.relay_direct_targets.len(), 2);
+        assert_eq!(parsed.relay_direct_ids, ["lon-dist-a", "lon-dist-b"]);
+        assert!(!parsed.relay_direct_repair);
+        assert!(parsed.relay_send_batch);
+        assert!(parsed.aep1_shared_recovery);
+    }
+
     /// With `--relay-send-batch` and without it, each lane carries the same
     /// symbols in the same order; only the number of send calls differs.
     async fn relay_session_routes_source_and_secondary_repair(send_batch: bool) {
@@ -11137,6 +11589,10 @@ mod tests {
             publication_shard_mix: true,
             relay_send_batch: true,
             aep1_shared_recovery: true,
+            relay_direct_targets: Vec::new(),
+            relay_direct_bind: None,
+            relay_direct_ids: Vec::new(),
+            relay_direct_repair: false,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         }
     }
@@ -11220,6 +11676,10 @@ mod tests {
             publication_shard_mix: true,
             relay_send_batch: true,
             aep1_shared_recovery: true,
+            relay_direct_targets: Vec::new(),
+            relay_direct_bind: None,
+            relay_direct_ids: Vec::new(),
+            relay_direct_repair: false,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
 
@@ -11808,6 +12268,10 @@ mod tests {
             publication_shard_mix: true,
             relay_send_batch: true,
             aep1_shared_recovery: true,
+            relay_direct_targets: Vec::new(),
+            relay_direct_bind: None,
+            relay_direct_ids: Vec::new(),
+            relay_direct_repair: false,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -12031,6 +12495,10 @@ mod tests {
             publication_shard_mix: true,
             relay_send_batch: true,
             aep1_shared_recovery: true,
+            relay_direct_targets: Vec::new(),
+            relay_direct_bind: None,
+            relay_direct_ids: Vec::new(),
+            relay_direct_repair: false,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -12154,6 +12622,10 @@ mod tests {
             publication_shard_mix: true,
             relay_send_batch: true,
             aep1_shared_recovery: true,
+            relay_direct_targets: Vec::new(),
+            relay_direct_bind: None,
+            relay_direct_ids: Vec::new(),
+            relay_direct_repair: false,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());

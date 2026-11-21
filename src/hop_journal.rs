@@ -59,6 +59,9 @@ pub enum HopStage {
     Sent,
     /// The same for the secondary lane.
     SentSecondary,
+    /// The same for a direct lane to a distributor of the contributor's
+    /// region (`peer` is the distributor).
+    SentDirect,
 }
 
 impl HopStage {
@@ -73,6 +76,7 @@ impl HopStage {
             Self::Encoded => "encoded",
             Self::Sent => "sent",
             Self::SentSecondary => "sent_secondary",
+            Self::SentDirect => "sent_direct",
         }
     }
 }

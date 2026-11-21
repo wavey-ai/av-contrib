@@ -312,6 +312,22 @@ mesh lane, which only re-frames it; with `false` the normaliser decodes its
 own copy of every datagram. With `--relay-exclusive` the canonical envelope
 of the byte-FEC cache lane is no longer built for each part.
 
+`--relay-direct-target ADDR` (repeatable, with `--relay-direct-id` per
+target and one `--relay-direct-bind`) also sends each part's source symbols
+straight to the distributors of the contributor's own region, beside the two
+backbone lanes: one hop less for that region. All direct lanes share one
+socket, so a part reaches every direct distributor in one `sendmmsg` call;
+`--relay-direct-repair true` adds the repair symbols. A direct lane never
+fails a part (`sent_direct` is journalled per distributor; failures are
+counted). The symbols are the primary lane's, byte for byte, so a
+distributor that has the contributor registered as a parent keeps whichever
+copy arrives first. av-mesh does not yet register such a parent: a
+distributor rejects RelaySession datagrams from an address that is not one
+of its two backbone parents (`--relay-primary-peer`,
+`--relay-secondary-peer`), at most two parents may join one object, and two
+parents may not share a role. Until av-mesh accepts a third, direct parent,
+leave the direct targets unset.
+
 The stdin senders are kept for local smoke tests and protocol debugging:
 
 ```sh
