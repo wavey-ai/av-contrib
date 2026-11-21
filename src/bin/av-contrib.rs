@@ -9,6 +9,10 @@ use av_contrib::fmp4_bridge::{
     PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge, DEFAULT_MIN_PART_MS,
 };
 use av_contrib::hls_stamp::StreamStamper;
+use av_contrib::hop_journal::{
+    self, HopEvent, HopJournal, HopStage, DEFAULT_HOP_JOURNAL_CAPACITY, HOP_JOURNAL_CONTENT_TYPE,
+    HOP_JOURNAL_PATH,
+};
 use av_contrib::ingress_authorization::{
     decode_envelope_header_bytes, gate_from_bootstrap_path, parse_bearer_header,
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
@@ -55,7 +59,7 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::Duration;
@@ -743,6 +747,17 @@ struct Args {
     #[arg(long, env = "AV_LL_HLS_VIDEO_SEGMENT_MS")]
     fmp4_video_segment_ms: Option<u32>,
 
+    /// Close a video part as soon as the access unit just pushed brings it to
+    /// the part target, instead of when the next access unit arrives. With
+    /// one-frame parts this removes one frame interval from every part.
+    #[arg(
+        long,
+        env = "AV_FMP4_FLUSH_ON_COMPLETE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    fmp4_flush_on_complete: bool,
+
     #[arg(long, env = "AV_LL_HLS_TARGET_DURATION_MS", default_value_t = DEFAULT_TARGET_DURATION_MS)]
     hls_target_duration_ms: u32,
 
@@ -751,6 +766,28 @@ struct Args {
 
     #[arg(long, default_value_t = 800)]
     playlist_buffer_kb: usize,
+
+    /// Events kept in the hop journal served at /api/hops. 0 disables it.
+    #[arg(
+        long,
+        env = "AV_HOP_JOURNAL_CAPACITY",
+        default_value_t = DEFAULT_HOP_JOURNAL_CAPACITY
+    )]
+    hop_journal_capacity: usize,
+
+    /// Give each new stream the next publication worker of its pool, audio
+    /// and video in separate pools, instead of `stream_id % 8`, and give
+    /// audio and video parts their own RaptorQ encoder, so that an audio part
+    /// never waits behind a video part's queue or encode. With `false` the
+    /// DAW streams 2001, 3001 and 4001 and video stream 1 share a worker and
+    /// every part shares one encoder.
+    #[arg(
+        long,
+        env = "AV_PUBLICATION_SHARD_MIX",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    publication_shard_mix: bool,
 
     #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
     #[command(flatten)]
@@ -962,7 +999,12 @@ enum RelayPipelineStage {
 }
 
 struct RelaySessionPublisher {
-    encoder: Mutex<RaptorQObjectEncoder>,
+    /// One RaptorQ encoder, or with `--publication-shard-mix` one for audio
+    /// parts and one for video parts, so that an audio part never waits for
+    /// the encoder while a video part of hundreds of KB is encoded. The
+    /// encoders' block ids and packet sequences are their own; a relay
+    /// decodes each object, keyed by its object key, on its own.
+    encoders: Vec<Mutex<RaptorQObjectEncoder>>,
     primary: PrivateUdpTransport,
     secondary: Option<PrivateUdpTransport>,
     secondary_seed_source: bool,
@@ -1082,8 +1124,13 @@ impl RelaySessionPublisher {
             secondary_path_metrics,
         ));
 
+        let encoders = if args.publication_shard_mix {
+            vec![Mutex::new(encoder.clone()), Mutex::new(encoder)]
+        } else {
+            vec![Mutex::new(encoder)]
+        };
         Ok(Some(Self {
-            encoder: Mutex::new(encoder),
+            encoders,
             primary,
             secondary,
             secondary_seed_source: args.relay_secondary_seed_source,
@@ -1093,15 +1140,51 @@ impl RelaySessionPublisher {
         }))
     }
 
-    async fn publish_object(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
+    async fn publish_object(
+        &self,
+        object: &MediaObject,
+        class: PublicationClass,
+    ) -> Result<RelayPublishOutcome> {
+        self.publish_part_object(object, None, class).await
+    }
+
+    /// The encoder of parts of `class`.
+    fn encoder(&self, class: PublicationClass) -> &Mutex<RaptorQObjectEncoder> {
+        match class {
+            PublicationClass::Audio => &self.encoders[0],
+            PublicationClass::Video => self.encoders.last().unwrap_or(&self.encoders[0]),
+        }
+    }
+
+    /// Publish an object; `part` is the (stream, sequence) of a media part,
+    /// whose encode and sends the hop journal records.
+    async fn publish_part_object(
+        &self,
+        object: &MediaObject,
+        part: Option<(u64, u64)>,
+        class: PublicationClass,
+    ) -> Result<RelayPublishOutcome> {
         let started = Instant::now();
-        let result = self.publish_object_inner(object).await;
+        let result = self.publish_object_inner(object, part, class).await;
         self.telemetry
             .record_relay_session_stage_duration(RelayPipelineStage::Total, started.elapsed());
         result
     }
 
-    async fn publish_object_inner(&self, object: &MediaObject) -> Result<RelayPublishOutcome> {
+    async fn publish_object_inner(
+        &self,
+        object: &MediaObject,
+        part: Option<(u64, u64)>,
+        class: PublicationClass,
+    ) -> Result<RelayPublishOutcome> {
+        let journal = part.and_then(|part| hop_journal::global().map(|journal| (journal, part)));
+        let journal_hop = |stage: HopStage, peer: Option<SocketAddr>| {
+            if let Some((journal, (stream, seq))) = journal {
+                journal.record(
+                    HopEvent::new(stage, stream, seq, hop_journal::now_unix_us()).with_peer(peer),
+                );
+            }
+        };
         let deadline = relay_deadline_for_object(object)?;
         if deadline.is_expired_at(now_unix_us()) {
             self.telemetry
@@ -1113,7 +1196,7 @@ impl RelaySessionPublisher {
             bail!("canonical media object expired before RelaySession encoding");
         }
         let encode_wait_started = Instant::now();
-        let mut encoder = self.encoder.lock().await;
+        let mut encoder = self.encoder(class).lock().await;
         self.telemetry.record_relay_session_stage_duration(
             RelayPipelineStage::EncodeWait,
             encode_wait_started.elapsed(),
@@ -1141,6 +1224,7 @@ impl RelaySessionPublisher {
                 return Err(error).context("failed to RaptorQ-protect canonical media object");
             }
         };
+        journal_hop(HopStage::Encoded, None);
 
         let schedule_started = Instant::now();
         let source_count = source_symbols.len();
@@ -1161,6 +1245,7 @@ impl RelaySessionPublisher {
                 self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
                     .await?;
             }
+            journal_hop(HopStage::Sent, Some(self.primary.peer_addr()));
             if repair_uses_primary {
                 for symbol in repair_symbols.iter().cloned() {
                     self.send_symbol(&self.primary, RelayCarrierPath::Primary, symbol)
@@ -1176,10 +1261,16 @@ impl RelaySessionPublisher {
                         self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
                             .await?;
                     }
+                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
                 }
                 for symbol in repair_symbols.iter().cloned() {
                     self.send_symbol(secondary, RelayCarrierPath::Secondary, symbol)
                         .await?;
+                }
+                // A secondary without the source set decodes from its repair
+                // symbols: they are what it needs.
+                if !self.secondary_seed_source {
+                    journal_hop(HopStage::SentSecondary, Some(secondary.peer_addr()));
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -1834,6 +1925,7 @@ fn handoff_audio_epoch_hls_datagram(
     tx: Option<&mpsc::Sender<AudioEpochHlsDatagram>>,
     peer: SocketAddr,
     datagram: &[u8],
+    received_unix_us: u64,
 ) {
     let Some(tx) = tx else {
         return;
@@ -1857,6 +1949,7 @@ fn handoff_audio_epoch_hls_datagram(
     if let Err(error) = tx.try_send(AudioEpochHlsDatagram {
         peer,
         bytes: Bytes::copy_from_slice(datagram),
+        received_unix_us,
     }) {
         let depth = tx.max_capacity().saturating_sub(tx.capacity()) as u64;
         AUDIO_EPOCH_HLS_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
@@ -2071,6 +2164,7 @@ async fn run_daw_media_udp_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                let received_unix_us = hop_journal::now_unix_us();
                 if len == 0 {
                     continue;
                 }
@@ -2086,7 +2180,12 @@ async fn run_daw_media_udp_ingest(
                 }
 
                 if is_audio_transport_datagram(datagram) {
-                    handoff_audio_epoch_hls_datagram(audio_epoch_hls_tx.as_ref(), peer, datagram);
+                    handoff_audio_epoch_hls_datagram(
+                        audio_epoch_hls_tx.as_ref(),
+                        peer,
+                        datagram,
+                        received_unix_us,
+                    );
                     handoff_audio_epoch_mesh_datagram(audio_epoch_mesh_tx.as_ref(), peer, datagram);
                     continue;
                 }
@@ -2168,6 +2267,7 @@ async fn bind_daw_media_udp_socket(bind: SocketAddr) -> Result<UdpSocket> {
 #[async_trait::async_trait]
 impl Fmp4PartPublisher for MeshForwarder {
     async fn publish_fmp4_part(&self, part: PublishedFmp4Part) -> std::result::Result<(), String> {
+        let class = fmp4_publication_class(&part);
         let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
         self.telemetry
             .media_object_source_epoch
@@ -2199,7 +2299,7 @@ impl Fmp4PartPublisher for MeshForwarder {
                 }
                 if let Some(relay) = &self.relay {
                     let outcome = relay
-                        .publish_object(&object)
+                        .publish_object(&object, class)
                         .await
                         .map_err(|error| error.to_string())?;
                     trace!(
@@ -2273,7 +2373,7 @@ impl Fmp4PartPublisher for MeshForwarder {
 
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_object(&media_object)
+                .publish_part_object(&media_object, Some((part.stream_id, part.sequence)), class)
                 .await
                 .map_err(|error| error.to_string())?;
             trace!(
@@ -2311,7 +2411,11 @@ impl Fmp4PartPublisher for MeshForwarder {
         }
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_object(&object)
+                .publish_part_object(
+                    &object,
+                    Some((part.stream_id, part.sequence)),
+                    PublicationClass::Audio,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             trace!(
@@ -2331,11 +2435,35 @@ enum QueuedPublication {
     Fmp4 {
         part: PublishedFmp4Part,
         enqueued_at: Instant,
+        /// Held for its drop, when the worker is done with the part.
+        #[allow(dead_code)]
+        in_flight: InFlight,
     },
     Opaque {
         part: PublishedOpaquePart,
         enqueued_at: Instant,
+        /// Held for its drop, when the worker is done with the part.
+        #[allow(dead_code)]
+        in_flight: InFlight,
     },
+}
+
+/// A part of a stream between its hand-off to a publication worker and the
+/// end of its publication: dropped when the worker has published it (or
+/// when the queue rejects or drops it).
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl QueuedPublication {
@@ -2343,6 +2471,13 @@ impl QueuedPublication {
         match self {
             Self::Fmp4 { part, .. } => part.stream_id,
             Self::Opaque { part, .. } => part.stream_id,
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Fmp4 { part, .. } => part.sequence,
+            Self::Opaque { part, .. } => part.sequence,
         }
     }
 
@@ -2369,6 +2504,99 @@ struct StreamPublication {
     stamper: Option<StreamStamper>,
     /// Wall clock that numbers the first segment of a video stream.
     video_started_unix_ms: Option<u64>,
+    /// Publication worker of the stream, chosen when its first part arrives.
+    /// A stream keeps its worker so that its parts leave in order.
+    shard: Option<usize>,
+    /// Pool of `shard`.
+    class: Option<PublicationClass>,
+    /// Parts of the stream handed to `shard` and not yet published.
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl StreamPublication {
+    fn new() -> Self {
+        Self {
+            next_sequence: 0,
+            stamper: None,
+            video_started_unix_ms: None,
+            shard: None,
+            class: None,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// Kind of a stream for the choice of its publication worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationClass {
+    Audio,
+    Video,
+}
+
+/// Chooses the publication worker of each stream.
+///
+/// Without mixing a stream goes to `stream_id % workers`. The DAW streams
+/// 2001, 3001 and 4001 and the video stream 1 then all land on worker 1, and a
+/// 5 ms audio part waits behind the encode and the sends of a 200 ms video
+/// part. With mixing, the workers form two pools, one for audio and one for
+/// video, and each new stream takes the next worker of its pool in turn, so
+/// the first streams of a pool never share a worker.
+#[derive(Debug)]
+struct PublicationShards {
+    workers: usize,
+    mix: bool,
+    next_audio: usize,
+    next_video: usize,
+}
+
+impl PublicationShards {
+    fn new(workers: usize, mix: bool) -> Self {
+        assert!(workers > 0);
+        Self {
+            workers,
+            mix,
+            next_audio: 0,
+            next_video: 0,
+        }
+    }
+
+    /// Workers of the audio pool: the first half, rounded up.
+    fn audio_pool(&self) -> std::ops::Range<usize> {
+        0..self.workers.div_ceil(2)
+    }
+
+    /// Workers of the video pool: the second half. With a single worker the
+    /// pools are the same.
+    fn video_pool(&self) -> std::ops::Range<usize> {
+        let audio = self.audio_pool();
+        if audio.end >= self.workers {
+            audio
+        } else {
+            audio.end..self.workers
+        }
+    }
+
+    fn assign(&mut self, stream_id: u64, class: PublicationClass) -> usize {
+        if !self.mix {
+            return (stream_id % self.workers as u64) as usize;
+        }
+        let (pool, next) = match class {
+            PublicationClass::Audio => (self.audio_pool(), &mut self.next_audio),
+            PublicationClass::Video => (self.video_pool(), &mut self.next_video),
+        };
+        let shard = pool.start + *next % pool.len();
+        *next = next.wrapping_add(1);
+        shard
+    }
+}
+
+/// Class of an fMP4 part's stream: a part with a video track is video.
+fn fmp4_publication_class(part: &PublishedFmp4Part) -> PublicationClass {
+    if part.video_units > 0 || part.video_codec.is_some() {
+        PublicationClass::Video
+    } else {
+        PublicationClass::Audio
+    }
 }
 
 /// Video streams that start within this time of each other number their
@@ -2394,7 +2622,41 @@ struct BoundedFmp4Publisher {
     senders: Vec<mpsc::Sender<QueuedPublication>>,
     telemetry: Arc<IngestTelemetry>,
     streams: Mutex<HashMap<u64, StreamPublication>>,
+    shards: std::sync::Mutex<PublicationShards>,
     durations: StampDurations,
+}
+
+impl BoundedFmp4Publisher {
+    /// The worker of the stream's next part, of class `class`.
+    ///
+    /// A stream keeps the worker of its first part, so that its parts leave
+    /// in order, with one exception: a muxed stream can publish audio-only
+    /// parts before its first video access unit (a TS demuxer often has
+    /// audio before the first whole video PES), which would put it in the
+    /// audio pool for good. Its first part with video moves it to the video
+    /// pool once every part it handed to the audio worker has been
+    /// published; until then its parts stay where they are, in order.
+    fn shard_of(
+        &self,
+        stream: &mut StreamPublication,
+        stream_id: u64,
+        class: PublicationClass,
+    ) -> usize {
+        let to_video_pool = stream.class == Some(PublicationClass::Audio)
+            && class == PublicationClass::Video
+            && stream.in_flight.load(Ordering::Acquire) == 0;
+        if let Some(shard) = stream.shard.filter(|_| !to_video_pool) {
+            return shard;
+        }
+        let shard = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .assign(stream_id, class);
+        stream.shard = Some(shard);
+        stream.class = Some(class);
+        shard
+    }
 }
 
 #[async_trait::async_trait]
@@ -2421,11 +2683,9 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         } else {
             published_unix_ms
         };
-        let stream = streams.entry(stream_id).or_insert(StreamPublication {
-            next_sequence: 0,
-            stamper: None,
-            video_started_unix_ms: None,
-        });
+        let stream = streams
+            .entry(stream_id)
+            .or_insert_with(StreamPublication::new);
         part.sequence = stream.next_sequence;
         let sequence = part.sequence;
         // A stream with video cuts its segments at key frames. An audio
@@ -2448,12 +2708,24 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             part.keyframe || !has_video,
             started_unix_ms,
         ));
-        let shard = stream_id as usize % self.senders.len();
+        let class = fmp4_publication_class(&part);
+        let shard = self.shard_of(stream, stream_id, class);
+        let source_times = part.source_times;
+        let packaged_at_unix_ns = part.packaged_at_unix_ns;
+        let enqueued_us = hop_journal::now_unix_us();
         let result = self.senders[shard].try_send(QueuedPublication::Fmp4 {
             part,
             enqueued_at: Instant::now(),
+            in_flight: InFlight::new(&stream.in_flight),
         });
         if result.is_ok() {
+            journal_enqueued(
+                stream_id,
+                sequence,
+                &source_times,
+                packaged_at_unix_ns,
+                enqueued_us,
+            );
             stream.next_sequence = stream.next_sequence.saturating_add(1);
         } else {
             // The part was not published: it has no place in the playlist.
@@ -2478,11 +2750,9 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
         let mut streams = self.streams.lock().await;
-        let stream = streams.entry(stream_id).or_insert(StreamPublication {
-            next_sequence: 0,
-            stamper: None,
-            video_started_unix_ms: None,
-        });
+        let stream = streams
+            .entry(stream_id)
+            .or_insert_with(StreamPublication::new);
         part.sequence = stream.next_sequence;
         let sequence = part.sequence;
         let durations = self.durations;
@@ -2495,12 +2765,23 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             true,
             u64::try_from(part.published_at_unix_ns / 1_000_000).unwrap_or(0),
         ));
-        let shard = stream_id as usize % self.senders.len();
+        let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
+        let source_times = part.source_times;
+        let packaged_at_unix_ns = part.packaged_at_unix_ns;
+        let enqueued_us = hop_journal::now_unix_us();
         let result = self.senders[shard].try_send(QueuedPublication::Opaque {
             part,
             enqueued_at: Instant::now(),
+            in_flight: InFlight::new(&stream.in_flight),
         });
         if result.is_ok() {
+            journal_enqueued(
+                stream_id,
+                sequence,
+                &source_times,
+                packaged_at_unix_ns,
+                enqueued_us,
+            );
             stream.next_sequence = stream.next_sequence.saturating_add(1);
         } else {
             stream.stamper = before;
@@ -2514,6 +2795,33 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             &self.telemetry,
         )
     }
+}
+
+/// Journal a part handed to its publication worker, with the source and
+/// packaging times it carried there.
+fn journal_enqueued(
+    stream: u64,
+    seq: u64,
+    source_times: &hop_journal::PartSourceTimes,
+    packaged_at_unix_ns: i64,
+    enqueued_us: u64,
+) {
+    let Some(journal) = hop_journal::global() else {
+        return;
+    };
+    for event in source_times.events(stream, seq) {
+        journal.record(event);
+    }
+    journal.record(
+        HopEvent::new(
+            HopStage::Packaged,
+            stream,
+            seq,
+            hop_journal::unix_ns_to_us(packaged_at_unix_ns),
+        )
+        .with_epoch(source_times.last_epoch),
+    );
+    journal.record(HopEvent::new(HopStage::Enqueued, stream, seq, enqueued_us));
 }
 
 fn enqueue_publication_result(
@@ -2556,6 +2864,7 @@ fn start_bounded_publication_pipeline(
     inner: Arc<dyn Fmp4PartPublisher>,
     telemetry: Arc<IngestTelemetry>,
     durations: StampDurations,
+    shard_mix: bool,
     shutdown_rx: watch::Receiver<()>,
 ) -> (Arc<dyn Fmp4PartPublisher>, Vec<tokio::task::JoinHandle<()>>) {
     assert!(PUBLICATION_WORKERS > 0);
@@ -2583,6 +2892,7 @@ fn start_bounded_publication_pipeline(
             senders,
             telemetry,
             streams: Mutex::new(HashMap::new()),
+            shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, shard_mix)),
             durations,
         }),
         tasks,
@@ -2640,6 +2950,12 @@ async fn process_queued_publication(
             Some(depth.saturating_sub(1))
         })
         .ok();
+    hop_journal::record(HopEvent::new(
+        HopStage::Dequeued,
+        publication.stream_id(),
+        publication.sequence(),
+        hop_journal::now_unix_us(),
+    ));
     publication_queue_age().record(publication.enqueued_at().elapsed());
     let started = Instant::now();
     let stream_id = publication.stream_id();
@@ -6867,6 +7183,41 @@ fn needletail_ingest_query(
     }
 }
 
+/// `GET /api/hops`: the journal as NDJSON, oldest first. It reads the ring
+/// only; it creates no demand and opens no session. The copy, sort and
+/// serialization of up to the whole ring (tens of MB) run on the blocking
+/// pool, not on a runtime worker that the publication tasks share.
+async fn hop_journal_response(
+    journal: Option<&'static HopJournal>,
+    query: Option<&str>,
+) -> HandlerResponse {
+    let Some(journal) = journal else {
+        return response(
+            StatusCode::NOT_FOUND,
+            Some(Bytes::from_static(b"the hop journal is disabled\n")),
+            Some("text/plain; charset=utf-8"),
+        );
+    };
+    let query = query.map(str::to_owned);
+    match tokio::task::spawn_blocking(move || journal.respond(query.as_deref())).await {
+        Ok(Ok(body)) => response(
+            StatusCode::OK,
+            Some(Bytes::from(body)),
+            Some(HOP_JOURNAL_CONTENT_TYPE),
+        ),
+        Ok(Err(error)) => response(
+            StatusCode::BAD_REQUEST,
+            Some(Bytes::from(format!("{error}\n"))),
+            Some("text/plain; charset=utf-8"),
+        ),
+        Err(error) => response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(Bytes::from(format!("hop journal query failed: {error}\n"))),
+            Some("text/plain; charset=utf-8"),
+        ),
+    }
+}
+
 fn needletail_ingest_response(status: StatusCode) -> HandlerResponse {
     let body = serde_json::to_vec(&serde_json::json!({
         "error": "needletail_ingest_rejected",
@@ -6924,6 +7275,9 @@ impl Router for ContribRouter {
                     Some(Bytes::from(json)),
                     Some("application/json"),
                 ))
+            }
+            HOP_JOURNAL_PATH => {
+                Ok(hop_journal_response(hop_journal::global(), req.uri().query()).await)
             }
             CONTRIB_METRICS_PATH => {
                 let mut metrics = self.status.prometheus_metrics().to_vec();
@@ -7056,7 +7410,12 @@ impl Router for ContribRouter {
                     if !is_audio_transport_datagram(datagram) {
                         return Ok(needletail_ingest_response(StatusCode::BAD_REQUEST));
                     }
-                    handoff_audio_epoch_hls_datagram(Some(audio_epoch_hls_tx), peer, datagram);
+                    handoff_audio_epoch_hls_datagram(
+                        Some(audio_epoch_hls_tx),
+                        peer,
+                        datagram,
+                        hop_journal::now_unix_us(),
+                    );
                     handoff_audio_epoch_mesh_datagram(Some(audio_epoch_mesh_tx), peer, datagram);
                     datagrams = datagrams.saturating_add(1);
                     payload_bytes = payload_bytes.saturating_add(length as u64);
@@ -7399,6 +7758,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
+    hop_journal::install(HopJournal::new(
+        args.relay_local_id.clone(),
+        args.hop_journal_capacity,
+    ));
     validate_compiled_ingress_features(&args)?;
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
@@ -7411,6 +7775,7 @@ async fn main() -> Result<()> {
         mesh_publisher,
         telemetry.clone(),
         args.stamp_durations(),
+        args.publication_shard_mix,
         publication_shutdown_rx,
     );
     let (playlists, _chunk_cache, _m3u8_cache) = playlists::Playlists::new(playlist_options(&args));
@@ -8378,7 +8743,343 @@ mod tests {
             audio_codec: (audio_units > 0).then_some("aac"),
             audio_units,
             hls: None,
+            source_times: Default::default(),
         }
+    }
+
+    fn test_opaque_part(stream_id: u64) -> PublishedOpaquePart {
+        PublishedOpaquePart {
+            stream_id,
+            stream_idx: 0,
+            source_epoch: None,
+            sequence: 0,
+            duration_ms: 5,
+            packaged_at_unix_ns: now_unix_ns(),
+            published_at_unix_ns: now_unix_ns(),
+            bytes: Bytes::from_static(b"pcm"),
+            audio_units: 1,
+            hls: None,
+            source_times: Default::default(),
+        }
+    }
+
+    /// A publisher whose shard queues the test reads directly.
+    fn test_sharded_publisher(
+        mix: bool,
+    ) -> (BoundedFmp4Publisher, Vec<mpsc::Receiver<QueuedPublication>>) {
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..PUBLICATION_WORKERS {
+            let (sender, receiver) = mpsc::channel(16);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+        (
+            BoundedFmp4Publisher {
+                senders,
+                telemetry: Arc::new(IngestTelemetry::default()),
+                streams: Mutex::new(HashMap::new()),
+                shards: std::sync::Mutex::new(PublicationShards::new(PUBLICATION_WORKERS, mix)),
+                durations: StampDurations {
+                    video_part_ms: 200,
+                    video_segment_ms: 2_000,
+                    audio_part_ms: 5,
+                    audio_segment_ms: 1_000,
+                },
+            },
+            receivers,
+        )
+    }
+
+    fn drain_shards(
+        receivers: &mut [mpsc::Receiver<QueuedPublication>],
+    ) -> HashMap<u64, Vec<usize>> {
+        let mut shards = HashMap::<u64, Vec<usize>>::new();
+        for (shard, receiver) in receivers.iter_mut().enumerate() {
+            while let Ok(publication) = receiver.try_recv() {
+                shards
+                    .entry(publication.stream_id())
+                    .or_default()
+                    .push(shard);
+            }
+        }
+        shards
+    }
+
+    #[test]
+    fn publication_shards_separate_audio_from_video_and_spread_new_streams() {
+        let mut shards = PublicationShards::new(PUBLICATION_WORKERS, true);
+        let video = shards.assign(1, PublicationClass::Video);
+        let flac = shards.assign(2001, PublicationClass::Audio);
+        let opus = shards.assign(3001, PublicationClass::Audio);
+        let pcm = shards.assign(4001, PublicationClass::Audio);
+        let all = [video, flac, opus, pcm];
+        for (index, shard) in all.iter().enumerate() {
+            assert!(*shard < PUBLICATION_WORKERS);
+            assert!(!all[index + 1..].contains(shard), "{all:?} share a worker");
+        }
+        // However many streams arrive, audio and video never share a worker.
+        let audio_pool = shards.audio_pool();
+        let video_pool = shards.video_pool();
+        for stream_id in 0..64 {
+            assert!(audio_pool.contains(&shards.assign(stream_id, PublicationClass::Audio)));
+            assert!(video_pool.contains(&shards.assign(stream_id, PublicationClass::Video)));
+        }
+        assert!(audio_pool.end <= video_pool.start);
+
+        // The old rule puts all four on worker 1.
+        let mut modulo = PublicationShards::new(PUBLICATION_WORKERS, false);
+        for stream_id in [1, 2001, 3001, 4001] {
+            assert_eq!(modulo.assign(stream_id, PublicationClass::Audio), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_publication_routes_each_stream_to_one_worker_of_its_pool() {
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        for round in 0..3_u64 {
+            publisher
+                .publish_fmp4_part(test_fmp4_part(
+                    1,
+                    round,
+                    round == 0,
+                    1,
+                    1,
+                    None,
+                    Bytes::from_static(b"video"),
+                    now_unix_ns(),
+                ))
+                .await
+                .unwrap();
+            for stream_id in [2001, 3001, 4001] {
+                publisher
+                    .publish_opaque_part(test_opaque_part(stream_id))
+                    .await
+                    .unwrap();
+            }
+            // An fMP4 audio-only stream (for example AAC) is audio as well.
+            publisher
+                .publish_fmp4_part(test_fmp4_part(
+                    5001,
+                    round,
+                    true,
+                    0,
+                    1,
+                    None,
+                    Bytes::from_static(b"aac"),
+                    now_unix_ns(),
+                ))
+                .await
+                .unwrap();
+        }
+        let routed = drain_shards(&mut receivers);
+        let mut per_stream = HashMap::new();
+        for (stream_id, shards) in &routed {
+            assert_eq!(shards.len(), 3);
+            assert!(
+                shards.iter().all(|shard| *shard == shards[0]),
+                "stream {stream_id} moved between workers: {shards:?}"
+            );
+            per_stream.insert(*stream_id, shards[0]);
+        }
+        let video = per_stream[&1];
+        let audio = [2001, 3001, 4001].map(|stream_id| per_stream[&stream_id]);
+        assert!(!audio.contains(&video));
+        assert!(per_stream[&5001] != video);
+        assert!(audio[0] != audio[1] && audio[1] != audio[2] && audio[0] != audio[2]);
+
+        let (publisher, mut receivers) = test_sharded_publisher(false);
+        publisher
+            .publish_opaque_part(test_opaque_part(4001))
+            .await
+            .unwrap();
+        assert_eq!(drain_shards(&mut receivers)[&4001], vec![1]);
+    }
+
+    #[tokio::test]
+    async fn muxed_stream_that_starts_audio_only_moves_to_the_video_pool_in_order() {
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        let audio_pool = PublicationShards::new(PUBLICATION_WORKERS, true).audio_pool();
+        let video_pool = PublicationShards::new(PUBLICATION_WORKERS, true).video_pool();
+        let part = |sequence: u64, video_units: usize| {
+            test_fmp4_part(
+                9,
+                sequence,
+                video_units > 0,
+                video_units,
+                1,
+                None,
+                Bytes::from_static(b"muxed"),
+                now_unix_ns(),
+            )
+        };
+        let queued = |receivers: &mut [mpsc::Receiver<QueuedPublication>]| {
+            let mut queued = Vec::new();
+            for (shard, receiver) in receivers.iter_mut().enumerate() {
+                while let Ok(publication) = receiver.try_recv() {
+                    queued.push((shard, publication));
+                }
+            }
+            queued
+        };
+
+        // The demuxer had audio before the first whole video access unit: the
+        // first part is audio only and goes to the audio pool.
+        publisher.publish_fmp4_part(part(0, 0)).await.unwrap();
+        // The first video part arrives while the audio-only part is still
+        // queued: it stays on the same worker, behind it, so they leave in
+        // order.
+        publisher.publish_fmp4_part(part(1, 1)).await.unwrap();
+        let held = queued(&mut receivers);
+        assert_eq!(held.len(), 2);
+        let audio_shard = held[0].0;
+        assert!(audio_pool.contains(&audio_shard));
+        assert!(held.iter().all(|(shard, _)| *shard == audio_shard));
+
+        // Both still in flight (taken, not yet published): no move.
+        publisher.publish_fmp4_part(part(2, 1)).await.unwrap();
+        let next = queued(&mut receivers);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, audio_shard);
+
+        // Once the worker has published them, the next video part moves the
+        // stream to the video pool, and it stays there, audio-only parts too.
+        drop(held);
+        drop(next);
+        publisher.publish_fmp4_part(part(3, 1)).await.unwrap();
+        publisher.publish_fmp4_part(part(4, 0)).await.unwrap();
+        publisher.publish_fmp4_part(part(5, 1)).await.unwrap();
+        let moved = queued(&mut receivers);
+        assert_eq!(moved.len(), 3);
+        let video_shard = moved[0].0;
+        assert!(video_pool.contains(&video_shard), "{video_shard}");
+        assert!(moved.iter().all(|(shard, _)| *shard == video_shard));
+        assert_eq!(
+            moved
+                .iter()
+                .map(|(_, publication)| publication.sequence())
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+    }
+
+    /// The process journal, installed for tests that read it.
+    fn test_hop_journal() -> &'static HopJournal {
+        hop_journal::install(HopJournal::new("contrib-test", 1 << 16))
+    }
+
+    #[tokio::test]
+    async fn publication_journals_each_part_from_source_to_worker() {
+        let journal = test_hop_journal();
+        // The source and packaging times precede the hand-off.
+        let before_us = hop_journal::now_unix_us() - 100;
+        let (publisher, mut receivers) = test_sharded_publisher(true);
+        // A stream id of this test only: other tests share the process journal.
+        let stream_id = 4_000_000_041;
+        let mut part = test_opaque_part(stream_id);
+        part.packaged_at_unix_ns = i64::try_from((before_us + 70) * 1_000).unwrap();
+        // A part of two AEP1 epochs, 1,234 and 1,235.
+        part.source_times = hop_journal::PartSourceTimes {
+            first_epoch: Some(1_234),
+            last_epoch: Some(1_235),
+            src_first_us: Some(before_us + 10),
+            src_last_us: Some(before_us + 20),
+            recovered_us: Some(before_us + 25),
+        };
+        publisher.publish_opaque_part(part.clone()).await.unwrap();
+        publisher.publish_opaque_part(part).await.unwrap();
+
+        // The worker side: take both parts as a publication worker would.
+        let inner: Arc<dyn Fmp4PartPublisher> = Arc::new(BlockingPublicationSink {
+            blocked: std::sync::atomic::AtomicBool::new(true),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let telemetry = IngestTelemetry::default();
+        for receiver in receivers.iter_mut() {
+            while let Ok(publication) = receiver.try_recv() {
+                process_queued_publication(
+                    0,
+                    &inner,
+                    &telemetry,
+                    &mut HashMap::new(),
+                    &mut std::collections::HashSet::new(),
+                    publication,
+                )
+                .await;
+            }
+        }
+
+        let events = journal.query(Some(before_us), Some(stream_id));
+        let stages_of = |seq: u64| {
+            events
+                .iter()
+                .filter(|event| event.seq == seq)
+                .map(|event| event.stage)
+                .collect::<Vec<_>>()
+        };
+        for seq in [0, 1] {
+            assert_eq!(
+                stages_of(seq),
+                vec![
+                    HopStage::SrcFirst,
+                    HopStage::SrcLast,
+                    HopStage::Recovered,
+                    HopStage::Packaged,
+                    HopStage::Enqueued,
+                    HopStage::Dequeued,
+                ],
+                "{events:?}"
+            );
+        }
+        let first = events.iter().find(|event| event.seq == 0).unwrap();
+        assert_eq!(first.t_us, before_us + 10);
+        assert_eq!(first.epoch, Some(1_234));
+        // The stages after src_first name the part's last epoch, whose last
+        // sample ends the part.
+        for stage in [HopStage::SrcLast, HopStage::Recovered, HopStage::Packaged] {
+            let event = events
+                .iter()
+                .find(|event| event.seq == 0 && event.stage == stage)
+                .unwrap();
+            assert_eq!(event.epoch, Some(1_235), "{stage:?}");
+        }
+        let packaged = events
+            .iter()
+            .find(|event| event.stage == HopStage::Packaged)
+            .unwrap();
+        assert_eq!(packaged.t_us, before_us + 70);
+
+        // GET /api/hops serves the same events as NDJSON, oldest first.
+        let response = hop_journal_response(
+            Some(journal),
+            Some(&format!("since_us={before_us}&stream={stream_id}")),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some(HOP_JOURNAL_CONTENT_TYPE)
+        );
+        let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert_eq!(body.lines().count(), events.len());
+        let first_line: serde_json::Value =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(first_line["node"], "contrib-test");
+        assert_eq!(first_line["stage"], "src_first");
+        assert_eq!(first_line["stream"], stream_id);
+        assert_eq!(first_line["seq"], 0);
+        assert_eq!(first_line["epoch"], 1_234);
+        assert_eq!(
+            hop_journal_response(Some(journal), Some("since_us=x"))
+                .await
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            hop_journal_response(None, None).await.status,
+            StatusCode::NOT_FOUND
+        );
     }
 
     struct BlockingPublicationSink {
@@ -8420,6 +9121,7 @@ mod tests {
                 audio_part_ms: 5,
                 audio_segment_ms: 1_000,
             },
+            true,
             shutdown_rx,
         );
         let first = test_fmp4_part(
@@ -8780,6 +9482,7 @@ mod tests {
                 part_target_ms: 5,
                 target_duration_ms: 1_000,
             }),
+            source_times: Default::default(),
         };
         let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
         // The place of the part in the playlist travels with the object.
@@ -9010,7 +9713,32 @@ mod tests {
         .unwrap();
         let exact_envelope = media_object::encode(&object).unwrap();
 
-        let outcome = relay.publish_object(&object).await.unwrap();
+        let journal = test_hop_journal();
+        let before_us = hop_journal::now_unix_us();
+        // A stream id of this test only: other tests share the process journal.
+        let journal_stream = 77_000_000_077;
+        let outcome = relay
+            .publish_part_object(&object, Some((journal_stream, 42)), PublicationClass::Video)
+            .await
+            .unwrap();
+        let stages = journal
+            .query(Some(before_us), Some(journal_stream))
+            .into_iter()
+            .map(|event| (event.stage, event.seq, event.peer))
+            .collect::<Vec<_>>();
+        // The encode comes first; the two lanes send concurrently.
+        assert_eq!(stages.len(), 3, "{stages:?}");
+        assert_eq!(stages[0], (HopStage::Encoded, 42, None));
+        assert!(stages.contains(&(
+            HopStage::Sent,
+            42,
+            Some(primary_receiver.local_addr().unwrap())
+        )));
+        assert!(stages.contains(&(
+            HopStage::SentSecondary,
+            42,
+            Some(secondary_receiver.local_addr().unwrap())
+        )));
         let canonical_deadline_ns =
             u64::try_from(object.deadline().unwrap().unix_time_ns()).unwrap();
         assert_eq!(
@@ -9350,6 +10078,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audio_part_encode_does_not_wait_for_a_video_encode_in_flight() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let object =
+            build_opaque_media_object(&test_opaque_part(4001), TEST_SOURCE_EPOCH, 5_000, 1_000_000)
+                .unwrap();
+        for shard_mix in [true, false] {
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(receiver.local_addr().unwrap());
+            args.publication_shard_mix = shard_mix;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            // A video part's encode holds its encoder, as a 4K part's does
+            // for milliseconds.
+            let video_encode = relay.encoder(PublicationClass::Video).lock().await;
+            let audio = timeout(
+                Duration::from_millis(500),
+                relay.publish_part_object(&object, Some((4001, 7)), PublicationClass::Audio),
+            )
+            .await;
+            if shard_mix {
+                // The audio part has its own encoder and leaves at once.
+                let outcome = audio.expect("audio waited for the video encode").unwrap();
+                assert!(outcome.source_symbols > 0);
+            } else {
+                // One encoder for all: the audio part waits behind the video.
+                assert!(
+                    audio.is_err(),
+                    "the shared encoder did not hold the audio part"
+                );
+            }
+            drop(video_encode);
+        }
+    }
+
+    #[tokio::test]
     async fn relay_session_applies_and_bounds_the_initial_repair_floor() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut args = contrib_status_args();
@@ -9360,16 +10125,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            relay
-                .encoder
-                .lock()
-                .await
-                .controller()
-                .policy()
-                .min_repair_symbols,
-            3
-        );
+        for class in [PublicationClass::Audio, PublicationClass::Video] {
+            assert_eq!(
+                relay
+                    .encoder(class)
+                    .lock()
+                    .await
+                    .controller()
+                    .policy()
+                    .min_repair_symbols,
+                3
+            );
+        }
 
         args.relay_min_repair_symbols = AdaptiveFecPolicy::default().max_repair_symbols + 1;
         let error = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
@@ -9421,7 +10188,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = relay.publish_object(&object).await.unwrap_err();
+        let error = relay
+            .publish_object(&object, PublicationClass::Video)
+            .await
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("expired before RelaySession encoding"));
@@ -9468,7 +10238,10 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = relay.publish_object(&object).await.unwrap();
+        let outcome = relay
+            .publish_object(&object, PublicationClass::Video)
+            .await
+            .unwrap();
         assert!(outcome.repair_symbols > 0);
         let expected = outcome.source_symbols + outcome.repair_symbols;
         let limits = RelayLimits::default();
@@ -9667,9 +10440,12 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         }
     }
 
@@ -9743,9 +10519,12 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
 
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -10324,9 +11103,12 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
@@ -10540,9 +11322,12 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
@@ -10656,9 +11441,12 @@ mod tests {
             fmp4_segment_ms: DEFAULT_SEGMENT_MS,
             fmp4_video_part_ms: None,
             fmp4_video_segment_ms: None,
+            fmp4_flush_on_complete: true,
             hls_target_duration_ms: DEFAULT_TARGET_DURATION_MS,
             playlist_count: 65,
             playlist_buffer_kb: 800,
+            publication_shard_mix: true,
+            hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());

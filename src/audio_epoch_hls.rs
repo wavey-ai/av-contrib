@@ -9,6 +9,7 @@
 use crate::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, PublishedOpaquePart, TimestampInput, DEFAULT_MIN_PART_MS,
 };
+use crate::hop_journal::{now_unix_us, PartSourceTimes};
 use crate::soundkit_v2::{terminalize_soundkit_group, SoundKitV2StreamRef};
 use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS, PSI_STREAM_PRIVATE_DATA};
 use boxer::fmp4::{
@@ -22,7 +23,7 @@ use music_audio_session::{
 use playlists::Playlists;
 use raptorq_datagram_fec::{AudioPayloadKind, AudioSampleFormat};
 use raptorq_fec_transport::MultichannelAudioTransportAdapter;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{
@@ -43,6 +44,9 @@ const AUDIO_GROUP_FLAG_DISCONTINUITY: u8 = 1 << 0;
 const AUDIO_GROUP_FLAG_ERASURE: u8 = 1 << 1;
 const OPUS_RENDITION_STREAM_OFFSET: u64 = 1_000;
 const PCM_RENDITION_STREAM_OFFSET: u64 = 2_000;
+/// AEP1 blocks (epochs) of one source whose first arrival is remembered for
+/// the hop journal: a few hundred milliseconds of 5 ms epochs.
+const FIRST_ARRIVAL_BLOCKS: usize = 64;
 static WORKER_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 static WORKER_GROUPS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static WORKER_RAPTORQ_FRAGMENTS_RECOVERED: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +99,8 @@ pub fn worker_stats() -> AudioEpochHlsWorkerStats {
 pub struct AudioEpochHlsDatagram {
     pub peer: SocketAddr,
     pub bytes: Bytes,
+    /// Unix microseconds at which the ingest socket returned the datagram.
+    pub received_unix_us: u64,
 }
 
 #[derive(Clone)]
@@ -184,10 +190,14 @@ struct OpaquePartSegmenter {
     duration_ms: u32,
     audio_units: usize,
     published_parts: u64,
+    source_times: PartSourceTimes,
 }
 
+/// A recovered AEP1 group and when its datagrams arrived.
+type RecoveredGroup = (DecodedMultichannelAudioGroup, PartSourceTimes);
+
 struct RenditionWorker {
-    sender: mpsc::Sender<DecodedMultichannelAudioGroup>,
+    sender: mpsc::Sender<RecoveredGroup>,
     handle: JoinHandle<()>,
     last_seen: Instant,
 }
@@ -195,6 +205,63 @@ struct RenditionWorker {
 struct ReceiverState {
     receiver: MultichannelAudioReceiver,
     last_seen: Instant,
+    /// First arrival of each recent AEP1 block. A block carries one epoch.
+    block_first_us: VecDeque<(u32, u64)>,
+}
+
+impl ReceiverState {
+    fn new(now: Instant) -> Self {
+        Self {
+            receiver: MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default()),
+            last_seen: now,
+            block_first_us: VecDeque::with_capacity(FIRST_ARRIVAL_BLOCKS),
+        }
+    }
+
+    /// Note a datagram of `block_id` and return the block's first arrival.
+    fn observe_block(&mut self, block_id: u32, received_us: u64) -> u64 {
+        if let Some((_, first)) = self
+            .block_first_us
+            .iter()
+            .rev()
+            .find(|(block, _)| *block == block_id)
+        {
+            return *first;
+        }
+        if self.block_first_us.len() == FIRST_ARRIVAL_BLOCKS {
+            self.block_first_us.pop_front();
+        }
+        self.block_first_us.push_back((block_id, received_us));
+        received_us
+    }
+
+    /// Recover the groups this datagram completes, with their source times.
+    fn push(&mut self, payload: &[u8], received_us: u64) -> Result<Vec<RecoveredGroup>, String> {
+        let first_us = raptorq_datagram_fec::decode_header(payload)
+            .map(|header| self.observe_block(header.block_id, received_us))
+            .unwrap_or(received_us);
+        let outcome = self
+            .receiver
+            .push_datagram(payload)
+            .map_err(|error| error.to_string())?;
+        if outcome.completed_groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let recovered_us = now_unix_us();
+        Ok(outcome
+            .completed_groups
+            .into_iter()
+            .map(|group| {
+                let times = PartSourceTimes {
+                    src_first_us: Some(first_us.min(received_us)),
+                    src_last_us: Some(received_us),
+                    recovered_us: Some(recovered_us),
+                    ..PartSourceTimes::of_epoch(group.epoch_id)
+                };
+                (group, times)
+            })
+            .collect())
+    }
 }
 
 impl std::fmt::Debug for RenditionState {
@@ -258,11 +325,18 @@ impl OpaquePartSegmenter {
             duration_ms: 0,
             audio_units: 0,
             published_parts: 0,
+            source_times: PartSourceTimes::default(),
         }
     }
 
-    async fn push(&mut self, packet: Bytes, duration_ms: u32) -> Result<(), String> {
+    async fn push(
+        &mut self,
+        packet: Bytes,
+        duration_ms: u32,
+        source_times: PartSourceTimes,
+    ) -> Result<(), String> {
         self.bytes.extend_from_slice(&packet);
+        self.source_times.merge(&source_times);
         self.duration_ms = self.duration_ms.saturating_add(duration_ms);
         self.audio_units = self.audio_units.saturating_add(1);
         if self.duration_ms >= self.min_part_ms {
@@ -279,6 +353,7 @@ impl OpaquePartSegmenter {
         self.bytes.clear();
         self.duration_ms = 0;
         self.audio_units = 0;
+        self.source_times = PartSourceTimes::default();
     }
 
     async fn flush(&mut self) -> Result<(), String> {
@@ -297,6 +372,7 @@ impl OpaquePartSegmenter {
             bytes: self.bytes.split().freeze(),
             audio_units: std::mem::take(&mut self.audio_units),
             hls: None,
+            source_times: std::mem::take(&mut self.source_times),
         };
         self.duration_ms = 0;
         self.published_parts = self.published_parts.saturating_add(1);
@@ -365,17 +441,14 @@ pub async fn run_audio_epoch_hls_worker(
                 let now = Instant::now();
                 let receiver = receivers.entry(message.peer).or_insert_with(|| {
                     ACTIVE_RECEIVERS.fetch_add(1, Ordering::Relaxed);
-                    ReceiverState {
-                        receiver: MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default()),
-                        last_seen: now,
-                    }
+                    ReceiverState::new(now)
                 });
                 receiver.last_seen = now;
-                let outcome = receiver.receiver.push_datagram(payload);
+                let outcome = receiver.push(payload, message.received_unix_us);
                 match outcome {
-                    Ok(outcome) => {
+                    Ok(completed_groups) => {
                         WORKER_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
-                        for group in outcome.completed_groups {
+                        for (group, times) in completed_groups {
                             WORKER_GROUPS_COMPLETED.fetch_add(1, Ordering::Relaxed);
                             WORKER_RAPTORQ_FRAGMENTS_RECOVERED.fetch_add(
                                 u64::from(group.raptorq_recovered_fragments),
@@ -395,7 +468,7 @@ pub async fn run_audio_epoch_hls_worker(
                             if let Err(error) = dispatch_group_to_rendition_worker(
                                 &config,
                                 &mut rendition_workers,
-                                group,
+                                (group, times),
                             ).await {
                                 WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
                                 warn!(peer = %message.peer, error = %error, "failed to dispatch recovered AEP1 group to LL-HLS rendition worker");
@@ -418,16 +491,13 @@ pub async fn run_audio_epoch_hls_worker(
         let now = Instant::now();
         let receiver = receivers.entry(message.peer).or_insert_with(|| {
             ACTIVE_RECEIVERS.fetch_add(1, Ordering::Relaxed);
-            ReceiverState {
-                receiver: MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default()),
-                last_seen: now,
-            }
+            ReceiverState::new(now)
         });
         receiver.last_seen = now;
-        let outcome = receiver.receiver.push_datagram(payload);
-        if let Ok(outcome) = outcome {
+        let outcome = receiver.push(payload, message.received_unix_us);
+        if let Ok(completed_groups) = outcome {
             WORKER_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
-            for group in outcome.completed_groups {
+            for (group, times) in completed_groups {
                 WORKER_GROUPS_COMPLETED.fetch_add(1, Ordering::Relaxed);
                 WORKER_RAPTORQ_FRAGMENTS_RECOVERED.fetch_add(
                     u64::from(group.raptorq_recovered_fragments),
@@ -444,8 +514,12 @@ pub async fn run_audio_epoch_hls_worker(
                 if !config.formats.contains(&group.payload_kind) {
                     continue;
                 }
-                if let Err(error) =
-                    dispatch_group_to_rendition_worker(&config, &mut rendition_workers, group).await
+                if let Err(error) = dispatch_group_to_rendition_worker(
+                    &config,
+                    &mut rendition_workers,
+                    (group, times),
+                )
+                .await
                 {
                     WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
                     warn!(peer = %message.peer, error = %error, "failed to drain AEP1 group into LL-HLS rendition worker");
@@ -469,8 +543,9 @@ pub async fn run_audio_epoch_hls_worker(
 async fn dispatch_group_to_rendition_worker(
     config: &AudioEpochHlsConfig,
     workers: &mut HashMap<RenditionKey, RenditionWorker>,
-    group: DecodedMultichannelAudioGroup,
+    recovered: RecoveredGroup,
 ) -> Result<(), String> {
+    let group = &recovered.0;
     let key = RenditionKey {
         session_id: group.session_id,
         group_id: group.group_id,
@@ -497,13 +572,13 @@ async fn dispatch_group_to_rendition_worker(
                 .clone()
         }
     };
-    try_handoff_rendition_group(&sender, key, group)
+    try_handoff_rendition_group(&sender, key, recovered)
 }
 
 fn try_handoff_rendition_group(
-    sender: &mpsc::Sender<DecodedMultichannelAudioGroup>,
+    sender: &mpsc::Sender<RecoveredGroup>,
     key: RenditionKey,
-    group: DecodedMultichannelAudioGroup,
+    group: RecoveredGroup,
 ) -> Result<(), String> {
     match sender.try_send(group) {
         Ok(()) => {
@@ -575,14 +650,14 @@ async fn retire_idle_rendition_workers(
 async fn run_rendition_worker(
     config: AudioEpochHlsConfig,
     key: RenditionKey,
-    mut input: mpsc::Receiver<DecodedMultichannelAudioGroup>,
+    mut input: mpsc::Receiver<RecoveredGroup>,
 ) {
     let mut renditions = HashMap::<RenditionKey, RenditionState>::new();
-    while let Some(group) = input.recv().await {
+    while let Some((group, times)) = input.recv().await {
         let _ = RENDITION_QUEUE_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
             Some(depth.saturating_sub(1))
         });
-        if let Err(error) = package_group(&config, &mut renditions, group).await {
+        if let Err(error) = package_group_with_times(&config, &mut renditions, group, times).await {
             WORKER_ERRORS.fetch_add(1, Ordering::Relaxed);
             warn!(
                 session_id = key.session_id,
@@ -656,10 +731,20 @@ fn new_rendition_packager(
     }
 }
 
+#[cfg(test)]
 async fn package_group(
     config: &AudioEpochHlsConfig,
     renditions: &mut HashMap<RenditionKey, RenditionState>,
     group: DecodedMultichannelAudioGroup,
+) -> Result<(), String> {
+    package_group_with_times(config, renditions, group, PartSourceTimes::default()).await
+}
+
+async fn package_group_with_times(
+    config: &AudioEpochHlsConfig,
+    renditions: &mut HashMap<RenditionKey, RenditionState>,
+    group: DecodedMultichannelAudioGroup,
+    times: PartSourceTimes,
 ) -> Result<(), String> {
     if group.flags & AUDIO_GROUP_FLAG_ERASURE != 0 || group.payload.is_empty() {
         return Err(format!(
@@ -754,16 +839,17 @@ async fn package_group(
             state
                 .packager
                 .opaque()?
-                .push(group.payload, duration_ms)
+                .push(group.payload, duration_ms, times)
                 .await
         }
-        AudioEpochHlsPackaging::Fmp4 => package_group_as_fmp4(state, group).await,
+        AudioEpochHlsPackaging::Fmp4 => package_group_as_fmp4(state, group, times).await,
     }
 }
 
 async fn package_group_as_fmp4(
     state: &mut RenditionState,
     group: DecodedMultichannelAudioGroup,
+    times: PartSourceTimes,
 ) -> Result<(), String> {
     let audio_config = audio_track_config(&group)?;
     let (packets, stream_type) = match group.payload_kind {
@@ -794,7 +880,11 @@ async fn package_group_as_fmp4(
     let segmenter = state.packager.fmp4()?;
     segmenter.set_audio_track_config(audio_config);
     let mut pts_samples = group.pts_samples;
+    let mut times = Some(times);
     for packet in packets {
+        if let Some(times) = times.take() {
+            segmenter.set_next_source_times(times);
+        }
         let pts_ms = samples_to_millis(pts_samples, group.sample_rate)?;
         segmenter
             .push_access_unit(AccessUnit {
@@ -1100,19 +1190,13 @@ mod tests {
             .checked_sub(AUDIO_EPOCH_IDLE_TIMEOUT + Duration::from_secs(1))
             .expect("test instant supports the idle interval");
         let peer: SocketAddr = "127.0.0.1:41999".parse().unwrap();
-        let mut receivers = HashMap::from([(
-            peer,
-            ReceiverState {
-                receiver: MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default()),
-                last_seen: idle_since,
-            },
-        )]);
+        let mut receivers = HashMap::from([(peer, ReceiverState::new(idle_since))]);
         ACTIVE_RECEIVERS.fetch_add(1, Ordering::Relaxed);
 
         retire_idle_receivers(&mut receivers, now);
         assert!(receivers.is_empty());
 
-        let (sender, mut receiver) = mpsc::channel::<DecodedMultichannelAudioGroup>(1);
+        let (sender, mut receiver) = mpsc::channel::<RecoveredGroup>(1);
         let handle = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
         let key = RenditionKey {
             session_id: 99,
@@ -1201,6 +1285,7 @@ mod tests {
             tx.send(AudioEpochHlsDatagram {
                 peer,
                 bytes: datagram.payload,
+                received_unix_us: now_unix_us(),
             })
             .await
             .unwrap();
@@ -1283,6 +1368,7 @@ mod tests {
                 tx.send(AudioEpochHlsDatagram {
                     peer,
                     bytes: datagram.payload,
+                    received_unix_us: now_unix_us(),
                 })
                 .await
                 .unwrap();
@@ -1491,6 +1577,166 @@ mod tests {
         assert_eq!(parts[0].bytes.as_ref(), expected);
     }
 
+    /// The AEP1 datagrams of one epoch of one 3,000-byte group.
+    fn epoch_datagrams(
+        sender: &mut MultichannelAudioSender,
+        transport: &MultichannelAudioTransportAdapter,
+        epoch_id: u64,
+    ) -> Vec<Bytes> {
+        let payload = (0..3_000_u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let groups = [MultichannelAudioGroup {
+            group_id: 0,
+            channel_start: 0,
+            channel_count: 2,
+            payload_kind: AudioPayloadKind::Pcm,
+            sample_format: AudioSampleFormat::S24Le,
+            flags: 0,
+            payload: &payload,
+        }];
+        let encoded = sender
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 99,
+                config_generation: 1,
+                epoch_id,
+                pts_samples: epoch_id * 240,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+        transport
+            .wrap_epoch(encoded)
+            .unwrap()
+            .datagrams
+            .into_iter()
+            .map(|datagram| datagram.payload)
+            .collect()
+    }
+
+    #[test]
+    fn recovered_groups_carry_their_datagram_arrival_times() {
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+        fec.repair_symbols = 2;
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec,
+            ..MultichannelAudioSessionConfig::default()
+        });
+        let mut receiver = ReceiverState::new(Instant::now());
+
+        // Epoch 7 arrives whole: datagram k at 1,000 + 100 k µs. The group is
+        // complete with its last source datagram.
+        let datagrams = epoch_datagrams(&mut sender, &transport, 7);
+        assert!(datagrams.len() >= 4, "{} datagrams", datagrams.len());
+        let mut completed = Vec::new();
+        let mut completed_at = None;
+        for (index, datagram) in datagrams.iter().enumerate() {
+            let payload = transport.payload(datagram).unwrap();
+            let received_us = 1_000 + 100 * index as u64;
+            let groups = receiver.push(payload, received_us).unwrap();
+            if !groups.is_empty() {
+                completed_at.get_or_insert(received_us);
+            }
+            completed.extend(groups);
+        }
+        assert_eq!(completed.len(), 1);
+        let (group, times) = &completed[0];
+        assert_eq!(group.epoch_id, 7);
+        assert_eq!(times.first_epoch, Some(7));
+        assert_eq!(times.last_epoch, Some(7));
+        assert_eq!(times.src_first_us, Some(1_000));
+        assert_eq!(times.src_last_us, completed_at);
+        assert!(times.recovered_us.unwrap() >= now_unix_us() - 5_000_000);
+
+        // Epoch 8 loses its first source datagram: a repair datagram completes
+        // it, and the first arrival is the second source datagram.
+        let datagrams = epoch_datagrams(&mut sender, &transport, 8);
+        let mut completed = Vec::new();
+        for (index, datagram) in datagrams.iter().enumerate().skip(1) {
+            let payload = transport.payload(datagram).unwrap();
+            let received_us = 5_000 + 100 * index as u64;
+            for (group, times) in receiver.push(payload, received_us).unwrap() {
+                completed.push((group.epoch_id, times, received_us));
+            }
+        }
+        assert_eq!(completed.len(), 1);
+        let (epoch_id, times, completed_at) = completed[0];
+        assert_eq!(epoch_id, 8);
+        assert_eq!(times.src_first_us, Some(5_100));
+        assert_eq!(times.src_last_us, Some(completed_at));
+        assert!(completed_at > 5_100);
+    }
+
+    #[tokio::test]
+    async fn opaque_part_spans_the_source_times_of_its_units() {
+        let captured = Arc::new(CapturingPublisher::default());
+        let publisher: Arc<dyn Fmp4PartPublisher> = captured.clone();
+        let config = test_config(1, 25, AudioEpochHlsPackaging::Opaque, publisher);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..10_u64 {
+            let base = 1_000_000 + epoch_id * 5_000;
+            package_group_with_times(
+                &config,
+                &mut renditions,
+                decoded_group(
+                    epoch_id,
+                    epoch_id * 240,
+                    0,
+                    0,
+                    1,
+                    AudioPayloadKind::Opus,
+                    AudioSampleFormat::Unspecified,
+                    Bytes::from(vec![epoch_id as u8]),
+                ),
+                PartSourceTimes {
+                    src_first_us: Some(base),
+                    src_last_us: Some(base + 300),
+                    recovered_us: Some(base + 350),
+                    ..PartSourceTimes::of_epoch(epoch_id)
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 2);
+        for (index, part) in parts.iter().enumerate() {
+            let first_epoch = index as u64 * 5;
+            let first = 1_000_000 + first_epoch * 5_000;
+            let last = first + 4 * 5_000;
+            assert_eq!(
+                part.source_times,
+                PartSourceTimes {
+                    first_epoch: Some(first_epoch),
+                    last_epoch: Some(first_epoch + 4),
+                    src_first_us: Some(first),
+                    src_last_us: Some(last + 300),
+                    recovered_us: Some(last + 350),
+                }
+            );
+            // The part's journal events: src_first names its first epoch,
+            // the later stages the last, whose last sample ends the part.
+            let epochs = part
+                .source_times
+                .events(part.stream_id, part.sequence)
+                .map(|event| (event.stage, event.epoch))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                epochs,
+                vec![
+                    (crate::hop_journal::HopStage::SrcFirst, Some(first_epoch)),
+                    (crate::hop_journal::HopStage::SrcLast, Some(first_epoch + 4)),
+                    (
+                        crate::hop_journal::HopStage::Recovered,
+                        Some(first_epoch + 4)
+                    ),
+                ]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn declared_formats_use_independent_streams_and_object_sequences() {
         let captured = Arc::new(CapturingPublisher::default());
@@ -1599,9 +1845,11 @@ mod tests {
             AudioSampleFormat::Unspecified,
             Bytes::from_static(b"opus-packet"),
         );
-        try_handoff_rendition_group(&sender, key, group.clone()).unwrap();
+        try_handoff_rendition_group(&sender, key, (group.clone(), PartSourceTimes::default()))
+            .unwrap();
 
-        let error = try_handoff_rendition_group(&sender, key, group).unwrap_err();
+        let error = try_handoff_rendition_group(&sender, key, (group, PartSourceTimes::default()))
+            .unwrap_err();
         assert!(error.contains("queue is full"));
         assert_eq!(sender.capacity(), 0);
     }
