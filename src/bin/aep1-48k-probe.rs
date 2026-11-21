@@ -121,6 +121,14 @@ enum Command {
         repair_percent: u32,
         #[arg(long, default_value_t = 1)]
         min_repair_symbols: u32,
+        /// Samples (at 48 kHz) of each AEP1 epoch, and so of each part the
+        /// contributor makes from it: 240 is 5 ms, 120 is 2.5 ms (Opus's
+        /// shortest frame), 48 is 1 ms.
+        #[arg(long, default_value_t = FRAME_COUNT)]
+        epoch_samples: u32,
+        /// Opus bit rate in bit/s, for `--payload opus`.
+        #[arg(long, default_value_t = 96_000)]
+        opus_bitrate: u32,
     },
     /// Capture immutable codec-valid SoundKit v2 FLAC+Opus records from a live publication.
     CaptureFixture {
@@ -380,10 +388,13 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ProbePayload {
     Flac,
     Pcm,
+    /// SoundKit v2 Opus: one raw Opus packet of the epoch's samples (120 is
+    /// a 2.5 ms CELT frame, the shortest Opus frame). Two channels at most.
+    Opus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ValueEnum)]
@@ -506,6 +517,7 @@ impl ProbePayload {
         match self {
             Self::Flac => "flac",
             Self::Pcm => "pcm_s24le",
+            Self::Opus => "opus",
         }
     }
 }
@@ -567,6 +579,27 @@ impl PcmSource {
             Self::File(source) => source.group_s24le(first_sample, channel_start, channels),
         }
     }
+
+    /// `frame_count` samples of a group. A generated signal gives at most
+    /// one 5 ms epoch at a time.
+    fn group_s24le_frames(
+        &self,
+        first_sample: u64,
+        channel_start: u16,
+        channels: u16,
+        frame_count: u32,
+    ) -> Vec<u8> {
+        match self {
+            Self::Generated(signal) => {
+                let mut pcm = signal_s24le(first_sample, channel_start, channels, *signal);
+                pcm.truncate(frame_count.min(FRAME_COUNT) as usize * usize::from(channels) * 3);
+                pcm
+            }
+            Self::File(source) => {
+                source.group_s24le_frames(first_sample, channel_start, channels, frame_count)
+            }
+        }
+    }
 }
 
 struct LoopingPcm {
@@ -599,15 +632,25 @@ impl LoopingPcm {
     }
 
     fn group_s24le(&self, first_sample: u64, channel_start: u16, channels: u16) -> Vec<u8> {
+        self.group_s24le_frames(first_sample, channel_start, channels, FRAME_COUNT)
+    }
+
+    fn group_s24le_frames(
+        &self,
+        first_sample: u64,
+        channel_start: u16,
+        channels: u16,
+        frame_count: u32,
+    ) -> Vec<u8> {
         let channel_start = usize::from(channel_start);
         let channels = usize::from(channels);
         debug_assert!(channel_start + channels <= self.channels);
         let frame_bytes = self.channels * 3;
         let group_bytes = channels * 3;
         let channel_offset = channel_start * 3;
-        let mut pcm = Vec::with_capacity(FRAME_COUNT as usize * group_bytes);
+        let mut pcm = Vec::with_capacity(frame_count as usize * group_bytes);
         let mut source_frame = (first_sample % self.frames as u64) as usize;
-        for _ in 0..FRAME_COUNT {
+        for _ in 0..frame_count {
             let start = source_frame * frame_bytes + channel_offset;
             pcm.extend_from_slice(&self.bytes[start..start + group_bytes]);
             source_frame += 1;
@@ -1883,8 +1926,12 @@ async fn main() -> Result<()> {
             group_id,
             repair_percent,
             min_repair_symbols,
+            epoch_samples,
+            opus_bitrate,
         } => {
             let report = send(SendOptions {
+                epoch_samples,
+                opus_bitrate,
                 target,
                 duration_seconds,
                 session_id,
@@ -2290,10 +2337,14 @@ struct SendOptions<'a> {
     group_id: u16,
     repair_percent: u32,
     min_repair_symbols: u32,
+    epoch_samples: u32,
+    opus_bitrate: u32,
 }
 
 async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     let SendOptions {
+        epoch_samples,
+        opus_bitrate,
         target,
         duration_seconds,
         session_id,
@@ -2309,7 +2360,19 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     if duration_seconds == 0 {
         bail!("--duration-seconds must be positive");
     }
+    if !(16..=4_800).contains(&epoch_samples) {
+        bail!("--epoch-samples must be between 16 and 4800");
+    }
+    if epoch_samples > FRAME_COUNT && pcm_s24le_file.is_none() {
+        bail!("--epoch-samples above 240 needs --pcm-s24le-file");
+    }
+    if payload_kind == ProbePayload::Opus && ![120, 240, 480, 960].contains(&epoch_samples) {
+        bail!("Opus frames are 120, 240, 480 or 960 samples at 48 kHz");
+    }
     let group_plan = source_group_plan(group_id, channels, group_channels)?;
+    if payload_kind == ProbePayload::Opus && group_plan.iter().any(|group| group.channel_count > 2) {
+        bail!("--payload opus needs --group-channels 2 or fewer");
+    }
     let pcm_source = PcmSource::new(signal, pcm_s24le_file, channels)?;
     let session_id = session_id.unwrap_or(now_unix_ns()?.saturating_add(1_000_000_000));
     let now_ns = now_unix_ns()?;
@@ -2327,7 +2390,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         .context("invalid AEP1 geometry")?;
     let max_pcm_bytes_per_group = group_plan
         .iter()
-        .map(|group| usize::from(group.channel_count) * FRAME_COUNT as usize * 3)
+        .map(|group| usize::from(group.channel_count) * epoch_samples as usize * 3)
         .max()
         .unwrap_or(0);
     let source_symbols = max_pcm_bytes_per_group
@@ -2355,7 +2418,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
                     SAMPLE_RATE,
                     group.channel_count,
                     24,
-                    FRAME_COUNT,
+                    epoch_samples,
                     FlacProfile::Realtime,
                 )
                 .and_then(FlacFrameEncoder::new)
@@ -2364,9 +2427,32 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     } else {
         Vec::new()
     };
-    let epochs = duration_seconds.saturating_mul(1_000) / 5;
+    let mut opus_encoders = if payload_kind == ProbePayload::Opus {
+        use soundkit::audio_packet::Encoder as _;
+        group_plan
+            .iter()
+            .map(|group| {
+                let mut encoder = soundkit_opus::OpusEncoder::new(
+                    SAMPLE_RATE,
+                    16,
+                    u32::from(group.channel_count),
+                    epoch_samples,
+                    opus_bitrate,
+                );
+                encoder.init().map_err(|error| anyhow::anyhow!(error))?;
+                Ok(encoder)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let epochs = duration_seconds
+        .saturating_mul(u64::from(SAMPLE_RATE))
+        .saturating_div(u64::from(epoch_samples));
     let started = Instant::now();
-    let mut ticker = interval_at(TokioInstant::now(), FRAME_DURATION);
+    let epoch_duration =
+        Duration::from_nanos(u64::from(epoch_samples) * 1_000_000_000 / u64::from(SAMPLE_RATE));
+    let mut ticker = interval_at(TokioInstant::now(), epoch_duration);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut source_datagrams = 0_u64;
     let mut repair_datagrams = 0_u64;
@@ -2375,14 +2461,32 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
 
     for epoch_id in 0..epochs {
         ticker.tick().await;
-        let first_sample = epoch_id.saturating_mul(u64::from(FRAME_COUNT));
+        let first_sample = epoch_id.saturating_mul(u64::from(epoch_samples));
         let mut payloads = Vec::with_capacity(group_plan.len());
         for (index, group) in group_plan.iter().enumerate() {
-            let pcm =
-                pcm_source.group_s24le(first_sample, group.channel_start, group.channel_count);
+            let pcm = pcm_source.group_s24le_frames(
+                first_sample,
+                group.channel_start,
+                group.channel_count,
+                epoch_samples,
+            );
             let payload = match payload_kind {
                 ProbePayload::Flac => flac_encoders[index].encode_s24le(&pcm)?.payload,
                 ProbePayload::Pcm => pcm,
+                ProbePayload::Opus => {
+                    use soundkit::audio_packet::Encoder as _;
+                    // 24-bit samples to 16 for the Opus encoder.
+                    let samples: Vec<i16> = pcm
+                        .chunks_exact(3)
+                        .map(|sample| i16::from_le_bytes([sample[1], sample[2]]))
+                        .collect();
+                    let mut packet = vec![0_u8; 1_500];
+                    let len = opus_encoders[index]
+                        .encode_i16(&samples, &mut packet)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    packet.truncate(len);
+                    packet
+                }
             };
             lossless_payload_bytes = lossless_payload_bytes.saturating_add(payload.len() as u64);
             payloads.push(payload);
@@ -2391,18 +2495,19 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             .iter()
             .zip(payloads.iter())
             .map(|(group, payload)| {
-                let encoding = match payload_kind {
-                    ProbePayload::Flac => EncodingFlag::FLAC,
-                    ProbePayload::Pcm => EncodingFlag::PCMSigned,
+                let (encoding, bits) = match payload_kind {
+                    ProbePayload::Flac => (EncodingFlag::FLAC, 24),
+                    ProbePayload::Pcm => (EncodingFlag::PCMSigned, 24),
+                    ProbePayload::Opus => (EncodingFlag::Opus, 16),
                 };
                 let header = FrameHeaderV2::new(
                     encoding,
                     u32::try_from(payload.len()).expect("probe payload fits the v2 wire header"),
-                    FRAME_COUNT,
+                    epoch_samples,
                     SAMPLE_RATE,
                     u8::try_from(group.channel_count)
                         .expect("probe groups are limited to eight channels"),
-                    24,
+                    bits,
                     frame_header::Endianness::LittleEndian,
                     None,
                     None,
@@ -2436,9 +2541,9 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             session_id,
             config_generation: 1,
             epoch_id,
-            pts_samples: epoch_id.saturating_mul(u64::from(FRAME_COUNT)),
+            pts_samples: epoch_id.saturating_mul(u64::from(epoch_samples)),
             sample_rate: SAMPLE_RATE,
-            frame_count: FRAME_COUNT,
+            frame_count: epoch_samples,
             groups: &groups,
         })?;
         let wrapped = transport.wrap_epoch(encoded)?;
@@ -2463,7 +2568,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     }
 
     let pcm_reference_bytes = epochs
-        .saturating_mul(u64::from(FRAME_COUNT))
+        .saturating_mul(u64::from(epoch_samples))
         .saturating_mul(u64::from(channels))
         .saturating_mul(3);
     Ok(SendReport {
