@@ -636,11 +636,14 @@ struct Args {
     /// Copies of a one-symbol audio part (a 1 ms part is one RaptorQ
     /// symbol, and each repair symbol of it a full copy; wave 7 item 2).
     /// `measured` (the default): as many repair symbols as the loss that
-    /// the forwarders report on the lanes (RLR1, av-mesh
-    /// --relay-loss-report) calls for, so that a part is lost on a lane
+    /// the forwarders report on the lanes (RLR1 version 2, av-mesh
+    /// --relay-loss-report, measured against the ledger of the datagrams
+    /// each lane sent, RLL1) calls for, so that a part is lost on a lane
     /// with a chance under 1e-3 (none under 0.2 % loss, one at 1-3 %, two
-    /// at 5-10 %, at most four), and none until a lane reports loss; a
-    /// report older than 3 s counts as none. `configured`: the same rule on
+    /// at 5-10 %, at most four). A lane whose forwarder has sent no report
+    /// for 3 s (an older forwarder, --relay-loss-report false, reports
+    /// lost; a clean lane reports zero once a second) counts at the
+    /// --relay-path-loss-fraction observation. `configured`: the same rule on
     /// the --relay-path-loss-fraction observations. `policy`: the adaptive
     /// policy, as before (one repair symbol for any loss, plus its safety
     /// symbol). --relay-min-repair-symbols is the floor of each. Parts of
@@ -1418,25 +1421,44 @@ impl LaneLossReport {
         self.at_us.store(now_us, Ordering::Relaxed);
     }
 
-    /// The reported loss, as a fraction; zero once the report is stale.
-    fn loss(&self, now_us: u64) -> f64 {
+    /// The reported loss, as a fraction; `None` without a fresh report (a
+    /// forwarder that reports nothing: older, or --relay-loss-report
+    /// false, or its reports lost). A clean lane reports zero once a
+    /// second.
+    fn loss(&self, now_us: u64) -> Option<f64> {
         let at = self.at_us.load(Ordering::Relaxed);
         if at == 0 || now_us.saturating_sub(at) > LANE_LOSS_REPORT_TTL_US {
-            return 0.0;
+            return None;
         }
-        self.ppm.load(Ordering::Relaxed) as f64 / 1e6
+        Some(self.ppm.load(Ordering::Relaxed) as f64 / 1e6)
     }
 }
 
-/// RLR1, av-mesh's loss report (src/fast_plane/loss_report.rs): `RLR1`,
-/// version 1, three zero bytes, loss in ppm, packet sequences of the window.
+/// RLR1 version 2, av-mesh's loss report (src/fast_plane/loss_report.rs):
+/// `RLR1`, version 2, three zero bytes, loss in ppm, datagrams of the
+/// window. Version 1 (packet-sequence gaps, which read a lane that carries
+/// part of the sequences as lossy) is ignored.
 fn decode_lane_loss_report(datagram: &[u8]) -> Option<u32> {
-    if datagram.len() != 16 || &datagram[..4] != b"RLR1" || datagram[4] != 1 {
+    if datagram.len() != 16 || &datagram[..4] != b"RLR1" || datagram[4] != 2 {
         return None;
     }
     let ppm = u32::from_be_bytes(datagram[8..12].try_into().ok()?);
     (ppm <= 1_000_000).then_some(ppm)
 }
+
+/// RLL1, the ledger of a lane (av-mesh src/fast_plane/loss_report.rs):
+/// `RLL1`, version 1, three zero bytes, datagrams sent on the lane (u64).
+/// The lane's forwarder measures its loss against it.
+fn encode_lane_ledger(sent: u64) -> [u8; 16] {
+    let mut out = [0_u8; 16];
+    out[..4].copy_from_slice(b"RLL1");
+    out[4] = 1;
+    out[8..16].copy_from_slice(&sent.to_be_bytes());
+    out
+}
+
+/// How often each lane sends its forwarder its ledger.
+const LANE_LEDGER_INTERVAL_US: u64 = 250_000;
 
 /// `--relay-demand-renditions`: groups of renditions of one source.
 fn parse_rendition_groups(value: &str) -> Result<Vec<Vec<u64>>> {
@@ -1523,7 +1545,7 @@ const LANE_LOSS_POLL_US: u64 = 50_000;
 fn drain_lane_loss_reports(
     socket: &UdpSocket,
     report: &LaneLossReport,
-    demand: &LaneDemand,
+    demand: Option<&LaneDemand>,
     path: RelayCarrierPath,
 ) {
     let fd = socket.as_raw_fd();
@@ -1543,10 +1565,15 @@ fn drain_lane_loss_reports(
         if let Some(ppm) = decode_lane_loss_report(&buf[..len as usize]) {
             report.record(ppm, hop_journal::now_unix_us());
             RELAY_LANE_REPORTED_LOSS_PPM[path as usize].store(u64::from(ppm), Ordering::Relaxed);
-        } else if let Some(streams) = decode_lane_demand(&buf[..len as usize]) {
-            demand
-                .0
-                .store(Some(Arc::new((hop_journal::now_unix_us(), streams))));
+        } else if let Some(demand) = demand {
+            // Demand reports are read only with rendition groups
+            // (--relay-demand-renditions): without them nothing is held
+            // back, and the hot path decodes nothing.
+            if let Some(streams) = decode_lane_demand(&buf[..len as usize]) {
+                demand
+                    .0
+                    .store(Some(Arc::new((hop_journal::now_unix_us(), streams))));
+            }
         }
     }
 }
@@ -1861,6 +1888,24 @@ impl RelayLane {
     }
 
     /// The socket and parent address of parts of `class`.
+    /// `count` datagrams went to the kernel on `socket`: counted for the
+    /// lane's ledger when it is the lane's main socket (the one its
+    /// forwarder's audio thread reads).
+    fn count_sent(&self, socket: &Arc<UdpSocket>, count: usize) {
+        if count > 0 && Arc::ptr_eq(socket, &self.socket) {
+            self.backlog.sent.fetch_add(count as u64, Ordering::Release);
+        }
+    }
+
+    /// Send the lane's forwarder its ledger (RLL1): the datagrams handed to
+    /// the kernel on the main socket so far, behind them on that socket.
+    fn send_ledger(&self) {
+        let ledger = encode_lane_ledger(self.backlog.sent.load(Ordering::Acquire));
+        // Without waiting (and without the runtime's readiness): a full
+        // socket skips this ledger, and the next one covers the window.
+        let _ = udp_batch::try_send_all(&self.socket, &[udp_batch::Outbound::connected(&ledger)]);
+    }
+
     fn class_socket(&self, class: PublicationClass) -> (&Arc<UdpSocket>, SocketAddr) {
         match (class, &self.video) {
             (PublicationClass::Video, Some(video)) => (video, self.video_peer_addr),
@@ -2004,6 +2049,9 @@ fn direct_lane_id(args: &Args, index: usize) -> String {
 struct LaneBacklog {
     /// Parts queued and not yet sent.
     pending: Arc<AtomicUsize>,
+    /// Datagrams handed to the kernel on the lane's main socket, by the
+    /// lane and its backlog: the count of the lane's ledger (RLL1).
+    sent: Arc<AtomicU64>,
     sender: std::sync::OnceLock<std::sync::mpsc::SyncSender<BacklogPart>>,
 }
 
@@ -2053,6 +2101,7 @@ impl LaneBacklog {
                 Arc::clone(socket),
                 Arc::clone(telemetry),
                 Arc::clone(&self.pending),
+                Arc::clone(&self.sent),
             )
         });
         self.pending.fetch_add(1, Ordering::AcqRel);
@@ -2088,6 +2137,7 @@ fn start_lane_backlog(
     socket: Arc<UdpSocket>,
     telemetry: Arc<IngestTelemetry>,
     pending: Arc<AtomicUsize>,
+    sent: Arc<AtomicU64>,
 ) -> std::sync::mpsc::SyncSender<BacklogPart> {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<BacklogPart>(LANE_BACKLOG_PARTS);
     let started = std::thread::Builder::new()
@@ -2097,7 +2147,7 @@ fn start_lane_backlog(
             // thread's SCHED_FIFO and CPU: it runs normally, on any CPU.
             let _ = class_lanes::reset_current_thread_scheduling();
             while let Ok(part) = receiver.recv() {
-                send_backlog_part(&socket, &telemetry, part);
+                send_backlog_part(&socket, &telemetry, &sent, part);
                 pending.fetch_sub(1, Ordering::AcqRel);
             }
         });
@@ -2111,7 +2161,12 @@ fn start_lane_backlog(
 
 /// Send the rest of one part: the source set first, then the repair,
 /// waiting for room in the socket's buffer until the part's deadline.
-fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: BacklogPart) {
+fn send_backlog_part(
+    socket: &UdpSocket,
+    telemetry: &IngestTelemetry,
+    lane_sent: &AtomicU64,
+    part: BacklogPart,
+) {
     let expire = |unsent: &[(MediaDatagramRole, Bytes)]| {
         telemetry
             .relay_expired_symbols
@@ -2147,6 +2202,7 @@ fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: Back
             continue;
         }
         let outcome = send_until_taken(socket, &messages[from..to], part.deadline);
+        lane_sent.fetch_add(outcome.sent as u64, Ordering::Release);
         sent += outcome.sent;
         journal_sent_first(outcome.sent > 0);
         if let Some(error) = outcome.error {
@@ -2352,6 +2408,8 @@ struct RelaySessionPublisher {
     audio_copies: RelayAudioCopies,
     /// When the lanes were last looked at for loss reports (µs).
     loss_polled_us: AtomicU64,
+    /// When the lanes last sent their ledgers (RLL1).
+    ledger_sent_us: AtomicU64,
     /// `--relay-demand-renditions`.
     demand_groups: Vec<Vec<u64>>,
     configured_loss: f64,
@@ -2554,6 +2612,7 @@ impl RelaySessionPublisher {
             repair_both_lanes: args.relay_repair_both_lanes,
             audio_copies: args.relay_audio_copies,
             loss_polled_us: AtomicU64::new(0),
+            ledger_sent_us: AtomicU64::new(0),
             demand_groups: parse_rendition_groups(&args.relay_demand_renditions)?,
             configured_loss: f64::from(
                 adaptive_relay_path_metrics(primary_path_metrics, secondary_path_metrics)
@@ -2569,7 +2628,8 @@ impl RelaySessionPublisher {
     }
 
     /// Take the reports that each lane's forwarder sends to the lane's audio
-    /// socket (loss, RLR1; demand, RLD1); looked at every 50 ms at most.
+    /// socket (loss, RLR1; demand, RLD1), looked at every 50 ms at most,
+    /// and send each lane's ledger (RLL1) every 250 ms.
     fn poll_lane_reports(&self, now: u64) {
         let polled = self.loss_polled_us.load(Ordering::Relaxed);
         if now.saturating_sub(polled) < LANE_LOSS_POLL_US
@@ -2580,18 +2640,27 @@ impl RelaySessionPublisher {
         {
             return;
         }
-        drain_lane_loss_reports(
-            &self.primary.socket,
-            &self.primary.reported_loss,
-            &self.primary.demand,
-            RelayCarrierPath::Primary,
-        );
-        if let Some(secondary) = self.secondary.as_ref() {
+        let demand = !self.demand_groups.is_empty();
+        let ledger = self.ledger_sent_us.load(Ordering::Relaxed);
+        let ledger_due = now.saturating_sub(ledger) >= LANE_LEDGER_INTERVAL_US;
+        if ledger_due {
+            self.ledger_sent_us.store(now, Ordering::Relaxed);
+        }
+        for (lane, path) in [
+            (Some(&self.primary), RelayCarrierPath::Primary),
+            (self.secondary.as_ref(), RelayCarrierPath::Secondary),
+        ] {
+            let Some(lane) = lane else {
+                continue;
+            };
+            if ledger_due {
+                lane.send_ledger();
+            }
             drain_lane_loss_reports(
-                &secondary.socket,
-                &secondary.reported_loss,
-                &secondary.demand,
-                RelayCarrierPath::Secondary,
+                &lane.socket,
+                &lane.reported_loss,
+                demand.then_some(&lane.demand),
+                path,
             );
         }
     }
@@ -2626,17 +2695,25 @@ impl RelaySessionPublisher {
     /// The repair count of a one-symbol audio part now
     /// (`--relay-audio-copies`); `None` leaves it to the policy.
     fn single_symbol_audio_repair(&self) -> Option<u32> {
+        // The ledgers go out (and the reports come in) whatever sizes the
+        // copies, so the forwarders' measure and the metrics are there for
+        // an A/B.
+        let now = hop_journal::now_unix_us();
+        self.poll_lane_reports(now);
         let loss = match self.audio_copies {
             RelayAudioCopies::Policy => return None,
             RelayAudioCopies::Configured => self.configured_loss,
             RelayAudioCopies::Measured => {
-                let now = hop_journal::now_unix_us();
-                self.poll_lane_reports(now);
-                let secondary = self
-                    .secondary
-                    .as_ref()
-                    .map_or(0.0, |lane| lane.reported_loss.loss(now));
-                self.primary.reported_loss.loss(now).max(secondary)
+                // A lane whose forwarder reports nothing is taken at the
+                // configured loss (--relay-path-loss-fraction), not as
+                // clean (wave 7 review).
+                let lane_loss = |lane: &RelayLane| {
+                    lane.reported_loss
+                        .loss(now)
+                        .unwrap_or(self.configured_loss)
+                };
+                let secondary = self.secondary.as_ref().map_or(0.0, lane_loss);
+                lane_loss(&self.primary).max(secondary)
             }
         };
         let repair = single_symbol_audio_repair(loss).max(self.min_repair_symbols);
@@ -3599,6 +3676,7 @@ impl RelaySessionPublisher {
             .collect::<Vec<_>>();
         let outcome = udp_batch::try_send_all(socket, &messages);
         drop(messages);
+        lane.count_sent(socket, outcome.sent);
         if outcome.sent > 0
             && sent_first.is_some_and(|sent_first| !sent_first.swap(true, Ordering::AcqRel))
         {
@@ -3778,6 +3856,7 @@ impl RelaySessionPublisher {
                 .map(drop)
         };
         if let Err(stopped) = sent {
+            lane.count_sent(socket, stopped.sent);
             for (role, wire) in &wires[..stopped.sent] {
                 self.telemetry
                     .record_relay_session_send_success(*role, wire.len() as u64);
@@ -3789,6 +3868,7 @@ impl RelaySessionPublisher {
             return Err(stopped.error)
                 .with_context(|| format!("failed to send RelaySession datagrams to {peer}"));
         }
+        lane.count_sent(socket, wires.len());
         for (role, wire) in wires {
             self.telemetry
                 .record_relay_session_send_success(*role, wire.len() as u64);
@@ -3834,6 +3914,7 @@ impl RelaySessionPublisher {
                 Err(error)
                     .with_context(|| format!("failed to send RelaySession datagram to {peer}"))
             } else {
+                transport.count_sent(socket, 1);
                 self.telemetry
                     .record_relay_session_send_success(role, wire_bytes);
                 Ok(())
@@ -14384,6 +14465,73 @@ mod tests {
         assert_eq!(snapshot.stages.encode.count, 0);
     }
 
+    /// Each lane's ledger (RLL1) counts the datagrams that the lane handed
+    /// to the kernel on its main socket, and goes out behind them.
+    #[tokio::test]
+    async fn a_lanes_ledger_counts_what_it_sent() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(receiver.local_addr().unwrap());
+        args.relay_class_lanes = false;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = vec![0x5a; 12_000];
+        let (initialization, configuration_epoch) =
+            build_fmp4_initialization_object(8, TEST_SOURCE_EPOCH, b"ledger-init").unwrap();
+        let part = test_fmp4_part(
+            8,
+            3,
+            true,
+            3,
+            0,
+            None,
+            Bytes::copy_from_slice(&payload),
+            i64::try_from(now_unix_us().saturating_mul(1_000)).unwrap(),
+        );
+        let object = build_fmp4_media_object(
+            &part,
+            &payload,
+            initialization.key().clone(),
+            configuration_epoch,
+            TEST_SOURCE_EPOCH,
+            5_000,
+            1_000_000,
+        )
+        .unwrap();
+        let outcome = relay
+            .publish_object(&object, 1, PublicationClass::Video)
+            .await
+            .unwrap();
+        let expected = outcome.source_symbols + outcome.repair_symbols;
+        // Another socket's sends are not the lane's.
+        let other = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        relay.primary.count_sent(&other, 7);
+        relay.primary.send_ledger();
+        let mut wire = vec![0_u8; 4_096];
+        let mut datagrams = 0;
+        loop {
+            let (len, _) = timeout(Duration::from_secs(3), receiver.recv_from(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            if wire[..len].starts_with(b"RLL1") {
+                // The lane's first ledger may leave before the part (the
+                // publication polls the lane), with what was sent by then.
+                let sent = u64::from_be_bytes(wire[8..16].try_into().unwrap());
+                assert_eq!(sent, datagrams as u64);
+                if datagrams == expected {
+                    break;
+                }
+                continue;
+            }
+            datagrams += 1;
+        }
+        assert_eq!(datagrams, expected, "the ledger came behind them");
+    }
+
     #[tokio::test]
     async fn relay_session_uses_primary_repair_fallback_for_single_parent() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -15022,22 +15170,33 @@ mod tests {
         assert_eq!(single_symbol_audio_repair(f64::NAN), 0);
         let mut report = [0_u8; 16];
         report[..4].copy_from_slice(b"RLR1");
-        report[4] = 1;
+        report[4] = 2;
         report[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
         assert_eq!(decode_lane_loss_report(&report), Some(50_000));
         assert_eq!(decode_lane_loss_report(&report[..15]), None);
+        // Version 1 (packet-sequence gaps) is not read.
+        report[4] = 1;
+        assert_eq!(decode_lane_loss_report(&report), None);
         let lane = LaneLossReport::default();
-        assert_eq!(lane.loss(10_000_000), 0.0);
+        assert_eq!(lane.loss(10_000_000), None);
         lane.record(50_000, 10_000_000);
-        assert!((lane.loss(11_000_000) - 0.05).abs() < 1e-9);
-        // Stale after 3 s.
-        assert_eq!(lane.loss(13_500_000), 0.0);
+        assert!((lane.loss(11_000_000).unwrap() - 0.05).abs() < 1e-9);
+        // Stale after 3 s: unknown, not clean.
+        assert_eq!(lane.loss(13_500_000), None);
+        let ledger = encode_lane_ledger(u64::from(u32::MAX) + 3);
+        assert_eq!(&ledger[..5], b"RLL1\x01");
+        assert_eq!(
+            u64::from_be_bytes(ledger[8..16].try_into().unwrap()),
+            u64::from(u32::MAX) + 3
+        );
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
         assert_eq!(parsed.relay_audio_copies, RelayAudioCopies::Measured);
     }
 
     /// A lane's forwarder reports 5 % loss: the next one-symbol audio part
-    /// goes with two copies on each lane; without reports it goes alone.
+    /// goes with two copies on each lane. Before any report a lane counts
+    /// at the configured loss; reports of zero from both lanes send it
+    /// alone. Each lane sends its forwarder a ledger (RLL1) of what it sent.
     #[tokio::test]
     async fn measured_lane_loss_sizes_the_copies_of_a_one_symbol_audio_part() {
         let primary = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -15054,17 +15213,48 @@ mod tests {
         args.relay_secondary_target = Some(secondary.local_addr().unwrap());
         args.relay_secondary_bind = Some(free());
         args.relay_audio_copies = RelayAudioCopies::Measured;
+        args.relay_path_loss_fraction = 0.02;
         let telemetry = Arc::new(IngestTelemetry::default());
         let publisher = RelaySessionPublisher::new(&args, telemetry)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(publisher.single_symbol_audio_repair(), Some(0));
+        // No report yet: the configured loss (copies), not zero.
+        let configured = single_symbol_audio_repair(publisher.configured_loss);
+        assert!(configured > 0);
+        assert_eq!(publisher.single_symbol_audio_repair(), Some(configured));
+        // Each lane's forwarder hears the lane's ledger.
+        primary
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut ledger = [0_u8; 64];
+        let (len, _) = primary.recv_from(&mut ledger).unwrap();
+        assert_eq!(&ledger[..5], b"RLL1\x01");
+        assert_eq!(len, 16);
+        let report_of = |ppm: u32| {
+            let mut report = [0_u8; 16];
+            report[..4].copy_from_slice(b"RLR1");
+            report[4] = 2;
+            report[8..12].copy_from_slice(&ppm.to_be_bytes());
+            report
+        };
+        // Both forwarders report a clean lane: no copy.
+        primary
+            .send_to(&report_of(0), publisher.primary.local_addr().unwrap())
+            .unwrap();
+        secondary
+            .send_to(
+                &report_of(0),
+                publisher.secondary.as_ref().unwrap().local_addr().unwrap(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while publisher.single_symbol_audio_repair() != Some(0) {
+            assert!(std::time::Instant::now() < deadline, "not heard");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // The primary's forwarder reports 5 % from the lane's peer address.
-        let mut report = [0_u8; 16];
-        report[..4].copy_from_slice(b"RLR1");
-        report[4] = 1;
-        report[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
+        let report = report_of(50_000);
         primary
             .send_to(&report, publisher.primary.local_addr().unwrap())
             .unwrap();
@@ -17820,7 +18010,7 @@ mod tests {
             path: RelayCarrierPath::Primary,
             records_outcome: true,
         };
-        send_backlog_part(socket, &telemetry, part);
+        send_backlog_part(socket, &telemetry, &AtomicU64::new(0), part);
         let snapshot = telemetry.snapshot().relay_session;
         assert_eq!(snapshot.primary_lane_objects_failed, 1);
         assert_eq!(snapshot.primary_lane_objects_succeeded, 0);
@@ -17840,7 +18030,7 @@ mod tests {
             path: RelayCarrierPath::Primary,
             records_outcome: true,
         };
-        send_backlog_part(socket, &telemetry, part);
+        send_backlog_part(socket, &telemetry, &AtomicU64::new(0), part);
         let mut wire = [0_u8; 64];
         let (len, _) = timeout(Duration::from_secs(2), primary_audio.recv_from(&mut wire))
             .await
