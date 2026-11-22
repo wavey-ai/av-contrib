@@ -516,6 +516,9 @@ const DURATION_HISTOGRAM_BUCKETS_US: [u64; 13] = [
     1_000_000,
 ];
 
+/// `--relay-video-gso-segments`.
+const DEFAULT_RELAY_VIDEO_GSO_SEGMENTS: u16 = 16;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "av-contrib",
@@ -847,19 +850,36 @@ struct Args {
     relay_send_batch: bool,
 
     /// Hand a 4K part's RelaySession symbols to the kernel as UDP GSO
-    /// messages (UDP_SEGMENT: up to 64 symbols in one pass through the
+    /// messages (UDP_SEGMENT: a run of symbols in one pass through the
     /// stack, cut into the same datagrams by the kernel) on the video lanes,
-    /// instead of one `sendmmsg` entry per symbol. Every hop of the 4K
-    /// plane pays per datagram; this is the contributor's share. A host
-    /// without UDP GSO is detected on the first send and the lanes go on
-    /// without it. Needs --relay-send-batch.
+    /// instead of one `sendmmsg` entry per symbol. It saves the contributor
+    /// send cost per symbol only: the wire, the packet rate and every
+    /// receiver's cost are the same. A GSO message is one packet to the
+    /// qdisc, so its datagrams leave back to back: a `prio` qdisc lets
+    /// audio in only between messages, and `fq` pacing
+    /// (--relay-video-pacing-mbps) spaces messages, not datagrams. Runs are
+    /// kept to --relay-video-gso-segments, and on paced video sockets to
+    /// about one millisecond of the pacing rate. Off until a lab A/B shows
+    /// lower contributor CPU with audio p99 unchanged. A host without UDP
+    /// GSO is detected on the first send and the lanes go on without it.
+    /// Needs --relay-send-batch.
     #[arg(
         long,
         env = "AV_RELAY_VIDEO_GSO",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set
     )]
     relay_video_gso: bool,
+
+    /// --relay-video-gso: datagrams of one GSO message at most (1-64).
+    /// 16 symbols of about 1.2 kB is about 19 kB, 40 us at 4 Gbit/s.
+    #[arg(
+        long,
+        env = "AV_RELAY_VIDEO_GSO_SEGMENTS",
+        default_value_t = DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
+        value_parser = clap::value_parser!(u16).range(1..=udp_batch::GSO_MAX_SEGMENTS as i64)
+    )]
+    relay_video_gso_segments: u16,
 
     /// Recover each AEP1 epoch once: the LL-HLS worker's FEC receiver hands
     /// every completed epoch to the SoundKit v2 normaliser of the mesh lane,
@@ -1901,6 +1921,9 @@ struct RelaySessionPublisher {
     /// `--relay-video-gso`: a video part's symbols leave each lane as UDP
     /// GSO messages. Cleared for good when the host refuses UDP GSO.
     video_gso: AtomicBool,
+    /// The size of those messages: `--relay-video-gso-segments`, and one
+    /// millisecond of `--relay-video-pacing-mbps` on paced class sockets.
+    video_gso_limits: udp_batch::GsoLimits,
     /// `--relay-audio-inline`: an audio part's lanes are each handed their
     /// symbols without waiting, one after the other, with no join.
     audio_inline: bool,
@@ -2074,6 +2097,10 @@ impl RelaySessionPublisher {
             direct,
             send_batch: args.relay_send_batch,
             video_gso: AtomicBool::new(args.relay_send_batch && args.relay_video_gso),
+            video_gso_limits: udp_batch::GsoLimits::new(
+                usize::from(args.relay_video_gso_segments),
+                classes.video_pacing_bytes_per_second,
+            ),
             audio_inline: args.relay_audio_inline,
             repair_both_lanes: args.relay_repair_both_lanes,
             class_lanes: classes.enabled(),
@@ -2696,49 +2723,45 @@ impl RelaySessionPublisher {
             .iter()
             .map(|(_, wire)| udp_batch::Outbound::connected(wire))
             .collect::<Vec<_>>();
-        let mut from = 0;
-        if class == PublicationClass::Video && self.video_gso.load(Ordering::Relaxed) {
-            match udp_batch::send_all_gso(socket, &messages).await {
-                Ok(sent) => {
-                    self.telemetry
-                        .relay_gso_messages
-                        .fetch_add(sent.messages as u64, Ordering::Relaxed);
-                    self.telemetry
-                        .relay_gso_datagrams
-                        .fetch_add(messages.len() as u64, Ordering::Relaxed);
-                    from = messages.len();
+        let sent = if class == PublicationClass::Video {
+            udp_batch::send_all_gso_or_plain(
+                socket,
+                &messages,
+                self.video_gso_limits,
+                &self.video_gso,
+            )
+            .await
+            .map(|sent| {
+                if let Some(error) = &sent.turned_off {
+                    // The rest of this part, and every later part, went
+                    // one datagram each.
+                    warn!(
+                        %error,
+                        "UDP GSO is unavailable: video symbols leave one datagram each"
+                    );
                 }
-                Err(stopped) if udp_batch::gso_unsupported(&stopped.error) => {
-                    // The rest goes without GSO, now and from now on.
-                    if self.video_gso.swap(false, Ordering::Relaxed) {
-                        warn!(
-                            error = %stopped.error,
-                            "UDP GSO is unavailable: video symbols leave one datagram each"
-                        );
-                    }
-                    from = stopped.sent;
-                }
-                Err(stopped) => {
-                    for (role, wire) in &wires[..stopped.sent] {
-                        self.telemetry
-                            .record_relay_session_send_success(*role, wire.len() as u64);
-                    }
-                    let role = wires
-                        .get(stopped.sent)
-                        .map_or(MediaDatagramRole::Source, |(role, _)| *role);
-                    self.telemetry.record_relay_session_send_error(role);
-                    return Err(stopped.error).with_context(|| {
-                        format!("failed to send RelaySession datagrams to {peer}")
-                    });
-                }
+                self.telemetry
+                    .relay_gso_messages
+                    .fetch_add(sent.gso_messages as u64, Ordering::Relaxed);
+                self.telemetry
+                    .relay_gso_datagrams
+                    .fetch_add(sent.gso_datagrams as u64, Ordering::Relaxed);
+            })
+        } else {
+            udp_batch::send_all_until_refused(socket, &messages, true)
+                .await
+                .map(drop)
+        };
+        if let Err(stopped) = sent {
+            for (role, wire) in &wires[..stopped.sent] {
+                self.telemetry
+                    .record_relay_session_send_success(*role, wire.len() as u64);
             }
-        }
-        if let Err(error) = udp_batch::send_all(socket, &messages[from..], true).await {
             let role = wires
-                .first()
+                .get(stopped.sent)
                 .map_or(MediaDatagramRole::Source, |(role, _)| *role);
             self.telemetry.record_relay_session_send_error(role);
-            return Err(error)
+            return Err(stopped.error)
                 .with_context(|| format!("failed to send RelaySession datagrams to {peer}"));
         }
         for (role, wire) in &wires {
@@ -6866,6 +6889,7 @@ impl ContribStatusConfig {
                 relay_direct_repair: args.relay_direct_repair,
                 relay_send_batch: args.relay_send_batch,
                 relay_video_gso: args.relay_send_batch && args.relay_video_gso,
+                relay_video_gso_segments: args.relay_video_gso_segments,
                 relay_class_lanes: args.relay_class_lanes,
                 relay_class_port_offset: args.relay_class_port_offset,
                 relay_audio_inline: args.relay_audio_inline,
@@ -8818,6 +8842,8 @@ struct MeshTargetStatus {
     /// `--relay-video-gso` (with `--relay-send-batch`); the runtime's
     /// `gso_messages` say whether the host took it.
     relay_video_gso: bool,
+    /// `--relay-video-gso-segments`.
+    relay_video_gso_segments: u16,
     /// `--relay-class-lanes` and `--relay-class-port-offset`.
     relay_class_lanes: bool,
     relay_class_port_offset: u16,
@@ -12089,12 +12115,83 @@ mod tests {
         relay_session_routes_source_and_secondary_repair(true, false).await;
     }
 
+    /// Off by default until a lab A/B shows a gain; runs of 16 by default,
+    /// 1-64 accepted.
     #[test]
-    fn the_relay_video_gso_flag_defaults_on_and_can_be_turned_off() {
+    fn the_relay_video_gso_flag_defaults_off_and_can_be_turned_on() {
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
-        assert!(parsed.relay_video_gso);
-        let parsed = Args::try_parse_from(["av-contrib", "--relay-video-gso", "false"]).unwrap();
         assert!(!parsed.relay_video_gso);
+        assert_eq!(parsed.relay_video_gso_segments, 16);
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--relay-video-gso",
+            "true",
+            "--relay-video-gso-segments",
+            "64",
+        ])
+        .unwrap();
+        assert!(parsed.relay_video_gso);
+        assert_eq!(parsed.relay_video_gso_segments, 64);
+        for refused in ["0", "65"] {
+            assert!(
+                Args::try_parse_from(["av-contrib", "--relay-video-gso-segments", refused])
+                    .is_err()
+            );
+        }
+    }
+
+    /// A paced video socket gets GSO messages of about one millisecond at
+    /// its pacing rate, so `fq` spaces bursts of a few symbols rather than
+    /// of a whole run; unpaced lanes keep the segment cap.
+    #[tokio::test]
+    async fn video_gso_messages_are_one_millisecond_of_the_pacing_rate() {
+        let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = reservation.local_addr().unwrap();
+        drop(reservation);
+        for (class_lanes, pacing_mbps, expected) in [
+            (
+                true,
+                40,
+                udp_batch::GsoLimits {
+                    segments: 16,
+                    bytes: 5_000,
+                },
+            ),
+            (
+                true,
+                0,
+                udp_batch::GsoLimits {
+                    segments: 16,
+                    bytes: udp_batch::GSO_MAX_BYTES,
+                },
+            ),
+            // Without class lanes the video socket is not paced.
+            (
+                false,
+                40,
+                udp_batch::GsoLimits {
+                    segments: 16,
+                    bytes: udp_batch::GSO_MAX_BYTES,
+                },
+            ),
+        ] {
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_receiver.local_addr().unwrap());
+            args.relay_primary_bind = Some(bind);
+            args.relay_send_batch = true;
+            args.relay_video_gso = true;
+            args.relay_class_lanes = class_lanes;
+            args.relay_video_pacing_mbps = pacing_mbps;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                relay.video_gso_limits, expected,
+                "{class_lanes} {pacing_mbps}"
+            );
+        }
     }
 
     fn reserved_loopback_addr() -> SocketAddr {
@@ -12368,6 +12465,7 @@ mod tests {
         args.relay_secondary_seed_source = true;
         args.relay_send_batch = send_batch;
         args.relay_video_gso = video_gso;
+        args.relay_video_gso_segments = 16;
         // Today's lanes: one socket per lane, no repair on the primary.
         // The class lanes and repair on both lanes have their own tests.
         args.relay_class_lanes = false;
@@ -12583,10 +12681,18 @@ mod tests {
         // A video part: with GSO (where the host has it) each lane's
         // symbols leave in a few GSO messages; without it, none.
         let symbols = (primary.len() + secondary_source.len() + secondary_repair.len()) as u64;
+        if send_batch && video_gso && udp_batch::gso_available() {
+            // A host with UDP GSO keeps it: a silent fallback fails here.
+            assert!(relay.video_gso.load(Ordering::Relaxed));
+        }
         if send_batch && video_gso && relay.video_gso.load(Ordering::Relaxed) {
+            let messages = snapshot.relay_session.gso_messages;
+            eprintln!("{symbols} symbols of one video part in {messages} GSO messages");
             assert_eq!(snapshot.relay_session.gso_datagrams, symbols);
-            assert!(snapshot.relay_session.gso_messages >= 2);
-            assert!(snapshot.relay_session.gso_messages * 4 <= symbols);
+            // At most 16 symbols a message, and runs that fill it: the
+            // part costs a few passes through the stack, not one a symbol.
+            assert!(messages >= symbols.div_ceil(16), "{messages} {symbols}");
+            assert!(messages * 4 <= symbols, "{messages} {symbols}");
         } else {
             assert_eq!(snapshot.relay_session.gso_messages, 0);
             assert_eq!(snapshot.relay_session.gso_datagrams, 0);
@@ -13220,7 +13326,8 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
-            relay_video_gso: true,
+            relay_video_gso: false,
+            relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -13318,7 +13425,8 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
-            relay_video_gso: true,
+            relay_video_gso: false,
+            relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -13921,7 +14029,8 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
-            relay_video_gso: true,
+            relay_video_gso: false,
+            relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14159,7 +14268,8 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
-            relay_video_gso: true,
+            relay_video_gso: false,
+            relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14297,7 +14407,8 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
-            relay_video_gso: true,
+            relay_video_gso: false,
+            relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,

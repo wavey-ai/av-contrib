@@ -52,6 +52,15 @@ pub async fn send_all(
         .map_err(|stopped| stopped.error)
 }
 
+/// [`send_all`] that says, on an error, how many datagrams went before it.
+pub async fn send_all_until_refused(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    batch: bool,
+) -> Result<usize, Stopped> {
+    send_until_refused(socket, messages, batch).await
+}
+
 /// A batch that stopped at a datagram the kernel refused.
 #[derive(Debug)]
 pub struct Stopped {
@@ -282,11 +291,52 @@ pub const GSO_MAX_BYTES: usize = 63 * 1024;
 /// GSO messages handed to the kernel in one `sendmmsg` call at most.
 const GSO_MESSAGES_PER_CALL: usize = 16;
 
+/// How large one UDP GSO message may be. A GSO message is one packet to
+/// the qdisc: a `prio` qdisc lets another band in only between packets,
+/// and `fq` charges a paced socket's whole message at once and then lets
+/// the device send its datagrams back to back. So a run is kept short
+/// (`segments`), and on a paced socket to about one millisecond at the
+/// pacing rate, as TCP sizes its own GSO packets (`tcp_tso_autosize`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GsoLimits {
+    /// Datagrams of one message, `1..=GSO_MAX_SEGMENTS` (1: no GSO).
+    pub segments: usize,
+    /// Payload bytes of one message; a run always takes its first datagram.
+    pub bytes: usize,
+}
+
+impl GsoLimits {
+    /// The kernel's own limits.
+    pub const MAX: Self = Self {
+        segments: GSO_MAX_SEGMENTS,
+        bytes: GSO_MAX_BYTES,
+    };
+
+    /// At most `segments` datagrams a message and, when the socket is paced
+    /// at `pacing_bytes_per_second`, at most one millisecond of that rate.
+    pub fn new(segments: usize, pacing_bytes_per_second: Option<u64>) -> Self {
+        let bytes =
+            pacing_bytes_per_second
+                .filter(|rate| *rate > 0)
+                .map_or(GSO_MAX_BYTES, |rate| {
+                    usize::try_from(rate / 1_000)
+                        .map_or(GSO_MAX_BYTES, |bytes| bytes.min(GSO_MAX_BYTES))
+                });
+        Self {
+            segments: segments.clamp(1, GSO_MAX_SEGMENTS),
+            bytes,
+        }
+    }
+}
+
 /// The runs of `messages` that one UDP GSO message each can carry:
 /// consecutive datagrams to one target, every one but the last exactly as
-/// long as the first, within [`GSO_MAX_SEGMENTS`] and [`GSO_MAX_BYTES`].
-/// `(first, count)` of each run, in order, covering every message once.
-pub fn gso_runs(messages: &[Outbound<'_>]) -> Vec<(usize, usize)> {
+/// long as the first, within `limits` (a run always holds at least its
+/// first datagram). `(first, count)` of each run, in order, covering every
+/// message once.
+pub fn gso_runs(messages: &[Outbound<'_>], limits: GsoLimits) -> Vec<(usize, usize)> {
+    let max_segments = limits.segments.clamp(1, GSO_MAX_SEGMENTS);
+    let max_bytes = limits.bytes.min(GSO_MAX_BYTES);
     let mut runs = Vec::new();
     let mut index = 0;
     while index < messages.len() {
@@ -295,13 +345,13 @@ pub fn gso_runs(messages: &[Outbound<'_>]) -> Vec<(usize, usize)> {
         let mut length = 1;
         let mut bytes = size;
         if size > 0 {
-            while index + length < messages.len() && length < GSO_MAX_SEGMENTS {
+            while index + length < messages.len() && length < max_segments {
                 let next = &messages[index + length];
                 let next_size = next.bytes.len();
                 if next.target != first.target
                     || next_size == 0
                     || next_size > size
-                    || bytes + next_size > GSO_MAX_BYTES
+                    || bytes + next_size > max_bytes
                 {
                     break;
                 }
@@ -319,20 +369,48 @@ pub fn gso_runs(messages: &[Outbound<'_>]) -> Vec<(usize, usize)> {
 }
 
 /// Whether a send failed because this host cannot do UDP GSO on the socket
-/// (no `UDP_SEGMENT`, or a device without checksum offload): send without
-/// it from then on.
+/// (no `UDP_SEGMENT`, a device without checksum offload, or a segment that
+/// does not fit the path's MTU): send without it from then on.
 pub fn gso_unsupported(error: &io::Error) -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(
             error.raw_os_error(),
             Some(libc::EIO | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOPROTOOPT)
-        )
+        ) || error.kind() == io::ErrorKind::Unsupported
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = error;
         true
+    }
+}
+
+/// Whether this kernel has UDP GSO at all (`UDP_SEGMENT`, Linux 4.18): a
+/// socket takes the option. A device may still refuse a GSO send.
+pub fn gso_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+            return false;
+        };
+        let segment: libc::c_int = 1_200;
+        // SAFETY: an int option of a socket this function owns.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_UDP,
+                libc::UDP_SEGMENT,
+                std::ptr::addr_of!(segment).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        rc == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -342,7 +420,7 @@ pub struct GsoSent {
     /// `sendmmsg` calls.
     pub calls: usize,
     /// GSO messages: passes through the stack, each cut by the kernel into
-    /// up to [`GSO_MAX_SEGMENTS`] datagrams.
+    /// up to [`GsoLimits::segments`] datagrams.
     pub messages: usize,
 }
 
@@ -351,30 +429,168 @@ pub struct GsoSent {
 /// of a 4K part cost a few passes through the stack instead of one each.
 /// The receiver sees exactly the datagrams of [`send_all`], in order. Waits
 /// for room in the socket's buffer as [`send_all`] does. A [`Stopped`]
-/// error says how many datagrams went before it; with
-/// [`gso_unsupported`] and none sent, send the batch with [`send_all`].
+/// error says how many datagrams went before it.
 pub async fn send_all_gso(
     socket: &UdpSocket,
     messages: &[Outbound<'_>],
+    limits: GsoLimits,
 ) -> Result<GsoSent, Stopped> {
+    send_all_gso_with(socket, messages, limits, &mut sendmmsg_gso).await
+}
+
+/// One `sendmmsg` call of GSO messages, one per run: how many runs the
+/// kernel took.
+fn sendmmsg_gso(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    runs: &[(usize, usize)],
+) -> io::Result<usize> {
     #[cfg(target_os = "linux")]
     {
-        linux::send_all_gso(socket, messages).await
+        linux::sendmmsg_gso(socket, messages, runs)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (socket, messages);
-        Err(Stopped {
-            sent: 0,
-            calls: 0,
-            error: io::Error::new(io::ErrorKind::Unsupported, "UDP GSO is Linux only"),
-        })
+        let _ = (socket, messages, runs);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "UDP GSO is Linux only",
+        ))
+    }
+}
+
+/// [`send_all_gso`] with the `sendmmsg` call given: tests stand in a kernel
+/// that refuses GSO part way through a batch.
+async fn send_all_gso_with<F>(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    limits: GsoLimits,
+    call: &mut F,
+) -> Result<GsoSent, Stopped>
+where
+    F: FnMut(&UdpSocket, &[Outbound<'_>], &[(usize, usize)]) -> io::Result<usize>,
+{
+    use tokio::io::Interest;
+    let runs = gso_runs(messages, limits);
+    let mut done = GsoSent::default();
+    let mut next_run = 0;
+    let mut sent = 0;
+    while next_run < runs.len() {
+        let end = (next_run + GSO_MESSAGES_PER_CALL).min(runs.len());
+        match socket.try_io(Interest::WRITABLE, || {
+            call(socket, messages, &runs[next_run..end])
+        }) {
+            Ok(0) => {
+                return Err(Stopped {
+                    sent,
+                    calls: done.calls + 1,
+                    error: io::Error::new(io::ErrorKind::WriteZero, "sendmmsg took no GSO message"),
+                })
+            }
+            Ok(taken) => {
+                done.calls += 1;
+                done.messages += taken;
+                sent += runs[next_run..next_run + taken]
+                    .iter()
+                    .map(|run| run.1)
+                    .sum::<usize>();
+                next_run += taken;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if let Err(error) = socket.writable().await {
+                    return Err(Stopped {
+                        sent,
+                        calls: done.calls,
+                        error,
+                    });
+                }
+            }
+            Err(error) => {
+                return Err(Stopped {
+                    sent,
+                    calls: done.calls + 1,
+                    error,
+                })
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// What [`send_all_gso_or_plain`] did.
+#[derive(Debug, Default)]
+pub struct GsoOrPlainSent {
+    /// GSO messages, and the datagrams they carried.
+    pub gso_messages: usize,
+    pub gso_datagrams: usize,
+    /// Datagrams that left one each (after a refusal, or with GSO off).
+    pub plain_datagrams: usize,
+    /// The refusal that turned GSO off in this call (the caller's to log
+    /// once): the rest of the batch went without GSO.
+    pub turned_off: Option<io::Error>,
+}
+
+/// Send every datagram of `messages` in order: as UDP GSO messages while
+/// `gso` is set, then one datagram each. When the kernel refuses GSO
+/// ([`gso_unsupported`]) part way, `gso` is cleared for good and the
+/// datagrams from the refused message on are sent with [`send_all`]
+/// (batched), so each still arrives once and in order. A [`Stopped`] error
+/// gives the index, in `messages`, of the datagram that failed.
+pub async fn send_all_gso_or_plain(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    limits: GsoLimits,
+    gso: &std::sync::atomic::AtomicBool,
+) -> Result<GsoOrPlainSent, Stopped> {
+    send_all_gso_or_plain_with(socket, messages, limits, gso, &mut sendmmsg_gso).await
+}
+
+async fn send_all_gso_or_plain_with<F>(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    limits: GsoLimits,
+    gso: &std::sync::atomic::AtomicBool,
+    call: &mut F,
+) -> Result<GsoOrPlainSent, Stopped>
+where
+    F: FnMut(&UdpSocket, &[Outbound<'_>], &[(usize, usize)]) -> io::Result<usize>,
+{
+    use std::sync::atomic::Ordering;
+    let mut outcome = GsoOrPlainSent::default();
+    let mut from = 0;
+    if gso.load(Ordering::Relaxed) {
+        match send_all_gso_with(socket, messages, limits, call).await {
+            Ok(sent) => {
+                outcome.gso_messages = sent.messages;
+                outcome.gso_datagrams = messages.len();
+                return Ok(outcome);
+            }
+            Err(stopped) if gso_unsupported(&stopped.error) => {
+                if gso.swap(false, Ordering::Relaxed) {
+                    outcome.turned_off = Some(stopped.error);
+                }
+                outcome.gso_datagrams = stopped.sent;
+                from = stopped.sent;
+            }
+            Err(stopped) => return Err(stopped),
+        }
+    }
+    match send_until_refused(socket, &messages[from..], true).await {
+        Ok(_) => {
+            outcome.plain_datagrams = messages.len() - from;
+            Ok(outcome)
+        }
+        Err(stopped) => Err(Stopped {
+            sent: from + stopped.sent,
+            calls: stopped.calls,
+            error: stopped.error,
+        }),
     }
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{GsoSent, Outbound, Stopped, GSO_MESSAGES_PER_CALL, MESSAGES_PER_CALL};
+    use super::{Outbound, Stopped, GSO_MESSAGES_PER_CALL, MESSAGES_PER_CALL};
     use std::io;
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
@@ -423,62 +639,9 @@ mod linux {
         Ok(calls)
     }
 
-    pub(super) async fn send_all_gso(
-        socket: &UdpSocket,
-        messages: &[Outbound<'_>],
-    ) -> Result<GsoSent, Stopped> {
-        let runs = super::gso_runs(messages);
-        let mut done = GsoSent::default();
-        let mut next_run = 0;
-        let mut sent = 0;
-        while next_run < runs.len() {
-            let end = (next_run + GSO_MESSAGES_PER_CALL).min(runs.len());
-            match socket.try_io(Interest::WRITABLE, || {
-                sendmmsg_gso(socket, messages, &runs[next_run..end])
-            }) {
-                Ok(0) => {
-                    return Err(Stopped {
-                        sent,
-                        calls: done.calls + 1,
-                        error: io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "sendmmsg took no GSO message",
-                        ),
-                    })
-                }
-                Ok(taken) => {
-                    done.calls += 1;
-                    done.messages += taken;
-                    sent += runs[next_run..next_run + taken]
-                        .iter()
-                        .map(|run| run.1)
-                        .sum::<usize>();
-                    next_run += taken;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if let Err(error) = socket.writable().await {
-                        return Err(Stopped {
-                            sent,
-                            calls: done.calls,
-                            error,
-                        });
-                    }
-                }
-                Err(error) => {
-                    return Err(Stopped {
-                        sent,
-                        calls: done.calls + 1,
-                        error,
-                    })
-                }
-            }
-        }
-        Ok(done)
-    }
-
     /// One `sendmmsg` call of GSO messages, one per run. Returns how many
     /// runs the kernel took.
-    fn sendmmsg_gso(
+    pub(super) fn sendmmsg_gso(
         socket: &UdpSocket,
         messages: &[Outbound<'_>],
         runs: &[(usize, usize)],
@@ -687,56 +850,216 @@ mod tests {
             Outbound::to(b, &full),
         ]);
         assert_eq!(
-            gso_runs(&messages),
+            gso_runs(&messages, GsoLimits::MAX),
             vec![(0, 11), (11, 1), (12, 2), (14, 1)]
         );
         let longer = vec![3_u8; 1_300];
         let grow = [Outbound::connected(&full), Outbound::connected(&longer)];
-        assert_eq!(gso_runs(&grow), vec![(0, 1), (1, 1)]);
+        assert_eq!(gso_runs(&grow, GsoLimits::MAX), vec![(0, 1), (1, 1)]);
         let many = vec![Outbound::connected(&full); 200];
-        let runs = gso_runs(&many);
+        let runs = gso_runs(&many, GsoLimits::MAX);
         assert!(runs.iter().all(|run| run.1 <= GSO_MAX_SEGMENTS));
         assert!(runs.iter().all(|run| run.1 * full.len() <= GSO_MAX_BYTES));
         assert_eq!(runs.iter().map(|run| run.1).sum::<usize>(), 200);
-        assert!(gso_runs(&[]).is_empty());
+        assert!(gso_runs(&[], GsoLimits::MAX).is_empty());
+    }
+
+    #[test]
+    fn gso_runs_keep_to_the_segment_cap_and_to_a_millisecond_of_the_pacing_rate() {
+        let full = vec![1_u8; 1_190];
+        let many = vec![Outbound::connected(&full); 100];
+        // The segment cap: runs of 16, then the rest.
+        let capped = gso_runs(&many, GsoLimits::new(16, None));
+        assert_eq!(capped.len(), 7);
+        assert!(capped.iter().all(|run| run.1 <= 16));
+        assert_eq!(capped.last(), Some(&(96, 4)));
+        // 40 Mbit/s of pacing is 5,000 bytes a millisecond: 4 symbols of
+        // 1,190 bytes a message, whatever the segment cap says.
+        let paced = GsoLimits::new(64, Some(40_000_000 / 8));
+        assert_eq!(paced.bytes, 5_000);
+        let runs = gso_runs(&many, paced);
+        assert!(runs.iter().all(|run| run.1 == 4), "{runs:?}");
+        assert_eq!(runs.len(), 25);
+        // Pacing below one symbol a millisecond: one datagram a message
+        // (no GSO), never an empty run.
+        let slow = GsoLimits::new(64, Some(500_000 / 8));
+        let runs = gso_runs(&many, slow);
+        assert_eq!(runs.len(), 100);
+        assert!(runs.iter().all(|run| run.1 == 1));
+        // Fast pacing and out-of-range caps stay within the kernel's limits.
+        assert_eq!(GsoLimits::new(1_000, Some(10_000_000_000)), GsoLimits::MAX);
+        assert_eq!(GsoLimits::new(0, None).segments, 1);
+        assert_eq!(GsoLimits::new(16, Some(0)).bytes, GSO_MAX_BYTES);
+    }
+
+    /// A receiver with the buffer of a host left at the default
+    /// net.core.rmem_max (212,992 bytes, doubled by the kernel), so a test
+    /// that passes here passes on any host.
+    async fn default_receiver() -> UdpSocket {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(212_992)
+            .unwrap();
+        socket
+    }
+
+    /// The symbols of a 4K part to one lane: `count - 1` of one size, then a
+    /// short last one, as RLS1 datagrams of one object are.
+    fn part_symbols(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| {
+                let len = if index + 1 == count { 77 } else { 1_190 };
+                (0..len).map(|byte| (byte * 3 + index) as u8).collect()
+            })
+            .collect()
     }
 
     #[tokio::test]
     async fn a_gso_batch_arrives_as_the_same_datagrams_in_order() {
-        let receiver = receiver().await;
+        let receiver = default_receiver().await;
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender
             .connect(receiver.local_addr().unwrap())
             .await
             .unwrap();
-        // A 4K part's symbols: 400 of one size, then a short last one, as
-        // RLS1 datagrams of one object are.
-        let data: Vec<Vec<u8>> = (0..401_usize)
-            .map(|index| {
-                let len = if index == 400 { 77 } else { 1_190 };
-                (0..len).map(|byte| (byte * 3 + index) as u8).collect()
-            })
-            .collect();
+        // 121 datagrams fit a default receive buffer before it is read.
+        let data = part_symbols(121);
         let messages = data
             .iter()
             .map(|bytes| Outbound::connected(bytes))
             .collect::<Vec<_>>();
-        let sent = match send_all_gso(&sender, &messages).await {
-            Ok(sent) => sent,
-            Err(stopped) if stopped.sent == 0 && gso_unsupported(&stopped.error) => {
-                eprintln!("UDP GSO is not available here: {}", stopped.error);
-                return;
+        for limits in [GsoLimits::MAX, GsoLimits::new(16, None)] {
+            let sent = match send_all_gso(&sender, &messages, limits).await {
+                Ok(sent) => sent,
+                Err(stopped) if stopped.sent == 0 && gso_unsupported(&stopped.error) => {
+                    assert!(!gso_available(), "UDP GSO refused: {}", stopped.error);
+                    eprintln!("UDP GSO is not available here: {}", stopped.error);
+                    return;
+                }
+                Err(stopped) => panic!("GSO send failed: {:?}", stopped.error),
+            };
+            // Runs of 52 by bytes: 3 messages; runs of 16: 8 messages.
+            let expected = if limits == GsoLimits::MAX { 3 } else { 8 };
+            assert_eq!(sent.messages, expected, "{sent:?}");
+            assert_eq!(sent.calls, 1, "{sent:?}");
+            let received = receive(&receiver, data.len()).await;
+            for (index, (bytes, from)) in received.into_iter().enumerate() {
+                assert_eq!(bytes, data[index], "datagram {index}");
+                assert_eq!(from, sender.local_addr().unwrap());
             }
-            Err(stopped) => panic!("GSO send failed: {:?}", stopped.error),
-        };
-        // 401 datagrams in 8 messages (runs of 52 by bytes) and one call.
-        assert!(sent.messages <= 8, "{sent:?}");
-        assert!(sent.calls <= 1, "{sent:?}");
-        let received = receive(&receiver, data.len()).await;
-        for (index, (bytes, from)) in received.into_iter().enumerate() {
-            assert_eq!(bytes, data[index], "datagram {index}");
-            assert_eq!(from, sender.local_addr().unwrap());
         }
+    }
+
+    /// A kernel that refuses GSO (EINVAL, as for a segment over the path's
+    /// MTU) on the second `sendmmsg` call of a batch: the first call's
+    /// messages have gone, the rest goes one datagram each, and every
+    /// datagram arrives once and in order. GSO stays off afterwards.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_gso_refusal_part_way_sends_the_rest_once_and_in_order_and_turns_gso_off() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let receiver = default_receiver().await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let data = part_symbols(121);
+        let messages = data
+            .iter()
+            .map(|bytes| Outbound::connected(bytes))
+            .collect::<Vec<_>>();
+        // Runs of 4: 31 messages, 16 a call, so the refusal is the second
+        // call's after 64 datagrams have gone.
+        let limits = GsoLimits::new(4, None);
+        let gso = AtomicBool::new(true);
+        let calls = std::cell::Cell::new(0);
+        let mut refusing =
+            |socket: &UdpSocket, messages: &[Outbound<'_>], runs: &[(usize, usize)]| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    // The real call; without kernel GSO, one datagram a run.
+                    if gso_available() {
+                        linux::sendmmsg_gso(socket, messages, runs)
+                    } else {
+                        let plain = runs
+                            .iter()
+                            .flat_map(|run| &messages[run.0..run.0 + run.1])
+                            .copied()
+                            .collect::<Vec<_>>();
+                        let sent = linux::sendmmsg(socket, &plain)?;
+                        assert_eq!(sent, plain.len());
+                        Ok(runs.len())
+                    }
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EINVAL))
+                }
+            };
+        let outcome = send_all_gso_or_plain_with(&sender, &messages, limits, &gso, &mut refusing)
+            .await
+            .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(outcome.gso_messages, 0, "the GSO send did not finish");
+        assert_eq!(outcome.gso_datagrams, 64);
+        assert_eq!(outcome.plain_datagrams, 121 - 64);
+        assert_eq!(
+            outcome
+                .turned_off
+                .as_ref()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EINVAL)
+        );
+        assert!(!gso.load(Ordering::Relaxed));
+        let received = receive(&receiver, data.len()).await;
+        for (index, (bytes, _)) in received.into_iter().enumerate() {
+            assert_eq!(bytes, data[index], "datagram {index}");
+        }
+        // The next batch goes without GSO: the refusing call is not made.
+        let outcome =
+            send_all_gso_or_plain_with(&sender, &messages[..10], limits, &gso, &mut refusing)
+                .await
+                .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(outcome.plain_datagrams, 10);
+        assert_eq!(outcome.gso_datagrams, 0);
+        assert!(outcome.turned_off.is_none());
+        let received = receive(&receiver, 10).await;
+        for (index, (bytes, _)) in received.into_iter().enumerate() {
+            assert_eq!(bytes, data[index], "datagram {index} of the second batch");
+        }
+        // Nothing arrived twice.
+        let mut buffer = [0_u8; 2_048];
+        assert!(receiver.try_recv_from(&mut buffer).is_err());
+    }
+
+    /// Any other error stops the batch and is the caller's, with the index
+    /// of the failed datagram; GSO stays on.
+    #[tokio::test]
+    async fn a_gso_send_error_that_is_not_a_refusal_of_gso_is_returned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect("127.0.0.1:9").await.unwrap();
+        let data = part_symbols(20);
+        let messages = data
+            .iter()
+            .map(|bytes| Outbound::connected(bytes))
+            .collect::<Vec<_>>();
+        let gso = AtomicBool::new(true);
+        let mut refused = |_: &UdpSocket, _: &[Outbound<'_>], _: &[(usize, usize)]| {
+            Err::<usize, _>(io::Error::from(io::ErrorKind::ConnectionRefused))
+        };
+        let stopped = send_all_gso_or_plain_with(
+            &sender,
+            &messages,
+            GsoLimits::new(8, None),
+            &gso,
+            &mut refused,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stopped.sent, 0);
+        assert_eq!(stopped.error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(gso.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
