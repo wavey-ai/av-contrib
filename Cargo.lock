@@ -247,9 +247,9 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "socket2 0.6.5",
- "soundkit",
+ "soundkit 0.13.3",
  "soundkit-flac",
- "soundkit-opus 0.12.3",
+ "soundkit-opus 0.13.3",
  "synchronized-stems-media",
  "talkback-media",
  "tokio",
@@ -1989,15 +1989,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libopus-rs"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a634b0aceefbc10a498a403c596eba9f716e0bab602439035584e297417684d5"
-dependencies = [
- "wide",
-]
-
-[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3471,6 +3462,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundkit"
+version = "0.13.3"
+source = "git+https://github.com/wavey-ai/soundkit.git?branch=opus-custom-1ms#4cc934c3cb5196c79b97a6b2e4e67ab8409a88eb"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "chacha20poly1305",
+ "crc32fast",
+ "frame-header",
+ "serde",
+]
+
+[[package]]
 name = "soundkit-flac"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3481,19 +3485,7 @@ dependencies = [
  "libc",
  "oxideav-core",
  "oxideav-flac",
- "soundkit",
- "tracing",
-]
-
-[[package]]
-name = "soundkit-opus"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a30ce9412fdd5448f2fb9c4deeb13925279e658dcce221fc8edb2abb8b2714"
-dependencies = [
- "frame-header",
- "libopus-rs",
- "soundkit",
+ "soundkit 0.12.3",
  "tracing",
 ]
 
@@ -3505,7 +3497,18 @@ checksum = "4beb90c88bb899ca949686f9f43c4605a9e09e76055ffd5c8f9cc5013435eda5"
 dependencies = [
  "frame-header",
  "ropus",
- "soundkit",
+ "soundkit 0.12.3",
+ "tracing",
+ "wide",
+]
+
+[[package]]
+name = "soundkit-opus"
+version = "0.13.3"
+source = "git+https://github.com/wavey-ai/soundkit.git?branch=opus-custom-1ms#4cc934c3cb5196c79b97a6b2e4e67ab8409a88eb"
+dependencies = [
+ "frame-header",
+ "soundkit 0.13.3",
  "tracing",
  "wide",
 ]

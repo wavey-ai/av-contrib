@@ -5,6 +5,7 @@ pub mod fmp4_bridge;
 pub mod hls_stamp;
 pub mod hop_journal;
 pub mod ingress_authorization;
+pub mod opus_custom;
 pub mod part_timing;
 pub mod quadra_renditions;
 pub mod soundkit_v2;
