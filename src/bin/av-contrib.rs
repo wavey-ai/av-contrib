@@ -756,8 +756,10 @@ struct Args {
     /// re-encode): the RelaySession lanes carry every part that edges,
     /// LL-HLS and UDP clients use; the AEP1 lane only feeds WebTransport
     /// WAVEY-AUDIO-EPOCH readers and native relay subscribers at a
-    /// distributor. `auto` (the default) is `off` with --relay-exclusive and
-    /// `on` without it.
+    /// distributor. `auto` (the default) is `on` without --relay-exclusive,
+    /// and with it `on` only when an AEP1 ingress target is given
+    /// (--audio-epoch-ingress-target or -redundant-): a deploy that names
+    /// targets wants the lane, one that does not gets none.
     #[arg(
         long,
         env = "AV_AUDIO_EPOCH_MESH_LANE",
@@ -1564,12 +1566,15 @@ enum AudioEpochMeshLane {
 
 impl AudioEpochMeshLane {
     /// Whether the legacy AEP1 lane runs, for a contributor with or without
-    /// --relay-exclusive.
-    const fn enabled(self, relay_exclusive: bool) -> bool {
+    /// --relay-exclusive, and with or without an explicit AEP1 ingress
+    /// target. An explicit target turns `auto` on under --relay-exclusive
+    /// (wave 7 review: `auto` dropped the targets that a deploy rendered to
+    /// keep the lane, so the A/B setting could not bring it back).
+    const fn enabled(self, relay_exclusive: bool, explicit_target: bool) -> bool {
         match self {
             Self::On => true,
             Self::Off => false,
-            Self::Auto => !relay_exclusive,
+            Self::Auto => !relay_exclusive || explicit_target,
         }
     }
 }
@@ -3991,7 +3996,12 @@ struct MeshForwarder {
 }
 
 fn configured_audio_epoch_ingress_targets(args: &Args) -> Result<Vec<SocketAddr>> {
-    if !args.audio_epoch_mesh_lane.enabled(args.relay_exclusive) {
+    let explicit_target = args.audio_epoch_ingress_target.is_some()
+        || args.audio_epoch_redundant_ingress_target.is_some();
+    if !args
+        .audio_epoch_mesh_lane
+        .enabled(args.relay_exclusive, explicit_target)
+    {
         return Ok(Vec::new());
     }
     let primary = args
@@ -15175,11 +15185,25 @@ mod tests {
             configured_audio_epoch_ingress_targets(&args).unwrap().len(),
             2
         );
-        // ... and not with it: no target, so no re-encode and no send.
+        // ... and with it when a deploy names its targets (wave 7 review) ...
         args.relay_exclusive = true;
+        assert_eq!(
+            configured_audio_epoch_ingress_targets(&args).unwrap().len(),
+            2
+        );
+        args.audio_epoch_ingress_target = Some("127.0.0.1:12003".parse().unwrap());
+        args.audio_epoch_redundant_ingress_target = None;
+        assert_eq!(
+            configured_audio_epoch_ingress_targets(&args).unwrap(),
+            vec!["127.0.0.1:12003".parse::<SocketAddr>().unwrap()]
+        );
+        // ... and not when it names none: no target, so no re-encode and
+        // no send.
+        args.audio_epoch_ingress_target = None;
         assert!(configured_audio_epoch_ingress_targets(&args)
             .unwrap()
             .is_empty());
+        args.audio_epoch_redundant_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
         args.audio_epoch_mesh_lane = AudioEpochMeshLane::On;
         assert_eq!(
             configured_audio_epoch_ingress_targets(&args).unwrap().len(),
