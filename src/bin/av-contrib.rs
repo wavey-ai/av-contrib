@@ -136,6 +136,16 @@ static PUBLICATION_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PUBLICATION_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Audio parts published on the packager's task (`--relay-audio-inline`).
 static PUBLICATION_INLINE: AtomicU64 = AtomicU64::new(0);
+/// Inline audio publications that held their packager longer than
+/// [`INLINE_PUBLISH_SLOW`], and the longest hold (µs).
+static PUBLICATION_INLINE_SLOW: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_INLINE_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// An inline audio publication this long holds every later part of its
+/// rendition behind it (the referee saw one hold 1.34 s: 550 parts published
+/// late together, and the part held lost to its 1 s deadline): it is logged
+/// with the part, so that the stage that held it can be found in the hop
+/// journal.
+const INLINE_PUBLISH_SLOW: Duration = Duration::from_millis(20);
 static AUDIO_EPOCH_HLS_QUEUE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_EPOCH_HLS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -4827,6 +4837,8 @@ impl BoundedFmp4Publisher {
             hop_journal::now_unix_us(),
         ));
         PUBLICATION_INLINE.fetch_add(1, Ordering::Relaxed);
+        let (stream_id, sequence) = (publication.stream_id(), publication.sequence());
+        let started = Instant::now();
         publish_publication(
             None,
             inner,
@@ -4835,6 +4847,19 @@ impl BoundedFmp4Publisher {
             publication,
         )
         .await;
+        let held = started.elapsed();
+        PUBLICATION_INLINE_MAX_US.fetch_max(held.as_micros() as u64, Ordering::Relaxed);
+        if held >= INLINE_PUBLISH_SLOW {
+            let slow = PUBLICATION_INLINE_SLOW.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                stream_id,
+                sequence,
+                held_ms = held.as_secs_f64() * 1_000.0,
+                slow,
+                "an inline audio publication held its packager: later parts of the \
+                 rendition waited behind it"
+            );
+        }
     }
 
     /// The worker of the stream's next part, of class `class`.
@@ -7722,6 +7747,18 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "Audio parts published on the packager's own task, without a publication queue.",
             "counter",
             PUBLICATION_INLINE.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_inline_slow_total",
+            "Inline audio publications that held their packager 20 ms or more.",
+            "counter",
+            PUBLICATION_INLINE_SLOW.load(Ordering::Relaxed),
+        ),
+        (
+            "av_contrib_publication_inline_max_us",
+            "The longest inline audio publication since process start, in microseconds.",
+            "gauge",
+            PUBLICATION_INLINE_MAX_US.load(Ordering::Relaxed),
         ),
         (
             "av_contrib_publication_errors_total",
