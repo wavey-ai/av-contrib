@@ -633,6 +633,26 @@ struct Args {
     #[arg(long, env = "AV_RELAY_MIN_REPAIR_SYMBOLS", default_value_t = 0)]
     relay_min_repair_symbols: u32,
 
+    /// Copies of a one-symbol audio part (a 1 ms part is one RaptorQ
+    /// symbol, and each repair symbol of it a full copy; wave 7 item 2).
+    /// `measured` (the default): as many repair symbols as the loss that
+    /// the forwarders report on the lanes (RLR1, av-mesh
+    /// --relay-loss-report) calls for, so that a part is lost on a lane
+    /// with a chance under 1e-3 (none under 0.2 % loss, one at 1-3 %, two
+    /// at 5-10 %, at most four), and none until a lane reports loss; a
+    /// report older than 3 s counts as none. `configured`: the same rule on
+    /// the --relay-path-loss-fraction observations. `policy`: the adaptive
+    /// policy, as before (one repair symbol for any loss, plus its safety
+    /// symbol). --relay-min-repair-symbols is the floor of each. Parts of
+    /// several symbols keep the policy.
+    #[arg(
+        long,
+        env = "AV_RELAY_AUDIO_COPIES",
+        value_enum,
+        default_value_t = RelayAudioCopies::Measured
+    )]
+    relay_audio_copies: RelayAudioCopies,
+
     /// Controller-observed loss across the selected source path, as a fraction
     /// from zero through one. This seeds the adaptive RaptorQ policy until live
     /// carrier feedback supplies a newer observation.
@@ -1312,6 +1332,103 @@ struct QuadraCliArgs {
     derived_only: bool,
 }
 
+/// `--relay-audio-copies`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RelayAudioCopies {
+    Measured,
+    Configured,
+    Policy,
+}
+
+/// A one-symbol audio part is lost on a lane with at most this chance.
+const SINGLE_SYMBOL_AUDIO_LOSS_TARGET: f64 = 1e-3;
+/// Lane loss below this gets no copy.
+const SINGLE_SYMBOL_AUDIO_MIN_LOSS: f64 = 0.002;
+const SINGLE_SYMBOL_AUDIO_MAX_REPAIR: u32 = 4;
+/// A lane's loss report counts this long.
+const LANE_LOSS_REPORT_TTL_US: u64 = 3_000_000;
+
+/// Repair symbols (copies) of a one-symbol audio part on a lane that loses
+/// `loss` of its datagrams: the fewest copies `n` with `loss^n` at most
+/// [`SINGLE_SYMBOL_AUDIO_LOSS_TARGET`], less the source.
+fn single_symbol_audio_repair(loss: f64) -> u32 {
+    if !loss.is_finite() || loss < SINGLE_SYMBOL_AUDIO_MIN_LOSS {
+        return 0;
+    }
+    let loss = loss.min(0.5);
+    let copies = (SINGLE_SYMBOL_AUDIO_LOSS_TARGET.ln() / loss.ln()).ceil().max(1.0) as u32;
+    (copies - 1).min(SINGLE_SYMBOL_AUDIO_MAX_REPAIR)
+}
+
+/// The loss that the forwarder at the far end of a lane last reported
+/// (RLR1).
+#[derive(Debug, Default)]
+struct LaneLossReport {
+    ppm: AtomicU64,
+    at_us: AtomicU64,
+}
+
+impl LaneLossReport {
+    fn record(&self, ppm: u32, now_us: u64) {
+        self.ppm.store(u64::from(ppm), Ordering::Relaxed);
+        self.at_us.store(now_us, Ordering::Relaxed);
+    }
+
+    /// The reported loss, as a fraction; zero once the report is stale.
+    fn loss(&self, now_us: u64) -> f64 {
+        let at = self.at_us.load(Ordering::Relaxed);
+        if at == 0 || now_us.saturating_sub(at) > LANE_LOSS_REPORT_TTL_US {
+            return 0.0;
+        }
+        self.ppm.load(Ordering::Relaxed) as f64 / 1e6
+    }
+}
+
+/// RLR1, av-mesh's loss report (src/fast_plane/loss_report.rs): `RLR1`,
+/// version 1, three zero bytes, loss in ppm, packet sequences of the window.
+fn decode_lane_loss_report(datagram: &[u8]) -> Option<u32> {
+    if datagram.len() != 16 || &datagram[..4] != b"RLR1" || datagram[4] != 1 {
+        return None;
+    }
+    let ppm = u32::from_be_bytes(datagram[8..12].try_into().ok()?);
+    (ppm <= 1_000_000).then_some(ppm)
+}
+
+/// How often the publish path looks for loss reports on its lanes.
+const LANE_LOSS_POLL_US: u64 = 50_000;
+
+/// Take the loss reports waiting on a lane's audio socket (connected to the
+/// lane's forwarder, so nothing else arrives there) without blocking: a
+/// `recv` with MSG_DONTWAIT until the socket is empty.
+fn drain_lane_loss_reports(socket: &UdpSocket, report: &LaneLossReport, path: RelayCarrierPath) {
+    let fd = socket.as_raw_fd();
+    let mut buf = [0_u8; 64];
+    for _ in 0..64 {
+        // SAFETY: `buf` is valid for `buf.len()` bytes and `fd` is the open
+        // socket that `socket` owns.
+        let len = unsafe {
+            libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT)
+        };
+        if len < 0 {
+            // Empty (EAGAIN), or an ICMP refusal of an earlier send, which a
+            // later recv no longer reports.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                return;
+            }
+            continue;
+        }
+        if let Some(ppm) = decode_lane_loss_report(&buf[..len as usize]) {
+            report.record(ppm, hop_journal::now_unix_us());
+            RELAY_LANE_REPORTED_LOSS_PPM[path as usize].store(u64::from(ppm), Ordering::Relaxed);
+        }
+    }
+}
+
+/// The last reported loss of each lane (ppm), and the repair count of the
+/// last one-symbol audio part, for /metrics.
+static RELAY_LANE_REPORTED_LOSS_PPM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static RELAY_SINGLE_SYMBOL_AUDIO_REPAIR: AtomicU64 = AtomicU64::new(0);
+
 /// `--audio-epoch-mesh-lane`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AudioEpochMeshLane {
@@ -1502,6 +1619,9 @@ struct RelayLane {
     /// Audio parts whose symbols the socket's buffer could not take at once
     /// (`--relay-audio-inline`): sent, in order, by a task of the lane.
     backlog: LaneBacklog,
+    /// The loss that the lane's forwarder reports (`--relay-audio-copies
+    /// measured`).
+    reported_loss: LaneLossReport,
 }
 
 /// The class lane settings: `--relay-class-lanes` and its socket options.
@@ -1598,6 +1718,7 @@ impl RelayLane {
             limits: config.limits,
             path_metrics: std::sync::RwLock::new(PathMetrics::default()),
             backlog: LaneBacklog::default(),
+            reported_loss: LaneLossReport::default(),
         })
     }
 
@@ -2093,6 +2214,13 @@ struct RelaySessionPublisher {
     /// `--relay-repair-both-lanes`: the primary lane carries the repair
     /// symbols too, not only the source set.
     repair_both_lanes: bool,
+    /// `--relay-audio-copies`, the configured lanes' loss for `configured`,
+    /// and `--relay-min-repair-symbols`.
+    audio_copies: RelayAudioCopies,
+    /// When the lanes were last looked at for loss reports (µs).
+    loss_polled_us: AtomicU64,
+    configured_loss: f64,
+    min_repair_symbols: u32,
     /// `--relay-class-lanes`: the class of a part's stream picks its
     /// socket and port. Without class lanes a part's own class is used, as
     /// before.
@@ -2286,12 +2414,61 @@ impl RelaySessionPublisher {
             video_gso_pace_bytes_per_second: video_gso_pace_bytes_per_second(args),
             audio_inline: args.relay_audio_inline,
             repair_both_lanes: args.relay_repair_both_lanes,
+            audio_copies: args.relay_audio_copies,
+            loss_polled_us: AtomicU64::new(0),
+            configured_loss: f64::from(
+                adaptive_relay_path_metrics(primary_path_metrics, secondary_path_metrics)
+                    .loss_fraction,
+            ),
+            min_repair_symbols: args.relay_min_repair_symbols,
             class_lanes: classes.enabled(),
             video_streams: VideoStreamClasses::default(),
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
             subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
             telemetry,
         }))
+    }
+
+    /// The repair count of a one-symbol audio part now
+    /// (`--relay-audio-copies`); `None` leaves it to the policy.
+    fn single_symbol_audio_repair(&self) -> Option<u32> {
+        let loss = match self.audio_copies {
+            RelayAudioCopies::Policy => return None,
+            RelayAudioCopies::Configured => self.configured_loss,
+            RelayAudioCopies::Measured => {
+                let now = hop_journal::now_unix_us();
+                // Each lane's forwarder reports the loss it measures (RLR1)
+                // to the lane's audio socket; looked at every 50 ms.
+                let polled = self.loss_polled_us.load(Ordering::Relaxed);
+                if now.saturating_sub(polled) >= LANE_LOSS_POLL_US
+                    && self
+                        .loss_polled_us
+                        .compare_exchange(polled, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    drain_lane_loss_reports(
+                        &self.primary.socket,
+                        &self.primary.reported_loss,
+                        RelayCarrierPath::Primary,
+                    );
+                    if let Some(secondary) = self.secondary.as_ref() {
+                        drain_lane_loss_reports(
+                            &secondary.socket,
+                            &secondary.reported_loss,
+                            RelayCarrierPath::Secondary,
+                        );
+                    }
+                }
+                let secondary = self
+                    .secondary
+                    .as_ref()
+                    .map_or(0.0, |lane| lane.reported_loss.loss(now));
+                self.primary.reported_loss.loss(now).max(secondary)
+            }
+        };
+        let repair = single_symbol_audio_repair(loss).max(self.min_repair_symbols);
+        RELAY_SINGLE_SYMBOL_AUDIO_REPAIR.store(u64::from(repair), Ordering::Relaxed);
+        Some(repair)
     }
 
     /// Publish an object of stream `stream_id` that is not a media part
@@ -2640,8 +2817,13 @@ impl RelaySessionPublisher {
         journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
     ) -> Result<RelayPublishOutcome> {
         let encode_started = Instant::now();
-        let encoded =
-            encoder.encode_sources(object, self.generation, self.subscription_id, deadline);
+        let encoded = encoder.encode_sources_with(
+            object,
+            self.generation,
+            self.subscription_id,
+            deadline,
+            self.single_symbol_audio_repair(),
+        );
         let mut encode_time = encode_started.elapsed();
         let encoded = match encoded {
             Ok(encoded) => encoded,
@@ -8177,6 +8359,21 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
         prometheus_label_value(snapshot.mesh.relay_path_observation_source)
     ));
     for (name, help, value) in [
+        (
+            "av_contrib_relay_lane_reported_loss_primary_ppm",
+            "Loss that the primary lane's forwarder last reported (RLR1), in ppm.",
+            RELAY_LANE_REPORTED_LOSS_PPM[0].load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_lane_reported_loss_secondary_ppm",
+            "Loss that the secondary lane's forwarder last reported (RLR1), in ppm.",
+            RELAY_LANE_REPORTED_LOSS_PPM[1].load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_single_symbol_audio_repair_symbols",
+            "Repair symbols (copies) of the last one-symbol audio part (--relay-audio-copies).",
+            RELAY_SINGLE_SYMBOL_AUDIO_REPAIR.load(Ordering::Relaxed) as f64,
+        ),
         (
             "av_contrib_relay_session_path_loss_fraction",
             "Observed selected-source-path loss fraction driving adaptive RaptorQ policy.",
@@ -14183,6 +14380,7 @@ mod tests {
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
+            relay_audio_copies: RelayAudioCopies::Measured,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -14288,6 +14486,7 @@ mod tests {
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
+            relay_audio_copies: RelayAudioCopies::Measured,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -14592,6 +14791,76 @@ mod tests {
 
         args.audio_epoch_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
         assert!(configured_audio_epoch_ingress_targets(&args).is_err());
+    }
+
+    #[test]
+    fn single_symbol_audio_copies_follow_the_loss() {
+        assert_eq!(single_symbol_audio_repair(0.0), 0);
+        assert_eq!(single_symbol_audio_repair(0.001), 0);
+        assert_eq!(single_symbol_audio_repair(0.01), 1);
+        assert_eq!(single_symbol_audio_repair(0.02), 1);
+        assert_eq!(single_symbol_audio_repair(0.05), 2);
+        assert_eq!(single_symbol_audio_repair(0.10), 2);
+        assert_eq!(single_symbol_audio_repair(0.5), SINGLE_SYMBOL_AUDIO_MAX_REPAIR);
+        assert_eq!(single_symbol_audio_repair(f64::NAN), 0);
+        let mut report = [0_u8; 16];
+        report[..4].copy_from_slice(b"RLR1");
+        report[4] = 1;
+        report[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
+        assert_eq!(decode_lane_loss_report(&report), Some(50_000));
+        assert_eq!(decode_lane_loss_report(&report[..15]), None);
+        let lane = LaneLossReport::default();
+        assert_eq!(lane.loss(10_000_000), 0.0);
+        lane.record(50_000, 10_000_000);
+        assert!((lane.loss(11_000_000) - 0.05).abs() < 1e-9);
+        // Stale after 3 s.
+        assert_eq!(lane.loss(13_500_000), 0.0);
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(parsed.relay_audio_copies, RelayAudioCopies::Measured);
+    }
+
+    /// A lane's forwarder reports 5 % loss: the next one-symbol audio part
+    /// goes with two copies on each lane; without reports it goes alone.
+    #[tokio::test]
+    async fn measured_lane_loss_sizes_the_copies_of_a_one_symbol_audio_part() {
+        let primary = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let secondary = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary.local_addr().unwrap());
+        let free = || {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        };
+        args.relay_primary_bind = Some(free());
+        args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+        args.relay_secondary_bind = Some(free());
+        args.relay_audio_copies = RelayAudioCopies::Measured;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let publisher = RelaySessionPublisher::new(&args, telemetry)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publisher.single_symbol_audio_repair(), Some(0));
+        // The primary's forwarder reports 5 % from the lane's peer address.
+        let mut report = [0_u8; 16];
+        report[..4].copy_from_slice(b"RLR1");
+        report[4] = 1;
+        report[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
+        primary
+            .send_to(&report, publisher.primary.local_addr().unwrap())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while publisher.single_symbol_audio_repair() != Some(2) {
+            assert!(std::time::Instant::now() < deadline, "the report was not heard");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let publisher_policy = RelaySessionPublisher {
+            audio_copies: RelayAudioCopies::Policy,
+            ..publisher
+        };
+        assert_eq!(publisher_policy.single_symbol_audio_repair(), None);
     }
 
     #[test]
@@ -14929,6 +15198,7 @@ mod tests {
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
+            relay_audio_copies: RelayAudioCopies::Measured,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -15174,6 +15444,7 @@ mod tests {
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
+            relay_audio_copies: RelayAudioCopies::Measured,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -15319,6 +15590,7 @@ mod tests {
             relay_subscription_id: DEFAULT_RELAY_SUBSCRIPTION_ID,
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
+            relay_audio_copies: RelayAudioCopies::Measured,
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,

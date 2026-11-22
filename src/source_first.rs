@@ -143,6 +143,26 @@ impl SourceFirstEncoder {
         subscription_id: SubscriptionId,
         deadline: MediaDeadline,
     ) -> Result<SourcePart> {
+        self.encode_sources_with(object, generation, subscription_id, deadline, None)
+    }
+
+    /// [`Self::encode_sources`], with the repair count of a one-symbol
+    /// audio object given (`single_symbol_audio_repair`, wave 7 item 2):
+    /// its repair symbols are full copies, sized by the caller to the
+    /// loss of its lanes instead of the controller's policy. Other objects
+    /// keep the policy's count.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::encode_sources`].
+    pub fn encode_sources_with(
+        &self,
+        object: &MediaObject,
+        generation: TopologyGeneration,
+        subscription_id: SubscriptionId,
+        deadline: MediaDeadline,
+        single_symbol_audio_repair: Option<u32>,
+    ) -> Result<SourcePart> {
         let priority = priority_for_object(object);
         // `encode` validates the object (its payload hash among the rest).
         let envelope = media_object::encode(object)?;
@@ -172,7 +192,10 @@ impl SourceFirstEncoder {
                 maximum: raptorq_datagram_fec::MAX_SOURCE_SYMBOLS_PER_BLOCK as usize,
             });
         }
-        let repair_symbols = self.controller.repair_symbols_for(source_symbols, priority);
+        let repair_symbols = match single_symbol_audio_repair {
+            Some(repair) if priority == MediaPriority::Audio && source_symbols == 1 => repair,
+            _ => self.controller.repair_symbols_for(source_symbols, priority),
+        };
         if repair_symbols > self.limits.max_extra_repair_symbols {
             return Err(Error::LimitExceeded {
                 field: "initial_repair_symbols",
@@ -763,6 +786,36 @@ mod tests {
 
     /// A receiver that lost sources recovers the object from the repair
     /// symbols computed after the sources left.
+    #[test]
+    fn a_one_symbol_audio_part_takes_the_repair_count_it_is_given() {
+        let (generation, subscription, deadline) = ids();
+        // The policy gives audio one repair symbol at least.
+        let encoder = SourceFirstEncoder::new(controller(1), RelayLimits::default()).unwrap();
+        let audio = object(3001, 0, 60, b"audio", false);
+        let policy = encoder
+            .encode_sources(&audio, generation, subscription, deadline)
+            .unwrap();
+        assert!(policy.repair_count() >= 1);
+        for given in [0_u32, 1, 3] {
+            let part = encoder
+                .encode_sources_with(&audio, generation, subscription, deadline, Some(given))
+                .unwrap();
+            assert_eq!(part.source_wires().len(), 1);
+            assert_eq!(part.repair_count(), given);
+            assert_eq!(part.repair_wires().unwrap().len(), given as usize);
+        }
+        // A part of several symbols keeps the policy.
+        let large = object(3001, 1, 4_000, b"audio", false);
+        let policy = encoder
+            .encode_sources(&large, generation, subscription, deadline)
+            .unwrap();
+        let given = encoder
+            .encode_sources_with(&large, generation, subscription, deadline, Some(0))
+            .unwrap();
+        assert!(given.source_wires().len() > 1);
+        assert_eq!(given.repair_count(), policy.repair_count());
+    }
+
     #[test]
     fn late_repair_recovers_lost_sources() {
         let limits = RelayLimits::default();
