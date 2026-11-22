@@ -3122,7 +3122,13 @@ impl RelaySessionPublisher {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let primary_repair = repair_uses_primary && repair_count > 0;
-        let secondary_sources = self.secondary_seed_source;
+        // A secondary that takes no sources (--relay-secondary-seed-source
+        // off) still carries a one-symbol audio part that has no copy (the
+        // measured copies of a clean lane are none): its source, so the
+        // secondary forwarder stays warm and its children fed when the
+        // primary fails (wave 7 review; the policy always gave one copy).
+        let secondary_sources = self.secondary_seed_source
+            || (class == PublicationClass::Audio && source_count == 1 && repair_count == 0);
         let secondary_repair = repair_count > 0;
         let direct_repair = self.direct.as_ref().is_some_and(|direct| direct.repair);
         let sent_first = Arc::new(AtomicBool::new(false));
@@ -14530,6 +14536,54 @@ mod tests {
             datagrams += 1;
         }
         assert_eq!(datagrams, expected, "the ledger came behind them");
+    }
+
+    /// Wave 7 review: with --relay-secondary-seed-source off and no copies
+    /// (a clean lane), the secondary still carries a one-symbol audio part:
+    /// its source. With a copy it carries the copy, as before.
+    #[tokio::test]
+    async fn a_secondary_without_its_seed_source_still_carries_a_one_symbol_audio_part() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        let free = || {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        };
+        args.relay_primary_target = Some(primary.local_addr().unwrap());
+        args.relay_primary_bind = Some(free());
+        args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+        args.relay_secondary_bind = Some(free());
+        args.relay_secondary_seed_source = false;
+        args.relay_audio_copies = RelayAudioCopies::Configured;
+        args.relay_path_loss_fraction = 0.0;
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(relay.source_encoders.is_some(), "the source-first path");
+        let mut part = test_opaque_part(4001);
+        part.sequence = 7;
+        part.duration_ms = 1;
+        part.duration_us = 1_000;
+        part.duration_samples = Some(48);
+        part.bytes = Bytes::from(vec![0x11; 288]);
+        let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
+        let outcome = relay
+            .publish_object(&object, 4001, PublicationClass::Audio)
+            .await
+            .unwrap();
+        assert_eq!((outcome.source_symbols, outcome.repair_symbols), (1, 0));
+        let mut wire = vec![0_u8; 4_096];
+        for (name, socket) in [("primary", &primary), ("secondary", &secondary)] {
+            let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut wire))
+                .await
+                .unwrap_or_else(|_| panic!("the {name} lane carries the part"))
+                .unwrap();
+            assert!(len > 0);
+        }
     }
 
     #[tokio::test]
