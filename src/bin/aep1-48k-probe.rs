@@ -52,25 +52,26 @@ const DEFAULT_GROUP_CHANNELS: u16 = 8;
 const FLAC_MAX_CHANNELS: u16 = 8;
 const LOGICAL_MAX_CHANNELS: u16 = 128;
 const FRAME_COUNT: u32 = 240;
-/// Default epoch of `send`: 48 samples (1 ms) of PCM or FLAC, and 120
-/// samples (2.5 ms, the smallest CELT frame) of Opus.
+/// Default epoch of `send`: 48 samples (1 ms) of PCM or FLAC, and the DAW
+/// lane's Opus frame, 48 samples (1 ms Opus Custom), of Opus.
 const DEFAULT_PCM_EPOCH_SAMPLES: u32 = 48;
-const DEFAULT_OPUS_EPOCH_SAMPLES: u32 = 120;
-/// Smallest epochs `send` makes: PCM has no codec floor, soundkit-flac's
-/// encoder refuses blocks under 32 samples, and Opus (CELT) frames are 2.5,
-/// 5, 10 or 20 ms.
+const DEFAULT_OPUS_EPOCH_SAMPLES: u32 = av_contrib::opus_custom::LANE_DEFAULT_OPUS_FRAME_SAMPLES;
+/// Smallest epochs `send` makes: PCM has no codec floor and soundkit-flac's
+/// encoder refuses blocks under 32 samples. Opus takes the frames of
+/// `OPUS_EPOCH_SAMPLES` only.
 const MIN_PCM_EPOCH_SAMPLES: u32 = 12;
 const MIN_FLAC_EPOCH_SAMPLES: u32 = 32;
 const MAX_EPOCH_SAMPLES: u32 = 48_000;
 /// Opus frames the send command codes: Opus Custom (48, 64, 72 samples: 1,
-/// 1.33, 1.5 ms, without the signalling byte, as the DAW lane sends them)
+/// 1.33, 1.5 ms, with libopus's signalling byte, as the DAW lane sends them)
 /// and standard Opus (120 to 960 samples).
 const OPUS_EPOCH_SAMPLES: [u32; 7] = [48, 64, 72, 120, 240, 480, 960];
 /// Opus channels per AEP1 group: one Opus packet per group, as a DAW track
 /// sends it, and libopus codes one or two channels.
 const OPUS_MAX_GROUP_CHANNELS: u16 = 2;
-/// The DAW lane's default Opus bitrate (daw-nexus `LANE_DEFAULT_OPUS_BITRATE`).
-const PROBE_OPUS_BITRATE: u32 = 256_000;
+/// The DAW lane's default Opus bitrate (daw-nexus `LANE_DEFAULT_OPUS_BITRATE`):
+/// 320 kb/s CBR. `send --opus-bitrate 256000` is the lower-bandwidth option.
+const PROBE_OPUS_BITRATE: u32 = av_contrib::opus_custom::LANE_DEFAULT_OPUS_BITRATE;
 const MAX_DATAGRAM_BYTES: usize = 1_200;
 const AUDIO_GROUP_FLAG_DISCONTINUITY: u8 = 1 << 0;
 const AUDIO_GROUP_FLAG_ERASURE: u8 = 1 << 1;
@@ -126,11 +127,17 @@ enum Command {
         #[arg(long, value_enum, default_value_t = ProbePayload::Flac)]
         payload: ProbePayload,
         /// Samples (at 48 kHz) in each epoch. Defaults to 48 (1 ms) for PCM
-        /// and FLAC and 120 (2.5 ms) for Opus. PCM takes any value from 12,
-        /// FLAC from 32, Opus one of 48, 64 or 72 (Opus Custom, no
-        /// signalling byte) or 120, 240, 480 or 960 (standard Opus).
+        /// and FLAC and to the DAW lane's 48 (1 ms Opus Custom) for Opus.
+        /// PCM takes any value from 12, FLAC from 32, Opus one of 48, 64 or
+        /// 72 (Opus Custom, with the signalling byte) or 120, 240, 480 or
+        /// 960 (standard Opus; 120 is the interop setting).
         #[arg(long)]
         epoch_samples: Option<u32>,
+        /// Opus bitrate, CBR, bits per second: the DAW lane's 320000 by
+        /// default; 256000 is the lower-bandwidth option at 1 ms.
+        #[arg(long, default_value_t = PROBE_OPUS_BITRATE,
+              value_parser = clap::value_parser!(u32).range(6_000..=512_000))]
+        opus_bitrate: u32,
         /// Logical channel count for the generated publication.
         #[arg(long, default_value_t = DEFAULT_CHANNELS)]
         channels: u16,
@@ -1835,7 +1842,7 @@ impl SoundKitOpusConsumer {
                 );
             }
             // The header's frame count chooses Opus Custom (48, 64, 72
-            // samples, no signalling byte) or standard Opus; a change of
+            // samples, signalling byte on) or standard Opus; a change of
             // frame size starts a new decoder.
             if !self.decoder.as_ref().is_some_and(|decoder| {
                 lane_opus_decoder_matches(decoder, sample_rate, usize::from(channels), frame_count)
@@ -2268,6 +2275,7 @@ async fn main() -> Result<()> {
             session_id,
             payload,
             epoch_samples,
+            opus_bitrate,
             channels,
             group_channels,
             signal,
@@ -2283,6 +2291,7 @@ async fn main() -> Result<()> {
                 session_id,
                 payload_kind: payload,
                 epoch_samples,
+                opus_bitrate,
                 channels,
                 group_channels,
                 signal,
@@ -2729,6 +2738,7 @@ struct SendOptions<'a> {
     session_id: Option<u64>,
     payload_kind: ProbePayload,
     epoch_samples: Option<u32>,
+    opus_bitrate: u32,
     channels: u16,
     group_channels: u16,
     signal: ProbeSignal,
@@ -2746,6 +2756,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         session_id,
         payload_kind,
         epoch_samples,
+        opus_bitrate,
         channels,
         group_channels,
         signal,
@@ -2775,6 +2786,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         session_id,
         payload_kind,
         epoch_samples,
+        opus_bitrate,
         channels,
         group_channels,
         signal,
@@ -3072,6 +3084,8 @@ struct EpochSourceOptions {
     session_id: u64,
     payload_kind: ProbePayload,
     epoch_samples: u32,
+    /// Opus bitrate (CBR), bits per second.
+    opus_bitrate: u32,
     channels: u16,
     group_channels: u16,
     signal: ProbeSignal,
@@ -3158,13 +3172,14 @@ impl EpochEncoder {
             group_plan
                 .iter()
                 .map(|group| {
-                    // CELT only: Opus Custom (signalling off) for 48, 64
-                    // and 72 samples, standard Opus from 120.
+                    // CELT only: Opus Custom (signalling byte on, the
+                    // lane's) for 48, 64 and 72 samples, standard Opus from
+                    // 120.
                     new_lane_opus_encoder(
                         SAMPLE_RATE,
                         u32::from(group.channel_count),
                         epoch_samples,
-                        PROBE_OPUS_BITRATE,
+                        options.opus_bitrate,
                     )
                     .map_err(|error| anyhow::anyhow!("Opus encoder: {error}"))
                 })
@@ -7741,7 +7756,7 @@ mod tests {
     fn epoch_sizes_follow_the_payload() {
         assert_eq!(ProbePayload::Pcm.epoch_samples(None).unwrap(), 48);
         assert_eq!(ProbePayload::Flac.epoch_samples(None).unwrap(), 48);
-        assert_eq!(ProbePayload::Opus.epoch_samples(None).unwrap(), 120);
+        assert_eq!(ProbePayload::Opus.epoch_samples(None).unwrap(), 48);
         assert_eq!(ProbePayload::Pcm.epoch_samples(Some(12)).unwrap(), 12);
         assert!(ProbePayload::Pcm.epoch_samples(Some(11)).is_err());
         assert_eq!(ProbePayload::Flac.epoch_samples(Some(32)).unwrap(), 32);
@@ -7854,7 +7869,7 @@ mod tests {
 
     #[test]
     fn opus_epochs_reach_the_contributor_as_opus_groups() {
-        // 1, 1.33 and 1.5 ms Opus Custom (no signalling byte) and 2.5 ms
+        // 1, 1.33 and 1.5 ms Opus Custom (signalling byte on) and 2.5 ms
         // standard Opus.
         for frame in [48_u32, 64, 72, 120] {
             let groups = contributor_groups(ProbePayload::Opus, frame, 8);
@@ -7881,11 +7896,13 @@ mod tests {
                 assert!(!header.is_encrypted());
                 let packet = stream.packets[0].payload;
                 if custom {
-                    // CBR at the lane's 256 kb/s, all CELT data.
+                    // CBR at the lane's 320 kb/s, signalling byte included
+                    // (bit 2: stereo).
                     assert_eq!(
                         packet.len(),
-                        (256_000 * frame as usize + 4 * 48_000) / (8 * 48_000)
+                        (320_000 * frame as usize + 4 * 48_000) / (8 * 48_000)
                     );
+                    assert_eq!(packet[0] & 0x04, 0x04);
                 } else {
                     assert!(packet[0] & 0x80 != 0, "CELT-only TOC");
                 }
@@ -8078,6 +8095,7 @@ mod tests {
             session_id: now_unix_ns().unwrap() + 20_000_000,
             payload_kind: ProbePayload::Pcm,
             epoch_samples: 240,
+            opus_bitrate: PROBE_OPUS_BITRATE,
             channels: 2,
             group_channels: 8,
             signal: ProbeSignal::Sine,
@@ -8108,6 +8126,7 @@ mod tests {
             session_id,
             payload_kind: ProbePayload::Pcm,
             epoch_samples: 240,
+            opus_bitrate: PROBE_OPUS_BITRATE,
             channels: 2,
             group_channels: 8,
             signal: ProbeSignal::Sine,

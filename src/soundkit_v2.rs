@@ -389,12 +389,17 @@ mod tests {
 
     #[test]
     fn terminalize_accepts_one_ms_opus_custom_packets() {
-        let mut encoder =
-            crate::opus_custom::new_lane_opus_encoder(48_000, 2, 48, 256_000).unwrap();
+        let mut encoder = crate::opus_custom::new_lane_opus_encoder(
+            48_000,
+            2,
+            crate::opus_custom::LANE_DEFAULT_OPUS_FRAME_SAMPLES,
+            crate::opus_custom::LANE_DEFAULT_OPUS_BITRATE,
+        )
+        .unwrap();
         let mut payload = vec![0u8; 1_500];
         let len = encoder.encode_i16(&[0x100; 96], &mut payload).unwrap();
-        // CBR, no signalling byte: 32 bytes of CELT data at 256 kb/s.
-        assert_eq!(len, 32);
+        // CBR at 320 kb/s: 40 bytes, the signalling byte and 39 of CELT data.
+        assert_eq!(len, 40);
         let packet = frame_soundkit_v2_packet(
             SoundKitV2PacketMetadata {
                 frame_count: 48,
