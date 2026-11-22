@@ -311,6 +311,28 @@ milliseconds (32 samples) are rounded by the boxer, with a warning. Exact
 2.5 ms Opus, sub-millisecond PCM and 32-sample FLAC parts need the default
 opaque path, or a boxer with a timescale of the sample rate.
 
+Opus Custom frames. The DAW lane's Opus defaults to 1 ms Opus Custom CELT
+frames (48 samples; 64 and 72 samples, 1.33 and 1.5 ms, are settings of the
+producer, daw-nexus `--opus-frame-ms`). A SoundKit v2 Opus packet whose
+`frame_count` is not a multiple of 120 at 48 kHz is Opus Custom
+(`soundkit_opus::custom_frame_size`); it carries no TOC and no libopus
+signalling byte, since the header already gives the frame size and the
+channels. The opaque rendition carries these packets unchanged, one frame
+per part by default (`--audio-part epoch`). A part of a set size must hold
+whole Opus frames: 64-sample frames fit 4 ms parts (three frames) but not
+5 ms parts, and such a rendition is refused with an error naming the
+frame. fMP4 packaging refuses Opus Custom (OpusHead and dOps cannot describe
+it); anything that needs standard Opus (fMP4/Ogg, WebRTC/RTP, talkback, the
+public programme rendition) needs the producer at `--opus-frame-ms 2.5` or
+larger. `aep1-48k-probe` decodes either kind by the frame count of each
+packet: `receive-hls --decode-soundkit-opus` (plain packets with
+`--soundkit-opus-protection plain`, encrypted ones with
+`--soundkit-key-file`), `receive-udp --decode-soundkit-opus`, and
+`decode-soundkit-opus PART...` for saved parts; `--expected-opus-frame-samples`
+makes any other frame size a failure, and the reports give
+`opus_frame_samples` and `opus_mode` (`custom` or `standard`). `send
+--payload opus --epoch-samples 48` sends 1 ms Opus Custom at 256 kb/s.
+
 The per-part send path is short. `--relay-send-batch` (default `true`)
 hands the RelaySession symbols of a part to the kernel in one `sendmmsg`
 call per lane instead of one awaited send per symbol. `--aep1-shared-recovery`
