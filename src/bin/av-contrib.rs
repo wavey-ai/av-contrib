@@ -12075,6 +12075,101 @@ mod tests {
         );
     }
 
+    /// Thread CPU time, for the benchmark below.
+    fn thread_cpu_ns() -> u64 {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes the timespec it is given.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) };
+        spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
+    }
+
+    /// Not a check, a benchmark: thread CPU per part of the contributor's
+    /// publication of an opaque audio part (canonical media object, its
+    /// encoding, and the RelaySession FEC encode and sends of
+    /// `publish_part_object`) for the DAW lane's Opus parts of 1, 2.5 and
+    /// 5 ms (one 320 kb/s stereo SoundKit Opus packet each) and 1 ms PCM,
+    /// to one lane and to a primary and a secondary lane. Run with
+    /// `cargo test --release --bin av-contrib publication_cpu_per_part -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "benchmark"]
+    async fn publication_cpu_per_part_at_each_opus_frame() {
+        const PARTS: u64 = 4_000;
+        for secondary in [false, true] {
+            let primary_receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let secondary_receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_receiver.local_addr().unwrap());
+            if secondary {
+                args.relay_secondary_target = Some(secondary_receiver.local_addr().unwrap());
+                args.relay_secondary_seed_source = true;
+            }
+            args.relay_send_batch = true;
+            args.relay_class_lanes = false;
+            args.relay_repair_both_lanes = false;
+            args.relay_deadline_ms = 5_000;
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap()
+                .unwrap();
+            for (label, samples, bytes) in [
+                // 16-byte SoundKit v2 header and the 320 kb/s packet.
+                ("opus 1 ms", 48_u64, 16 + 40),
+                ("opus 2.5 ms", 120, 16 + 100),
+                ("opus 5 ms", 240, 16 + 200),
+                ("pcm 1 ms", 48, 16 + 288),
+            ] {
+                let payload = Bytes::from(vec![0x5a_u8; bytes]);
+                let mut object_ns = 0;
+                let mut encode_ns = 0;
+                let mut relay_ns = 0;
+                let mut symbols = 0;
+                for sequence in 0..PARTS {
+                    let mut part = test_opaque_part(91_000 + samples);
+                    part.sequence = sequence;
+                    part.duration_samples = Some(samples);
+                    part.duration_us = samples * 1_000_000 / 48_000;
+                    part.duration_ms = (part.duration_us / 1_000).max(1) as u32;
+                    part.bytes = payload.clone();
+                    let begin = thread_cpu_ns();
+                    let object =
+                        build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 5_000, 1_000_000)
+                            .unwrap();
+                    let built = thread_cpu_ns();
+                    let encoded = encode_canonical_media_object(&object).unwrap();
+                    let encoded_at = thread_cpu_ns();
+                    std::hint::black_box(&encoded);
+                    let outcome = relay
+                        .publish_part_object(&object, None, PublicationClass::Audio)
+                        .await
+                        .unwrap();
+                    let sent = thread_cpu_ns();
+                    object_ns += built - begin;
+                    encode_ns += encoded_at - built;
+                    relay_ns += sent - encoded_at;
+                    symbols += (outcome.source_symbols + outcome.repair_symbols) as u64;
+                }
+                let per_part = (object_ns + encode_ns + relay_ns) / PARTS;
+                let per_second = 48_000 / samples;
+                eprintln!(
+                    "{} lane(s), {label}: object {} ns, canonical encode {} ns, RelaySession \
+                     {} ns ({:.1} symbols) = {} ns/part; {:.1} ms CPU per second of audio \
+                     at {per_second} parts/s",
+                    1 + usize::from(secondary),
+                    object_ns / PARTS,
+                    encode_ns / PARTS,
+                    relay_ns / PARTS,
+                    symbols as f64 / PARTS as f64,
+                    per_part,
+                    (per_part * per_second) as f64 / 1e6,
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn relay_session_routes_source_and_secondary_repair_and_recovers_exact_object() {
         relay_session_routes_source_and_secondary_repair(true, true).await;
