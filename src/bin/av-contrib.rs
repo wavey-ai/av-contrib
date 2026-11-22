@@ -1139,6 +1139,33 @@ struct Args {
     )]
     relay_video_plan_grid: bool,
 
+    /// Send a one-datagram audio part as a compact RLC1 datagram (wave 7
+    /// item 3): the relay fields as varints (about 44 bytes, for RLS1 and
+    /// RQD2's 163) and a slim object (about 30 bytes and the part, for a
+    /// media-object envelope of about 700 bytes and the part) against the
+    /// stream's descriptor. The part that carries the descriptor goes whole
+    /// (RLS1) when the stream's shape is new or changes, and every
+    /// --relay-compact-whole-ms after. A receiver rebuilds the exact
+    /// envelope, so the LL-HLS part is byte for byte the same; a part whose
+    /// rebuilt envelope would differ goes whole. Copies are the same slim
+    /// object under a repair header. Needs --relay-source-first, and
+    /// forwarders and edges that read RLC1 (av-mesh wave 7 item 3). With
+    /// `false` every part goes whole.
+    #[arg(
+        long,
+        env = "AV_RELAY_COMPACT_AUDIO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_compact_audio: bool,
+
+    /// With --relay-compact-audio: a stream's part goes whole at least this
+    /// often, so a receiver that joins (or lost a whole part) learns the
+    /// descriptor within it. A 1 ms part whole is about 900 bytes, so 100
+    /// ms costs about 9 bytes a part.
+    #[arg(long, env = "AV_RELAY_COMPACT_WHOLE_MS", default_value_t = 100)]
+    relay_compact_whole_ms: u64,
+
     /// Compute a large part's repair symbols on a blocking thread while its
     /// source symbols are being sent, so the repair is ready at about the
     /// later of the two instead of their sum (a 500 kB 4K part: sources
@@ -1369,7 +1396,9 @@ fn single_symbol_audio_repair(loss: f64) -> u32 {
         return 0;
     }
     let loss = loss.min(0.5);
-    let copies = (SINGLE_SYMBOL_AUDIO_LOSS_TARGET.ln() / loss.ln()).ceil().max(1.0) as u32;
+    let copies = (SINGLE_SYMBOL_AUDIO_LOSS_TARGET.ln() / loss.ln())
+        .ceil()
+        .max(1.0) as u32;
     (copies - 1).min(SINGLE_SYMBOL_AUDIO_MAX_REPAIR)
 }
 
@@ -1410,14 +1439,17 @@ fn decode_lane_loss_report(datagram: &[u8]) -> Option<u32> {
 /// `--relay-demand-renditions`: groups of renditions of one source.
 fn parse_rendition_groups(value: &str) -> Result<Vec<Vec<u64>>> {
     let mut groups = Vec::new();
-    for group in value.split(';').map(str::trim).filter(|group| !group.is_empty()) {
+    for group in value
+        .split(';')
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+    {
         let streams = group
             .split(',')
             .map(|stream| {
-                stream
-                    .trim()
-                    .parse::<u64>()
-                    .with_context(|| format!("--relay-demand-renditions: {stream:?} is not a stream id"))
+                stream.trim().parse::<u64>().with_context(|| {
+                    format!("--relay-demand-renditions: {stream:?} is not a stream id")
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         if streams.len() < 2 {
@@ -1477,6 +1509,9 @@ impl LaneDemand {
 /// Parts of a rendition that no forwarder read, held back (item 5).
 static RELAY_DEMAND_HELD_PARTS: AtomicU64 = AtomicU64::new(0);
 
+/// One-symbol audio parts sent compact (RLC1) and whole (item 3).
+static RELAY_COMPACT_AUDIO_PARTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 /// How often the publish path looks for loss reports on its lanes.
 const LANE_LOSS_POLL_US: u64 = 50_000;
 
@@ -1494,9 +1529,7 @@ fn drain_lane_loss_reports(
     for _ in 0..64 {
         // SAFETY: `buf` is valid for `buf.len()` bytes and `fd` is the open
         // socket that `socket` owns.
-        let len = unsafe {
-            libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT)
-        };
+        let len = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
         if len < 0 {
             // Empty (EAGAIN), or an ICMP refusal of an earlier send, which a
             // later recv no longer reports.
@@ -2483,6 +2516,9 @@ impl RelaySessionPublisher {
                     SourceFirstEncoder::new(encoder.controller().clone(), limits).map(|fast| {
                         fast.with_video_symbol_size(args.relay_video_symbol_size)
                             .with_video_plan_grid(args.relay_video_plan_grid)
+                            .with_compact_audio(args.relay_compact_audio.then_some(
+                                args.relay_compact_whole_ms.saturating_mul(1_000).max(1_000),
+                            ))
                     })
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
@@ -2967,6 +3003,10 @@ impl RelaySessionPublisher {
             }
         };
         journal_hop(HopStage::Encoded, None);
+        if class == PublicationClass::Audio && encoded.source_wires().len() == 1 {
+            RELAY_COMPACT_AUDIO_PARTS[usize::from(!encoded.is_compact())]
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let encoded = Arc::new(encoded);
         let hot = self.audio_inline && class == PublicationClass::Audio;
         // `--relay-repair-alongside-sources`: a large part's repair is
@@ -8516,6 +8556,16 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_demand_held_parts",
             "Rendition parts not published because no forwarder reads them (--relay-demand-renditions).",
             RELAY_DEMAND_HELD_PARTS.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_compact_audio_parts",
+            "One-symbol audio parts sent as compact RLC1 datagrams (--relay-compact-audio).",
+            RELAY_COMPACT_AUDIO_PARTS[0].load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_whole_audio_parts",
+            "One-symbol audio parts sent whole (RLS1): descriptors, and every part without --relay-compact-audio.",
+            RELAY_COMPACT_AUDIO_PARTS[1].load(Ordering::Relaxed) as f64,
         ),
         (
             "av_contrib_relay_single_symbol_audio_repair_symbols",
@@ -14590,6 +14640,8 @@ mod tests {
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
+            relay_compact_audio: false,
+            relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
@@ -14697,6 +14749,8 @@ mod tests {
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
+            relay_compact_audio: false,
+            relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
@@ -14951,7 +15005,10 @@ mod tests {
         assert_eq!(single_symbol_audio_repair(0.02), 1);
         assert_eq!(single_symbol_audio_repair(0.05), 2);
         assert_eq!(single_symbol_audio_repair(0.10), 2);
-        assert_eq!(single_symbol_audio_repair(0.5), SINGLE_SYMBOL_AUDIO_MAX_REPAIR);
+        assert_eq!(
+            single_symbol_audio_repair(0.5),
+            SINGLE_SYMBOL_AUDIO_MAX_REPAIR
+        );
         assert_eq!(single_symbol_audio_repair(f64::NAN), 0);
         let mut report = [0_u8; 16];
         report[..4].copy_from_slice(b"RLR1");
@@ -15003,7 +15060,10 @@ mod tests {
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while publisher.single_symbol_audio_repair() != Some(2) {
-            assert!(std::time::Instant::now() < deadline, "the report was not heard");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the report was not heard"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let publisher_policy = RelaySessionPublisher {
@@ -15064,18 +15124,44 @@ mod tests {
             .send_to(&report, publisher.primary.local_addr().unwrap())
             .unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(publisher.publishes(4001), "one lane without a report: fail open");
+        assert!(
+            publisher.publishes(4001),
+            "one lane without a report: fail open"
+        );
         secondary
-            .send_to(&report, publisher.secondary.as_ref().unwrap().local_addr().unwrap())
+            .send_to(
+                &report,
+                publisher.secondary.as_ref().unwrap().local_addr().unwrap(),
+            )
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while publisher.publishes(4001) {
-            assert!(std::time::Instant::now() < deadline, "the reports were not heard");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reports were not heard"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(publisher.publishes(3001));
         assert!(!publisher.publishes(2001));
         assert!(publisher.publishes(1));
+    }
+
+    #[test]
+    fn compact_audio_is_on_by_default_and_can_be_turned_off() {
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert!(parsed.relay_compact_audio);
+        assert_eq!(parsed.relay_compact_whole_ms, 100);
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--relay-compact-audio",
+            "false",
+            "--relay-compact-whole-ms",
+            "250",
+        ])
+        .unwrap();
+        assert!(!parsed.relay_compact_audio);
+        assert_eq!(parsed.relay_compact_whole_ms, 250);
     }
 
     #[test]
@@ -15085,25 +15171,27 @@ mod tests {
         args.audio_epoch_redundant_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
         // auto: the lane runs without --relay-exclusive ...
         args.relay_exclusive = false;
-        assert_eq!(configured_audio_epoch_ingress_targets(&args).unwrap().len(), 2);
+        assert_eq!(
+            configured_audio_epoch_ingress_targets(&args).unwrap().len(),
+            2
+        );
         // ... and not with it: no target, so no re-encode and no send.
         args.relay_exclusive = true;
         assert!(configured_audio_epoch_ingress_targets(&args)
             .unwrap()
             .is_empty());
         args.audio_epoch_mesh_lane = AudioEpochMeshLane::On;
-        assert_eq!(configured_audio_epoch_ingress_targets(&args).unwrap().len(), 2);
+        assert_eq!(
+            configured_audio_epoch_ingress_targets(&args).unwrap().len(),
+            2
+        );
         args.audio_epoch_mesh_lane = AudioEpochMeshLane::Off;
         args.relay_exclusive = false;
         assert!(configured_audio_epoch_ingress_targets(&args)
             .unwrap()
             .is_empty());
-        let parsed = Args::try_parse_from([
-            "av-contrib",
-            "--audio-epoch-mesh-lane",
-            "off",
-        ])
-        .unwrap();
+        let parsed =
+            Args::try_parse_from(["av-contrib", "--audio-epoch-mesh-lane", "off"]).unwrap();
         assert_eq!(parsed.audio_epoch_mesh_lane, AudioEpochMeshLane::Off);
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
         assert_eq!(parsed.audio_epoch_mesh_lane, AudioEpochMeshLane::Auto);
@@ -15475,6 +15563,8 @@ mod tests {
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
+            relay_compact_audio: false,
+            relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
@@ -15722,6 +15812,8 @@ mod tests {
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
+            relay_compact_audio: false,
+            relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
@@ -15869,6 +15961,8 @@ mod tests {
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
+            relay_compact_audio: false,
+            relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,

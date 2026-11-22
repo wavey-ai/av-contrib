@@ -2379,13 +2379,14 @@ dependencies = [
 [[package]]
 name = "playlists"
 version = "0.2.0"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=f592da0cf2b5ad8ff71f5bf50ef67415377ab785#f592da0cf2b5ad8ff71f5bf50ef67415377ab785"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=4023d2e0761e876c6b92c6580550e3e2daa9b962#4023d2e0761e876c6b92c6580550e3e2daa9b962"
 dependencies = [
  "access-unit",
  "arc-swap",
  "bytes",
  "chrono",
  "flate2",
+ "media-object",
  "thiserror 1.0.69",
  "tls-helpers 0.2.0",
  "tokio",

@@ -37,11 +37,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use media_object::{MediaObject, ObjectKey, ObjectKind};
+use playlists::compact_object::{self, CompactDecision, CompactHeader, CompactSender};
 use raptorq::{
     EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder,
     SourceBlockEncodingPlan,
 };
-use raptorq_datagram_fec::{source_symbol_count, DatagramFecHeader, HEADER_LEN};
+use raptorq_datagram_fec::{
+    source_symbol_count, DatagramFecHeader, RaptorQBlockProfile, HEADER_LEN,
+};
 use relay_session::{
     decode_datagram, encode_datagram, priority_for_object, AdaptiveFecController, CodingProfile,
     Error, MediaDatagramRole, MediaDeadline, MediaObjectKind, MediaPathIntent, MediaPriority,
@@ -67,7 +70,18 @@ pub struct SourceFirstEncoder {
     plans: Arc<PlanCache>,
     block_id: AtomicU32,
     packet_sequence: AtomicU32,
+    /// `--relay-compact-audio`: one-datagram audio parts go as RLC1
+    /// datagrams of a slim object (wave 7 item 3), whole every so often.
+    compact: Option<Mutex<CompactSender>>,
+    /// The clock of the compact sender's interval.
+    started: std::time::Instant,
 }
+
+/// The largest compact datagram the contributor sends: under 1,280 bytes
+/// (the smallest IPv6 path MTU) with its IP and UDP headers.
+pub const MAX_COMPACT_DATAGRAM: usize = 1_200;
+/// The track of the parts that go compact: opaque audio parts.
+pub const COMPACT_TRACK: &str = "opaque-audio";
 
 impl SourceFirstEncoder {
     /// An encoder with `controller`'s policy, whose block ids and packet
@@ -86,7 +100,27 @@ impl SourceFirstEncoder {
             plans: Arc::new(PlanCache::default()),
             block_id: AtomicU32::new(0),
             packet_sequence: AtomicU32::new(0),
+            compact: None,
+            started: std::time::Instant::now(),
         })
+    }
+
+    /// One-datagram audio parts go as compact RLC1 datagrams (wave 7 item
+    /// 3): a slim object of about 30 bytes and the part against the
+    /// stream's descriptor, which the part sent whole when the stream's
+    /// shape is new or changed, and every `whole_every_us` after, carries.
+    /// `None` sends every part whole (RLS1).
+    #[must_use]
+    pub fn with_compact_audio(mut self, whole_every_us: Option<u64>) -> Self {
+        self.compact = whole_every_us.map(|every| Mutex::new(CompactSender::new(every)));
+        self
+    }
+
+    /// The compact sender's counts (`None` without compact audio).
+    pub fn compact_counts(&self) -> Option<compact_object::CompactSenderCounts> {
+        self.compact
+            .as_ref()
+            .map(|sender| sender.lock().unwrap_or_else(|e| e.into_inner()).counts())
     }
 
     /// Non-audio objects use symbols of at most `symbol_size` bytes (still
@@ -208,6 +242,20 @@ impl SourceFirstEncoder {
             actual: envelope.len(),
             maximum: u32::MAX as usize,
         })?;
+        if priority == MediaPriority::Audio && source_symbols == 1 {
+            if let Some(part) = self.encode_compact(
+                object,
+                &envelope,
+                generation,
+                subscription_id,
+                deadline,
+                transfer_length,
+                symbol_size,
+                repair_symbols,
+            )? {
+                return Ok(part);
+            }
+        }
         let block_id = self.block_id.fetch_add(1, Ordering::Relaxed);
         let first_sequence = self.packet_sequence.fetch_add(
             u32::from(source_symbols) + repair_symbols,
@@ -275,7 +323,148 @@ impl SourceFirstEncoder {
             envelope,
             header,
             plans: Arc::clone(&self.plans),
+            compact: None,
         })
+    }
+
+    /// The compact form of a one-symbol audio object, when the compact
+    /// sender gives it a slim object and its datagram fits; `None` sends
+    /// it whole. It takes a block id and its packet sequences as the whole
+    /// object would.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_compact(
+        &self,
+        object: &MediaObject,
+        envelope: &[u8],
+        generation: TopologyGeneration,
+        subscription_id: SubscriptionId,
+        deadline: MediaDeadline,
+        transfer_length: u32,
+        symbol_size: u16,
+        repair_symbols: u32,
+    ) -> Result<Option<SourcePart>> {
+        let Some(sender) = self.compact.as_ref() else {
+            return Ok(None);
+        };
+        // Opaque parts only: their payload is the LL-HLS part, which an
+        // edge reads straight out of the slim object for its UDP clients.
+        if object.key().track() != COMPACT_TRACK
+            || object.metadata().get("payload-format").map(Vec::as_slice)
+                == Some(b"soundkit-v2-bundle".as_slice())
+        {
+            return Ok(None);
+        }
+        let now_us = self.started.elapsed().as_micros() as u64;
+        let slim = match sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .decide(object, envelope, now_us)
+        {
+            CompactDecision::Whole => return Ok(None),
+            CompactDecision::Slim(slim) => slim,
+        };
+        let key = object.key();
+        let (Some(tenant), Some(track)) = (
+            compact_object::static_name(&compact_object::TENANT_CODES, key.tenant()),
+            compact_object::static_name(&compact_object::TRACK_CODES, key.track()),
+        ) else {
+            return Ok(None);
+        };
+        let kind = scheduler_kind(object, MediaPriority::Audio);
+        let block_id = self.block_id.fetch_add(1, Ordering::Relaxed);
+        let first_sequence = self
+            .packet_sequence
+            .fetch_add(1 + repair_symbols, Ordering::Relaxed);
+        let header = CompactHeader {
+            generation: generation.get(),
+            subscription_id: subscription_id.get(),
+            deadline_us: deadline.expires_at_us,
+            role: 0,
+            kind: kind_tag(kind),
+            path: 0,
+            tenant,
+            stream: key.stream(),
+            track,
+            epoch: key.epoch(),
+            group: key.group(),
+            object: key.object(),
+            version: key.version(),
+            packet_sequence: first_sequence,
+            esi: 0,
+        };
+        let Some(wire) = compact_object::encode_datagram(&header, &slim) else {
+            return Ok(None);
+        };
+        if wire.len() > MAX_COMPACT_DATAGRAM.min(self.limits.max_datagram_bytes) {
+            return Ok(None);
+        }
+        let block = RaptorQBlockProfile::new(block_id, transfer_length, 1, symbol_size)
+            .map_err(Error::from)?;
+        let symbol_header = SymbolHeader {
+            generation,
+            subscription_id,
+            key: key.clone(),
+            kind,
+            deadline,
+            block_id,
+            transfer_length,
+            source_symbols: 1,
+            symbol_size,
+            limits: self.limits,
+        };
+        Ok(Some(SourcePart {
+            announcement: ObjectAnnouncement {
+                generation,
+                subscription_id,
+                key: key.clone(),
+                kind,
+                deadline,
+                coding: CodingProfile::from_block(block),
+                initial_repair_symbols: repair_symbols,
+                next_packet_sequence: first_sequence.wrapping_add(1 + repair_symbols),
+            },
+            source: vec![Bytes::from(wire.clone())],
+            repair_symbols,
+            first_repair_sequence: first_sequence.wrapping_add(1),
+            envelope: envelope.to_vec(),
+            header: symbol_header,
+            plans: Arc::clone(&self.plans),
+            compact: Some(CompactCopies { wire }),
+        }))
+    }
+}
+
+/// The RLS1 tag of an object kind, as the compact datagram carries it.
+const fn kind_tag(kind: MediaObjectKind) -> u8 {
+    match kind {
+        MediaObjectKind::Initialization => 0,
+        MediaObjectKind::CodecConfig => 1,
+        MediaObjectKind::VideoKeyframe => 2,
+        MediaObjectKind::Audio => 3,
+        MediaObjectKind::VideoDelta => 4,
+        MediaObjectKind::Data => 5,
+    }
+}
+
+/// A compact part's source datagram, from which its copies are made.
+#[derive(Debug)]
+struct CompactCopies {
+    wire: Vec<u8>,
+}
+
+impl CompactCopies {
+    /// Copy `index` (from 0) of the part, a repair: the same slim object
+    /// under a repair header, ESI `1 + index`, its own packet sequence.
+    fn copy(&self, index: u32, packet_sequence: u32) -> Option<Bytes> {
+        let (source, slim) = compact_object::parse_datagram(&self.wire).ok()?;
+        let header = CompactHeader {
+            role: 1,
+            path: 1,
+            packet_sequence,
+            esi: 1 + index,
+            ..source
+        };
+        compact_object::encode_datagram(&header, slim).map(Bytes::from)
     }
 }
 
@@ -407,9 +596,16 @@ pub struct SourcePart {
     envelope: Vec<u8>,
     header: SymbolHeader,
     plans: Arc<PlanCache>,
+    /// A compact part (RLC1): its copies are its datagram's.
+    compact: Option<CompactCopies>,
 }
 
 impl SourcePart {
+    /// Whether the part goes as compact RLC1 datagrams.
+    pub const fn is_compact(&self) -> bool {
+        self.compact.is_some()
+    }
+
     /// The source symbols' RLS1 datagrams (the same for every lane).
     pub fn source_wires(&self) -> &[Bytes] {
         &self.source
@@ -468,6 +664,18 @@ impl SourcePart {
     pub fn repair_wires(&self) -> Result<Vec<Bytes>> {
         if self.repair_symbols == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(compact) = &self.compact {
+            return (0..self.repair_symbols)
+                .map(|index| {
+                    compact
+                        .copy(index, self.first_repair_sequence.wrapping_add(index))
+                        .ok_or(Error::InvalidField {
+                            field: "compact_copy",
+                            reason: "the compact datagram does not read back",
+                        })
+                })
+                .collect();
         }
         let size = usize::from(self.header.symbol_size);
         let padded_len = usize::from(self.header.source_symbols) * size;
@@ -814,6 +1022,124 @@ mod tests {
             .unwrap();
         assert!(given.source_wires().len() > 1);
         assert_eq!(given.repair_count(), policy.repair_count());
+    }
+
+    /// An opaque 1 ms audio part as the contributor publishes it.
+    fn opaque_part(sequence: u64, published_ns: i64) -> MediaObject {
+        use media_object::{ClockConfidence, ClockTimestamp, Stage, StageTimestamp};
+        let payload = (0..56)
+            .map(|index| (index * 13 + sequence as usize) as u8)
+            .collect::<Vec<_>>();
+        let key = ObjectKey::for_payload(
+            "default",
+            "3001",
+            "opaque-audio",
+            1_784_151_600_000_001,
+            0,
+            sequence,
+            1,
+            &payload,
+        )
+        .unwrap();
+        let stamp = |ns| {
+            ClockTimestamp::new(
+                ns,
+                "system:realtime:av-contrib",
+                ClockConfidence::estimated(5_000_000),
+            )
+            .unwrap()
+        };
+        MediaObject::builder(key, ObjectKind::Media, payload)
+            .with_deadline(stamp(published_ns + 2_000_000_000))
+            .with_stage_timestamp(StageTimestamp::new(
+                Stage::Packaged,
+                stamp(published_ns - 20_000),
+            ))
+            .with_stage_timestamp(StageTimestamp::new(Stage::Published, stamp(published_ns)))
+            .with_metadata("scheduler-class", b"audio".to_vec())
+            .with_metadata("duration-us", b"1000".to_vec())
+            .with_metadata("hls-msn", (sequence / 1_000).to_string().into_bytes())
+            .with_metadata("hls-part", (sequence % 1_000).to_string().into_bytes())
+            .build()
+            .unwrap()
+    }
+
+    /// `--relay-compact-audio`: the first part of a stream goes whole (the
+    /// descriptor), the next ones as RLC1 datagrams of a few dozen bytes
+    /// and the part, whose copies are repair headers over the same slim
+    /// object; a receiver that learnt the descriptor rebuilds each part's
+    /// envelope byte for byte. Without it, every part goes whole.
+    #[test]
+    fn compact_audio_parts_rebuild_the_whole_envelope() {
+        use playlists::compact_object::{parse_datagram, CompactTemplates};
+        let limits = RelayLimits::default();
+        let (generation, subscription, deadline) = ids();
+        let encoder = SourceFirstEncoder::new(controller(0), limits)
+            .unwrap()
+            .with_compact_audio(Some(60_000_000));
+        let mut templates = CompactTemplates::new();
+        let mut sequences = Vec::new();
+        for sequence in 998..1_003_u64 {
+            let object = opaque_part(sequence, 1_000_000_000 + 1_000_000 * sequence as i64);
+            let envelope = media_object::encode(&object).unwrap();
+            let part = encoder
+                .encode_sources_with(&object, generation, subscription, deadline, Some(2))
+                .unwrap();
+            assert_eq!(part.source_wires().len(), 1);
+            let wires = part
+                .source_wires()
+                .iter()
+                .cloned()
+                .chain(part.repair_wires().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(wires.len(), 3);
+            if sequence == 998 {
+                assert!(!part.is_compact());
+                assert!(wires.iter().all(|wire| wire.starts_with(b"RLS1")));
+                templates.learn(&object).unwrap();
+                continue;
+            }
+            assert!(part.is_compact());
+            for (index, wire) in wires.iter().enumerate() {
+                assert!(wire.len() <= 56 + 80, "{} B", wire.len());
+                let (header, slim) = parse_datagram(wire).unwrap();
+                assert_eq!(header.stream, "3001");
+                assert_eq!(header.object, sequence);
+                assert_eq!(header.generation, 7);
+                assert_eq!(header.subscription_id, 9);
+                assert_eq!(header.kind, 3);
+                assert_eq!(header.esi, index as u32);
+                assert_eq!(header.role, u8::from(index > 0));
+                assert_eq!(header.path, u8::from(index > 0));
+                sequences.push(header.packet_sequence);
+                let rebuilt = templates.expand("3001", slim).unwrap();
+                assert_eq!(media_object::encode(&rebuilt).unwrap(), envelope);
+            }
+            assert_eq!(part.announcement.key, *object.key());
+            assert_eq!(
+                part.announcement.coding.block().transfer_length() as usize,
+                envelope.len()
+            );
+        }
+        let mut distinct = sequences.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), sequences.len());
+        let counts = encoder.compact_counts().unwrap();
+        assert_eq!((counts.whole, counts.slim), (1, 4));
+
+        let whole = SourceFirstEncoder::new(controller(0), limits).unwrap();
+        assert!(whole.compact_counts().is_none());
+        let part = whole
+            .encode_sources_with(
+                &opaque_part(5, 5),
+                generation,
+                subscription,
+                deadline,
+                Some(0),
+            )
+            .unwrap();
+        assert!(!part.is_compact());
     }
 
     #[test]
