@@ -2994,4 +2994,175 @@ mod tests {
         assert!(sink_rx.recv().await.is_none());
         assert!(worker_stats().recovered_epochs_dropped >= dropped_before + 2);
     }
+
+    /// Thread CPU time, for the benchmark below.
+    fn thread_cpu_ns() -> u64 {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes the timespec it is given.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) };
+        spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
+    }
+
+    /// Discards parts: the benchmark times the packaging, not a sink.
+    struct CountingPublisher(AtomicU64);
+
+    #[async_trait::async_trait]
+    impl Fmp4PartPublisher for CountingPublisher {
+        async fn publish_fmp4_part(&self, _part: PublishedFmp4Part) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn publish_opaque_part(&self, _part: PublishedOpaquePart) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Not a check, a benchmark: thread CPU per AEP1 datagram and per part of
+    /// the contributor's LL-HLS worker (FEC recovery, SoundKit validation and
+    /// opaque packaging, one epoch per part) for the DAW lane's Opus at 1, 2.5
+    /// and 5 ms (one 320 kb/s stereo SoundKit Opus packet an epoch, 1 source
+    /// and 4 repair datagrams, as daw-nexus sends it) and for 1 ms PCM. The
+    /// cost is per datagram and per part, not per millisecond, so a 1 ms
+    /// lane costs 2.5 times a 2.5 ms one. Run with
+    /// `cargo test --release --lib contributor_cpu_per_part -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "benchmark"]
+    async fn contributor_cpu_per_part_at_each_opus_frame() {
+        const EPOCHS: u64 = 20_000;
+        // daw-nexus: AUDIO_FEC_MIN_REPAIR_SYMBOLS 4 from 1 ms up.
+        const DAW_REPAIR_SYMBOLS: u32 = 4;
+        let pcm = vec![0x5a_u8; 48 * 2 * 3];
+        for (label, frame_count, opus) in [
+            ("opus 1 ms (48)", 48_u32, true),
+            ("opus 2.5 ms (120)", 120, true),
+            ("opus 5 ms (240)", 240, true),
+            ("pcm 1 ms (48)", 48, false),
+        ] {
+            // daw-nexus frames both lanes as SoundKit v2: Opus, and 24-bit
+            // PCM for the lossless lane.
+            let (encoding, bits_per_sample, codec) = if opus {
+                let mut encoder = crate::opus_custom::new_lane_opus_encoder(
+                    48_000,
+                    2,
+                    frame_count,
+                    crate::opus_custom::LANE_DEFAULT_OPUS_BITRATE,
+                )
+                .unwrap();
+                let mut packet = vec![0u8; 1_500];
+                let pcm = vec![0x100_i16; frame_count as usize * 2];
+                let len = encoder.encode_i16(&pcm, &mut packet).unwrap();
+                packet.truncate(len);
+                (EncodingFlag::Opus, 0, packet)
+            } else {
+                (EncodingFlag::PCMSigned, 24, pcm.clone())
+            };
+            let payload = crate::soundkit_v2::frame_soundkit_v2_packet(
+                crate::soundkit_v2::SoundKitV2PacketMetadata {
+                    encoding,
+                    frame_count,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bits_per_sample,
+                    endianness: frame_header::Endianness::LittleEndian,
+                    id: Some(1),
+                    pts: None,
+                },
+                &codec,
+            )
+            .unwrap();
+            let transport = MultichannelAudioTransportAdapter::udp(1_200);
+            let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+            fec.repair_symbols = DAW_REPAIR_SYMBOLS;
+            let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+                fec,
+                ..MultichannelAudioSessionConfig::default()
+            });
+            let groups = [MultichannelAudioGroup {
+                group_id: 0,
+                channel_start: 0,
+                channel_count: 2,
+                payload_kind: AudioPayloadKind::SoundKitV2,
+                sample_format: AudioSampleFormat::Unspecified,
+                flags: 0,
+                payload: &payload,
+            }];
+            let encode_started = thread_cpu_ns();
+            let datagrams = (0..EPOCHS)
+                .map(|epoch_id| {
+                    let encoded = sender
+                        .encode_epoch(MultichannelAudioEpoch {
+                            session_id: 99,
+                            config_generation: 1,
+                            epoch_id,
+                            pts_samples: epoch_id * u64::from(frame_count),
+                            sample_rate: 48_000,
+                            frame_count,
+                            groups: &groups,
+                        })
+                        .unwrap();
+                    transport
+                        .wrap_epoch(encoded)
+                        .unwrap()
+                        .datagrams
+                        .into_iter()
+                        .map(|datagram| datagram.payload)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let encode_ns = thread_cpu_ns() - encode_started;
+            let datagram_count = datagrams.iter().map(Vec::len).sum::<usize>() as u64;
+
+            // Recovery and validation, as run_audio_epoch_hls_worker does
+            // them for every datagram.
+            let mut receiver = ReceiverState::new(Instant::now());
+            let mut groups_out = Vec::with_capacity(EPOCHS as usize);
+            let recover_started = thread_cpu_ns();
+            for epoch in &datagrams {
+                for bytes in epoch {
+                    let payload = transport.payload(bytes).unwrap();
+                    let (completed, _) = receiver.push(payload, now_unix_us()).unwrap();
+                    for (group, times) in completed {
+                        groups_out.push((terminalize_soundkit_group(group).unwrap(), times));
+                    }
+                }
+            }
+            let recover_ns = thread_cpu_ns() - recover_started;
+            assert_eq!(groups_out.len() as u64, EPOCHS);
+
+            // Packaging: one epoch per part, to a publisher that drops it.
+            let counting = Arc::new(CountingPublisher(AtomicU64::new(0)));
+            let publisher: Arc<dyn Fmp4PartPublisher> = counting.clone();
+            let mut config = test_config(40, 5, AudioEpochHlsPackaging::Opaque, publisher);
+            config.part = AudioPartSize::Epoch;
+            let mut renditions = HashMap::new();
+            let package_started = thread_cpu_ns();
+            for (group, times) in groups_out {
+                package_group_with_times(&config, &mut renditions, group, times)
+                    .await
+                    .unwrap();
+            }
+            let package_ns = thread_cpu_ns() - package_started;
+            assert_eq!(counting.0.load(Ordering::Relaxed), EPOCHS);
+
+            let parts_per_second = 48_000 / u64::from(frame_count);
+            let per_part_ns = (recover_ns + package_ns) / EPOCHS;
+            eprintln!(
+                "{label}: {:.1} datagrams/part, {parts_per_second} parts/s; \
+                 recovery {} ns/datagram ({} ns/part), packaging {} ns/part; \
+                 contributor {:.1} ms CPU per second of audio; \
+                 (source FEC encode {} ns/part)",
+                datagram_count as f64 / EPOCHS as f64,
+                recover_ns / datagram_count,
+                recover_ns / EPOCHS,
+                package_ns / EPOCHS,
+                (per_part_ns * parts_per_second) as f64 / 1e6,
+                encode_ns / EPOCHS,
+            );
+        }
+    }
 }
