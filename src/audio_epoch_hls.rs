@@ -297,6 +297,38 @@ struct RenditionState {
     format: RenditionFormat,
     expected_pts_samples: Option<u64>,
     packager: RenditionPackager,
+    /// Opus groups refused because their frame does not fit the packaging
+    /// (an Opus Custom frame for fMP4, or a frame that does not divide the
+    /// part). The error is returned for the 1st, 2nd, 4th, 8th... refusal.
+    refused_opus_groups: u64,
+}
+
+/// Whether Opus groups of `frame_count` samples fit the packaging: fMP4
+/// takes standard Opus only (Opus Custom has no OpusHead), and an opaque
+/// part of a set size must hold whole frames.
+fn opus_frame_fits_packaging(
+    packaging: AudioEpochHlsPackaging,
+    part: AudioPartSize,
+    sample_rate: u32,
+    frame_count: u32,
+) -> Result<(), String> {
+    match packaging {
+        AudioEpochHlsPackaging::Fmp4 => crate::opus_custom::refuse_custom_opus(
+            sample_rate,
+            frame_count,
+            "fMP4 packaging (--daw-hls-packaging fmp4)",
+        ),
+        AudioEpochHlsPackaging::Opaque => match part.target_samples(sample_rate, false) {
+            Some(target) if frame_count == 0 || target % u64::from(frame_count) != 0 => {
+                Err(format!(
+                    "the audio part ({part}, {target} samples at {sample_rate} Hz) does not hold \
+                     a whole number of {frame_count}-sample Opus frames; use --audio-part epoch \
+                     (one frame per part) or a multiple of {frame_count} samples"
+                ))
+            }
+            _ => Ok(()),
+        },
+    }
 }
 
 enum RenditionPackager {
@@ -1134,6 +1166,7 @@ async fn package_group_with_times(
             let state = entry.insert(RenditionState {
                 format,
                 expected_pts_samples: None,
+                refused_opus_groups: 0,
                 packager: new_rendition_packager(
                     config,
                     output_stream_id,
@@ -1156,6 +1189,27 @@ async fn package_group_with_times(
             state
         }
     };
+
+    if group.payload_kind == AudioPayloadKind::Opus {
+        if let Err(error) = opus_frame_fits_packaging(
+            config.packaging,
+            config.part,
+            group.sample_rate,
+            group.frame_count,
+        ) {
+            // Every group of the rendition fails the same way; report the
+            // 1st, 2nd, 4th, 8th... and drop the others quietly.
+            state.refused_opus_groups = state.refused_opus_groups.saturating_add(1);
+            return if state.refused_opus_groups.is_power_of_two() {
+                Err(format!(
+                    "{error} ({} Opus groups refused)",
+                    state.refused_opus_groups
+                ))
+            } else {
+                Ok(())
+            };
+        }
+    }
 
     let pts_discontinuity = state
         .expected_pts_samples
@@ -1365,6 +1419,11 @@ fn raw_opus_packets(
             {
                 return Err("SoundKit Opus metadata does not match its AEP1 group".to_string());
             }
+            crate::opus_custom::refuse_custom_opus(
+                header.sample_rate(),
+                header.frame_count(),
+                "fMP4 packaging (--daw-hls-packaging fmp4)",
+            )?;
             if header.pts().is_some_and(|pts| pts != expected_pts) {
                 return Err("SoundKit Opus packet PTS is not contiguous".to_string());
             }
@@ -1380,6 +1439,11 @@ fn raw_opus_packets(
         }
         packets
     } else {
+        crate::opus_custom::refuse_custom_opus(
+            group.sample_rate,
+            group.frame_count,
+            "fMP4 packaging (--daw-hls-packaging fmp4)",
+        )?;
         validate_raw_opus_packet(&group.payload, group.frame_count, group.sample_rate)?;
         vec![ElementaryAudioPacket {
             data: group.payload.clone(),
@@ -2395,6 +2459,141 @@ mod tests {
                 assert_eq!(part.duration_ms, 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn one_ms_opus_custom_frames_are_one_part_each_by_default() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..5_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(
+                    epoch_id,
+                    48,
+                    AudioPayloadKind::Opus,
+                    vec![epoch_id as u8; 32],
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 5);
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(part.sequence, index as u64);
+            assert_eq!(part.audio_units, 1);
+            assert_eq!(part.duration_samples, Some(48));
+            assert_eq!(part.duration_us, 1_000);
+            assert_eq!(part.duration_ms, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_custom_parts_hold_whole_frames_or_are_refused() {
+        // 64-sample (1.33 ms) frames in 4 ms parts: three frames a part.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Micros(4_000), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..6_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(epoch_id, 64, AudioPayloadKind::Opus, vec![epoch_id as u8]),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let parts = captured.opaque_parts.lock().unwrap();
+            assert_eq!(parts.len(), 2);
+            for part in parts.iter() {
+                assert_eq!(part.audio_units, 3);
+                assert_eq!(part.duration_samples, Some(192));
+                assert_eq!(part.duration_us, 4_000);
+            }
+            assert_eq!(parts[0].bytes.as_ref(), [0, 1, 2]);
+        }
+
+        // 64-sample frames do not divide a 5 ms (240-sample) part.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Micros(5_000), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        let error = package_group(
+            &config,
+            &mut renditions,
+            sized_group(0, 64, AudioPayloadKind::Opus, vec![0]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("whole number of 64-sample Opus frames"),
+            "{error}"
+        );
+        // The second refusal is reported too, the third is dropped quietly.
+        for (epoch_id, reported) in [(1_u64, true), (2, false), (3, true)] {
+            let result = package_group(
+                &config,
+                &mut renditions,
+                sized_group(epoch_id, 64, AudioPayloadKind::Opus, vec![0]),
+            )
+            .await;
+            assert_eq!(result.is_err(), reported, "{result:?}");
+        }
+        assert!(captured.opaque_parts.lock().unwrap().is_empty());
+
+        // 120-sample standard frames fit 5 ms parts; 72-sample frames fit
+        // 3 ms parts.
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Opaque,
+            AudioPartSize::Micros(5_000),
+            48_000,
+            120
+        )
+        .is_ok());
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Opaque,
+            AudioPartSize::Samples(144),
+            48_000,
+            72
+        )
+        .is_ok());
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Opaque,
+            AudioPartSize::Epoch,
+            48_000,
+            72
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn fmp4_packaging_refuses_opus_custom_frames() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Fmp4);
+        let mut renditions = HashMap::new();
+        for frame_count in [48_u32, 64, 72] {
+            let error = package_group(
+                &config,
+                &mut renditions,
+                sized_group(0, frame_count, AudioPayloadKind::Opus, vec![0; 32]),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Opus Custom"), "{error}");
+            assert!(error.contains("--daw-hls-packaging opaque"), "{error}");
+            renditions.clear();
+        }
+        assert!(captured.fmp4_parts.lock().unwrap().is_empty());
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Fmp4,
+            AudioPartSize::Epoch,
+            48_000,
+            120
+        )
+        .is_ok());
     }
 
     #[tokio::test]

@@ -388,6 +388,48 @@ mod tests {
     }
 
     #[test]
+    fn terminalize_accepts_one_ms_opus_custom_packets() {
+        let mut encoder =
+            crate::opus_custom::new_lane_opus_encoder(48_000, 2, 48, 256_000).unwrap();
+        let mut payload = vec![0u8; 1_500];
+        let len = encoder.encode_i16(&[0x100; 96], &mut payload).unwrap();
+        // CBR, no signalling byte: 32 bytes of CELT data at 256 kb/s.
+        assert_eq!(len, 32);
+        let packet = frame_soundkit_v2_packet(
+            SoundKitV2PacketMetadata {
+                frame_count: 48,
+                ..metadata(EncodingFlag::Opus, 7, 4_800)
+            },
+            &payload[..len],
+        )
+        .unwrap();
+        let group = DecodedMultichannelAudioGroup {
+            session_id: 1,
+            config_generation: 1,
+            epoch_id: 100,
+            pts_samples: 4_800,
+            sample_rate: 48_000,
+            frame_count: 48,
+            group_count: 1,
+            group_id: 0,
+            group_index: 0,
+            channel_start: 0,
+            channel_count: 2,
+            payload_kind: AudioPayloadKind::SoundKitV2,
+            sample_format: AudioSampleFormat::Unspecified,
+            flags: 0,
+            payload: packet.clone(),
+            raptorq_recovered_fragments: 0,
+        };
+        let terminal = terminalize_soundkit_group(group).unwrap();
+        assert_eq!(terminal.payload_kind, AudioPayloadKind::Opus);
+        assert_eq!(terminal.frame_count, 48);
+        // Opus keeps its SoundKit framing for the opaque rendition.
+        assert_eq!(terminal.payload, packet);
+        assert!(crate::opus_custom::is_custom_opus_frame(48_000, 48));
+    }
+
+    #[test]
     fn rejects_truncated_or_corrupt_packets() {
         let packet =
             frame_soundkit_v2_packet(metadata(EncodingFlag::FLAC, 1, 0), b"lossless-frame")
