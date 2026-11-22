@@ -653,6 +653,19 @@ struct Args {
     )]
     relay_audio_copies: RelayAudioCopies,
 
+    /// Renditions of one source (wave 7 item 5): `;`-separated groups of
+    /// `,`-separated stream ids (the DAW lane's FLAC, Opus and PCM from base
+    /// stream 2001 are "2001,3001,4001"). A part of a rendition of a group
+    /// is published on the RelaySession lanes only while the first
+    /// forwarders read it (they report their subtrees' demand, RLD1,
+    /// av-mesh --relay-demand-report), or read no rendition of the group (a
+    /// source nobody reads stays live), or a lane has not reported for 2 s
+    /// (fails open). Empty (the default for now): every rendition is
+    /// published; a held rendition's first reader does not start cleanly
+    /// yet (see av-mesh --relay-demand-renditions).
+    #[arg(long, env = "AV_RELAY_DEMAND_RENDITIONS", default_value = "")]
+    relay_demand_renditions: String,
+
     /// Controller-observed loss across the selected source path, as a fraction
     /// from zero through one. This seeds the adaptive RaptorQ policy until live
     /// carrier feedback supplies a newer observation.
@@ -1394,15 +1407,90 @@ fn decode_lane_loss_report(datagram: &[u8]) -> Option<u32> {
     (ppm <= 1_000_000).then_some(ppm)
 }
 
+/// `--relay-demand-renditions`: groups of renditions of one source.
+fn parse_rendition_groups(value: &str) -> Result<Vec<Vec<u64>>> {
+    let mut groups = Vec::new();
+    for group in value.split(';').map(str::trim).filter(|group| !group.is_empty()) {
+        let streams = group
+            .split(',')
+            .map(|stream| {
+                stream
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("--relay-demand-renditions: {stream:?} is not a stream id"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if streams.len() < 2 {
+            bail!("--relay-demand-renditions: a group needs two streams or more: {group:?}");
+        }
+        groups.push(streams);
+    }
+    Ok(groups)
+}
+
+/// Whether a rendition goes out when the lanes' fresh reports ask for
+/// `demand` (None: a lane has no fresh report): it is in no group, it is
+/// asked for, or no rendition of its group is.
+fn rendition_demanded(groups: &[Vec<u64>], stream: u64, demand: Option<&[u64]>) -> bool {
+    let Some(demand) = demand else {
+        return true;
+    };
+    let Some(group) = groups.iter().find(|group| group.contains(&stream)) else {
+        return true;
+    };
+    demand.contains(&stream) || !group.iter().any(|other| demand.contains(other))
+}
+
+/// RLD1, av-mesh's demand report (src/fast_plane/demand.rs): `RLD1`,
+/// version 1, a zero byte, a u16 count, then each stream id (u64).
+fn decode_lane_demand(datagram: &[u8]) -> Option<Vec<u64>> {
+    if datagram.len() < 8 || &datagram[..4] != b"RLD1" || datagram[4] != 1 {
+        return None;
+    }
+    let count = usize::from(u16::from_be_bytes([datagram[6], datagram[7]]));
+    if datagram.len() != 8 + count * 8 {
+        return None;
+    }
+    Some(
+        datagram[8..]
+            .chunks_exact(8)
+            .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("eight bytes")))
+            .collect(),
+    )
+}
+
+/// A lane's demand report counts this long.
+const LANE_DEMAND_TTL_US: u64 = 2_000_000;
+
+/// The last demand report of a lane: (when, streams).
+#[derive(Debug, Default)]
+struct LaneDemand(arc_swap::ArcSwapOption<(u64, Vec<u64>)>);
+
+impl LaneDemand {
+    fn fresh(&self, now_us: u64) -> Option<Arc<(u64, Vec<u64>)>> {
+        self.0
+            .load_full()
+            .filter(|report| now_us.saturating_sub(report.0) <= LANE_DEMAND_TTL_US)
+    }
+}
+
+/// Parts of a rendition that no forwarder read, held back (item 5).
+static RELAY_DEMAND_HELD_PARTS: AtomicU64 = AtomicU64::new(0);
+
 /// How often the publish path looks for loss reports on its lanes.
 const LANE_LOSS_POLL_US: u64 = 50_000;
 
 /// Take the loss reports waiting on a lane's audio socket (connected to the
 /// lane's forwarder, so nothing else arrives there) without blocking: a
 /// `recv` with MSG_DONTWAIT until the socket is empty.
-fn drain_lane_loss_reports(socket: &UdpSocket, report: &LaneLossReport, path: RelayCarrierPath) {
+fn drain_lane_loss_reports(
+    socket: &UdpSocket,
+    report: &LaneLossReport,
+    demand: &LaneDemand,
+    path: RelayCarrierPath,
+) {
     let fd = socket.as_raw_fd();
-    let mut buf = [0_u8; 64];
+    let mut buf = [0_u8; 2_048];
     for _ in 0..64 {
         // SAFETY: `buf` is valid for `buf.len()` bytes and `fd` is the open
         // socket that `socket` owns.
@@ -1420,6 +1508,10 @@ fn drain_lane_loss_reports(socket: &UdpSocket, report: &LaneLossReport, path: Re
         if let Some(ppm) = decode_lane_loss_report(&buf[..len as usize]) {
             report.record(ppm, hop_journal::now_unix_us());
             RELAY_LANE_REPORTED_LOSS_PPM[path as usize].store(u64::from(ppm), Ordering::Relaxed);
+        } else if let Some(streams) = decode_lane_demand(&buf[..len as usize]) {
+            demand
+                .0
+                .store(Some(Arc::new((hop_journal::now_unix_us(), streams))));
         }
     }
 }
@@ -1622,6 +1714,8 @@ struct RelayLane {
     /// The loss that the lane's forwarder reports (`--relay-audio-copies
     /// measured`).
     reported_loss: LaneLossReport,
+    /// The demand that the lane's forwarder reports (RLD1).
+    demand: LaneDemand,
 }
 
 /// The class lane settings: `--relay-class-lanes` and its socket options.
@@ -1719,6 +1813,7 @@ impl RelayLane {
             path_metrics: std::sync::RwLock::new(PathMetrics::default()),
             backlog: LaneBacklog::default(),
             reported_loss: LaneLossReport::default(),
+            demand: LaneDemand::default(),
         })
     }
 
@@ -2219,6 +2314,8 @@ struct RelaySessionPublisher {
     audio_copies: RelayAudioCopies,
     /// When the lanes were last looked at for loss reports (µs).
     loss_polled_us: AtomicU64,
+    /// `--relay-demand-renditions`.
+    demand_groups: Vec<Vec<u64>>,
     configured_loss: f64,
     min_repair_symbols: u32,
     /// `--relay-class-lanes`: the class of a part's stream picks its
@@ -2416,6 +2513,7 @@ impl RelaySessionPublisher {
             repair_both_lanes: args.relay_repair_both_lanes,
             audio_copies: args.relay_audio_copies,
             loss_polled_us: AtomicU64::new(0),
+            demand_groups: parse_rendition_groups(&args.relay_demand_renditions)?,
             configured_loss: f64::from(
                 adaptive_relay_path_metrics(primary_path_metrics, secondary_path_metrics)
                     .loss_fraction,
@@ -2429,6 +2527,61 @@ impl RelaySessionPublisher {
         }))
     }
 
+    /// Take the reports that each lane's forwarder sends to the lane's audio
+    /// socket (loss, RLR1; demand, RLD1); looked at every 50 ms at most.
+    fn poll_lane_reports(&self, now: u64) {
+        let polled = self.loss_polled_us.load(Ordering::Relaxed);
+        if now.saturating_sub(polled) < LANE_LOSS_POLL_US
+            || self
+                .loss_polled_us
+                .compare_exchange(polled, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        drain_lane_loss_reports(
+            &self.primary.socket,
+            &self.primary.reported_loss,
+            &self.primary.demand,
+            RelayCarrierPath::Primary,
+        );
+        if let Some(secondary) = self.secondary.as_ref() {
+            drain_lane_loss_reports(
+                &secondary.socket,
+                &secondary.reported_loss,
+                &secondary.demand,
+                RelayCarrierPath::Secondary,
+            );
+        }
+    }
+
+    /// Whether a part of `stream` goes out on the lanes now
+    /// (`--relay-demand-renditions`): yes unless every lane has a fresh
+    /// demand report and none reads it while one reads a sibling.
+    fn publishes(&self, stream: u64) -> bool {
+        if self.demand_groups.is_empty()
+            || !self
+                .demand_groups
+                .iter()
+                .any(|group| group.contains(&stream))
+        {
+            return true;
+        }
+        let now = hop_journal::now_unix_us();
+        self.poll_lane_reports(now);
+        let Some(primary) = self.primary.demand.fresh(now) else {
+            return true;
+        };
+        let mut demand = primary.1.clone();
+        if let Some(secondary) = self.secondary.as_ref() {
+            let Some(report) = secondary.demand.fresh(now) else {
+                return true;
+            };
+            demand.extend_from_slice(&report.1);
+        }
+        rendition_demanded(&self.demand_groups, stream, Some(&demand))
+    }
+
     /// The repair count of a one-symbol audio part now
     /// (`--relay-audio-copies`); `None` leaves it to the policy.
     fn single_symbol_audio_repair(&self) -> Option<u32> {
@@ -2437,28 +2590,7 @@ impl RelaySessionPublisher {
             RelayAudioCopies::Configured => self.configured_loss,
             RelayAudioCopies::Measured => {
                 let now = hop_journal::now_unix_us();
-                // Each lane's forwarder reports the loss it measures (RLR1)
-                // to the lane's audio socket; looked at every 50 ms.
-                let polled = self.loss_polled_us.load(Ordering::Relaxed);
-                if now.saturating_sub(polled) >= LANE_LOSS_POLL_US
-                    && self
-                        .loss_polled_us
-                        .compare_exchange(polled, now, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    drain_lane_loss_reports(
-                        &self.primary.socket,
-                        &self.primary.reported_loss,
-                        RelayCarrierPath::Primary,
-                    );
-                    if let Some(secondary) = self.secondary.as_ref() {
-                        drain_lane_loss_reports(
-                            &secondary.socket,
-                            &secondary.reported_loss,
-                            RelayCarrierPath::Secondary,
-                        );
-                    }
-                }
+                self.poll_lane_reports(now);
                 let secondary = self
                     .secondary
                     .as_ref()
@@ -4728,6 +4860,17 @@ impl Fmp4PartPublisher for MeshForwarder {
         &self,
         part: PublishedOpaquePart,
     ) -> std::result::Result<(), String> {
+        if self.relay_exclusive
+            && self
+                .relay
+                .as_ref()
+                .is_some_and(|relay| !relay.publishes(part.stream_id))
+        {
+            // A rendition that no forwarder reads (item 5): not built, not
+            // sent.
+            RELAY_DEMAND_HELD_PARTS.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
         self.telemetry
             .media_object_source_epoch
@@ -8368,6 +8511,11 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_lane_reported_loss_secondary_ppm",
             "Loss that the secondary lane's forwarder last reported (RLR1), in ppm.",
             RELAY_LANE_REPORTED_LOSS_PPM[1].load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_demand_held_parts",
+            "Rendition parts not published because no forwarder reads them (--relay-demand-renditions).",
+            RELAY_DEMAND_HELD_PARTS.load(Ordering::Relaxed) as f64,
         ),
         (
             "av_contrib_relay_single_symbol_audio_repair_symbols",
@@ -14381,6 +14529,7 @@ mod tests {
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
             relay_audio_copies: RelayAudioCopies::Measured,
+            relay_demand_renditions: String::new(),
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -14487,6 +14636,7 @@ mod tests {
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
             relay_audio_copies: RelayAudioCopies::Measured,
+            relay_demand_renditions: String::new(),
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -14864,6 +15014,71 @@ mod tests {
     }
 
     #[test]
+    fn rendition_groups_parse_and_hold_back_only_unread_renditions() {
+        let groups = parse_rendition_groups("2001,3001,4001; 11,12").unwrap();
+        assert_eq!(groups, vec![vec![2001, 3001, 4001], vec![11, 12]]);
+        assert!(parse_rendition_groups("2001").is_err());
+        assert!(parse_rendition_groups("").unwrap().is_empty());
+        assert!(rendition_demanded(&groups, 4001, None));
+        assert!(rendition_demanded(&groups, 3001, Some(&[3001])));
+        assert!(!rendition_demanded(&groups, 4001, Some(&[3001])));
+        assert!(!rendition_demanded(&groups, 2001, Some(&[3001, 1])));
+        assert!(rendition_demanded(&groups, 4001, Some(&[1])));
+        assert!(rendition_demanded(&groups, 1, Some(&[3001])));
+        let mut report = b"RLD1\x01\x00\x00\x02".to_vec();
+        report.extend_from_slice(&3001_u64.to_be_bytes());
+        report.extend_from_slice(&1_u64.to_be_bytes());
+        assert_eq!(decode_lane_demand(&report), Some(vec![3001, 1]));
+        assert_eq!(decode_lane_demand(&report[..20]), None);
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(parsed.relay_demand_renditions, "");
+    }
+
+    /// Both first forwarders report that their subtrees read Opus only: the
+    /// PCM and FLAC renditions are held back, other streams are not; a lane
+    /// without a report keeps everything going.
+    #[tokio::test]
+    async fn renditions_that_no_lane_reads_are_held_back() {
+        let primary = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let secondary = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let free = || {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        };
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary.local_addr().unwrap());
+        args.relay_primary_bind = Some(free());
+        args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+        args.relay_secondary_bind = Some(free());
+        args.relay_demand_renditions = "2001,3001,4001".to_owned();
+        let publisher = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(publisher.publishes(4001), "no report: fail open");
+        let mut report = b"RLD1\x01\x00\x00\x01".to_vec();
+        report.extend_from_slice(&3001_u64.to_be_bytes());
+        primary
+            .send_to(&report, publisher.primary.local_addr().unwrap())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(publisher.publishes(4001), "one lane without a report: fail open");
+        secondary
+            .send_to(&report, publisher.secondary.as_ref().unwrap().local_addr().unwrap())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while publisher.publishes(4001) {
+            assert!(std::time::Instant::now() < deadline, "the reports were not heard");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(publisher.publishes(3001));
+        assert!(!publisher.publishes(2001));
+        assert!(publisher.publishes(1));
+    }
+
+    #[test]
     fn the_legacy_aep1_lane_is_off_under_relay_exclusive_by_default() {
         let mut args = contrib_status_args();
         args.mesh_media_fec_target = "127.0.0.1:12001".parse().unwrap();
@@ -15199,6 +15414,7 @@ mod tests {
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
             relay_audio_copies: RelayAudioCopies::Measured,
+            relay_demand_renditions: String::new(),
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -15445,6 +15661,7 @@ mod tests {
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
             relay_audio_copies: RelayAudioCopies::Measured,
+            relay_demand_renditions: String::new(),
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
@@ -15591,6 +15808,7 @@ mod tests {
             relay_deadline_ms: DEFAULT_RELAY_DEADLINE_MS,
             relay_min_repair_symbols: 0,
             relay_audio_copies: RelayAudioCopies::Measured,
+            relay_demand_renditions: String::new(),
             relay_path_loss_fraction: 0.0,
             relay_path_best_direct_rtt_ms: 0.0,
             relay_path_rtt_ms: 0.0,
