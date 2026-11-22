@@ -6119,14 +6119,11 @@ async fn resolve_output_stream_idx(
     playlists: &Arc<playlists::Playlists>,
     output_stream_id: u64,
 ) -> usize {
-    if output_stream_id < playlists.chunk_cache.options.num_playlists as u64 {
-        output_stream_id as usize
-    } else {
-        playlists
-            .chunk_cache
-            .get_or_create_stream_idx(output_stream_id)
-            .await
-    }
+    playlists
+        .chunk_cache
+        .resolve_or_create_stream(output_stream_id)
+        .await
+        .index()
 }
 
 /// The output stream of an RTMP publish.
@@ -11094,8 +11091,8 @@ fn load_tls(args: &Args) -> Result<(String, String)> {
 /// Every segmenter of the contributor publishes only (`retain_local_cache`
 /// is false outside tests): the local Playlists maps stream ids to cache
 /// indexes and nothing more, and its ChunkCache and M3u8Cache are never
-/// written or served. playlists 0.1.6 still builds both caches up front, a
-/// slot per stream x segment x part each. Sized from the 1 ms default part
+/// written or served. The ChunkCache is still built up front, a slot per
+/// stream x segment x part. Sized from the 1 ms default part
 /// (1,008 parts a segment, 32 segments, 65 streams) they took 2.1M slots
 /// each, 276 MB of RSS at start, for memory nobody reads; 128 parts (the
 /// old floor) took 34 MB. These sizes take about 1 MB, whatever the part.
@@ -11113,9 +11110,10 @@ fn playlist_options(args: &Args) -> playlists::Options {
             .max(args.nominal_audio_part_ms())
             .max(1),
         target_duration_ms: args.hls_target_duration_ms.max(1_000),
-        part_target_ms: args.nominal_audio_part_ms(),
+        part_target_us: u32::try_from(args.nominal_audio_part_us()).unwrap_or(u32::MAX),
         buffer_size_kb: args.playlist_buffer_kb.max(1),
         init_size_kb: 5,
+        ..Default::default()
     }
 }
 

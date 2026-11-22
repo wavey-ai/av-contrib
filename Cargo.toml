@@ -41,7 +41,7 @@ mpeg2ts-reader = { package = "wavey-mpeg2ts-reader", version = "0.1.0" }
 media-object = "0.1.1"
 media-capability = "0.1.1"
 music-audio-session = "0.1.2"
-playlists = "0.1.6"
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "f592da0cf2b5ad8ff71f5bf50ef67415377ab785" }
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 raptorq = "2.0.1"
@@ -90,3 +90,10 @@ raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", rev
 # fix is 0.1.1 on the branch `fix-rtmp-aac-frame-start` of boxer, which is
 # not published.
 wavey-boxer = { git = "https://github.com/wavey-ai/boxer.git", rev = "ee90c8fe4cdb5e15c462f4532348e59e53bbe06e" }
+# playlists takes access-unit from git (default branch, no rev), so its
+# `Fmp4` would be a different type from the crates.io 0.1.3 that av-contrib,
+# boxer, rtmp-ingress and soundkit-flac use. Cargo refuses a patch of a git
+# source to the same repository at a rev, so playlists' dependency is pinned
+# to the crates.io release instead: one package, versioned and checksummed.
+[patch."https://github.com/wavey-ai/access-unit.git"]
+access-unit = "=0.1.3"

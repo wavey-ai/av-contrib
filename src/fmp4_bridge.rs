@@ -1320,10 +1320,12 @@ impl Fmp4Segmenter {
         }
         self.last_packaged_at_unix_ns = Some(packaged_at_unix_ns);
         if self.retain_local_cache {
-            if let Err(error) = self
-                .playlists
-                .chunk_cache
-                .append(self.output_stream_idx, part_bytes.clone())
+            let chunk_cache = &self.playlists.chunk_cache;
+            let stream = chunk_cache
+                .resolve_or_create_stream(self.output_stream_id)
+                .await;
+            if let Err(error) = chunk_cache
+                .append_for_handle(stream, part_bytes.clone())
                 .await
             {
                 error!(
@@ -2161,7 +2163,7 @@ mod tests {
             assert!(parts[0].published_at_unix_ns >= parts[0].packaged_at_unix_ns);
         }
         assert_eq!(playlists.active(), 0);
-        assert!(playlists.chunk_cache.stream_ids().await.is_empty());
+        assert!(playlists.chunk_cache.stream_handles().is_empty());
     }
 
     fn h264_frame(dts: u64, key: bool) -> AccessUnit {

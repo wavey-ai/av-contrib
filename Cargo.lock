@@ -12,14 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "access-unit"
-version = "0.1.3"
-source = "git+https://github.com/wavey-ai/access-unit.git#ae7aa5f0baa6c2827e17ce19319d57181bdb401a"
-dependencies = [
- "bytes",
-]
-
-[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,7 +203,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "av-contrib"
 version = "0.1.0"
 dependencies = [
- "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "access-unit",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -233,7 +225,7 @@ dependencies = [
  "media-capability",
  "media-object",
  "music-audio-session",
- "playlists 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "playlists 0.2.0",
  "raptorq",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
@@ -2357,7 +2349,7 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a079df8689d40f9bcecbdfea78f0b5af588637777078715ec24a7b2a48c565f"
 dependencies = [
- "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "access-unit",
  "bytes",
  "chrono",
  "flate2",
@@ -2373,7 +2365,24 @@ name = "playlists"
 version = "0.1.6"
 source = "git+https://github.com/wavey-ai/playlists.git#f9037f88749671dde5436158086838c136cd20ce"
 dependencies = [
- "access-unit 0.1.3 (git+https://github.com/wavey-ai/access-unit.git)",
+ "access-unit",
+ "bytes",
+ "chrono",
+ "flate2",
+ "thiserror 1.0.69",
+ "tls-helpers 0.2.0",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "playlists"
+version = "0.2.0"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=f592da0cf2b5ad8ff71f5bf50ef67415377ab785#f592da0cf2b5ad8ff71f5bf50ef67415377ab785"
+dependencies = [
+ "access-unit",
+ "arc-swap",
  "bytes",
  "chrono",
  "flate2",
@@ -2964,7 +2973,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19cc0de7cad709a7bfbf889c9cc9cebc46a9f879d555c1f48ba0a92244a9ff14"
 dependencies = [
- "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "access-unit",
  "bytes",
  "chrono",
  "futures",
@@ -3481,7 +3490,7 @@ version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d32b6a8f310caabc9156ecf6ecef61cb2b9250d9ed7808c864d1441c83cafc9b"
 dependencies = [
- "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "access-unit",
  "flacenc",
  "libc",
  "oxideav-core",
@@ -4293,7 +4302,7 @@ name = "wavey-boxer"
 version = "0.1.1"
 source = "git+https://github.com/wavey-ai/boxer.git?rev=ee90c8fe4cdb5e15c462f4532348e59e53bbe06e#ee90c8fe4cdb5e15c462f4532348e59e53bbe06e"
 dependencies = [
- "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "access-unit",
  "bytes",
  "soundkit-opus 0.13.0",
 ]

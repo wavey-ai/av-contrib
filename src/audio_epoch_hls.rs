@@ -1557,7 +1557,7 @@ mod tests {
     ) -> AudioEpochHlsConfig {
         let (playlists, _, _) = Playlists::new(Options {
             num_playlists: 256,
-            part_target_ms: min_part_ms,
+            part_target_us: min_part_ms.saturating_mul(1_000),
             ..Options::default()
         });
         AudioEpochHlsConfig::new(
