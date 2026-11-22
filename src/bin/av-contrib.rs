@@ -717,6 +717,22 @@ struct Args {
     #[arg(long, env = "AV_AUDIO_EPOCH_REDUNDANT_INGRESS_TARGET")]
     audio_epoch_redundant_ingress_target: Option<SocketAddr>,
 
+    /// The legacy AEP1 mesh lane: each DAW/probe AEP1 epoch re-framed as
+    /// SoundKit v2 (one source and four repair datagrams) and sent to the
+    /// AEP1 ingress targets. `off` sends none of it (no ingress target, no
+    /// re-encode): the RelaySession lanes carry every part that edges,
+    /// LL-HLS and UDP clients use; the AEP1 lane only feeds WebTransport
+    /// WAVEY-AUDIO-EPOCH readers and native relay subscribers at a
+    /// distributor. `auto` (the default) is `off` with --relay-exclusive and
+    /// `on` without it.
+    #[arg(
+        long,
+        env = "AV_AUDIO_EPOCH_MESH_LANE",
+        value_enum,
+        default_value_t = AudioEpochMeshLane::Auto
+    )]
+    audio_epoch_mesh_lane: AudioEpochMeshLane,
+
     /// Bounded handoff from the live AEP1 datagram path to format-preserving LL-HLS packaging.
     #[arg(
         long,
@@ -1294,6 +1310,26 @@ struct QuadraCliArgs {
     /// of the canonical source stream.
     #[arg(long, env = "AV_QUADRA_DERIVED_ONLY")]
     derived_only: bool,
+}
+
+/// `--audio-epoch-mesh-lane`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AudioEpochMeshLane {
+    Auto,
+    On,
+    Off,
+}
+
+impl AudioEpochMeshLane {
+    /// Whether the legacy AEP1 lane runs, for a contributor with or without
+    /// --relay-exclusive.
+    const fn enabled(self, relay_exclusive: bool) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Auto => !relay_exclusive,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -3601,6 +3637,9 @@ struct MeshForwarder {
 }
 
 fn configured_audio_epoch_ingress_targets(args: &Args) -> Result<Vec<SocketAddr>> {
+    if !args.audio_epoch_mesh_lane.enabled(args.relay_exclusive) {
+        return Ok(Vec::new());
+    }
     let primary = args
         .audio_epoch_ingress_target
         .unwrap_or(args.mesh_media_fec_target);
@@ -10619,8 +10658,14 @@ async fn main() -> Result<()> {
         // With --aep1-shared-recovery the ingest hands each datagram to the
         // LL-HLS worker only, and the mesh normaliser takes the epochs that
         // the worker recovered; else each path decodes its own copy.
-        let (audio_epoch_normalizer_task, ingest_audio_epoch_mesh_tx) = if args.aep1_shared_recovery
-        {
+        // The legacy AEP1 mesh lane (--audio-epoch-mesh-lane): without it
+        // no epoch is re-framed or sent, and nothing decodes a copy for it.
+        let audio_epoch_mesh_lane = !forwarder.audio_epoch_ingress_targets.is_empty();
+        let (audio_epoch_normalizer_task, ingest_audio_epoch_mesh_tx) = if !audio_epoch_mesh_lane {
+            drop(audio_epoch_mesh_rx);
+            drop(audio_epoch_mesh_send_tx);
+            (None, None)
+        } else if args.aep1_shared_recovery {
             drop(audio_epoch_mesh_rx);
             let (recovered_tx, recovered_rx) = mpsc::channel(AUDIO_EPOCH_MESH_QUEUE_CAPACITY);
             audio_epoch_hls_config = audio_epoch_hls_config.with_recovered_epoch_sink(recovered_tx);
@@ -10629,14 +10674,14 @@ async fn main() -> Result<()> {
                 audio_epoch_mesh_send_tx,
                 shutdown_rx.clone(),
             ));
-            (task, None)
+            (Some(task), None)
         } else {
             let task = tokio::spawn(run_audio_epoch_soundkit_normalizer(
                 audio_epoch_mesh_rx,
                 audio_epoch_mesh_send_tx,
                 shutdown_rx.clone(),
             ));
-            (task, Some(audio_epoch_mesh_tx))
+            (Some(task), Some(audio_epoch_mesh_tx))
         };
         // The DAW receive, the AEP1 recovery and the rendition workers run
         // on the audio hot threads: no AEP1 datagram or audio part waits for
@@ -10655,14 +10700,17 @@ async fn main() -> Result<()> {
                 shutdown_rx.clone(),
             ),
         );
-        let audio_epoch_mesh_task = tokio::spawn(run_audio_epoch_mesh_forward_worker(
-            forwarder.clone(),
-            audio_epoch_mesh_send_rx,
-            shutdown_rx.clone(),
-        ));
+        let audio_epoch_mesh_task = audio_epoch_mesh_lane.then(|| {
+            tokio::spawn(run_audio_epoch_mesh_forward_worker(
+                forwarder.clone(),
+                audio_epoch_mesh_send_rx,
+                shutdown_rx.clone(),
+            ))
+        });
         info!(
             bind = %local_addr,
-            audio_epoch_ingress_target = %forwarder.audio_epoch_ingress_targets[0],
+            audio_epoch_mesh_lane,
+            audio_epoch_ingress_target = ?forwarder.audio_epoch_ingress_targets.first(),
             audio_epoch_ingress_targets = AUDIO_EPOCH_INGRESS_TARGETS.load(Ordering::Relaxed),
             hls_base_stream_id = args.stream_id,
             hls_queue_capacity = args.daw_hls_queue_capacity,
@@ -10703,8 +10751,8 @@ async fn main() -> Result<()> {
         (
             Some(daw_media_task),
             Some(audio_epoch_hls_task),
-            Some(audio_epoch_normalizer_task),
-            Some(audio_epoch_mesh_task),
+            audio_epoch_normalizer_task,
+            audio_epoch_mesh_task,
             Some(audio_epoch_hls_tx),
             ingest_audio_epoch_mesh_tx,
             audio_hot,
@@ -14151,6 +14199,7 @@ mod tests {
             daw_media_bind: None,
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
+            audio_epoch_mesh_lane: AudioEpochMeshLane::Auto,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
@@ -14255,6 +14304,7 @@ mod tests {
             daw_media_bind: None,
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
+            audio_epoch_mesh_lane: AudioEpochMeshLane::Auto,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
@@ -14542,6 +14592,37 @@ mod tests {
 
         args.audio_epoch_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
         assert!(configured_audio_epoch_ingress_targets(&args).is_err());
+    }
+
+    #[test]
+    fn the_legacy_aep1_lane_is_off_under_relay_exclusive_by_default() {
+        let mut args = contrib_status_args();
+        args.mesh_media_fec_target = "127.0.0.1:12001".parse().unwrap();
+        args.audio_epoch_redundant_ingress_target = Some("127.0.0.1:12002".parse().unwrap());
+        // auto: the lane runs without --relay-exclusive ...
+        args.relay_exclusive = false;
+        assert_eq!(configured_audio_epoch_ingress_targets(&args).unwrap().len(), 2);
+        // ... and not with it: no target, so no re-encode and no send.
+        args.relay_exclusive = true;
+        assert!(configured_audio_epoch_ingress_targets(&args)
+            .unwrap()
+            .is_empty());
+        args.audio_epoch_mesh_lane = AudioEpochMeshLane::On;
+        assert_eq!(configured_audio_epoch_ingress_targets(&args).unwrap().len(), 2);
+        args.audio_epoch_mesh_lane = AudioEpochMeshLane::Off;
+        args.relay_exclusive = false;
+        assert!(configured_audio_epoch_ingress_targets(&args)
+            .unwrap()
+            .is_empty());
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--audio-epoch-mesh-lane",
+            "off",
+        ])
+        .unwrap();
+        assert_eq!(parsed.audio_epoch_mesh_lane, AudioEpochMeshLane::Off);
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(parsed.audio_epoch_mesh_lane, AudioEpochMeshLane::Auto);
     }
 
     #[test]
@@ -14864,6 +14945,7 @@ mod tests {
             daw_media_bind: None,
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
+            audio_epoch_mesh_lane: AudioEpochMeshLane::Auto,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
@@ -15108,6 +15190,7 @@ mod tests {
             daw_media_bind: Some(daw_bind),
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
+            audio_epoch_mesh_lane: AudioEpochMeshLane::Auto,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
@@ -15252,6 +15335,7 @@ mod tests {
             daw_media_bind: Some(daw_bind),
             audio_epoch_ingress_target: None,
             audio_epoch_redundant_ingress_target: None,
+            audio_epoch_mesh_lane: AudioEpochMeshLane::Auto,
             daw_hls_queue_capacity: DEFAULT_AUDIO_EPOCH_HLS_QUEUE_CAPACITY,
             daw_hls_packaging: DawHlsPackaging::Opaque,
             daw_hls_formats: vec![DawHlsFormat::Flac],
