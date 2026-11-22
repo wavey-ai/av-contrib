@@ -524,6 +524,12 @@ const DURATION_HISTOGRAM_BUCKETS_US: [u64; 13] = [
 /// `--relay-video-gso-segments`.
 const DEFAULT_RELAY_VIDEO_GSO_SEGMENTS: u16 = 16;
 
+/// `--relay-video-gso-pace-mbps`: no faster than the one-datagram-each
+/// batch hands a 4K part to the kernel (on a loopback benchmark host, see
+/// `video_gso_cpu_and_bursts`: off, 23 to 28 datagrams in any 100 us and
+/// 172 to 190 in any 1 ms; paced at 2,000, 24 and 152 to 160).
+const DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS: u64 = 2_000;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "av-contrib",
@@ -864,10 +870,15 @@ struct Args {
     /// audio in only between messages, and `fq` pacing
     /// (--relay-video-pacing-mbps) spaces messages, not datagrams. Runs are
     /// kept to --relay-video-gso-segments, and on paced video sockets to
-    /// about one millisecond of the pacing rate. Off until a lab A/B shows
-    /// lower contributor CPU with audio p99 unchanged. A host without UDP
-    /// GSO is detected on the first send and the lanes go on without it.
-    /// Needs --relay-send-batch.
+    /// about one millisecond of the pacing rate. Unpaced, GSO hands a whole
+    /// 4K part to the kernel in well under a millisecond (4 to 5 times the
+    /// one-datagram-each batch's density): with it on the wave-4 lab
+    /// contributor went from 33% to 125% of a vCPU at 81 Mbit/s and frames
+    /// came late at 122, so the messages are now paced
+    /// (--relay-video-gso-pace-mbps). Off until a lab A/B of the paced send
+    /// shows lower contributor CPU with frames and audio p99 unchanged. A
+    /// host without UDP GSO is detected on the first send and the lanes go
+    /// on without it. Needs --relay-send-batch.
     #[arg(
         long,
         env = "AV_RELAY_VIDEO_GSO",
@@ -885,6 +896,19 @@ struct Args {
         value_parser = clap::value_parser!(u16).range(1..=udp_batch::GSO_MAX_SEGMENTS as i64)
     )]
     relay_video_gso_segments: u16,
+
+    /// --relay-video-gso: hand each lane's GSO messages to the kernel no
+    /// faster than this many Mbit/s of payload, from a blocking thread that
+    /// sleeps between messages (and messages of at most 50 us of it). 0
+    /// hands them over as fast as the kernel takes them, a whole 4K part in
+    /// well under a millisecond: the wave-4 lab's CPU and late frames at
+    /// 81-122 Mbit/s. Ignored with GSO off.
+    #[arg(
+        long,
+        env = "AV_RELAY_VIDEO_GSO_PACE_MBPS",
+        default_value_t = DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS
+    )]
+    relay_video_gso_pace_mbps: u64,
 
     /// Recover each AEP1 epoch once: the LL-HLS worker's FEC receiver hands
     /// every completed epoch to the SoundKit v2 normaliser of the mesh lane,
@@ -1649,6 +1673,11 @@ impl RelayDirectLanes {
     }
 }
 
+/// `--relay-video-gso-pace-mbps` in bytes per second of payload.
+fn video_gso_pace_bytes_per_second(args: &Args) -> u64 {
+    args.relay_video_gso_pace_mbps.saturating_mul(1_000_000) / 8
+}
+
 /// Node id of direct lane `index`.
 fn direct_lane_id(args: &Args, index: usize) -> String {
     args.relay_direct_ids
@@ -2005,10 +2034,13 @@ struct RelaySessionPublisher {
     send_batch: bool,
     /// `--relay-video-gso`: a video part's symbols leave each lane as UDP
     /// GSO messages. Cleared for good when the host refuses UDP GSO.
-    video_gso: AtomicBool,
-    /// The size of those messages: `--relay-video-gso-segments`, and one
-    /// millisecond of `--relay-video-pacing-mbps` on paced class sockets.
+    video_gso: Arc<AtomicBool>,
+    /// The size of those messages: `--relay-video-gso-segments`, one
+    /// millisecond of `--relay-video-pacing-mbps` on paced class sockets,
+    /// and 50 us of `--relay-video-gso-pace-mbps`.
     video_gso_limits: udp_batch::GsoLimits,
+    /// `--relay-video-gso-pace-mbps` in bytes per second (0: unpaced).
+    video_gso_pace_bytes_per_second: u64,
     /// `--relay-audio-inline`: an audio part's lanes are each handed their
     /// symbols without waiting, one after the other, with no join.
     audio_inline: bool,
@@ -2197,11 +2229,15 @@ impl RelaySessionPublisher {
             secondary_seed_source: args.relay_secondary_seed_source,
             direct,
             send_batch: args.relay_send_batch,
-            video_gso: AtomicBool::new(args.relay_send_batch && args.relay_video_gso),
+            video_gso: Arc::new(AtomicBool::new(
+                args.relay_send_batch && args.relay_video_gso,
+            )),
             video_gso_limits: udp_batch::GsoLimits::new(
                 usize::from(args.relay_video_gso_segments),
                 classes.video_pacing_bytes_per_second,
-            ),
+            )
+            .paced(video_gso_pace_bytes_per_second(args)),
+            video_gso_pace_bytes_per_second: video_gso_pace_bytes_per_second(args),
             audio_inline: args.relay_audio_inline,
             repair_both_lanes: args.relay_repair_both_lanes,
             class_lanes: classes.enabled(),
@@ -3215,7 +3251,10 @@ impl RelaySessionPublisher {
         let started = Instant::now();
         let stage = relay_send_stage(path, first.role);
         let result = match self.lane_wires(groups, lane.limits) {
-            Ok(wires) => self.send_wire_batch_inner(lane, class, &wires).await,
+            Ok(wires) => {
+                self.send_wire_batch_inner(lane, class, &wires, first.deadline)
+                    .await
+            }
             Err(error) => Err(error),
         };
         self.telemetry
@@ -3249,7 +3288,8 @@ impl RelaySessionPublisher {
                 "RelaySession symbol expired before carrier send"
             ))
         } else {
-            self.send_wire_batch_inner(lane, class, wires).await
+            self.send_wire_batch_inner(lane, class, wires, deadline)
+                .await
         };
         self.telemetry
             .record_relay_session_stage_duration(stage, started.elapsed());
@@ -3261,6 +3301,7 @@ impl RelaySessionPublisher {
         lane: &RelayLane,
         class: PublicationClass,
         wires: &[(MediaDatagramRole, Bytes)],
+        deadline: MediaDeadline,
     ) -> Result<()> {
         let (socket, peer) = lane.class_socket(class);
         let messages = wires
@@ -3268,14 +3309,49 @@ impl RelaySessionPublisher {
             .map(|(_, wire)| udp_batch::Outbound::connected(wire))
             .collect::<Vec<_>>();
         let sent = if class == PublicationClass::Video {
-            udp_batch::send_all_gso_or_plain(
-                socket,
-                &messages,
-                self.video_gso_limits,
-                &self.video_gso,
-            )
-            .await
-            .map(|sent| {
+            let sent = if self.video_gso_pace_bytes_per_second > 0
+                && self.video_gso.load(Ordering::Relaxed)
+            {
+                // Paced: on a blocking thread, which sleeps between the
+                // messages (a lane's part is a few milliseconds at most).
+                drop(messages);
+                let socket = Arc::clone(socket);
+                let wires = wires
+                    .iter()
+                    .map(|(_, wire)| wire.clone())
+                    .collect::<Vec<_>>();
+                let limits = self.video_gso_limits;
+                let pace = self.video_gso_pace_bytes_per_second;
+                let gso = Arc::clone(&self.video_gso);
+                let give_up = std::time::Instant::now()
+                    + Duration::from_micros(deadline.expires_at_us.saturating_sub(now_unix_us()));
+                tokio::task::spawn_blocking(move || {
+                    let messages = wires
+                        .iter()
+                        .map(|wire| udp_batch::Outbound::connected(wire))
+                        .collect::<Vec<_>>();
+                    udp_batch::send_all_gso_or_plain_paced(
+                        &socket, &messages, limits, pace, &gso, give_up,
+                    )
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(udp_batch::Stopped {
+                        sent: 0,
+                        calls: 0,
+                        error: std::io::Error::other(error),
+                    })
+                })
+            } else {
+                udp_batch::send_all_gso_or_plain(
+                    socket,
+                    &messages,
+                    self.video_gso_limits,
+                    &self.video_gso,
+                )
+                .await
+            };
+            sent.map(|sent| {
                 if let Some(error) = &sent.turned_off {
                     // The rest of this part, and every later part, went
                     // one datagram each.
@@ -7434,6 +7510,7 @@ impl ContribStatusConfig {
                 relay_send_batch: args.relay_send_batch,
                 relay_video_gso: args.relay_send_batch && args.relay_video_gso,
                 relay_video_gso_segments: args.relay_video_gso_segments,
+                relay_video_gso_pace_mbps: args.relay_video_gso_pace_mbps,
                 relay_class_lanes: args.relay_class_lanes,
                 relay_class_port_offset: args.relay_class_port_offset,
                 relay_audio_inline: args.relay_audio_inline,
@@ -9392,6 +9469,8 @@ struct MeshTargetStatus {
     relay_video_gso: bool,
     /// `--relay-video-gso-segments`.
     relay_video_gso_segments: u16,
+    /// `--relay-video-gso-pace-mbps` (0: unpaced).
+    relay_video_gso_pace_mbps: u64,
     /// `--relay-class-lanes` and `--relay-class-port-offset`.
     relay_class_lanes: bool,
     relay_class_port_offset: u16,
@@ -12751,26 +12830,57 @@ mod tests {
 
     #[tokio::test]
     async fn relay_session_routes_source_and_secondary_repair_and_recovers_exact_object() {
-        relay_session_routes_source_and_secondary_repair(true, true, true).await;
+        relay_session_routes_source_and_secondary_repair(
+            true,
+            true,
+            true,
+            DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
+        )
+        .await;
     }
 
     /// `--relay-source-first false`: relay-session's encoder, source and
     /// repair together; the receivers see the same.
     #[tokio::test]
     async fn relay_session_without_source_first_sends_the_same_symbols() {
-        relay_session_routes_source_and_secondary_repair(true, true, false).await;
+        relay_session_routes_source_and_secondary_repair(
+            true,
+            true,
+            false,
+            DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn relay_session_without_send_batching_sends_the_same_symbols() {
-        relay_session_routes_source_and_secondary_repair(false, true, true).await;
+        relay_session_routes_source_and_secondary_repair(
+            false,
+            true,
+            true,
+            DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
+        )
+        .await;
     }
 
     /// `--relay-video-gso false`: the video lanes send one datagram per
     /// symbol, and the receivers see exactly what they see with GSO.
     #[tokio::test]
     async fn relay_session_video_without_gso_sends_the_same_symbols() {
-        relay_session_routes_source_and_secondary_repair(true, false, true).await;
+        relay_session_routes_source_and_secondary_repair(
+            true,
+            false,
+            true,
+            DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
+        )
+        .await;
+    }
+
+    /// `--relay-video-gso-pace-mbps 0`: GSO messages handed over as fast as
+    /// the kernel takes them, from the publishing task; the same symbols.
+    #[tokio::test]
+    async fn relay_session_video_with_unpaced_gso_sends_the_same_symbols() {
+        relay_session_routes_source_and_secondary_repair(true, true, true, 0).await;
     }
 
     /// Off by default until a lab A/B shows a gain; runs of 16 by default,
@@ -12780,16 +12890,20 @@ mod tests {
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
         assert!(!parsed.relay_video_gso);
         assert_eq!(parsed.relay_video_gso_segments, 16);
+        assert_eq!(parsed.relay_video_gso_pace_mbps, 2_000);
         let parsed = Args::try_parse_from([
             "av-contrib",
             "--relay-video-gso",
             "true",
             "--relay-video-gso-segments",
             "64",
+            "--relay-video-gso-pace-mbps",
+            "0",
         ])
         .unwrap();
         assert!(parsed.relay_video_gso);
         assert_eq!(parsed.relay_video_gso_segments, 64);
+        assert_eq!(parsed.relay_video_gso_pace_mbps, 0);
         for refused in ["0", "65"] {
             assert!(
                 Args::try_parse_from(["av-contrib", "--relay-video-gso-segments", refused])
@@ -12839,6 +12953,8 @@ mod tests {
             args.relay_primary_bind = Some(bind);
             args.relay_send_batch = true;
             args.relay_video_gso = true;
+            // The fq pacing alone (see the paced GSO send for its own).
+            args.relay_video_gso_pace_mbps = 0;
             args.relay_class_lanes = class_lanes;
             args.relay_video_pacing_mbps = pacing_mbps;
             let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
@@ -12849,6 +12965,28 @@ mod tests {
                 relay.video_gso_limits, expected,
                 "{class_lanes} {pacing_mbps}"
             );
+        }
+        // Paced GSO (the default 2,000 Mbit/s): messages of 50 us of it,
+        // 12,500 bytes, under the fq pacing's millisecond as well.
+        for (pacing_mbps, bytes) in [(0, 12_500), (40, 5_000)] {
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_receiver.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_video_gso = true;
+            args.relay_video_pacing_mbps = pacing_mbps;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                relay.video_gso_limits,
+                udp_batch::GsoLimits {
+                    segments: 16,
+                    bytes
+                },
+                "{pacing_mbps}"
+            );
+            assert_eq!(relay.video_gso_pace_bytes_per_second, 250_000_000);
         }
     }
 
@@ -13111,6 +13249,7 @@ mod tests {
         send_batch: bool,
         video_gso: bool,
         source_first: bool,
+        gso_pace_mbps: u64,
     ) {
         let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let secondary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -13128,6 +13267,7 @@ mod tests {
         args.relay_send_batch = send_batch;
         args.relay_video_gso = video_gso;
         args.relay_video_gso_segments = 16;
+        args.relay_video_gso_pace_mbps = gso_pace_mbps;
         args.relay_source_first = source_first;
         // Source first needs the batched sends.
         let source_first = source_first && send_batch;
@@ -13204,7 +13344,8 @@ mod tests {
         let journal_stream = 77_000_000_077
             + u64::from(send_batch)
             + 2 * u64::from(video_gso)
-            + 4 * u64::from(source_first);
+            + 4 * u64::from(source_first)
+            + 8 * u64::from(gso_pace_mbps == 0);
         let outcome = relay
             .publish_part_object(&object, Some((journal_stream, 42)), PublicationClass::Video)
             .await
@@ -14003,6 +14144,7 @@ mod tests {
             relay_send_batch: true,
             relay_video_gso: false,
             relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
+            relay_video_gso_pace_mbps: DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14106,6 +14248,7 @@ mod tests {
             relay_send_batch: true,
             relay_video_gso: false,
             relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
+            relay_video_gso_pace_mbps: DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14714,6 +14857,7 @@ mod tests {
             relay_send_batch: true,
             relay_video_gso: false,
             relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
+            relay_video_gso_pace_mbps: DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14957,6 +15101,7 @@ mod tests {
             relay_send_batch: true,
             relay_video_gso: false,
             relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
+            relay_video_gso_pace_mbps: DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -15100,6 +15245,7 @@ mod tests {
             relay_send_batch: true,
             relay_video_gso: false,
             relay_video_gso_segments: DEFAULT_RELAY_VIDEO_GSO_SEGMENTS,
+            relay_video_gso_pace_mbps: DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -16157,17 +16303,6 @@ mod tests {
         }
     }
 
-    /// Thread CPU time in nanoseconds, for the benchmarks.
-    fn thread_cpu_ns() -> u64 {
-        let mut spec = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: clock_gettime writes the timespec it is given.
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) };
-        spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
-    }
-
     /// Process CPU time in nanoseconds (the publishing thread and the
     /// blocking thread that may compute the repair), for the benchmarks.
     fn process_cpu_ns() -> u64 {
@@ -16320,6 +16455,203 @@ mod tests {
                         received / parts as usize,
                     );
                 }
+                drop((primary_audio, secondary_audio));
+            }
+        }
+    }
+
+    /// A receiver of one video lane for [`video_gso_cpu_and_bursts`]: the
+    /// kernel's receive time of every datagram (SO_TIMESTAMPNS), and the
+    /// thread's own CPU, which the benchmark leaves out of the contributor's.
+    fn video_lane_sink(
+        socket: std::net::UdpSocket,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<(Vec<u64>, u64)> {
+        use std::os::fd::AsRawFd;
+        std::thread::spawn(move || {
+            let cpu_before = thread_cpu_ns();
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let on: libc::c_int = 1;
+            // SAFETY: an int option of a socket this thread owns.
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_TIMESTAMPNS,
+                    std::ptr::addr_of!(on).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+            let mut times = Vec::with_capacity(1 << 20);
+            let mut buffer = [0_u8; 2_048];
+            let mut control = [0_u64; 16];
+            loop {
+                let mut iov = libc::iovec {
+                    iov_base: buffer.as_mut_ptr().cast(),
+                    iov_len: buffer.len(),
+                };
+                // SAFETY: a zeroed msghdr is valid; the buffers outlive the
+                // call.
+                let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+                header.msg_iov = &mut iov;
+                header.msg_iovlen = 1;
+                header.msg_control = control.as_mut_ptr().cast();
+                header.msg_controllen = std::mem::size_of_val(&control) as _;
+                // SAFETY: as above.
+                let rc = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut header, 0) };
+                if rc < 0 {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                // SAFETY: the kernel filled `control` as `header` says.
+                let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&header) };
+                while !cmsg.is_null() {
+                    // SAFETY: a control message of the kernel's.
+                    unsafe {
+                        if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                            && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS
+                        {
+                            let spec = std::ptr::read_unaligned(
+                                libc::CMSG_DATA(cmsg).cast::<libc::timespec>(),
+                            );
+                            times.push(spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64);
+                        }
+                        cmsg = libc::CMSG_NXTHDR(&header, cmsg);
+                    }
+                }
+            }
+            (times, thread_cpu_ns() - cpu_before)
+        })
+    }
+
+    /// Most datagrams within any `window_ns` of sorted receive times.
+    fn max_in_window(times: &[u64], window_ns: u64) -> usize {
+        let mut best = 0;
+        let mut start = 0;
+        for end in 0..times.len() {
+            while times[end] - times[start] >= window_ns {
+                start += 1;
+            }
+            best = best.max(end - start + 1);
+        }
+        best
+    }
+
+    /// Not a check, a benchmark: the contributor's CPU and the burst
+    /// profile of 4K parts on the video lanes, `--relay-video-gso` off, on
+    /// unpaced, and on paced at `--relay-video-gso-pace-mbps` (its default,
+    /// or AV_GSO_BENCH_PACE_MBPS). Parts of one 24 fps frame at 80, 122 and 160 Mbit/s are
+    /// published in real time for five seconds each to a primary and a
+    /// seeded secondary (class lanes, as the lab deploys it), each drained
+    /// by its own thread. Reported: the process CPU less the sinks' threads,
+    /// as % of one core, and per lane the most datagrams the kernel took in
+    /// within any 100 us and any 1 ms (loopback: the receive time is the
+    /// send time). Loopback frees a datagram's send buffer charge at once, so
+    /// the socket never pushes back here as a NIC's queue does. Run with
+    /// `cargo test --release --bin av-contrib video_gso_cpu_and_bursts --
+    /// --ignored --nocapture` (AV_GSO_BENCH_SECONDS to change the length).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark"]
+    async fn video_gso_cpu_and_bursts() {
+        let seconds: u64 = std::env::var("AV_GSO_BENCH_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5);
+        let pace_mbps: u64 = std::env::var("AV_GSO_BENCH_PACE_MBPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS);
+        const FPS: u64 = 24;
+        for mbps in [80_u64, 122, 160] {
+            for (gso, pace) in [(false, 0), (true, 0), (true, pace_mbps)] {
+                let (primary_audio, primary_video) = class_port_receivers().await;
+                let (secondary_audio, secondary_video) = class_port_receivers().await;
+                for socket in [&primary_video, &secondary_video] {
+                    SockRef::from(socket)
+                        .set_recv_buffer_size(64 << 20)
+                        .unwrap();
+                }
+                let mut args = contrib_status_args();
+                args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+                args.relay_primary_bind = Some(reserved_loopback_addr());
+                args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+                args.relay_secondary_bind = Some(reserved_loopback_addr());
+                args.relay_secondary_seed_source = true;
+                args.relay_exclusive = true;
+                args.relay_deadline_ms = 5_000;
+                args.relay_video_gso = gso;
+                args.relay_video_gso_pace_mbps = pace;
+                let telemetry = Arc::new(IngestTelemetry::default());
+                let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let sinks = [primary_video, secondary_video]
+                    .map(|socket| video_lane_sink(socket.into_std().unwrap(), Arc::clone(&stop)));
+                let bytes = (mbps * 1_000_000 / 8 / FPS) as usize;
+                let parts = seconds * FPS;
+                let stream = 94_000_000 + mbps * 100_000 + pace * 10 + u64::from(gso);
+                let frame = Duration::from_nanos(1_000_000_000 / FPS);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let cpu_before = process_cpu_ns();
+                let started = tokio::time::Instant::now();
+                let mut late = 0;
+                // The parts are built as they are due (their deadline runs
+                // from their time), on this thread: its CPU is left out.
+                let mut build_cpu = 0;
+                for sequence in 0..parts as usize {
+                    tokio::time::sleep_until(started + frame * sequence as u32).await;
+                    let build_started = thread_cpu_ns();
+                    let object = test_video_object_of(stream, sequence as u64, 1, bytes);
+                    build_cpu += thread_cpu_ns() - build_started;
+                    relay
+                        .publish_part_object(
+                            &object,
+                            Some((stream, sequence as u64)),
+                            PublicationClass::Video,
+                        )
+                        .await
+                        .unwrap();
+                    if started.elapsed() > frame * (sequence as u32 + 1) {
+                        late += 1;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let wall = started.elapsed();
+                let cpu = (process_cpu_ns() - cpu_before).saturating_sub(build_cpu);
+                stop.store(true, Ordering::Release);
+                let mut sink_cpu = 0;
+                let mut lanes = Vec::new();
+                for sink in sinks {
+                    let (mut times, cpu) = sink.join().unwrap();
+                    sink_cpu += cpu;
+                    times.sort_unstable();
+                    lanes.push(format!(
+                        "{} datagrams/part, max {}/100us {}/1ms",
+                        times.len() as u64 / parts,
+                        max_in_window(&times, 100_000),
+                        max_in_window(&times, 1_000_000),
+                    ));
+                }
+                let snapshot = telemetry.snapshot();
+                eprintln!(
+                    "gso={gso} pace={pace} {mbps} Mbit/s ({bytes} B parts at {FPS} fps): contributor CPU \
+                     {:.1}% of a core ({:.2}% per 10 Mbit/s); {} GSO messages/part; parts over \
+                     a frame {late}/{parts}; primary {}; secondary {}",
+                    (cpu.saturating_sub(sink_cpu)) as f64 * 100.0 / wall.as_nanos() as f64,
+                    (cpu.saturating_sub(sink_cpu)) as f64 * 1_000.0
+                        / wall.as_nanos() as f64
+                        / mbps as f64,
+                    snapshot.relay_session.gso_messages / parts,
+                    lanes[0],
+                    lanes[1],
+                );
                 drop((primary_audio, secondary_audio));
             }
         }

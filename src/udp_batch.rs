@@ -327,7 +327,27 @@ impl GsoLimits {
             bytes,
         }
     }
+
+    /// These limits for a send paced at `bytes_per_second` by
+    /// [`send_all_gso_or_plain_paced`]: a message is at most
+    /// [`GSO_PACED_MESSAGE_US`] of the pace, so that no message, which the
+    /// device sends back to back, is a burst denser than the pace.
+    pub fn paced(self, bytes_per_second: u64) -> Self {
+        if bytes_per_second == 0 {
+            return self;
+        }
+        let bytes =
+            usize::try_from(bytes_per_second.saturating_mul(GSO_PACED_MESSAGE_US) / 1_000_000)
+                .unwrap_or(GSO_MAX_BYTES);
+        Self {
+            segments: self.segments,
+            bytes: self.bytes.min(bytes),
+        }
+    }
 }
+
+/// The longest stretch of the pace that one paced GSO message carries.
+pub const GSO_PACED_MESSAGE_US: u64 = 50;
 
 /// The runs of `messages` that one UDP GSO message each can carry:
 /// consecutive datagrams to one target, every one but the last exactly as
@@ -585,6 +605,202 @@ where
             calls: stopped.calls,
             error: stopped.error,
         }),
+    }
+}
+
+/// [`send_all_gso_or_plain`] paced, for a blocking thread: the GSO messages
+/// are handed to the kernel no faster than `bytes_per_second` of payload,
+/// the thread sleeping (not spinning) between them for as long as the bytes
+/// already handed over take at that pace. Unpaced, GSO hands a whole 4K part
+/// to the kernel in well under a millisecond, several times denser than
+/// the one-datagram-each batch, whose own cost per datagram spreads it out:
+/// a NIC slower than that queues it, the socket's buffer fills, and the
+/// part reaches the wire and the next hop as one line-rate burst. Paced, the
+/// kernel sees a part no faster than the pace, and the GSO saving (one pass
+/// through the stack per message) is kept. Waits for room in the socket's
+/// buffer with `poll(2)` until `give_up` (then `TimedOut`). After a refusal
+/// of GSO the rest goes one datagram each, unpaced, as with GSO off.
+pub fn send_all_gso_or_plain_paced(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    limits: GsoLimits,
+    bytes_per_second: u64,
+    gso: &std::sync::atomic::AtomicBool,
+    give_up: std::time::Instant,
+) -> Result<GsoOrPlainSent, Stopped> {
+    send_all_gso_or_plain_paced_with(
+        socket,
+        messages,
+        limits,
+        bytes_per_second,
+        gso,
+        give_up,
+        &mut sendmmsg_gso,
+    )
+}
+
+fn send_all_gso_or_plain_paced_with<F>(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    limits: GsoLimits,
+    bytes_per_second: u64,
+    gso: &std::sync::atomic::AtomicBool,
+    give_up: std::time::Instant,
+    call: &mut F,
+) -> Result<GsoOrPlainSent, Stopped>
+where
+    F: FnMut(&UdpSocket, &[Outbound<'_>], &[(usize, usize)]) -> io::Result<usize>,
+{
+    use std::sync::atomic::Ordering;
+    let mut outcome = GsoOrPlainSent::default();
+    let mut from = 0;
+    if gso.load(Ordering::Relaxed) {
+        match send_all_gso_paced_with(socket, messages, limits, bytes_per_second, give_up, call) {
+            Ok(sent) => {
+                outcome.gso_messages = sent.messages;
+                outcome.gso_datagrams = messages.len();
+                return Ok(outcome);
+            }
+            Err(stopped) if gso_unsupported(&stopped.error) => {
+                if gso.swap(false, Ordering::Relaxed) {
+                    outcome.turned_off = Some(stopped.error);
+                }
+                outcome.gso_datagrams = stopped.sent;
+                from = stopped.sent;
+            }
+            Err(stopped) => return Err(stopped),
+        }
+    }
+    let mut sent = from;
+    let mut calls = 0;
+    while sent < messages.len() {
+        let outcome = try_send_all(socket, &messages[sent..]);
+        sent += outcome.sent;
+        calls += outcome.calls;
+        if outcome.would_block() {
+            wait_writable_until(socket, give_up).map_err(|error| Stopped { sent, calls, error })?;
+        } else if let Some(error) = outcome.error {
+            return Err(Stopped { sent, calls, error });
+        }
+    }
+    outcome.plain_datagrams = messages.len() - from;
+    Ok(outcome)
+}
+
+/// Wait for room in `socket`'s buffer until `give_up`.
+fn wait_writable_until(socket: &UdpSocket, give_up: std::time::Instant) -> io::Result<()> {
+    let now = std::time::Instant::now();
+    if now >= give_up {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "gave up waiting for room in the socket buffer",
+        ));
+    }
+    wait_writable(
+        socket,
+        (give_up - now)
+            .min(std::time::Duration::from_millis(100))
+            .max(std::time::Duration::from_millis(1)),
+    )
+    .map(drop)
+}
+
+/// The paced GSO send of [`send_all_gso_or_plain_paced`].
+fn send_all_gso_paced_with<F>(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+    limits: GsoLimits,
+    bytes_per_second: u64,
+    give_up: std::time::Instant,
+    call: &mut F,
+) -> Result<GsoSent, Stopped>
+where
+    F: FnMut(&UdpSocket, &[Outbound<'_>], &[(usize, usize)]) -> io::Result<usize>,
+{
+    use std::time::{Duration, Instant};
+    precise_sleeps();
+    let runs = gso_runs(messages, limits);
+    let run_bytes = |run: &(usize, usize)| -> u64 {
+        messages[run.0..run.0 + run.1]
+            .iter()
+            .map(|message| message.bytes.len() as u64)
+            .sum()
+    };
+    let rate = u128::from(bytes_per_second.max(1));
+    // How long `bytes` take at the pace.
+    let span = |bytes: u64| Duration::from_nanos((u128::from(bytes) * 1_000_000_000 / rate) as u64);
+    let mut done = GsoSent::default();
+    let mut start = Instant::now();
+    let mut paced_bytes = 0_u64;
+    let mut next_run = 0;
+    let mut sent = 0;
+    while next_run < runs.len() {
+        // One message a call. A late wake-up is not made up for with a
+        // burst: the pace runs on from now.
+        let now = Instant::now();
+        let behind = start + span(paced_bytes);
+        if now > behind {
+            start = now.checked_sub(span(paced_bytes)).unwrap_or(start);
+        }
+        match call(socket, messages, &runs[next_run..next_run + 1]) {
+            Ok(0) => {
+                return Err(Stopped {
+                    sent,
+                    calls: done.calls + 1,
+                    error: io::Error::new(io::ErrorKind::WriteZero, "sendmmsg took no GSO message"),
+                })
+            }
+            Ok(taken) => {
+                done.calls += 1;
+                done.messages += taken;
+                for run in &runs[next_run..next_run + taken] {
+                    sent += run.1;
+                    paced_bytes += run_bytes(run);
+                }
+                next_run += taken;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_writable_until(socket, give_up).map_err(|error| Stopped {
+                    sent,
+                    calls: done.calls + 1,
+                    error,
+                })?;
+                continue;
+            }
+            Err(error) => {
+                return Err(Stopped {
+                    sent,
+                    calls: done.calls + 1,
+                    error,
+                })
+            }
+        }
+        if next_run < runs.len() {
+            let wake = start + span(paced_bytes);
+            let now = Instant::now();
+            if wake > now {
+                std::thread::sleep(wake - now);
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// Sleeps of this thread end within a microsecond or so of when they are
+/// asked to, not the default 50 us timer slack later: the paced send sleeps
+/// tens of microseconds at a time.
+fn precise_sleeps() {
+    #[cfg(target_os = "linux")]
+    {
+        thread_local! {
+            static SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        SET.with(|set| {
+            if !set.replace(true) {
+                // SAFETY: PR_SET_TIMERSLACK takes the slack in nanoseconds.
+                unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1_000_u64) };
+            }
+        });
     }
 }
 
@@ -1056,6 +1272,164 @@ mod tests {
             &mut refused,
         )
         .await
+        .unwrap_err();
+        assert_eq!(stopped.sent, 0);
+        assert_eq!(stopped.error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(gso.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn paced_gso_messages_carry_at_most_50_us_of_the_pace() {
+        let limits = GsoLimits::new(16, None);
+        // 2,000 Mbit/s: 12,500 bytes, 10 symbols of 1,190 bytes.
+        assert_eq!(limits.paced(250_000_000).bytes, 12_500);
+        assert_eq!(limits.paced(250_000_000).segments, 16);
+        let full = vec![1_u8; 1_190];
+        let many = vec![Outbound::connected(&full); 100];
+        let runs = gso_runs(&many, limits.paced(250_000_000));
+        assert!(runs.iter().all(|run| run.1 == 10), "{runs:?}");
+        // Unpaced: unchanged; the fq millisecond stays when it is shorter.
+        assert_eq!(limits.paced(0), limits);
+        assert_eq!(
+            GsoLimits::new(16, Some(5_000_000)).paced(250_000_000).bytes,
+            5_000
+        );
+        // A pace below a symbol in 50 us: one datagram a message.
+        let runs = gso_runs(&many, limits.paced(10_000_000));
+        assert!(runs.iter().all(|run| run.1 == 1));
+    }
+
+    /// A paced GSO send: every datagram once and in order, no sooner than
+    /// the pace allows, in messages of 50 us of it, one a call.
+    #[tokio::test]
+    async fn a_paced_gso_batch_arrives_whole_in_order_and_keeps_to_the_pace() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let receiver = default_receiver().await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let data = part_symbols(121);
+        let messages = data
+            .iter()
+            .map(|bytes| Outbound::connected(bytes))
+            .collect::<Vec<_>>();
+        let total: usize = data.iter().map(Vec::len).sum();
+        // 160 Mbit/s: 1,000 bytes in 50 us is less than a symbol, so the
+        // pace is kept with one datagram a message; at 1,600 Mbit/s, 10,000
+        // bytes, 8 symbols a message.
+        for (rate, per_message) in [(20_000_000_u64, 1), (200_000_000, 8)] {
+            let limits = GsoLimits::new(16, None).paced(rate);
+            let gso = AtomicBool::new(true);
+            let started = std::time::Instant::now();
+            let outcome = send_all_gso_or_plain_paced(
+                &sender,
+                &messages,
+                limits,
+                rate,
+                &gso,
+                started + Duration::from_secs(2),
+            )
+            .unwrap();
+            let took = started.elapsed();
+            if !gso.load(Ordering::Relaxed) {
+                assert!(
+                    !gso_available(),
+                    "UDP GSO refused: {:?}",
+                    outcome.turned_off
+                );
+            } else {
+                assert_eq!(outcome.gso_datagrams, data.len());
+                // The short last symbol joins the last run.
+                let runs = gso_runs(&messages, limits);
+                assert!(runs[..runs.len() - 1]
+                    .iter()
+                    .all(|run| run.1 == per_message));
+                assert_eq!(outcome.gso_messages, runs.len());
+            }
+            // The last message leaves when the rest are due at the pace.
+            let floor =
+                Duration::from_nanos(((total - per_message * 1_190) as u64) * 1_000_000_000 / rate);
+            assert!(took >= floor, "{took:?} < {floor:?} at {rate} B/s");
+            let received = receive(&receiver, data.len()).await;
+            for (index, (bytes, _)) in received.into_iter().enumerate() {
+                assert_eq!(bytes, data[index], "datagram {index} at {rate} B/s");
+            }
+        }
+    }
+
+    /// A kernel that refuses GSO on the second paced message: the first went
+    /// by GSO, the rest one datagram each, every datagram once and in order,
+    /// and GSO is off. Any other error is returned with GSO left on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_paced_gso_refusal_sends_the_rest_once_and_in_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let receiver = default_receiver().await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let data = part_symbols(121);
+        let messages = data
+            .iter()
+            .map(|bytes| Outbound::connected(bytes))
+            .collect::<Vec<_>>();
+        let limits = GsoLimits::new(4, None);
+        let gso = AtomicBool::new(true);
+        let calls = std::cell::Cell::new(0);
+        let mut refusing =
+            |socket: &UdpSocket, messages: &[Outbound<'_>], runs: &[(usize, usize)]| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    let plain = runs
+                        .iter()
+                        .flat_map(|run| &messages[run.0..run.0 + run.1])
+                        .copied()
+                        .collect::<Vec<_>>();
+                    assert_eq!(linux::sendmmsg(socket, &plain)?, plain.len());
+                    Ok(runs.len())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EINVAL))
+                }
+            };
+        let outcome = send_all_gso_or_plain_paced_with(
+            &sender,
+            &messages,
+            limits,
+            1_000_000_000,
+            &gso,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &mut refusing,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(outcome.gso_datagrams, 4);
+        assert_eq!(outcome.plain_datagrams, 117);
+        assert!(outcome.turned_off.is_some());
+        assert!(!gso.load(Ordering::Relaxed));
+        let received = receive(&receiver, data.len()).await;
+        for (index, (bytes, _)) in received.into_iter().enumerate() {
+            assert_eq!(bytes, data[index], "datagram {index}");
+        }
+        let mut buffer = [0_u8; 2_048];
+        assert!(receiver.try_recv_from(&mut buffer).is_err());
+
+        let gso = AtomicBool::new(true);
+        let mut refused = |_: &UdpSocket, _: &[Outbound<'_>], _: &[(usize, usize)]| {
+            Err::<usize, _>(io::Error::from(io::ErrorKind::ConnectionRefused))
+        };
+        let stopped = send_all_gso_or_plain_paced_with(
+            &sender,
+            &messages,
+            limits,
+            1_000_000_000,
+            &gso,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &mut refused,
+        )
         .unwrap_err();
         assert_eq!(stopped.sent, 0);
         assert_eq!(stopped.error.kind(), io::ErrorKind::ConnectionRefused);
