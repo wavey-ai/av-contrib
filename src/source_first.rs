@@ -18,12 +18,29 @@
 //! for the same block id and packet sequence (checked in the tests below);
 //! the encoder's counters are atomics, so publishing threads share it
 //! without a lock.
+//!
+//! Encoding plans. `raptorq`'s own plan cache is one FIFO of 64 plans keyed
+//! by the source-symbol count K, shared by the whole process: 4K parts vary
+//! in size frame to frame, so their K changes almost every frame, the cache
+//! mostly misses (a plan of K = 380 is about 1.2 ms to generate) and video
+//! pushes audio's K = 1..3 plans out of it. Each [`SourceFirstEncoder`] keeps
+//! its own plans instead ([`PlanCache`]): small K are generated once and
+//! never evicted, larger K in a bounded FIFO. With
+//! [`SourceFirstEncoder::with_video_plan_grid`] (`--relay-video-plan-grid`) a
+//! video object's symbol size is trimmed a little so its K lands on a
+//! coarse grid (16 values per octave), so the plans of every 4K part size
+//! fit the FIFO and a part's repair never pays for a plan after warm-up.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use media_object::{MediaObject, ObjectKey, ObjectKind};
-use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder};
+use raptorq::{
+    EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder,
+    SourceBlockEncodingPlan,
+};
 use raptorq_datagram_fec::{source_symbol_count, DatagramFecHeader, HEADER_LEN};
 use relay_session::{
     decode_datagram, encode_datagram, priority_for_object, AdaptiveFecController, CodingProfile,
@@ -45,6 +62,9 @@ pub struct SourceFirstEncoder {
     /// The configured symbol size of non-audio objects, in place of the
     /// controller's (`--relay-video-symbol-size`; `None` keeps it).
     video_symbol_size: Option<u16>,
+    /// `--relay-video-plan-grid`: video objects' K on [`grid_symbol_count`].
+    video_plan_grid: bool,
+    plans: Arc<PlanCache>,
     block_id: AtomicU32,
     packet_sequence: AtomicU32,
 }
@@ -62,6 +82,8 @@ impl SourceFirstEncoder {
             controller,
             limits,
             video_symbol_size: None,
+            video_plan_grid: false,
+            plans: Arc::new(PlanCache::default()),
             block_id: AtomicU32::new(0),
             packet_sequence: AtomicU32::new(0),
         })
@@ -73,6 +95,22 @@ impl SourceFirstEncoder {
     pub fn with_video_symbol_size(mut self, symbol_size: u16) -> Self {
         self.video_symbol_size = (symbol_size > 0).then_some(symbol_size);
         self
+    }
+
+    /// Non-audio objects of more than [`GRID_EXACT_SYMBOLS`] symbols take a
+    /// symbol size a little under the configured one, so that their symbol
+    /// count is on [`grid_symbol_count`]'s grid and the repair finds its
+    /// encoding plan cached. The bytes are the same; a part has at most
+    /// 1/16 more datagrams (about 3 % on average), each a few bytes shorter.
+    #[must_use]
+    pub const fn with_video_plan_grid(mut self, enabled: bool) -> Self {
+        self.video_plan_grid = enabled;
+        self
+    }
+
+    /// The encoding plans this encoder's repair uses.
+    pub fn plans(&self) -> &PlanCache {
+        &self.plans
     }
 
     /// Continue from these counters (tests compare with an encoder that has
@@ -120,7 +158,10 @@ impl SourceFirstEncoder {
             (MediaPriority::Audio, _) | (_, None) => decided.config.symbol_size,
             (_, Some(symbol_size)) => symbol_size,
         };
-        let symbol_size = symbol_size_for_key(object.key(), preferred, self.limits)?;
+        let mut symbol_size = symbol_size_for_key(object.key(), preferred, self.limits)?;
+        if self.video_plan_grid && priority != MediaPriority::Audio {
+            symbol_size = grid_symbol_size(envelope.len(), symbol_size);
+        }
         let source_symbols = source_symbol_count(envelope.len(), symbol_size);
         if envelope.len().div_ceil(usize::from(symbol_size))
             > raptorq_datagram_fec::MAX_SOURCE_SYMBOLS_PER_BLOCK as usize
@@ -210,7 +251,125 @@ impl SourceFirstEncoder {
             first_repair_sequence: first_sequence.wrapping_add(u32::from(source_symbols)),
             envelope,
             header,
+            plans: Arc::clone(&self.plans),
         })
+    }
+}
+
+/// Symbol counts up to this have a grid point each.
+pub const GRID_EXACT_SYMBOLS: u16 = 32;
+
+/// The grid point at or above `symbols`: `symbols` itself up to
+/// [`GRID_EXACT_SYMBOLS`], above it rounded up to 1/16 of its octave (a
+/// multiple of 2 from 32, 4 from 64, ... 32 from 512).
+#[must_use]
+pub fn grid_symbol_count(symbols: u16) -> u16 {
+    if symbols <= GRID_EXACT_SYMBOLS {
+        return symbols;
+    }
+    let octave = 15 - symbols.leading_zeros();
+    let step = 1_u32 << (octave - 4);
+    let rounded = u32::from(symbols).div_ceil(step) * step;
+    u16::try_from(rounded).unwrap_or(symbols)
+}
+
+/// The symbol size, at most `max_symbol_size`, that gives an object of
+/// `len` bytes a symbol count on the grid; `max_symbol_size` when its count
+/// is already on it or no size gives exactly the grid's count.
+#[must_use]
+pub fn grid_symbol_size(len: usize, max_symbol_size: u16) -> u16 {
+    let size = usize::from(max_symbol_size);
+    let Ok(symbols) = u16::try_from(len.div_ceil(size)) else {
+        return max_symbol_size;
+    };
+    let target = grid_symbol_count(symbols);
+    if target == symbols {
+        return max_symbol_size;
+    }
+    let trimmed = len.div_ceil(usize::from(target));
+    if trimmed == 0 || trimmed > size || len.div_ceil(trimmed) != usize::from(target) {
+        return max_symbol_size;
+    }
+    u16::try_from(trimmed).unwrap_or(max_symbol_size)
+}
+
+/// Symbol counts below this have a plan slot of their own, generated once and
+/// never evicted (audio parts, small video objects).
+const SMALL_PLAN_SYMBOLS: usize = 16;
+/// Larger plans kept, oldest evicted first; and their bound in total source
+/// symbols (a plan of K symbols is roughly 0.75 K KiB: about 24 MiB here).
+const LARGE_PLAN_CAPACITY: usize = 64;
+const LARGE_PLAN_SYMBOL_BUDGET: usize = 32_768;
+
+/// RaptorQ encoding plans by source-symbol count, for one encoder.
+#[derive(Default)]
+pub struct PlanCache {
+    small: [OnceLock<Arc<SourceBlockEncodingPlan>>; SMALL_PLAN_SYMBOLS],
+    large: Mutex<LargePlans>,
+    generated: AtomicU32,
+}
+
+#[derive(Default)]
+struct LargePlans {
+    plans: HashMap<u16, Arc<SourceBlockEncodingPlan>>,
+    order: VecDeque<u16>,
+    symbols: usize,
+}
+
+impl std::fmt::Debug for PlanCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlanCache")
+            .field("generated", &self.generated())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlanCache {
+    /// The plan of `symbols` source symbols, generated on a miss (outside
+    /// the lock: another encode of the same count may generate it too).
+    pub fn plan(&self, symbols: u16) -> Arc<SourceBlockEncodingPlan> {
+        if let Some(slot) = self.small.get(usize::from(symbols)) {
+            return Arc::clone(slot.get_or_init(|| self.generate(symbols)));
+        }
+        if let Some(plan) = self.lock().plans.get(&symbols) {
+            return Arc::clone(plan);
+        }
+        let plan = self.generate(symbols);
+        let mut large = self.lock();
+        if let Some(plan) = large.plans.get(&symbols) {
+            return Arc::clone(plan);
+        }
+        while large.order.len() >= LARGE_PLAN_CAPACITY
+            || (!large.order.is_empty()
+                && large.symbols + usize::from(symbols) > LARGE_PLAN_SYMBOL_BUDGET)
+        {
+            let Some(evicted) = large.order.pop_front() else {
+                break;
+            };
+            large.plans.remove(&evicted);
+            large.symbols -= usize::from(evicted);
+        }
+        large.order.push_back(symbols);
+        large.symbols += usize::from(symbols);
+        large.plans.insert(symbols, Arc::clone(&plan));
+        plan
+    }
+
+    /// Plans generated so far (each a cache miss).
+    pub fn generated(&self) -> u32 {
+        self.generated.load(Ordering::Relaxed)
+    }
+
+    fn generate(&self, symbols: u16) -> Arc<SourceBlockEncodingPlan> {
+        self.generated.fetch_add(1, Ordering::Relaxed);
+        Arc::new(SourceBlockEncodingPlan::generate(symbols))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LargePlans> {
+        self.large
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -224,6 +383,7 @@ pub struct SourcePart {
     first_repair_sequence: u32,
     envelope: Vec<u8>,
     header: SymbolHeader,
+    plans: Arc<PlanCache>,
 }
 
 impl SourcePart {
@@ -274,8 +434,8 @@ impl SourcePart {
 
     /// The RLS1 datagrams of the object's repair symbols: ESIs K..,
     /// packet sequences right after its source symbols. The RaptorQ
-    /// encoding plan of K source symbols comes from `raptorq`'s
-    /// process-wide cache, so only the first object of each K (since its
+    /// encoding plan of K source symbols comes from the encoder's
+    /// [`PlanCache`], so only the first object of each K (since its
     /// eviction) generates one.
     ///
     /// # Errors
@@ -305,7 +465,8 @@ impl SourcePart {
             1,
             1,
         );
-        let encoder = SourceBlockEncoder::new(0, &oti, block);
+        let plan = self.plans.plan(self.header.source_symbols);
+        let encoder = SourceBlockEncoder::with_encoding_plan(0, &oti, block, &plan);
         let mut template: Option<Vec<u8>> = None;
         let mut wires = Vec::with_capacity(self.repair_symbols as usize);
         for (index, packet) in encoder
@@ -707,10 +868,176 @@ mod tests {
         assert!(per_block.values().all(|count| *count == per_block[&0]));
     }
 
+    /// Part sizes of a 4K stream: `bytes` plus or minus up to 20 % every
+    /// frame (a fixed pseudo-random sequence) and a keyframe three times as
+    /// large every 50th part. Returns (bytes, keyframe).
+    fn varied_part_size(bytes: usize, sequence: u64) -> (usize, bool) {
+        if sequence % 50 == 0 {
+            return (bytes * 3, true);
+        }
+        // splitmix64 of the sequence: sizes independent frame to frame.
+        let mut mixed = sequence.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        let permille = 800 + (mixed >> 33) % 401;
+        (bytes * permille as usize / 1_000, false)
+    }
+
+    #[test]
+    fn the_grid_rounds_up_within_a_sixteenth() {
+        for symbols in 1..=8_192_u16 {
+            let grid = grid_symbol_count(symbols);
+            assert!(grid >= symbols);
+            if symbols <= GRID_EXACT_SYMBOLS {
+                assert_eq!(grid, symbols);
+            } else {
+                assert!(
+                    u32::from(grid) * 16 <= u32::from(symbols) * 17 + 16,
+                    "{symbols} -> {grid}"
+                );
+                assert_eq!(grid_symbol_count(grid), grid, "{symbols} -> {grid}");
+            }
+        }
+        // 4K parts of 500 kB +- 20 % in 1,316-byte symbols: 304..456.
+        let points = (304..=456)
+            .map(grid_symbol_count)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(points.len() <= 12, "{points:?}");
+    }
+
+    #[test]
+    fn a_grid_symbol_size_gives_the_grid_count_and_never_grows() {
+        for max in [1_088_u16, 1_316, 1_400] {
+            for len in (1..2_000_000).step_by(997) {
+                let size = grid_symbol_size(len, max);
+                assert!(size <= max && size > 0);
+                let symbols = u16::try_from(len.div_ceil(usize::from(size))).unwrap();
+                let natural = u16::try_from(len.div_ceil(usize::from(max))).unwrap();
+                assert!(
+                    symbols == grid_symbol_count(natural) || size == max,
+                    "{len} {max}"
+                );
+                // A size giving exactly the grid's count exists while the
+                // count is below the symbol size (L / K'(K'-1) >= 1): every
+                // 4K part. Above it the size may stay (off the grid).
+                if grid_symbol_count(natural) < max {
+                    assert_eq!(symbols, grid_symbol_count(natural), "{len} {max}");
+                }
+            }
+        }
+    }
+
+    /// With the grid, a varied 4K stream's parts decode after losses, their
+    /// symbols stay within the configured size, audio keeps its exact fit,
+    /// and after warm-up the repair never generates a plan.
+    #[test]
+    fn grid_parts_decode_and_their_plans_stay_cached() {
+        let limits = RelayLimits::default();
+        let (generation, subscription, deadline) = ids();
+        let encoder = SourceFirstEncoder::new(controller(2), limits)
+            .unwrap()
+            .with_video_plan_grid(true);
+        let plain = SourceFirstEncoder::new(controller(2), limits).unwrap();
+        let audio = object(4_001, 0, 300, b"audio", false);
+        let audio_part = encoder
+            .encode_sources(&audio, generation, subscription, deadline)
+            .unwrap();
+        assert_eq!(audio_part.source_wires().len(), 1);
+        assert_eq!(
+            audio_part.coding(),
+            plain
+                .encode_sources(&audio, generation, subscription, deadline)
+                .unwrap()
+                .coding()
+        );
+        let mut counts = std::collections::BTreeSet::new();
+        for sequence in 0..300_u64 {
+            let (bytes, keyframe) = varied_part_size(60_000, sequence);
+            let class: &[u8] = if keyframe {
+                b"video-keyframe"
+            } else {
+                b"video-delta"
+            };
+            let object = object(1, sequence, bytes, class, keyframe);
+            let part = encoder
+                .encode_sources(&object, generation, subscription, deadline)
+                .unwrap();
+            let symbols = u16::try_from(part.source_wires().len()).unwrap();
+            assert_eq!(grid_symbol_count(symbols), symbols);
+            assert!(part.coding().symbol_size() <= 1_316);
+            counts.insert(symbols);
+            if sequence < 3 {
+                let repair = part.repair().unwrap();
+                let mut assembler =
+                    ObjectAssembler::new(part.announcement.clone(), limits).unwrap();
+                let mut recovered = None;
+                for symbol in part.source().unwrap().iter().skip(2).chain(&repair) {
+                    if recovered.is_none() {
+                        recovered = assembler.push_symbol(symbol).unwrap();
+                    }
+                }
+                assert_eq!(recovered.unwrap(), object);
+            } else {
+                part.repair_wires().unwrap();
+            }
+        }
+        // Every plan the stream needed was generated once (the audio part's
+        // repair was never computed).
+        assert_eq!(encoder.plans().generated() as usize, counts.len());
+        assert!(counts.len() <= 16, "{counts:?}");
+    }
+
+    /// Video plans of many symbol counts never evict a small (audio) plan:
+    /// the audio part's plan is generated once.
+    #[test]
+    fn video_plans_never_evict_audio_plans() {
+        let limits = RelayLimits::default();
+        let (generation, subscription, deadline) = ids();
+        let encoder = SourceFirstEncoder::new(controller(1), limits).unwrap();
+        let audio = |sequence| {
+            encoder
+                .encode_sources(
+                    &object(4_001, sequence, 300, b"audio", false),
+                    generation,
+                    subscription,
+                    deadline,
+                )
+                .unwrap()
+                .repair_wires()
+                .unwrap()
+        };
+        audio(0);
+        let after_audio = encoder.plans().generated();
+        for sequence in 0..(LARGE_PLAN_CAPACITY as u64 + 20) {
+            // 1,316-byte symbols: K = 17, 18, ... (all distinct).
+            let bytes = (17 + sequence as usize) * 1_316 - 900;
+            encoder
+                .encode_sources(
+                    &object(1, sequence, bytes, b"video-delta", false),
+                    generation,
+                    subscription,
+                    deadline,
+                )
+                .unwrap()
+                .repair_wires()
+                .unwrap();
+        }
+        let after_video = encoder.plans().generated();
+        assert_eq!(after_video - after_audio, LARGE_PLAN_CAPACITY as u32 + 20);
+        audio(1);
+        assert_eq!(encoder.plans().generated(), after_video);
+    }
+
     /// Not a check, a benchmark: wall time per object of relay-session's
     /// encode against the source symbols and the repair symbols of this
-    /// encoder. Run with `cargo test --release --lib source_first_bench --
-    /// --ignored --nocapture`.
+    /// encoder, for parts of one size ("fixed": every repair after the first
+    /// finds its plan cached) and of 4K-like varied sizes (+-20 % per frame,
+    /// a keyframe 3x every 50th: "varied"), the latter without and with
+    /// `--relay-video-plan-grid`. "repair ready" is sources + repair: when
+    /// the last repair symbol could be handed to a lane if they are computed
+    /// one after the other. Run with `cargo test --release --lib
+    /// source_first_bench -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark"]
     fn source_first_bench() {
@@ -720,49 +1047,83 @@ mod tests {
             ("opus 2.5 ms", 116, &b"audio"[..], 4_000),
             ("pcm 1 ms", 304, &b"audio"[..], 4_000),
             ("pcm 5 ms", 1_456, &b"audio"[..], 4_000),
-            ("4K 25 Mbit/s 50 fps", 62_500, &b"video-delta"[..], 200),
-            ("4K 80 Mbit/s 50 fps", 200_000, &b"video-delta"[..], 100),
-            ("4K 200 Mbit/s 50 fps", 500_000, &b"video-delta"[..], 50),
+            ("4K 25 Mbit/s 50 fps", 62_500, &b"video-delta"[..], 1_000),
+            ("4K 80 Mbit/s 50 fps", 200_000, &b"video-delta"[..], 500),
+            ("4K 200 Mbit/s 50 fps", 500_000, &b"video-delta"[..], 300),
         ] {
-            for min_repair in [0, 2] {
-                let mut reference =
-                    RaptorQObjectEncoder::new(controller(min_repair), limits).unwrap();
-                let encoder = SourceFirstEncoder::new(controller(min_repair), limits).unwrap();
-                let objects = (0..rounds)
-                    .map(|sequence| object(4_001, sequence, bytes, class, false))
-                    .collect::<Vec<_>>();
-                let started = std::time::Instant::now();
-                let mut symbols = 0;
-                for object in &objects {
-                    let encoded = reference
-                        .encode_object_with_inferred_priority(
-                            object,
-                            generation,
-                            subscription,
-                            deadline,
-                        )
-                        .unwrap();
-                    symbols += encoded.source_symbols.len() + encoded.repair_symbols.len();
-                }
-                let old = started.elapsed().as_nanos() / u128::from(rounds as u32);
-                let mut sources_ns = 0;
-                let mut repair_ns = 0;
-                for object in &objects {
+            let audio = class == b"audio";
+            let modes: &[(&str, bool, bool)] = if audio {
+                &[("fixed", false, false)]
+            } else {
+                &[
+                    ("fixed", false, false),
+                    ("varied", true, false),
+                    ("varied+grid", true, true),
+                ]
+            };
+            for &(mode, varied, grid) in modes {
+                for min_repair in [0, 2] {
+                    let mut reference =
+                        RaptorQObjectEncoder::new(controller(min_repair), limits).unwrap();
+                    let encoder = SourceFirstEncoder::new(controller(min_repair), limits)
+                        .unwrap()
+                        .with_video_plan_grid(grid);
+                    let objects = (0..rounds)
+                        .map(|sequence| {
+                            if varied {
+                                let (size, keyframe) = varied_part_size(bytes, sequence);
+                                let class: &[u8] = if keyframe { b"video-keyframe" } else { class };
+                                object(4_001, sequence, size, class, keyframe)
+                            } else {
+                                object(4_001, sequence, bytes, class, false)
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     let started = std::time::Instant::now();
-                    let part = encoder
-                        .encode_sources(object, generation, subscription, deadline)
-                        .unwrap();
-                    let built = std::time::Instant::now();
-                    std::hint::black_box(part.repair_wires().unwrap());
-                    sources_ns += built.duration_since(started).as_nanos();
-                    repair_ns += built.elapsed().as_nanos();
+                    let mut symbols = 0;
+                    for object in &objects {
+                        let encoded = reference
+                            .encode_object_with_inferred_priority(
+                                object,
+                                generation,
+                                subscription,
+                                deadline,
+                            )
+                            .unwrap();
+                        symbols += encoded.source_symbols.len() + encoded.repair_symbols.len();
+                    }
+                    let old = started.elapsed().as_nanos() / u128::from(rounds as u32);
+                    let mut sources_ns = 0;
+                    let mut repair_ns = Vec::new();
+                    let mut ours = 0;
+                    for object in &objects {
+                        let started = std::time::Instant::now();
+                        let part = encoder
+                            .encode_sources(object, generation, subscription, deadline)
+                            .unwrap();
+                        let built = std::time::Instant::now();
+                        let repair = part.repair_wires().unwrap();
+                        sources_ns += built.duration_since(started).as_nanos();
+                        repair_ns.push(built.elapsed().as_nanos());
+                        ours += part.source_wires().len() + repair.len();
+                        std::hint::black_box(repair);
+                    }
+                    let per = |total: u128| total / u128::from(rounds as u32);
+                    let repair_mean = per(repair_ns.iter().sum());
+                    repair_ns.sort_unstable();
+                    eprintln!(
+                        "{label} {mode}, min repair {min_repair}: relay-session {old} ns ({:.1} \
+                         symbols); source first: sources {} ns, repair mean {repair_mean} ns \
+                         (p50 {} p95 {}), repair ready {} ns ({:.1} symbols, {} plans generated)",
+                        symbols as f64 / f64::from(rounds as u32),
+                        per(sources_ns),
+                        repair_ns[repair_ns.len() / 2],
+                        repair_ns[repair_ns.len() * 95 / 100],
+                        per(sources_ns) + repair_mean,
+                        ours as f64 / f64::from(rounds as u32),
+                        encoder.plans().generated(),
+                    );
                 }
-                eprintln!(
-                    "{label}, min repair {min_repair}: relay-session {old} ns; source first: sources {} ns, then repair {} ns ({:.1} symbols)",
-                    sources_ns / u128::from(rounds as u32),
-                    repair_ns / u128::from(rounds as u32),
-                    symbols as f64 / f64::from(rounds as u32),
-                );
             }
         }
     }

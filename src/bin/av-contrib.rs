@@ -113,6 +113,10 @@ const RELAY_LANE_IMPAIRED_HOLD_MS: u64 = 3_000;
 const AUDIO_EPOCH_MESH_QUEUE_CAPACITY: usize = 32_768;
 const AUDIO_EPOCH_MESH_SEND_QUEUE_CAPACITY: usize = 32_768;
 const PUBLICATION_WORKERS: usize = 8;
+/// Parts of at least this many source symbols compute their repair
+/// alongside their source sends (`--relay-repair-alongside-sources`); for
+/// smaller ones the blocking thread's hand-off costs more than the repair.
+const REPAIR_ALONGSIDE_MIN_SOURCES: usize = 16;
 // Parts that wait for a publication worker, sized in time. A pause of
 // 120 ms of the process (measured on a busy host; a shared CPU pauses a
 // Nanode in the same way) overflowed 32 places a worker at 5 ms parts, and
@@ -1035,6 +1039,37 @@ struct Args {
     #[arg(long, env = "AV_RELAY_VIDEO_SYMBOL_SIZE", default_value_t = 0)]
     relay_video_symbol_size: u16,
 
+    /// Trim a video object's RaptorQ symbol size a little (never above the
+    /// configured size) so its source-symbol count K lands on a coarse grid
+    /// (exact up to 32, then 16 steps per octave). A 4K part's size, and so
+    /// its K, changes almost every frame; the repair's encoding plan is
+    /// cached by K, and a plan missed is about 1.2 ms of CPU at K = 380.
+    /// On the grid, every part size finds its plan after warm-up, for at
+    /// most 1/16 more datagrams per part (about 3 % on average, each a few
+    /// bytes shorter). With `false` symbols are the configured size and K
+    /// is whatever the part's length gives. Needs --relay-source-first.
+    #[arg(
+        long,
+        env = "AV_RELAY_VIDEO_PLAN_GRID",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_video_plan_grid: bool,
+
+    /// Compute a large part's repair symbols on a blocking thread while its
+    /// source symbols are being sent, so the repair is ready at about the
+    /// later of the two instead of their sum (a 500 kB 4K part: sources
+    /// about 2 ms, plan and solve about 2 ms). Parts of fewer than 16
+    /// source symbols, and audio on the hot path, compute it inline after
+    /// the sources as with `false`. Needs --relay-source-first.
+    #[arg(
+        long,
+        env = "AV_RELAY_REPAIR_ALONGSIDE_SOURCES",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_repair_alongside_sources: bool,
+
     /// Run the AEP1 audio packagers (and, with --relay-audio-inline, the
     /// audio publication) on a thread of their own, with SCHED_FIFO
     /// --audio-hot-fifo-priority and pinned to --audio-hot-cpu where the
@@ -1954,6 +1989,8 @@ struct RelaySessionPublisher {
     /// same controller, used in their place. Its counters are atomics: no
     /// publishing thread waits for another's encode.
     source_encoders: Option<Vec<SourceFirstEncoder>>,
+    /// `--relay-repair-alongside-sources`.
+    repair_alongside_sources: bool,
     primary: RelayLane,
     secondary: Option<RelayLane>,
     secondary_seed_source: bool,
@@ -2137,8 +2174,10 @@ impl RelaySessionPublisher {
         let source_encoders = if args.relay_send_batch && args.relay_source_first {
             let encoders = (0..encoders.len())
                 .map(|_| {
-                    SourceFirstEncoder::new(encoder.controller().clone(), limits)
-                        .map(|fast| fast.with_video_symbol_size(args.relay_video_symbol_size))
+                    SourceFirstEncoder::new(encoder.controller().clone(), limits).map(|fast| {
+                        fast.with_video_symbol_size(args.relay_video_symbol_size)
+                            .with_video_plan_grid(args.relay_video_plan_grid)
+                    })
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context("invalid source-first RelaySession encoder")?;
@@ -2149,6 +2188,7 @@ impl RelaySessionPublisher {
         Ok(Some(Self {
             encoders,
             source_encoders,
+            repair_alongside_sources: args.relay_repair_alongside_sources,
             primary,
             secondary,
             secondary_seed_source: args.relay_secondary_seed_source,
@@ -2498,7 +2538,9 @@ impl RelaySessionPublisher {
 
     /// `--relay-source-first`: publish `object` with its source symbols
     /// handed to every lane that carries them before its repair symbols are
-    /// computed, then the repair to the lanes that carry it. The lanes and
+    /// sent, then the repair to the lanes that carry it. A large part's
+    /// repair is computed on a blocking thread while its sources are sent
+    /// (`--relay-repair-alongside-sources`), other parts' after. The lanes and
     /// the journal are those of the publication without it: audio parts take
     /// the hot path (each lane handed its symbols without waiting, no join),
     /// other parts the joined batches; `sent` is still the last source
@@ -2526,6 +2568,22 @@ impl RelaySessionPublisher {
             }
         };
         journal_hop(HopStage::Encoded, None);
+        let encoded = Arc::new(encoded);
+        let hot = self.audio_inline && class == PublicationClass::Audio;
+        // `--relay-repair-alongside-sources`: a large part's repair is
+        // computed on a blocking thread while its sources are sent.
+        let early_repair = (self.repair_alongside_sources
+            && !hot
+            && encoded.repair_count() > 0
+            && encoded.source_wires().len() >= REPAIR_ALONGSIDE_MIN_SOURCES)
+            .then(|| {
+                let part = Arc::clone(&encoded);
+                tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    let repair = part.repair_wires();
+                    (repair, started.elapsed())
+                })
+            });
         // One set of datagrams for every lane: they are the same bytes.
         let sources = encoded
             .source_wires()
@@ -2552,7 +2610,6 @@ impl RelaySessionPublisher {
                 journal_hop(HopStage::SentFirst, Some(peer));
             }
         };
-        let hot = self.audio_inline && class == PublicationClass::Audio;
 
         // The source symbols.
         let (mut primary_result, mut secondary_result) = if hot {
@@ -2639,19 +2696,31 @@ impl RelaySessionPublisher {
         };
         drop(sources);
 
-        // The repair symbols, after the sources left.
+        // The repair symbols, after the sources left (computed alongside
+        // them, or now).
         if repair_count > 0 {
-            let repair_started = Instant::now();
-            let repair = encoded.repair_wires();
-            encode_time += repair_started.elapsed();
+            let repair = match early_repair {
+                Some(task) => match task.await {
+                    Ok((repair, took)) => {
+                        encode_time += took;
+                        repair.map_err(anyhow::Error::new)
+                    }
+                    Err(error) => Err(anyhow::Error::new(error)),
+                },
+                None => {
+                    let repair_started = Instant::now();
+                    let repair = encoded.repair_wires();
+                    encode_time += repair_started.elapsed();
+                    repair.map_err(anyhow::Error::new)
+                }
+            };
             let repair = match repair {
                 Ok(repair) => repair,
                 Err(error) => {
                     // The sources are out; the lanes that needed repair
                     // fail the part.
                     self.telemetry.record_relay_session_encode_error();
-                    let error = anyhow::Error::new(error)
-                        .context("failed to compute RaptorQ repair symbols");
+                    let error = error.context("failed to compute RaptorQ repair symbols");
                     if primary_repair {
                         primary_result = Err(anyhow::anyhow!("{error:#}"));
                     }
@@ -7368,6 +7437,8 @@ impl ContribStatusConfig {
                 relay_repair_both_lanes: args.relay_repair_both_lanes,
                 relay_source_first: args.relay_send_batch && args.relay_source_first,
                 relay_video_symbol_size: args.relay_video_symbol_size,
+                relay_video_plan_grid: args.relay_video_plan_grid,
+                relay_repair_alongside_sources: args.relay_repair_alongside_sources,
                 audio_hot_thread: args.audio_hot_thread,
                 aep1_shared_recovery: args.aep1_shared_recovery,
                 relay_exclusive: args.relay_exclusive,
@@ -9329,6 +9400,10 @@ struct MeshTargetStatus {
     relay_source_first: bool,
     /// `--relay-video-symbol-size` (0: the encoder's default).
     relay_video_symbol_size: u16,
+    /// `--relay-video-plan-grid`.
+    relay_video_plan_grid: bool,
+    /// `--relay-repair-alongside-sources`.
+    relay_repair_alongside_sources: bool,
     /// `--audio-hot-thread`.
     audio_hot_thread: bool,
     /// `--aep1-shared-recovery`.
@@ -13843,6 +13918,8 @@ mod tests {
             relay_repair_both_lanes: true,
             relay_source_first: true,
             relay_video_symbol_size: 0,
+            relay_video_plan_grid: true,
+            relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -13944,6 +14021,8 @@ mod tests {
             relay_repair_both_lanes: true,
             relay_source_first: true,
             relay_video_symbol_size: 0,
+            relay_video_plan_grid: true,
+            relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14550,6 +14629,8 @@ mod tests {
             relay_repair_both_lanes: true,
             relay_source_first: true,
             relay_video_symbol_size: 0,
+            relay_video_plan_grid: true,
+            relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14791,6 +14872,8 @@ mod tests {
             relay_repair_both_lanes: true,
             relay_source_first: true,
             relay_video_symbol_size: 0,
+            relay_video_plan_grid: true,
+            relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14932,6 +15015,8 @@ mod tests {
             relay_repair_both_lanes: true,
             relay_source_first: true,
             relay_video_symbol_size: 0,
+            relay_video_plan_grid: true,
+            relay_repair_alongside_sources: true,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -15343,13 +15428,17 @@ mod tests {
     /// relay-session's encoder gives it (same objects in the same order),
     /// on the audio hot path (repair on both lanes) and on the joined video
     /// path (repair from the secondary); a lane's source symbols come
-    /// before its repair symbols.
+    /// before its repair symbols. With the video repair computed alongside
+    /// the sources (`--relay-repair-alongside-sources`, a part of 31
+    /// sources) the lanes are the same. (`--relay-video-plan-grid` off: it
+    /// trims a video part's symbol size, see
+    /// grid_video_parts_decode_from_the_lanes.)
     #[tokio::test]
     async fn source_first_lanes_carry_relay_sessions_datagrams() {
         let audio = test_audio_object(91_000_000_090, 3_000);
         let video = test_video_object_of(91_000_000_091, 0, 2, 40_000);
         let mut lanes = Vec::new();
-        for source_first in [false, true] {
+        for (source_first, alongside) in [(false, false), (true, false), (true, true)] {
             let (primary_audio, primary_video) = class_port_receivers().await;
             let (secondary_audio, secondary_video) = class_port_receivers().await;
             let mut args = contrib_status_args();
@@ -15361,6 +15450,8 @@ mod tests {
             args.relay_deadline_ms = 5_000;
             args.relay_min_repair_symbols = 2;
             args.relay_source_first = source_first;
+            args.relay_video_plan_grid = false;
+            args.relay_repair_alongside_sources = alongside;
             let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
                 .await
                 .unwrap()
@@ -15374,6 +15465,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(audio_out.repair_symbols >= 2 && video_out.repair_symbols >= 2);
+            assert!(video_out.source_symbols >= REPAIR_ALONGSIDE_MIN_SOURCES);
             let audio_all = audio_out.source_symbols + audio_out.repair_symbols;
             lanes.push((
                 receive_wires(&primary_audio, audio_all).await,
@@ -15408,6 +15500,103 @@ mod tests {
             }
         }
         assert_eq!(lanes[0], lanes[1]);
+        assert_eq!(lanes[0], lanes[2]);
+    }
+
+    /// `--relay-video-plan-grid` (default on): video parts of varied sizes
+    /// leave with a symbol count on the grid and symbols no larger than
+    /// without it, their sources ahead of their repair (computed alongside),
+    /// and a receiver that lost sources decodes each from the secondary
+    /// lane; an audio part's datagrams are as without the grid.
+    #[tokio::test]
+    async fn grid_video_parts_decode_from_the_lanes() {
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let (secondary_audio, secondary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+        args.relay_secondary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_seed_source = true;
+        args.relay_deadline_ms = 5_000;
+        args.relay_min_repair_symbols = 4;
+        assert!(args.relay_video_plan_grid && args.relay_repair_alongside_sources);
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let limits = RelayLimits::default();
+        let stream = 91_000_000_095;
+        for (sequence, bytes) in [100_000_usize, 61_234, 260_000].into_iter().enumerate() {
+            let video = test_video_object_of(stream, sequence as u64, 2, bytes);
+            let out = relay
+                .publish_part_object(
+                    &video,
+                    Some((stream, sequence as u64)),
+                    PublicationClass::Video,
+                )
+                .await
+                .unwrap();
+            let symbols = u16::try_from(out.source_symbols).unwrap();
+            assert_eq!(
+                av_contrib::source_first::grid_symbol_count(symbols),
+                symbols
+            );
+            assert!(symbols > av_contrib::source_first::GRID_EXACT_SYMBOLS);
+            assert!(out.announcement.coding.symbol_size() <= 1_316);
+            receive_wires(&primary_video, out.source_symbols).await;
+            let wires = receive_wires(&secondary_video, out.source_symbols + out.repair_symbols)
+                .await
+                .iter()
+                .map(|wire| relay_session::decode_datagram(wire, limits).unwrap())
+                .collect::<Vec<_>>();
+            assert!(wires[..out.source_symbols]
+                .iter()
+                .all(|symbol| symbol.role == MediaDatagramRole::Source));
+            let mut assembler =
+                relay_session::ObjectAssembler::new(out.announcement.clone(), limits).unwrap();
+            let mut recovered = None;
+            // The first four sources are lost.
+            for symbol in wires.iter().skip(4) {
+                if recovered.is_none() {
+                    recovered = assembler.push_symbol(symbol).unwrap();
+                }
+            }
+            assert_eq!(recovered.unwrap(), video);
+        }
+        let audio = test_audio_object(91_000_000_096, 3_000);
+        let out = relay
+            .publish_part_object(&audio, Some((91_000_000_096, 0)), PublicationClass::Audio)
+            .await
+            .unwrap();
+        let expected = SourceFirstEncoder::new(
+            relay
+                .source_encoder(PublicationClass::Audio)
+                .unwrap()
+                .controller()
+                .clone(),
+            limits,
+        )
+        .unwrap()
+        .encode_sources(
+            &audio,
+            relay.generation,
+            relay.subscription_id,
+            out.announcement.deadline,
+        )
+        .unwrap();
+        assert_eq!(out.announcement.coding, expected.coding());
+        for socket in [&primary_audio, &secondary_audio] {
+            receive_wires(socket, out.source_symbols + out.repair_symbols).await;
+        }
+        for socket in [
+            &primary_audio,
+            &secondary_audio,
+            &primary_video,
+            &secondary_video,
+        ] {
+            assert_silent(socket).await;
+        }
     }
 
     /// Source first takes no encoder lock: a part leaves while
@@ -15450,16 +15639,24 @@ mod tests {
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
         assert!(parsed.relay_source_first);
         assert_eq!(parsed.relay_video_symbol_size, 0);
+        assert!(parsed.relay_video_plan_grid);
+        assert!(parsed.relay_repair_alongside_sources);
         let parsed = Args::try_parse_from([
             "av-contrib",
             "--relay-source-first",
             "false",
             "--relay-video-symbol-size",
             "1088",
+            "--relay-video-plan-grid",
+            "false",
+            "--relay-repair-alongside-sources",
+            "false",
         ])
         .unwrap();
         assert!(!parsed.relay_source_first);
         assert_eq!(parsed.relay_video_symbol_size, 1_088);
+        assert!(!parsed.relay_video_plan_grid);
+        assert!(!parsed.relay_repair_alongside_sources);
     }
 
     /// The audio hot path with repair on both lanes: the primary alone
@@ -15873,103 +16070,160 @@ mod tests {
         spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
     }
 
+    /// Process CPU time in nanoseconds (the publishing thread and the
+    /// blocking thread that may compute the repair), for the benchmarks.
+    fn process_cpu_ns() -> u64 {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes the timespec it is given.
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut spec) };
+        spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
+    }
+
+    /// 4K part sizes: `bytes` plus or minus up to 20 % every frame (a fixed
+    /// pseudo-random sequence) and a keyframe three times as large every
+    /// 50th part, so the RaptorQ symbol count changes from part to part as
+    /// a real encoder's does.
+    fn varied_part_bytes(bytes: usize, sequence: u64) -> usize {
+        if sequence % 50 == 0 {
+            return bytes * 3;
+        }
+        // splitmix64 of the sequence: sizes independent frame to frame.
+        let mut mixed = sequence.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        bytes * (800 + ((mixed >> 33) % 401) as usize) / 1_000
+    }
+
     /// Not a check, a benchmark (wave 5 W3): the contributor's cost of a 4K
     /// part on the video lanes (class lanes, a seeded secondary that also
-    /// carries the repair) at 25, 80 and 200 Mbit/s of 50 fps parts: the
-    /// call's wall time to `sent` and to its return, and its thread CPU,
-    /// with relay-session's encoder or source first, GSO off or on. Run with
-    /// `cargo test --release --bin av-contrib video_lane_cost -- --ignored --nocapture`.
+    /// carries the repair) at 25, 80 and 200 Mbit/s of 50 fps parts, of one
+    /// size ("fixed": every repair finds its encoding plan cached) and of
+    /// sizes that vary as a real encoder's do ("varied", see
+    /// `varied_part_bytes`): the call's wall time to `sent` (last source on
+    /// the primary) and to its return (the last repair symbol handed to the
+    /// lanes: "repair sent"), and the process CPU per part (the publishing
+    /// thread and the repair's blocking thread), with relay-session's
+    /// encoder or source first; source first as first committed (repair
+    /// after the sources' join, symbol counts as they fall), with
+    /// --relay-video-plan-grid and --relay-repair-alongside-sources, and
+    /// with GSO. Run with `cargo test --release --bin av-contrib
+    /// video_lane_cost -- --ignored --nocapture`.
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "benchmark"]
     async fn video_lane_cost_per_part() {
         let journal = test_hop_journal();
-        for (source_first, gso, symbol_size) in [
-            (false, false, 0),
-            (true, false, 0),
-            (true, true, 0),
-            (true, true, 1_088),
-        ] {
-            let (primary_audio, primary_video) = class_port_receivers().await;
-            let (secondary_audio, secondary_video) = class_port_receivers().await;
-            for socket in [&primary_video, &secondary_video] {
-                SockRef::from(socket)
-                    .set_recv_buffer_size(64 << 20)
+        for (index, (source_first, grid, alongside, gso, symbol_size)) in [
+            (false, false, false, false, 0),
+            (true, false, false, false, 0),
+            (true, true, false, false, 0),
+            (true, true, true, false, 0),
+            (true, true, true, true, 0),
+            (true, true, true, true, 1_088),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for varied in [false, true] {
+                let (primary_audio, primary_video) = class_port_receivers().await;
+                let (secondary_audio, secondary_video) = class_port_receivers().await;
+                for socket in [&primary_video, &secondary_video] {
+                    SockRef::from(socket)
+                        .set_recv_buffer_size(64 << 20)
+                        .unwrap();
+                }
+                let mut args = contrib_status_args();
+                args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+                args.relay_primary_bind = Some(reserved_loopback_addr());
+                args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+                args.relay_secondary_bind = Some(reserved_loopback_addr());
+                args.relay_secondary_seed_source = true;
+                args.relay_exclusive = true;
+                args.relay_deadline_ms = 5_000;
+                args.relay_source_first = source_first;
+                args.relay_video_plan_grid = grid;
+                args.relay_repair_alongside_sources = alongside;
+                args.relay_video_gso = gso;
+                args.relay_video_symbol_size = symbol_size;
+                let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                    .await
+                    .unwrap()
                     .unwrap();
-            }
-            let mut args = contrib_status_args();
-            args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
-            args.relay_primary_bind = Some(reserved_loopback_addr());
-            args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
-            args.relay_secondary_bind = Some(reserved_loopback_addr());
-            args.relay_secondary_seed_source = true;
-            args.relay_exclusive = true;
-            args.relay_deadline_ms = 5_000;
-            args.relay_source_first = source_first;
-            args.relay_video_gso = gso;
-            args.relay_video_symbol_size = symbol_size;
-            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
-                .await
-                .unwrap()
-                .unwrap();
-            let primary_video = primary_video.into_std().unwrap();
-            let secondary_video = secondary_video.into_std().unwrap();
-            let drain = |socket: &std::net::UdpSocket| {
-                let mut wire = [0_u8; 2_048];
-                let mut count = 0;
-                while socket.recv_from(&mut wire).is_ok() {
-                    count += 1;
+                let primary_video = primary_video.into_std().unwrap();
+                let secondary_video = secondary_video.into_std().unwrap();
+                let drain = |socket: &std::net::UdpSocket| {
+                    let mut wire = [0_u8; 2_048];
+                    let mut count = 0;
+                    while socket.recv_from(&mut wire).is_ok() {
+                        count += 1;
+                    }
+                    count
+                };
+                for (label, bytes, parts) in [
+                    ("25 Mbit/s", 62_500, 300_u64),
+                    ("80 Mbit/s", 200_000, 200),
+                    ("200 Mbit/s", 500_000, 150),
+                ] {
+                    let stream = 93_000_000 + bytes as u64;
+                    let objects = (0..parts)
+                        .map(|sequence| {
+                            let size = if varied {
+                                varied_part_bytes(bytes, sequence)
+                            } else {
+                                bytes
+                            };
+                            test_video_object_of(stream, sequence, 1, size)
+                        })
+                        .collect::<Vec<_>>();
+                    let mut to_sent = Vec::new();
+                    let mut wall = Vec::new();
+                    let mut cpu = 0;
+                    let mut received = 0;
+                    for (sequence, object) in objects.iter().enumerate() {
+                        let seq =
+                            sequence as u64 + (index as u64 * 2 + u64::from(varied)) * 1_000_000;
+                        let called_us = hop_journal::now_unix_us();
+                        let cpu_before = process_cpu_ns();
+                        relay
+                            .publish_part_object(
+                                object,
+                                Some((stream, seq)),
+                                PublicationClass::Video,
+                            )
+                            .await
+                            .unwrap();
+                        cpu += process_cpu_ns() - cpu_before;
+                        wall.push(hop_journal::now_unix_us() - called_us);
+                        let sent_us = journal
+                            .query(Some(called_us), Some(stream))
+                            .into_iter()
+                            .find(|event| event.stage == HopStage::Sent && event.seq == seq)
+                            .map(|event| event.t_us)
+                            .unwrap();
+                        to_sent.push(sent_us - called_us);
+                        received += drain(&primary_video) + drain(&secondary_video);
+                    }
+                    to_sent.sort_unstable();
+                    wall.sort_unstable();
+                    eprintln!(
+                        "source_first={source_first} grid={grid} alongside={alongside} gso={gso} \
+                         symbol={symbol_size} {} 4K {label} ({bytes} B parts): call->sent p50 {} \
+                         us, call->repair sent p50 {} p95 {} us, process CPU {} us/part = {:.1}% \
+                         of a core at 50 fps; {} datagrams received/part",
+                        if varied { "varied" } else { "fixed" },
+                        to_sent[to_sent.len() / 2],
+                        wall[wall.len() / 2],
+                        wall[wall.len() * 95 / 100],
+                        cpu / parts / 1_000,
+                        (cpu / parts) as f64 * 50.0 / 1e7,
+                        received / parts as usize,
+                    );
                 }
-                count
-            };
-            for (label, bytes, parts) in [
-                ("25 Mbit/s", 62_500, 200_u64),
-                ("80 Mbit/s", 200_000, 100),
-                ("200 Mbit/s", 500_000, 50),
-            ] {
-                let stream = 93_000_000 + bytes as u64;
-                let objects = (0..parts)
-                    .map(|sequence| test_video_object_of(stream, sequence, 1, bytes))
-                    .collect::<Vec<_>>();
-                let mut to_sent = Vec::new();
-                let mut wall = Vec::new();
-                let mut cpu = 0;
-                let mut received = 0;
-                for (sequence, object) in objects.iter().enumerate() {
-                    let seq = sequence as u64
-                        + u64::from(source_first) * 1_000_000
-                        + u64::from(gso) * 2_000_000
-                        + u64::from(symbol_size) * 10_000_000;
-                    let called_us = hop_journal::now_unix_us();
-                    let cpu_before = thread_cpu_ns();
-                    relay
-                        .publish_part_object(object, Some((stream, seq)), PublicationClass::Video)
-                        .await
-                        .unwrap();
-                    cpu += thread_cpu_ns() - cpu_before;
-                    wall.push(hop_journal::now_unix_us() - called_us);
-                    let sent_us = journal
-                        .query(Some(called_us), Some(stream))
-                        .into_iter()
-                        .find(|event| event.stage == HopStage::Sent && event.seq == seq)
-                        .map(|event| event.t_us)
-                        .unwrap();
-                    to_sent.push(sent_us - called_us);
-                    received += drain(&primary_video) + drain(&secondary_video);
-                }
-                to_sent.sort_unstable();
-                wall.sort_unstable();
-                eprintln!(
-                    "source_first={source_first} gso={gso} symbol={symbol_size} 4K {label} \
-                     ({bytes} B parts): call->sent p50 {} us, call->return p50 {} us, thread CPU \
-                     {} us/part = {:.1}% of a core at 50 fps; {} datagrams received/part",
-                    to_sent[to_sent.len() / 2],
-                    wall[wall.len() / 2],
-                    cpu / parts / 1_000,
-                    (cpu / parts) as f64 * 50.0 / 1e7,
-                    received / parts as usize,
-                );
+                drop((primary_audio, secondary_audio));
             }
-            drop((primary_audio, secondary_audio));
         }
     }
 
@@ -16334,8 +16588,11 @@ mod tests {
         );
     }
 
+    /// A publisher with the audio hot path, on the source-first encoder or
+    /// (`source_first` false) relay-session's per-class encoders.
     async fn inline_audio_publisher(
         telemetry: &Arc<IngestTelemetry>,
+        source_first: bool,
     ) -> (RelaySessionPublisher, UdpSocket) {
         let (primary_audio, primary_video) = class_port_receivers().await;
         drop(primary_video);
@@ -16343,6 +16600,8 @@ mod tests {
         args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
         args.relay_primary_bind = Some(reserved_loopback_addr());
         args.relay_deadline_ms = 5_000;
+        args.relay_source_first = source_first;
+        assert!(args.relay_audio_inline);
         let relay = RelaySessionPublisher::new(&args, Arc::clone(telemetry))
             .await
             .unwrap()
@@ -16354,27 +16613,32 @@ mod tests {
     /// the lane records it failed.
     #[tokio::test]
     async fn a_full_lane_backlog_drops_the_part_and_records_the_lane_failed() {
-        let telemetry = Arc::new(IngestTelemetry::default());
-        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
-        // A part of the lane is waiting, and the backlog takes no more.
-        relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
-        let (full, _held) = std::sync::mpsc::sync_channel(0);
-        assert!(relay.primary.backlog.sender.set(full).is_ok());
-        let stream = 91_000_000_070;
-        relay
-            .publish_part_object(
-                &test_audio_object(stream, 64),
-                Some((stream, 0)),
-                PublicationClass::Audio,
-            )
-            .await
-            .unwrap();
-        let snapshot = telemetry.snapshot().relay_session;
-        assert_eq!(snapshot.lane_backlog_parts, 1);
-        assert_eq!(snapshot.lane_backlog_dropped, 1);
-        assert_eq!(snapshot.primary_lane_objects_succeeded, 0);
-        assert_eq!(snapshot.primary_lane_objects_failed, 1);
-        assert_silent(&primary_audio).await;
+        for source_first in [true, false] {
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let (relay, primary_audio) = inline_audio_publisher(&telemetry, source_first).await;
+            // A part of the lane is waiting, and the backlog takes no more.
+            relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
+            let (full, _held) = std::sync::mpsc::sync_channel(0);
+            assert!(relay.primary.backlog.sender.set(full).is_ok());
+            let stream = 91_000_000_070;
+            relay
+                .publish_part_object(
+                    &test_audio_object(stream, 64),
+                    Some((stream, 0)),
+                    PublicationClass::Audio,
+                )
+                .await
+                .unwrap();
+            let snapshot = telemetry.snapshot().relay_session;
+            assert_eq!(
+                snapshot.lane_backlog_parts, 1,
+                "source_first={source_first}"
+            );
+            assert_eq!(snapshot.lane_backlog_dropped, 1);
+            assert_eq!(snapshot.primary_lane_objects_succeeded, 0);
+            assert_eq!(snapshot.primary_lane_objects_failed, 1);
+            assert_silent(&primary_audio).await;
+        }
     }
 
     /// A backlog part whose deadline passed is not sent, and the lane
@@ -16382,7 +16646,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_backlog_part_is_counted_and_records_the_lane_failed() {
         let telemetry = Arc::new(IngestTelemetry::default());
-        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
+        let (relay, primary_audio) = inline_audio_publisher(&telemetry, true).await;
         let (socket, peer) = relay.primary.class_socket(PublicationClass::Audio);
         let part = BacklogPart {
             wires: vec![
@@ -16439,47 +16703,76 @@ mod tests {
     /// sent the part, not when the part was queued.
     #[tokio::test]
     async fn a_queued_part_is_recorded_delivered_once_the_backlog_sent_it() {
-        let telemetry = Arc::new(IngestTelemetry::default());
-        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
-        relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
-        let stream = 91_000_000_075;
-        let object = test_audio_object(stream, 64);
-        let outcome = relay
-            .publish_part_object(&object, Some((stream, 0)), PublicationClass::Audio)
-            .await
-            .unwrap();
-        receive_relay_datagrams(
-            &primary_audio,
-            outcome.source_symbols + outcome.repair_symbols,
-        )
-        .await;
-        for _ in 0..200 {
-            if telemetry
-                .snapshot()
-                .relay_session
-                .primary_lane_objects_succeeded
-                == 1
-            {
-                break;
+        for source_first in [true, false] {
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let (relay, primary_audio) = inline_audio_publisher(&telemetry, source_first).await;
+            relay.primary.backlog.pending.fetch_add(1, Ordering::AcqRel);
+            let stream = 91_000_000_075;
+            let object = test_audio_object(stream, 64);
+            let outcome = relay
+                .publish_part_object(&object, Some((stream, 0)), PublicationClass::Audio)
+                .await
+                .unwrap();
+            receive_relay_datagrams(
+                &primary_audio,
+                outcome.source_symbols + outcome.repair_symbols,
+            )
+            .await;
+            for _ in 0..200 {
+                if telemetry
+                    .snapshot()
+                    .relay_session
+                    .primary_lane_objects_succeeded
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let snapshot = telemetry.snapshot().relay_session;
+            assert_eq!(
+                snapshot.primary_lane_objects_succeeded, 1,
+                "source_first={source_first}"
+            );
+            assert_eq!(snapshot.primary_lane_objects_failed, 0);
         }
-        let snapshot = telemetry.snapshot().relay_session;
-        assert_eq!(snapshot.primary_lane_objects_succeeded, 1);
-        assert_eq!(snapshot.primary_lane_objects_failed, 0);
     }
 
     /// An audio part never waits for the video encoder: the classes have
     /// encoders of their own, and a 4K encode that holds the video one does
-    /// not hold an audio part back.
+    /// not hold an audio part back. This is the inline hot path with
+    /// relay-session's encoders (`--relay-source-first false`), the one
+    /// that takes an encoder lock: holding the audio encoder does hold the
+    /// part, so the lock is on the path this test exercises. (Source-first
+    /// parts take no lock at all:
+    /// source_first_parts_never_wait_for_an_encoder_lock.)
     #[tokio::test]
     async fn an_audio_part_does_not_wait_for_a_busy_video_encoder() {
         let telemetry = Arc::new(IngestTelemetry::default());
-        let (relay, primary_audio) = inline_audio_publisher(&telemetry).await;
+        let (relay, primary_audio) = inline_audio_publisher(&telemetry, false).await;
+        assert!(relay.source_encoder(PublicationClass::Audio).is_none());
         assert!(!std::ptr::eq(
             relay.encoder(PublicationClass::Audio),
             relay.encoder(PublicationClass::Video)
         ));
+        {
+            let held_audio = relay.encoder(PublicationClass::Audio).lock().await;
+            let object = test_audio_object(91_000_000_081, 64);
+            assert!(
+                timeout(
+                    Duration::from_millis(100),
+                    relay.publish_part_object(
+                        &object,
+                        Some((91_000_000_081, 0)),
+                        PublicationClass::Audio
+                    ),
+                )
+                .await
+                .is_err(),
+                "the audio part did not take the audio encoder's lock"
+            );
+            drop(held_audio);
+        }
         let held = relay.encoder(PublicationClass::Video).lock().await;
         let stream = 91_000_000_080;
         let object = test_audio_object(stream, 64);
