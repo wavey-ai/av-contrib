@@ -57,8 +57,13 @@ serde_json = "1.0"
 sha2 = "0.10"
 socket2 = "0.6"
 soundkit-flac = { version = "0.12.3", default-features = false, features = ["packet-codec"] }
-soundkit = "0.12.3"
-soundkit-opus = "0.12.3"
+# SoundKit's native CELT codec with Opus Custom modes (1, 1.33 and 1.5 ms
+# frames), from the branch `opus-custom-1ms` until a release has it. The
+# crates.io soundkit-opus 0.12.3 wrapped libopus-rs and had no custom modes.
+# soundkit-flac stays on crates.io: the repository's 0.13 has no
+# `packet-codec` feature.
+soundkit = { git = "https://github.com/wavey-ai/soundkit.git", branch = "opus-custom-1ms" }
+soundkit-opus = { git = "https://github.com/wavey-ai/soundkit.git", branch = "opus-custom-1ms" }
 synchronized-stems-media = "0.1.1"
 tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"

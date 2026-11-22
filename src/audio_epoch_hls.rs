@@ -297,6 +297,38 @@ struct RenditionState {
     format: RenditionFormat,
     expected_pts_samples: Option<u64>,
     packager: RenditionPackager,
+    /// Opus groups refused because their frame does not fit the packaging
+    /// (an Opus Custom frame for fMP4, or a frame that does not divide the
+    /// part). The error is returned for the 1st, 2nd, 4th, 8th... refusal.
+    refused_opus_groups: u64,
+}
+
+/// Whether Opus groups of `frame_count` samples fit the packaging: fMP4
+/// takes standard Opus only (Opus Custom has no OpusHead), and an opaque
+/// part of a set size must hold whole frames.
+fn opus_frame_fits_packaging(
+    packaging: AudioEpochHlsPackaging,
+    part: AudioPartSize,
+    sample_rate: u32,
+    frame_count: u32,
+) -> Result<(), String> {
+    match packaging {
+        AudioEpochHlsPackaging::Fmp4 => crate::opus_custom::refuse_custom_opus(
+            sample_rate,
+            frame_count,
+            "fMP4 packaging (--daw-hls-packaging fmp4)",
+        ),
+        AudioEpochHlsPackaging::Opaque => match part.target_samples(sample_rate, false) {
+            Some(target) if frame_count == 0 || target % u64::from(frame_count) != 0 => {
+                Err(format!(
+                    "the audio part ({part}, {target} samples at {sample_rate} Hz) does not hold \
+                     a whole number of {frame_count}-sample Opus frames; use --audio-part epoch \
+                     (one frame per part) or a multiple of {frame_count} samples"
+                ))
+            }
+            _ => Ok(()),
+        },
+    }
 }
 
 enum RenditionPackager {
@@ -1134,6 +1166,7 @@ async fn package_group_with_times(
             let state = entry.insert(RenditionState {
                 format,
                 expected_pts_samples: None,
+                refused_opus_groups: 0,
                 packager: new_rendition_packager(
                     config,
                     output_stream_id,
@@ -1156,6 +1189,27 @@ async fn package_group_with_times(
             state
         }
     };
+
+    if group.payload_kind == AudioPayloadKind::Opus {
+        if let Err(error) = opus_frame_fits_packaging(
+            config.packaging,
+            config.part,
+            group.sample_rate,
+            group.frame_count,
+        ) {
+            // Every group of the rendition fails the same way; report the
+            // 1st, 2nd, 4th, 8th... and drop the others quietly.
+            state.refused_opus_groups = state.refused_opus_groups.saturating_add(1);
+            return if state.refused_opus_groups.is_power_of_two() {
+                Err(format!(
+                    "{error} ({} Opus groups refused)",
+                    state.refused_opus_groups
+                ))
+            } else {
+                Ok(())
+            };
+        }
+    }
 
     let pts_discontinuity = state
         .expected_pts_samples
@@ -1365,6 +1419,11 @@ fn raw_opus_packets(
             {
                 return Err("SoundKit Opus metadata does not match its AEP1 group".to_string());
             }
+            crate::opus_custom::refuse_custom_opus(
+                header.sample_rate(),
+                header.frame_count(),
+                "fMP4 packaging (--daw-hls-packaging fmp4)",
+            )?;
             if header.pts().is_some_and(|pts| pts != expected_pts) {
                 return Err("SoundKit Opus packet PTS is not contiguous".to_string());
             }
@@ -1380,6 +1439,11 @@ fn raw_opus_packets(
         }
         packets
     } else {
+        crate::opus_custom::refuse_custom_opus(
+            group.sample_rate,
+            group.frame_count,
+            "fMP4 packaging (--daw-hls-packaging fmp4)",
+        )?;
         validate_raw_opus_packet(&group.payload, group.frame_count, group.sample_rate)?;
         vec![ElementaryAudioPacket {
             data: group.payload.clone(),
@@ -2398,6 +2462,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_ms_opus_custom_frames_are_one_part_each_by_default() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..5_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(
+                    epoch_id,
+                    48,
+                    AudioPayloadKind::Opus,
+                    vec![epoch_id as u8; 32],
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = captured.opaque_parts.lock().unwrap();
+        assert_eq!(parts.len(), 5);
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(part.sequence, index as u64);
+            assert_eq!(part.audio_units, 1);
+            assert_eq!(part.duration_samples, Some(48));
+            assert_eq!(part.duration_us, 1_000);
+            assert_eq!(part.duration_ms, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_custom_parts_hold_whole_frames_or_are_refused() {
+        // 64-sample (1.33 ms) frames in 4 ms parts: three frames a part.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Micros(4_000), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for epoch_id in 0..6_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                sized_group(epoch_id, 64, AudioPayloadKind::Opus, vec![epoch_id as u8]),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let parts = captured.opaque_parts.lock().unwrap();
+            assert_eq!(parts.len(), 2);
+            for part in parts.iter() {
+                assert_eq!(part.audio_units, 3);
+                assert_eq!(part.duration_samples, Some(192));
+                assert_eq!(part.duration_us, 4_000);
+            }
+            assert_eq!(parts[0].bytes.as_ref(), [0, 1, 2]);
+        }
+
+        // 64-sample frames do not divide a 5 ms (240-sample) part.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Micros(5_000), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        let error = package_group(
+            &config,
+            &mut renditions,
+            sized_group(0, 64, AudioPayloadKind::Opus, vec![0]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("whole number of 64-sample Opus frames"),
+            "{error}"
+        );
+        // The second refusal is reported too, the third is dropped quietly.
+        for (epoch_id, reported) in [(1_u64, true), (2, false), (3, true)] {
+            let result = package_group(
+                &config,
+                &mut renditions,
+                sized_group(epoch_id, 64, AudioPayloadKind::Opus, vec![0]),
+            )
+            .await;
+            assert_eq!(result.is_err(), reported, "{result:?}");
+        }
+        assert!(captured.opaque_parts.lock().unwrap().is_empty());
+
+        // 120-sample standard frames fit 5 ms parts; 72-sample frames fit
+        // 3 ms parts.
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Opaque,
+            AudioPartSize::Micros(5_000),
+            48_000,
+            120
+        )
+        .is_ok());
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Opaque,
+            AudioPartSize::Samples(144),
+            48_000,
+            72
+        )
+        .is_ok());
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Opaque,
+            AudioPartSize::Epoch,
+            48_000,
+            72
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn fmp4_packaging_refuses_opus_custom_frames() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Fmp4);
+        let mut renditions = HashMap::new();
+        for frame_count in [48_u32, 64, 72] {
+            let error = package_group(
+                &config,
+                &mut renditions,
+                sized_group(0, frame_count, AudioPayloadKind::Opus, vec![0; 32]),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Opus Custom"), "{error}");
+            assert!(error.contains("--daw-hls-packaging opaque"), "{error}");
+            renditions.clear();
+        }
+        assert!(captured.fmp4_parts.lock().unwrap().is_empty());
+        assert!(opus_frame_fits_packaging(
+            AudioEpochHlsPackaging::Fmp4,
+            AudioPartSize::Epoch,
+            48_000,
+            120
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
     async fn a_one_epoch_part_is_the_epoch_payload_without_a_copy() {
         let (config, captured) =
             epoch_config(AudioPartSize::default(), AudioEpochHlsPackaging::Opaque);
@@ -2794,5 +2993,176 @@ mod tests {
         assert_eq!(sink_rx.recv().await.unwrap().epoch.epoch_id, 3);
         assert!(sink_rx.recv().await.is_none());
         assert!(worker_stats().recovered_epochs_dropped >= dropped_before + 2);
+    }
+
+    /// Thread CPU time, for the benchmark below.
+    fn thread_cpu_ns() -> u64 {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes the timespec it is given.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) };
+        spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
+    }
+
+    /// Discards parts: the benchmark times the packaging, not a sink.
+    struct CountingPublisher(AtomicU64);
+
+    #[async_trait::async_trait]
+    impl Fmp4PartPublisher for CountingPublisher {
+        async fn publish_fmp4_part(&self, _part: PublishedFmp4Part) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn publish_opaque_part(&self, _part: PublishedOpaquePart) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Not a check, a benchmark: thread CPU per AEP1 datagram and per part of
+    /// the contributor's LL-HLS worker (FEC recovery, SoundKit validation and
+    /// opaque packaging, one epoch per part) for the DAW lane's Opus at 1, 2.5
+    /// and 5 ms (one 320 kb/s stereo SoundKit Opus packet an epoch, 1 source
+    /// and 4 repair datagrams, as daw-nexus sends it) and for 1 ms PCM. The
+    /// cost is per datagram and per part, not per millisecond, so a 1 ms
+    /// lane costs 2.5 times a 2.5 ms one. Run with
+    /// `cargo test --release --lib contributor_cpu_per_part -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "benchmark"]
+    async fn contributor_cpu_per_part_at_each_opus_frame() {
+        const EPOCHS: u64 = 20_000;
+        // daw-nexus: AUDIO_FEC_MIN_REPAIR_SYMBOLS 4 from 1 ms up.
+        const DAW_REPAIR_SYMBOLS: u32 = 4;
+        let pcm = vec![0x5a_u8; 48 * 2 * 3];
+        for (label, frame_count, opus) in [
+            ("opus 1 ms (48)", 48_u32, true),
+            ("opus 2.5 ms (120)", 120, true),
+            ("opus 5 ms (240)", 240, true),
+            ("pcm 1 ms (48)", 48, false),
+        ] {
+            // daw-nexus frames both lanes as SoundKit v2: Opus, and 24-bit
+            // PCM for the lossless lane.
+            let (encoding, bits_per_sample, codec) = if opus {
+                let mut encoder = crate::opus_custom::new_lane_opus_encoder(
+                    48_000,
+                    2,
+                    frame_count,
+                    crate::opus_custom::LANE_DEFAULT_OPUS_BITRATE,
+                )
+                .unwrap();
+                let mut packet = vec![0u8; 1_500];
+                let pcm = vec![0x100_i16; frame_count as usize * 2];
+                let len = encoder.encode_i16(&pcm, &mut packet).unwrap();
+                packet.truncate(len);
+                (EncodingFlag::Opus, 0, packet)
+            } else {
+                (EncodingFlag::PCMSigned, 24, pcm.clone())
+            };
+            let payload = crate::soundkit_v2::frame_soundkit_v2_packet(
+                crate::soundkit_v2::SoundKitV2PacketMetadata {
+                    encoding,
+                    frame_count,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bits_per_sample,
+                    endianness: frame_header::Endianness::LittleEndian,
+                    id: Some(1),
+                    pts: None,
+                },
+                &codec,
+            )
+            .unwrap();
+            let transport = MultichannelAudioTransportAdapter::udp(1_200);
+            let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+            fec.repair_symbols = DAW_REPAIR_SYMBOLS;
+            let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+                fec,
+                ..MultichannelAudioSessionConfig::default()
+            });
+            let groups = [MultichannelAudioGroup {
+                group_id: 0,
+                channel_start: 0,
+                channel_count: 2,
+                payload_kind: AudioPayloadKind::SoundKitV2,
+                sample_format: AudioSampleFormat::Unspecified,
+                flags: 0,
+                payload: &payload,
+            }];
+            let encode_started = thread_cpu_ns();
+            let datagrams = (0..EPOCHS)
+                .map(|epoch_id| {
+                    let encoded = sender
+                        .encode_epoch(MultichannelAudioEpoch {
+                            session_id: 99,
+                            config_generation: 1,
+                            epoch_id,
+                            pts_samples: epoch_id * u64::from(frame_count),
+                            sample_rate: 48_000,
+                            frame_count,
+                            groups: &groups,
+                        })
+                        .unwrap();
+                    transport
+                        .wrap_epoch(encoded)
+                        .unwrap()
+                        .datagrams
+                        .into_iter()
+                        .map(|datagram| datagram.payload)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let encode_ns = thread_cpu_ns() - encode_started;
+            let datagram_count = datagrams.iter().map(Vec::len).sum::<usize>() as u64;
+
+            // Recovery and validation, as run_audio_epoch_hls_worker does
+            // them for every datagram.
+            let mut receiver = ReceiverState::new(Instant::now());
+            let mut groups_out = Vec::with_capacity(EPOCHS as usize);
+            let recover_started = thread_cpu_ns();
+            for epoch in &datagrams {
+                for bytes in epoch {
+                    let payload = transport.payload(bytes).unwrap();
+                    let (completed, _) = receiver.push(payload, now_unix_us()).unwrap();
+                    for (group, times) in completed {
+                        groups_out.push((terminalize_soundkit_group(group).unwrap(), times));
+                    }
+                }
+            }
+            let recover_ns = thread_cpu_ns() - recover_started;
+            assert_eq!(groups_out.len() as u64, EPOCHS);
+
+            // Packaging: one epoch per part, to a publisher that drops it.
+            let counting = Arc::new(CountingPublisher(AtomicU64::new(0)));
+            let publisher: Arc<dyn Fmp4PartPublisher> = counting.clone();
+            let mut config = test_config(40, 5, AudioEpochHlsPackaging::Opaque, publisher);
+            config.part = AudioPartSize::Epoch;
+            let mut renditions = HashMap::new();
+            let package_started = thread_cpu_ns();
+            for (group, times) in groups_out {
+                package_group_with_times(&config, &mut renditions, group, times)
+                    .await
+                    .unwrap();
+            }
+            let package_ns = thread_cpu_ns() - package_started;
+            assert_eq!(counting.0.load(Ordering::Relaxed), EPOCHS);
+
+            let parts_per_second = 48_000 / u64::from(frame_count);
+            let per_part_ns = (recover_ns + package_ns) / EPOCHS;
+            eprintln!(
+                "{label}: {:.1} datagrams/part, {parts_per_second} parts/s; \
+                 recovery {} ns/datagram ({} ns/part), packaging {} ns/part; \
+                 contributor {:.1} ms CPU per second of audio; \
+                 (source FEC encode {} ns/part)",
+                datagram_count as f64 / EPOCHS as f64,
+                recover_ns / datagram_count,
+                recover_ns / EPOCHS,
+                package_ns / EPOCHS,
+                (per_part_ns * parts_per_second) as f64 / 1e6,
+                encode_ns / EPOCHS,
+            );
+        }
     }
 }
