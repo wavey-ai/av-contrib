@@ -1038,6 +1038,8 @@ const NOMINAL_SAMPLE_RATE: u32 = 48_000;
 /// The sender's default epoch, 48 samples at 48 kHz: the nominal part of
 /// one epoch per part where a number is needed before a stream starts.
 const NOMINAL_EPOCH_US: u64 = 1_000;
+/// The shortest Opus frame the DAW lane sends: 1 ms Opus Custom (48 samples).
+const MIN_OPUS_FRAME_US: u64 = 1_000;
 
 impl Args {
     /// Size of an audio part: `--audio-part`, else `--fmp4-part-ms`, else one
@@ -1074,14 +1076,15 @@ impl Args {
         let ms = self.fmp4_part_ms?;
         Some(format!(
             "--fmp4-part-ms {ms} (or AV_LL_HLS_PART_MS) sets audio parts of {ms} ms; the default is \
-             one AEP1 epoch per part (--audio-part epoch: 1 ms PCM, 2.5 ms Opus). It no longer \
+             one AEP1 epoch per part (--audio-part epoch: 1 ms PCM, 1 ms Opus Custom). It no longer \
              sets the video part (--video-part)."
         ))
     }
 
     /// Parts a second of the DAW formats at the nominal part: a lossless
     /// rendition (PCM or FLAC) at the nominal epoch, Opus at no less than
-    /// 2.5 ms. For the hop journal's coverage in time.
+    /// 1 ms (the lane's default Opus Custom frame; standard Opus stops at
+    /// 2.5 ms). For the hop journal's coverage in time.
     fn nominal_audio_parts_per_second(&self) -> u64 {
         let part_us = self.nominal_audio_part_us().max(1);
         let lossless = self
@@ -1093,7 +1096,7 @@ impl Args {
             .iter()
             .any(|format| matches!(format, DawHlsFormat::Opus));
         u64::from(lossless) * (1_000_000 / part_us)
-            + u64::from(opus) * (1_000_000 / part_us.max(2_500))
+            + u64::from(opus) * (1_000_000 / part_us.max(MIN_OPUS_FRAME_US))
     }
 
     /// Shortest audio-only part of a segmenter that counts time (the fMP4
@@ -10997,8 +11000,8 @@ mod tests {
                 AudioPayloadKind::Opus
             ]
         );
-        // PCM 1 ms and Opus 2.5 ms: what the hop journal is sized for.
-        assert_eq!(args.nominal_audio_parts_per_second(), 1_400);
+        // PCM 1 ms and 1 ms Opus Custom: what the hop journal is sized for.
+        assert_eq!(args.nominal_audio_parts_per_second(), 2_000);
         let durations = args.stamp_durations();
         assert_eq!(durations.audio_part_us, 0);
         assert_eq!(durations.video_part_us, 0);
