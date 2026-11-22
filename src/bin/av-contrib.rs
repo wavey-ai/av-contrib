@@ -1164,6 +1164,20 @@ struct Args {
     )]
     relay_compact_audio: bool,
 
+    /// Each RelaySession lane sends its forwarder a ledger (RLL1, 16 bytes,
+    /// every 250 ms): the datagrams it has handed to the kernel on the
+    /// lane. av-mesh measures the lane's loss against it (RLR1 version 2,
+    /// which --relay-audio-copies measured reads). `false`: no ledger, so no
+    /// measured loss (a lane without reports counts at
+    /// --relay-path-loss-fraction).
+    #[arg(
+        long,
+        env = "AV_RELAY_LANE_LEDGER",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_lane_ledger: bool,
+
     /// With --relay-compact-audio: a stream's part goes whole at least this
     /// often, so a receiver that joins (or lost a whole part) learns the
     /// descriptor within it. A 1 ms part whole is about 900 bytes, so 100
@@ -2408,8 +2422,9 @@ struct RelaySessionPublisher {
     audio_copies: RelayAudioCopies,
     /// When the lanes were last looked at for loss reports (µs).
     loss_polled_us: AtomicU64,
-    /// When the lanes last sent their ledgers (RLL1).
+    /// When the lanes last sent their ledgers (RLL1); `--relay-lane-ledger`.
     ledger_sent_us: AtomicU64,
+    lane_ledger: bool,
     /// `--relay-demand-renditions`.
     demand_groups: Vec<Vec<u64>>,
     configured_loss: f64,
@@ -2613,6 +2628,7 @@ impl RelaySessionPublisher {
             audio_copies: args.relay_audio_copies,
             loss_polled_us: AtomicU64::new(0),
             ledger_sent_us: AtomicU64::new(0),
+            lane_ledger: args.relay_lane_ledger,
             demand_groups: parse_rendition_groups(&args.relay_demand_renditions)?,
             configured_loss: f64::from(
                 adaptive_relay_path_metrics(primary_path_metrics, secondary_path_metrics)
@@ -2642,7 +2658,8 @@ impl RelaySessionPublisher {
         }
         let demand = !self.demand_groups.is_empty();
         let ledger = self.ledger_sent_us.load(Ordering::Relaxed);
-        let ledger_due = now.saturating_sub(ledger) >= LANE_LEDGER_INTERVAL_US;
+        let ledger_due =
+            self.lane_ledger && now.saturating_sub(ledger) >= LANE_LEDGER_INTERVAL_US;
         if ledger_due {
             self.ledger_sent_us.store(now, Ordering::Relaxed);
         }
@@ -14479,6 +14496,7 @@ mod tests {
         let mut args = contrib_status_args();
         args.relay_primary_target = Some(receiver.local_addr().unwrap());
         args.relay_class_lanes = false;
+        args.relay_lane_ledger = true;
         let telemetry = Arc::new(IngestTelemetry::default());
         let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
             .await
@@ -14853,6 +14871,7 @@ mod tests {
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
             relay_compact_audio: false,
+            relay_lane_ledger: false,
             relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
@@ -14962,6 +14981,7 @@ mod tests {
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
             relay_compact_audio: false,
+            relay_lane_ledger: false,
             relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
@@ -15245,6 +15265,10 @@ mod tests {
         );
         let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
         assert_eq!(parsed.relay_audio_copies, RelayAudioCopies::Measured);
+        assert!(parsed.relay_lane_ledger);
+        let parsed =
+            Args::try_parse_from(["av-contrib", "--relay-lane-ledger", "false"]).unwrap();
+        assert!(!parsed.relay_lane_ledger);
     }
 
     /// A lane's forwarder reports 5 % loss: the next one-symbol audio part
@@ -15268,6 +15292,7 @@ mod tests {
         args.relay_secondary_bind = Some(free());
         args.relay_audio_copies = RelayAudioCopies::Measured;
         args.relay_path_loss_fraction = 0.02;
+        args.relay_lane_ledger = true;
         let telemetry = Arc::new(IngestTelemetry::default());
         let publisher = RelaySessionPublisher::new(&args, telemetry)
             .await
@@ -15832,6 +15857,7 @@ mod tests {
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
             relay_compact_audio: false,
+            relay_lane_ledger: false,
             relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
@@ -16081,6 +16107,7 @@ mod tests {
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
             relay_compact_audio: false,
+            relay_lane_ledger: false,
             relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
@@ -16230,6 +16257,7 @@ mod tests {
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
             relay_compact_audio: false,
+            relay_lane_ledger: false,
             relay_compact_whole_ms: 100,
             relay_repair_alongside_sources: true,
             audio_hot_thread: false,
