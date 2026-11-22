@@ -27,6 +27,7 @@ use av_contrib::quadra_renditions::{
     QuadraRenditionTarget,
 };
 use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
+use av_contrib::source_first::SourceFirstEncoder;
 use av_contrib::udp_batch;
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use bytes::{Bytes, BytesMut};
@@ -1008,6 +1009,32 @@ struct Args {
     )]
     relay_repair_both_lanes: bool,
 
+    /// Source first: a part's source symbols are built straight from its
+    /// envelope (RaptorQ is systematic) and handed to the lanes before its
+    /// repair symbols are computed, which then use a cached RaptorQ
+    /// encoding plan. relay-session's encoder generates the plan for every
+    /// object and solves the whole block before the first symbol can leave:
+    /// about 40-200 us of an audio part's `packaged` -> `sent` and several
+    /// milliseconds of a 4K frame. The datagrams are byte for byte the
+    /// same. With `false` every part goes through relay-session's encoder,
+    /// source and repair together. Needs --relay-send-batch.
+    #[arg(
+        long,
+        env = "AV_RELAY_SOURCE_FIRST",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_source_first: bool,
+
+    /// RaptorQ symbol size of non-audio objects (video parts and
+    /// initializations) in bytes, within the carrier's budget (0: the
+    /// encoder's default, the largest that fits a 1,472-byte datagram).
+    /// 1,088 keeps an edge's fast-lane datagram to a client at 1,128 bytes,
+    /// which fits a WebTransport datagram. Audio parts keep their exact-fit
+    /// symbol. Needs --relay-source-first.
+    #[arg(long, env = "AV_RELAY_VIDEO_SYMBOL_SIZE", default_value_t = 0)]
+    relay_video_symbol_size: u16,
+
     /// Run the AEP1 audio packagers (and, with --relay-audio-inline, the
     /// audio publication) on a thread of their own, with SCHED_FIFO
     /// --audio-hot-fifo-priority and pinned to --audio-hot-cpu where the
@@ -1622,7 +1649,7 @@ const LANE_BACKLOG_POLL_MS: u64 = 100;
 
 /// The rest of one part on one lane.
 struct BacklogPart {
-    wires: Vec<(MediaDatagramRole, Vec<u8>)>,
+    wires: Vec<(MediaDatagramRole, Bytes)>,
     /// Source datagrams at the front of `wires`: `stage` is journalled
     /// once they are with the kernel.
     sources: usize,
@@ -1640,6 +1667,10 @@ struct BacklogPart {
     /// The lane, whose object outcome the backlog records when the part is
     /// sent, dropped or expired.
     path: RelayCarrierPath,
+    /// Whether this is the lane's last hand-off of the object, which
+    /// records the lane's object outcome (with --relay-source-first a lane
+    /// can be handed an object's source symbols and then its repair).
+    records_outcome: bool,
 }
 
 impl LaneBacklog {
@@ -1667,7 +1698,9 @@ impl LaneBacklog {
                 std::sync::mpsc::TrySendError::Full(part)
                 | std::sync::mpsc::TrySendError::Disconnected(part) => part,
             };
-            telemetry.record_relay_session_lane_object(part.path, false);
+            if part.records_outcome {
+                telemetry.record_relay_session_lane_object(part.path, false);
+            }
             let dropped = telemetry
                 .relay_lane_backlog_dropped
                 .fetch_add(1, Ordering::Relaxed)
@@ -1712,14 +1745,16 @@ fn start_lane_backlog(
 /// Send the rest of one part: the source set first, then the repair,
 /// waiting for room in the socket's buffer until the part's deadline.
 fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: BacklogPart) {
-    let expire = |unsent: &[(MediaDatagramRole, Vec<u8>)]| {
+    let expire = |unsent: &[(MediaDatagramRole, Bytes)]| {
         telemetry
             .relay_expired_symbols
             .fetch_add(unsent.len() as u64, Ordering::Relaxed);
         for (role, _) in unsent {
             telemetry.record_relay_session_send_error(*role);
         }
-        telemetry.record_relay_session_lane_object(part.path, false);
+        if part.records_outcome {
+            telemetry.record_relay_session_lane_object(part.path, false);
+        }
     };
     if part.deadline.is_expired_at(now_unix_us()) {
         expire(&part.wires);
@@ -1759,7 +1794,11 @@ fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: Back
         telemetry.record_relay_session_send_success(*role, wire.len() as u64);
     }
     match result {
-        Ok(()) => telemetry.record_relay_session_lane_object(part.path, true),
+        Ok(()) => {
+            if part.records_outcome {
+                telemetry.record_relay_session_lane_object(part.path, true);
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             expire(&part.wires[sent..]);
         }
@@ -1769,7 +1808,9 @@ fn send_backlog_part(socket: &UdpSocket, telemetry: &IngestTelemetry, part: Back
                 .get(sent)
                 .map_or(MediaDatagramRole::Source, |(role, _)| *role);
             telemetry.record_relay_session_send_error(role);
-            telemetry.record_relay_session_lane_object(part.path, false);
+            if part.records_outcome {
+                telemetry.record_relay_session_lane_object(part.path, false);
+            }
             debug!(error = %error, peer = %part.peer, "RelaySession lane backlog send failed");
         }
     }
@@ -1909,6 +1950,10 @@ struct RelaySessionPublisher {
     /// encoders' block ids and packet sequences are their own; a relay
     /// decodes each object, keyed by its object key, on its own.
     encoders: Vec<Mutex<RaptorQObjectEncoder>>,
+    /// `--relay-source-first`: an encoder per entry of `encoders`, with the
+    /// same controller, used in their place. Its counters are atomics: no
+    /// publishing thread waits for another's encode.
+    source_encoders: Option<Vec<SourceFirstEncoder>>,
     primary: RelayLane,
     secondary: Option<RelayLane>,
     secondary_seed_source: bool,
@@ -2085,12 +2130,25 @@ impl RelaySessionPublisher {
         ));
 
         let encoders = if args.publication_shard_mix {
-            vec![Mutex::new(encoder.clone()), Mutex::new(encoder)]
+            vec![Mutex::new(encoder.clone()), Mutex::new(encoder.clone())]
         } else {
-            vec![Mutex::new(encoder)]
+            vec![Mutex::new(encoder.clone())]
+        };
+        let source_encoders = if args.relay_send_batch && args.relay_source_first {
+            let encoders = (0..encoders.len())
+                .map(|_| {
+                    SourceFirstEncoder::new(encoder.controller().clone(), limits)
+                        .map(|fast| fast.with_video_symbol_size(args.relay_video_symbol_size))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("invalid source-first RelaySession encoder")?;
+            Some(encoders)
+        } else {
+            None
         };
         Ok(Some(Self {
             encoders,
+            source_encoders,
             primary,
             secondary,
             secondary_seed_source: args.relay_secondary_seed_source,
@@ -2138,6 +2196,16 @@ impl RelaySessionPublisher {
         }
         self.video_streams
             .class_of(stream_id, epoch, class, now_unix_us())
+    }
+
+    /// The source-first encoder of parts of `class`, with
+    /// `--relay-source-first`.
+    fn source_encoder(&self, class: PublicationClass) -> Option<&SourceFirstEncoder> {
+        let encoders = self.source_encoders.as_ref()?;
+        match class {
+            PublicationClass::Audio => encoders.first(),
+            PublicationClass::Video => encoders.last(),
+        }
     }
 
     /// The encoder of parts of `class`.
@@ -2200,6 +2268,11 @@ impl RelaySessionPublisher {
                 .fetch_add(1, Ordering::Relaxed);
             bail!("canonical media object expired before RelaySession encoding");
         }
+        if let Some(encoder) = self.source_encoder(class) {
+            return self
+                .publish_source_first(encoder, object, part, class, deadline, &journal_hop)
+                .await;
+        }
         let encode_wait_started = Instant::now();
         let mut encoder = self.encoder(class).lock().await;
         self.telemetry.record_relay_session_stage_duration(
@@ -2258,7 +2331,6 @@ impl RelaySessionPublisher {
                 journal_hop(HopStage::SentFirst, Some(peer));
             }
         };
-        let secondary_configured = self.secondary.is_some();
 
         let (primary_result, secondary_result) = if self.audio_inline
             && self.send_batch
@@ -2277,8 +2349,9 @@ impl RelaySessionPublisher {
                 RelayCarrierPath::Primary,
                 &primary_groups,
                 part,
-                HopStage::Sent,
-                &sent_first,
+                Some(HopStage::Sent),
+                Some(&sent_first),
+                true,
             );
             let secondary_result = match self.secondary.as_ref() {
                 Some(secondary) => {
@@ -2292,8 +2365,9 @@ impl RelaySessionPublisher {
                         RelayCarrierPath::Secondary,
                         &groups,
                         part,
-                        HopStage::SentSecondary,
-                        &sent_first,
+                        Some(HopStage::SentSecondary),
+                        Some(&sent_first),
+                        true,
                     )
                 }
                 None => Ok(LaneHandOff::Sent),
@@ -2305,6 +2379,7 @@ impl RelaySessionPublisher {
                     &source_symbols,
                     &repair_symbols,
                     &journal_hop,
+                    true,
                 )
                 .await;
             }
@@ -2395,6 +2470,7 @@ impl RelaySessionPublisher {
                         &source_symbols,
                         &repair_symbols,
                         &journal_hop,
+                        true,
                     )
                     .await;
                 }
@@ -2408,6 +2484,304 @@ impl RelaySessionPublisher {
                 secondary_result.map(|()| LaneHandOff::Sent),
             )
         };
+        self.settle_lanes(
+            primary_result,
+            secondary_result,
+            deadline,
+            RelayPublishOutcome {
+                announcement,
+                source_symbols: source_count,
+                repair_symbols: repair_count,
+            },
+        )
+    }
+
+    /// `--relay-source-first`: publish `object` with its source symbols
+    /// handed to every lane that carries them before its repair symbols are
+    /// computed, then the repair to the lanes that carry it. The lanes and
+    /// the journal are those of the publication without it: audio parts take
+    /// the hot path (each lane handed its symbols without waiting, no join),
+    /// other parts the joined batches; `sent` is still the last source
+    /// symbol with the kernel on the primary.
+    async fn publish_source_first(
+        &self,
+        encoder: &SourceFirstEncoder,
+        object: &MediaObject,
+        part: Option<(u64, u64)>,
+        class: PublicationClass,
+        deadline: MediaDeadline,
+        journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
+    ) -> Result<RelayPublishOutcome> {
+        let encode_started = Instant::now();
+        let encoded =
+            encoder.encode_sources(object, self.generation, self.subscription_id, deadline);
+        let mut encode_time = encode_started.elapsed();
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.telemetry.record_relay_session_encode_error();
+                self.telemetry
+                    .record_relay_session_stage_duration(RelayPipelineStage::Encode, encode_time);
+                return Err(error).context("failed to RaptorQ-protect canonical media object");
+            }
+        };
+        journal_hop(HopStage::Encoded, None);
+        // One set of datagrams for every lane: they are the same bytes.
+        let sources = encoded
+            .source_wires()
+            .iter()
+            .map(|wire| (MediaDatagramRole::Source, wire.clone()))
+            .collect::<Vec<_>>();
+        let source_count = sources.len();
+        let repair_count = encoded.repair_count() as usize;
+        // The lanes of today's rule (see publish_object_inner).
+        let repair_uses_primary = self.secondary.is_none()
+            || (self.repair_both_lanes && class == PublicationClass::Audio);
+        if self.secondary.is_none() && repair_count > 0 {
+            self.telemetry
+                .relay_repair_primary_fallback_objects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let primary_repair = repair_uses_primary && repair_count > 0;
+        let secondary_sources = self.secondary_seed_source;
+        let secondary_repair = repair_count > 0;
+        let direct_repair = self.direct.as_ref().is_some_and(|direct| direct.repair);
+        let sent_first = Arc::new(AtomicBool::new(false));
+        let journal_sent_first = |peer: SocketAddr| {
+            if !sent_first.swap(true, Ordering::AcqRel) {
+                journal_hop(HopStage::SentFirst, Some(peer));
+            }
+        };
+        let hot = self.audio_inline && class == PublicationClass::Audio;
+
+        // The source symbols.
+        let (mut primary_result, mut secondary_result) = if hot {
+            let primary = self.hand_lane_wires(
+                &self.primary,
+                RelayCarrierPath::Primary,
+                sources.clone(),
+                source_count,
+                deadline,
+                part,
+                Some(HopStage::Sent),
+                Some(&sent_first),
+                !primary_repair,
+                Instant::now(),
+            );
+            let secondary = match self.secondary.as_ref() {
+                Some(secondary) if secondary_sources => self.hand_lane_wires(
+                    secondary,
+                    RelayCarrierPath::Secondary,
+                    sources.clone(),
+                    source_count,
+                    deadline,
+                    part,
+                    Some(HopStage::SentSecondary),
+                    Some(&sent_first),
+                    !secondary_repair,
+                    Instant::now(),
+                ),
+                _ => Ok(LaneHandOff::Sent),
+            };
+            if let Some(direct) = self.direct.as_ref() {
+                self.send_direct_wires(direct, class, encoded.source_wires(), journal_hop, true)
+                    .await;
+            }
+            (primary, secondary)
+        } else {
+            let primary_lane = async {
+                let (_, peer) = self.primary.class_socket(class);
+                self.send_wire_batch(
+                    &self.primary,
+                    class,
+                    RelayCarrierPath::Primary,
+                    &sources,
+                    deadline,
+                )
+                .await?;
+                journal_sent_first(peer);
+                journal_hop(HopStage::Sent, Some(peer));
+                Ok::<_, anyhow::Error>(LaneHandOff::Sent)
+            };
+            let direct_lane = async {
+                if let Some(direct) = self.direct.as_ref() {
+                    self.send_direct_wires(
+                        direct,
+                        class,
+                        encoded.source_wires(),
+                        journal_hop,
+                        true,
+                    )
+                    .await;
+                }
+            };
+            let secondary_lane = async {
+                match self.secondary.as_ref() {
+                    Some(secondary) if secondary_sources => {
+                        let (_, peer) = secondary.class_socket(class);
+                        self.send_wire_batch(
+                            secondary,
+                            class,
+                            RelayCarrierPath::Secondary,
+                            &sources,
+                            deadline,
+                        )
+                        .await?;
+                        journal_sent_first(peer);
+                        journal_hop(HopStage::SentSecondary, Some(peer));
+                        Ok::<_, anyhow::Error>(LaneHandOff::Sent)
+                    }
+                    _ => Ok(LaneHandOff::Sent),
+                }
+            };
+            let (primary, (), secondary) = tokio::join!(primary_lane, direct_lane, secondary_lane);
+            (primary, secondary)
+        };
+        drop(sources);
+
+        // The repair symbols, after the sources left.
+        if repair_count > 0 {
+            let repair_started = Instant::now();
+            let repair = encoded.repair_wires();
+            encode_time += repair_started.elapsed();
+            let repair = match repair {
+                Ok(repair) => repair,
+                Err(error) => {
+                    // The sources are out; the lanes that needed repair
+                    // fail the part.
+                    self.telemetry.record_relay_session_encode_error();
+                    let error = anyhow::Error::new(error)
+                        .context("failed to compute RaptorQ repair symbols");
+                    if primary_repair {
+                        primary_result = Err(anyhow::anyhow!("{error:#}"));
+                    }
+                    secondary_result = Err(error);
+                    Vec::new()
+                }
+            };
+            let repair_wires = repair
+                .iter()
+                .map(|wire| (MediaDatagramRole::Repair, wire.clone()))
+                .collect::<Vec<_>>();
+            if !repair_wires.is_empty() {
+                if hot {
+                    if primary_repair && primary_result.is_ok() {
+                        primary_result = self.hand_lane_wires(
+                            &self.primary,
+                            RelayCarrierPath::Primary,
+                            repair_wires.clone(),
+                            repair_wires.len(),
+                            deadline,
+                            part,
+                            None,
+                            None,
+                            true,
+                            Instant::now(),
+                        );
+                    }
+                    if let Some(secondary) = self.secondary.as_ref() {
+                        if secondary_result.is_ok() {
+                            secondary_result = self.hand_lane_wires(
+                                secondary,
+                                RelayCarrierPath::Secondary,
+                                repair_wires.clone(),
+                                repair_wires.len(),
+                                deadline,
+                                part,
+                                // A secondary without the source set decodes
+                                // from its repair symbols: they are its `sent`.
+                                (!secondary_sources).then_some(HopStage::SentSecondary),
+                                Some(&sent_first),
+                                true,
+                                Instant::now(),
+                            );
+                        }
+                    }
+                    if direct_repair {
+                        if let Some(direct) = self.direct.as_ref() {
+                            self.send_direct_wires(direct, class, &repair, journal_hop, false)
+                                .await;
+                        }
+                    }
+                } else {
+                    let primary_lane = async {
+                        if primary_repair && primary_result.is_ok() {
+                            self.send_wire_batch(
+                                &self.primary,
+                                class,
+                                RelayCarrierPath::Primary,
+                                &repair_wires,
+                                deadline,
+                            )
+                            .await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    let direct_lane = async {
+                        if direct_repair {
+                            if let Some(direct) = self.direct.as_ref() {
+                                self.send_direct_wires(direct, class, &repair, journal_hop, false)
+                                    .await;
+                            }
+                        }
+                    };
+                    let secondary_lane = async {
+                        match self.secondary.as_ref() {
+                            Some(secondary) if secondary_result.is_ok() => {
+                                let (_, peer) = secondary.class_socket(class);
+                                self.send_wire_batch(
+                                    secondary,
+                                    class,
+                                    RelayCarrierPath::Secondary,
+                                    &repair_wires,
+                                    deadline,
+                                )
+                                .await?;
+                                journal_sent_first(peer);
+                                if !secondary_sources {
+                                    journal_hop(HopStage::SentSecondary, Some(peer));
+                                }
+                                Ok::<_, anyhow::Error>(())
+                            }
+                            _ => Ok(()),
+                        }
+                    };
+                    let (primary, (), secondary) =
+                        tokio::join!(primary_lane, direct_lane, secondary_lane);
+                    if let Err(error) = primary {
+                        primary_result = Err(error);
+                    }
+                    if let Err(error) = secondary {
+                        secondary_result = Err(error);
+                    }
+                }
+            }
+        }
+        self.telemetry
+            .record_relay_session_stage_duration(RelayPipelineStage::Encode, encode_time);
+        self.settle_lanes(
+            primary_result,
+            secondary_result,
+            deadline,
+            RelayPublishOutcome {
+                announcement: encoded.announcement.clone(),
+                source_symbols: source_count,
+                repair_symbols: repair_count,
+            },
+        )
+    }
+
+    /// The end of a part's publication: record each lane's outcome (unless
+    /// its backlog will), fail the part when no lane carried it, and count
+    /// the deadline.
+    fn settle_lanes(
+        &self,
+        primary_result: Result<LaneHandOff>,
+        secondary_result: Result<LaneHandOff>,
+        deadline: MediaDeadline,
+        outcome: RelayPublishOutcome,
+    ) -> Result<RelayPublishOutcome> {
+        let secondary_configured = self.secondary.is_some();
         // A lane that left part of the part in its backlog records the
         // part's outcome when the backlog has sent it, dropped it or let it
         // expire: queued is not yet delivered.
@@ -2471,17 +2845,15 @@ impl RelaySessionPublisher {
         self.telemetry
             .relay_last_deadline_unix_us
             .store(deadline.expires_at_us, Ordering::Relaxed);
-        Ok(RelayPublishOutcome {
-            announcement,
-            source_symbols: source_count,
-            repair_symbols: repair_count,
-        })
+        Ok(outcome)
     }
 
     /// Send a part's symbols to every direct distributor: each symbol to
     /// each target in turn, so every distributor has the first source
     /// symbol before any has the last. A failure is counted, journalled as
     /// no `sent_direct`, and never fails the part: the backbone carries it.
+    /// `whole_part` is false for the repair symbols that source first sends
+    /// after the sources: they neither journal nor count the part again.
     async fn send_direct(
         &self,
         direct: &RelayDirectLanes,
@@ -2489,8 +2861,9 @@ impl RelaySessionPublisher {
         source_symbols: &[relay_session::RelayDatagram],
         repair_symbols: &[relay_session::RelayDatagram],
         journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
+        whole_part: bool,
     ) {
-        let (socket, targets) = direct.class_lane(class);
+        let (_, targets) = direct.class_lane(class);
         let symbols = if direct.repair {
             source_symbols.len() + repair_symbols.len()
         } else {
@@ -2502,7 +2875,7 @@ impl RelaySessionPublisher {
             .chain(repair_symbols.iter().filter(|_| direct.repair))
         {
             match encode_relay_datagram(symbol, direct.limits) {
-                Ok(wire) => wires.push(wire),
+                Ok(wire) => wires.push(Bytes::from(wire)),
                 Err(error) => {
                     self.telemetry
                         .relay_direct_lane_objects_failed
@@ -2512,8 +2885,26 @@ impl RelaySessionPublisher {
                 }
             }
         }
+        self.send_direct_wires(direct, class, &wires, journal_hop, whole_part)
+            .await;
+    }
+
+    /// [`Self::send_direct`] of datagrams already encoded (the repair ones
+    /// only when the direct lanes carry repair: the caller's choice).
+    async fn send_direct_wires(
+        &self,
+        direct: &RelayDirectLanes,
+        class: PublicationClass,
+        wires: &[Bytes],
+        journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
+        whole_part: bool,
+    ) {
+        let (socket, targets) = direct.class_lane(class);
+        if wires.is_empty() {
+            return;
+        }
         let mut messages = Vec::with_capacity(wires.len() * targets.len());
-        for wire in &wires {
+        for wire in wires {
             for target in targets {
                 messages.push(udp_batch::Outbound::to(*target, wire));
             }
@@ -2525,11 +2916,13 @@ impl RelaySessionPublisher {
         self.telemetry
             .relay_direct_send_duration
             .record(started.elapsed());
-        let part_bytes = wires.iter().map(Vec::len).sum::<usize>() as u64;
+        let part_bytes = wires.iter().map(Bytes::len).sum::<usize>() as u64;
         let mut succeeded = 0_u64;
         for target in targets {
             if !outcome.refused(*target) {
-                journal_hop(HopStage::SentDirect, Some(*target));
+                if whole_part {
+                    journal_hop(HopStage::SentDirect, Some(*target));
+                }
                 succeeded += 1;
             }
         }
@@ -2539,6 +2932,9 @@ impl RelaySessionPublisher {
         self.telemetry
             .relay_direct_datagram_bytes
             .fetch_add(part_bytes * succeeded, Ordering::Relaxed);
+        if !whole_part {
+            return;
+        }
         self.telemetry
             .relay_direct_lane_objects_succeeded
             .fetch_add(succeeded, Ordering::Relaxed);
@@ -2564,27 +2960,51 @@ impl RelaySessionPublisher {
     /// What its buffer does not take (or everything, while earlier parts
     /// wait there) goes to the lane's backlog. `stage` is journalled when
     /// the leading group (the source set, or the only group) is with the
-    /// kernel; `sent_first` when the first datagram is.
+    /// kernel (`None`: nothing); `sent_first` when the first datagram is.
+    /// `records_outcome` is false when the lane will be handed more of the
+    /// object (source first: its repair), whose hand-off records it.
+    #[allow(clippy::too_many_arguments)]
     fn hand_lane_its_symbols(
         &self,
         lane: &RelayLane,
         path: RelayCarrierPath,
         groups: &[&[relay_session::RelayDatagram]],
         part: Option<(u64, u64)>,
-        stage: HopStage,
-        sent_first: &Arc<AtomicBool>,
+        stage: Option<HopStage>,
+        sent_first: Option<&Arc<AtomicBool>>,
+        records_outcome: bool,
     ) -> Result<LaneHandOff> {
         let Some(first) = groups.iter().find_map(|group| group.first()) else {
             return Ok(LaneHandOff::Sent);
         };
         let started = Instant::now();
-        let send_stage = relay_send_stage(path, first.role);
         let deadline = first.deadline;
-        let (socket, peer) = lane.class_socket(PublicationClass::Audio);
         let leading = groups
             .iter()
             .find(|group| !group.is_empty())
             .map_or(0, |group| group.len());
+        let wires = self.lane_wires(groups, lane.limits)?;
+        self.hand_lane_wires(
+            lane,
+            path,
+            wires,
+            leading,
+            deadline,
+            part,
+            stage,
+            sent_first,
+            records_outcome,
+            started,
+        )
+    }
+
+    /// The RLS1 datagrams of `groups`, in order; an expired symbol fails
+    /// them all.
+    fn lane_wires(
+        &self,
+        groups: &[&[relay_session::RelayDatagram]],
+        limits: RelayLimits,
+    ) -> Result<Vec<(MediaDatagramRole, Bytes)>> {
         let now_us = now_unix_us();
         let mut wires = Vec::with_capacity(groups.iter().map(|group| group.len()).sum());
         for symbol in groups.iter().flat_map(|group| group.iter()) {
@@ -2595,13 +3015,48 @@ impl RelaySessionPublisher {
                     .fetch_add(1, Ordering::Relaxed);
                 bail!("RelaySession symbol expired before carrier send");
             }
-            match encode_relay_datagram(symbol, lane.limits) {
-                Ok(wire) => wires.push((symbol.role, wire)),
+            match encode_relay_datagram(symbol, limits) {
+                Ok(wire) => wires.push((symbol.role, Bytes::from(wire))),
                 Err(error) => {
                     self.telemetry.record_relay_session_send_error(symbol.role);
                     return Err(error).context("failed to encode RelaySession datagram");
                 }
             }
+        }
+        Ok(wires)
+    }
+
+    /// [`Self::hand_lane_its_symbols`] of datagrams already encoded: the
+    /// first `leading` of `wires` are the leading group.
+    #[allow(clippy::too_many_arguments)]
+    fn hand_lane_wires(
+        &self,
+        lane: &RelayLane,
+        path: RelayCarrierPath,
+        mut wires: Vec<(MediaDatagramRole, Bytes)>,
+        leading: usize,
+        deadline: MediaDeadline,
+        part: Option<(u64, u64)>,
+        stage: Option<HopStage>,
+        sent_first: Option<&Arc<AtomicBool>>,
+        records_outcome: bool,
+        started: Instant,
+    ) -> Result<LaneHandOff> {
+        let journal = stage.and(part);
+        let stage = stage.unwrap_or(HopStage::Sent);
+        let Some((first_role, _)) = wires.first() else {
+            return Ok(LaneHandOff::Sent);
+        };
+        let send_stage = relay_send_stage(path, *first_role);
+        let (socket, peer) = lane.class_socket(PublicationClass::Audio);
+        if deadline.is_expired_at(now_unix_us()) {
+            for (role, _) in &wires {
+                self.telemetry.record_relay_session_send_error(*role);
+            }
+            self.telemetry
+                .relay_expired_symbols
+                .fetch_add(wires.len() as u64, Ordering::Relaxed);
+            bail!("RelaySession symbol expired before carrier send");
         }
         let backlog_part = |wires, sources, journal, sent_first| BacklogPart {
             wires,
@@ -2613,12 +3068,13 @@ impl RelaySessionPublisher {
             stage,
             peer,
             path,
+            records_outcome,
         };
         if lane.backlog.busy() {
             lane.backlog.push(
                 socket,
                 &self.telemetry,
-                backlog_part(wires, leading, part, Some(Arc::clone(sent_first))),
+                backlog_part(wires, leading, journal, sent_first.map(Arc::clone)),
             );
             self.telemetry
                 .record_relay_session_stage_duration(send_stage, started.elapsed());
@@ -2630,12 +3086,14 @@ impl RelaySessionPublisher {
             .collect::<Vec<_>>();
         let outcome = udp_batch::try_send_all(socket, &messages);
         drop(messages);
-        if outcome.sent > 0 && !sent_first.swap(true, Ordering::AcqRel) {
+        if outcome.sent > 0
+            && sent_first.is_some_and(|sent_first| !sent_first.swap(true, Ordering::AcqRel))
+        {
             journal_part_hop(part, HopStage::SentFirst, Some(peer));
         }
         let journalled = outcome.sent >= leading;
         if journalled {
-            journal_part_hop(part, stage, Some(peer));
+            journal_part_hop(journal, stage, Some(peer));
         }
         for (role, wire) in &wires[..outcome.sent] {
             self.telemetry
@@ -2650,8 +3108,8 @@ impl RelaySessionPublisher {
                 backlog_part(
                     rest,
                     sources,
-                    (!journalled).then_some(part).flatten(),
-                    (outcome.sent == 0).then(|| Arc::clone(sent_first)),
+                    (!journalled).then_some(journal).flatten(),
+                    sent_first.filter(|_| outcome.sent == 0).map(Arc::clone),
                 ),
             );
             Ok(LaneHandOff::Queued)
@@ -2684,41 +3142,55 @@ impl RelaySessionPublisher {
         };
         let started = Instant::now();
         let stage = relay_send_stage(path, first.role);
-        let count = groups.iter().map(|group| group.len()).sum::<usize>();
-        let result = self
-            .send_symbol_batch_inner(lane, class, groups, count)
-            .await;
+        let result = match self.lane_wires(groups, lane.limits) {
+            Ok(wires) => self.send_wire_batch_inner(lane, class, &wires).await,
+            Err(error) => Err(error),
+        };
         self.telemetry
             .record_relay_session_stage_duration(stage, started.elapsed());
         result
     }
 
-    async fn send_symbol_batch_inner(
+    /// [`Self::send_symbol_batch`] of datagrams already encoded, of an
+    /// object with `deadline`.
+    async fn send_wire_batch(
         &self,
         lane: &RelayLane,
         class: PublicationClass,
-        groups: &[&[relay_session::RelayDatagram]],
-        count: usize,
+        path: RelayCarrierPath,
+        wires: &[(MediaDatagramRole, Bytes)],
+        deadline: MediaDeadline,
+    ) -> Result<()> {
+        let Some((first_role, _)) = wires.first() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let stage = relay_send_stage(path, *first_role);
+        let result = if deadline.is_expired_at(now_unix_us()) {
+            for (role, _) in wires {
+                self.telemetry.record_relay_session_send_error(*role);
+            }
+            self.telemetry
+                .relay_expired_symbols
+                .fetch_add(wires.len() as u64, Ordering::Relaxed);
+            Err(anyhow::anyhow!(
+                "RelaySession symbol expired before carrier send"
+            ))
+        } else {
+            self.send_wire_batch_inner(lane, class, wires).await
+        };
+        self.telemetry
+            .record_relay_session_stage_duration(stage, started.elapsed());
+        result
+    }
+
+    async fn send_wire_batch_inner(
+        &self,
+        lane: &RelayLane,
+        class: PublicationClass,
+        wires: &[(MediaDatagramRole, Bytes)],
     ) -> Result<()> {
         let (socket, peer) = lane.class_socket(class);
-        let now_us = now_unix_us();
-        let mut wires = Vec::with_capacity(count);
-        for symbol in groups.iter().flat_map(|group| group.iter()) {
-            if symbol.deadline.is_expired_at(now_us) {
-                self.telemetry.record_relay_session_send_error(symbol.role);
-                self.telemetry
-                    .relay_expired_symbols
-                    .fetch_add(1, Ordering::Relaxed);
-                bail!("RelaySession symbol expired before carrier send");
-            }
-            match encode_relay_datagram(symbol, lane.limits) {
-                Ok(wire) => wires.push((symbol.role, wire)),
-                Err(error) => {
-                    self.telemetry.record_relay_session_send_error(symbol.role);
-                    return Err(error).context("failed to encode RelaySession datagram");
-                }
-            }
-        }
         let messages = wires
             .iter()
             .map(|(_, wire)| udp_batch::Outbound::connected(wire))
@@ -2764,7 +3236,7 @@ impl RelaySessionPublisher {
             return Err(stopped.error)
                 .with_context(|| format!("failed to send RelaySession datagrams to {peer}"));
         }
-        for (role, wire) in &wires {
+        for (role, wire) in wires {
             self.telemetry
                 .record_relay_session_send_success(*role, wire.len() as u64);
         }
@@ -6894,6 +7366,8 @@ impl ContribStatusConfig {
                 relay_class_port_offset: args.relay_class_port_offset,
                 relay_audio_inline: args.relay_audio_inline,
                 relay_repair_both_lanes: args.relay_repair_both_lanes,
+                relay_source_first: args.relay_send_batch && args.relay_source_first,
+                relay_video_symbol_size: args.relay_video_symbol_size,
                 audio_hot_thread: args.audio_hot_thread,
                 aep1_shared_recovery: args.aep1_shared_recovery,
                 relay_exclusive: args.relay_exclusive,
@@ -8851,6 +9325,10 @@ struct MeshTargetStatus {
     relay_audio_inline: bool,
     /// `--relay-repair-both-lanes`.
     relay_repair_both_lanes: bool,
+    /// `--relay-source-first` (with `--relay-send-batch`).
+    relay_source_first: bool,
+    /// `--relay-video-symbol-size` (0: the encoder's default).
+    relay_video_symbol_size: u16,
     /// `--audio-hot-thread`.
     audio_hot_thread: bool,
     /// `--aep1-shared-recovery`.
@@ -12100,19 +12578,26 @@ mod tests {
 
     #[tokio::test]
     async fn relay_session_routes_source_and_secondary_repair_and_recovers_exact_object() {
-        relay_session_routes_source_and_secondary_repair(true, true).await;
+        relay_session_routes_source_and_secondary_repair(true, true, true).await;
+    }
+
+    /// `--relay-source-first false`: relay-session's encoder, source and
+    /// repair together; the receivers see the same.
+    #[tokio::test]
+    async fn relay_session_without_source_first_sends_the_same_symbols() {
+        relay_session_routes_source_and_secondary_repair(true, true, false).await;
     }
 
     #[tokio::test]
     async fn relay_session_without_send_batching_sends_the_same_symbols() {
-        relay_session_routes_source_and_secondary_repair(false, true).await;
+        relay_session_routes_source_and_secondary_repair(false, true, true).await;
     }
 
     /// `--relay-video-gso false`: the video lanes send one datagram per
     /// symbol, and the receivers see exactly what they see with GSO.
     #[tokio::test]
     async fn relay_session_video_without_gso_sends_the_same_symbols() {
-        relay_session_routes_source_and_secondary_repair(true, false).await;
+        relay_session_routes_source_and_secondary_repair(true, false, true).await;
     }
 
     /// Off by default until a lab A/B shows a gain; runs of 16 by default,
@@ -12449,7 +12934,11 @@ mod tests {
 
     /// With `--relay-send-batch` and without it, each lane carries the same
     /// symbols in the same order; only the number of send calls differs.
-    async fn relay_session_routes_source_and_secondary_repair(send_batch: bool, video_gso: bool) {
+    async fn relay_session_routes_source_and_secondary_repair(
+        send_batch: bool,
+        video_gso: bool,
+        source_first: bool,
+    ) {
         let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let secondary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let primary_sender_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -12466,6 +12955,9 @@ mod tests {
         args.relay_send_batch = send_batch;
         args.relay_video_gso = video_gso;
         args.relay_video_gso_segments = 16;
+        args.relay_source_first = source_first;
+        // Source first needs the batched sends.
+        let source_first = source_first && send_batch;
         // Today's lanes: one socket per lane, no repair on the primary.
         // The class lanes and repair on both lanes have their own tests.
         args.relay_class_lanes = false;
@@ -12536,7 +13028,10 @@ mod tests {
         let journal = test_hop_journal();
         let before_us = hop_journal::now_unix_us();
         // A stream id of this test only: other tests share the process journal.
-        let journal_stream = 77_000_000_077 + u64::from(send_batch) + 2 * u64::from(video_gso);
+        let journal_stream = 77_000_000_077
+            + u64::from(send_batch)
+            + 2 * u64::from(video_gso)
+            + 4 * u64::from(source_first);
         let outcome = relay
             .publish_part_object(&object, Some((journal_stream, 42)), PublicationClass::Video)
             .await
@@ -12717,12 +13212,17 @@ mod tests {
         assert_eq!(snapshot.relay_session.expired_objects, 0);
         assert_eq!(snapshot.relay_session.expired_symbols, 0);
         assert_eq!(snapshot.relay_session.stages.total.count, 1);
-        assert_eq!(snapshot.relay_session.stages.encode_wait.count, 1);
+        // Source first takes no encoder lock and has no separate schedule.
+        let old_stages = u64::from(!source_first);
+        assert_eq!(snapshot.relay_session.stages.encode_wait.count, old_stages);
         assert_eq!(snapshot.relay_session.stages.encode.count, 1);
-        assert_eq!(snapshot.relay_session.stages.schedule.count, 1);
+        assert_eq!(snapshot.relay_session.stages.schedule.count, old_stages);
         // One send stage per symbol, or one per lane batch (timed under the
-        // role of the batch's first symbol).
-        let (primary_sends, secondary_source_sends, secondary_repair_sends) = if send_batch {
+        // role of the batch's first symbol); source first hands the
+        // secondary its sources and then its repair.
+        let (primary_sends, secondary_source_sends, secondary_repair_sends) = if source_first {
+            (1, 1, usize::from(!secondary_repair.is_empty()))
+        } else if send_batch {
             (1, 1, 0)
         } else {
             (
@@ -12963,6 +13463,8 @@ mod tests {
             let mut args = contrib_status_args();
             args.relay_primary_target = Some(receiver.local_addr().unwrap());
             args.publication_shard_mix = shard_mix;
+            // relay-session's encoders, behind their locks.
+            args.relay_source_first = false;
             let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
                 .await
                 .unwrap()
@@ -13339,6 +13841,8 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_source_first: true,
+            relay_video_symbol_size: 0,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -13438,6 +13942,8 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_source_first: true,
+            relay_video_symbol_size: 0,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14042,6 +14548,8 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_source_first: true,
+            relay_video_symbol_size: 0,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14281,6 +14789,8 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_source_first: true,
+            relay_video_symbol_size: 0,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14420,6 +14930,8 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_source_first: true,
+            relay_video_symbol_size: 0,
             audio_hot_thread: false,
             audio_hot_cpu: -1,
             audio_hot_fifo_priority: 0,
@@ -14813,6 +15325,143 @@ mod tests {
         assert_eq!(parsed.relay_class_port_offset, 2_000);
     }
 
+    /// Every datagram a lane receives, raw, in arrival order.
+    async fn receive_wires(socket: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
+        let mut wire = vec![0_u8; 65_536];
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut wire))
+                .await
+                .expect("RelaySession datagram timeout")
+                .expect("RelaySession UDP receive");
+            out.push(wire[..len].to_vec());
+        }
+        out
+    }
+
+    /// `--relay-source-first`: each lane receives byte for byte what
+    /// relay-session's encoder gives it (same objects in the same order),
+    /// on the audio hot path (repair on both lanes) and on the joined video
+    /// path (repair from the secondary); a lane's source symbols come
+    /// before its repair symbols.
+    #[tokio::test]
+    async fn source_first_lanes_carry_relay_sessions_datagrams() {
+        let audio = test_audio_object(91_000_000_090, 3_000);
+        let video = test_video_object_of(91_000_000_091, 0, 2, 40_000);
+        let mut lanes = Vec::new();
+        for source_first in [false, true] {
+            let (primary_audio, primary_video) = class_port_receivers().await;
+            let (secondary_audio, secondary_video) = class_port_receivers().await;
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+            args.relay_secondary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_seed_source = true;
+            args.relay_deadline_ms = 5_000;
+            args.relay_min_repair_symbols = 2;
+            args.relay_source_first = source_first;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            let audio_out = relay
+                .publish_part_object(&audio, Some((91_000_000_090, 0)), PublicationClass::Audio)
+                .await
+                .unwrap();
+            let video_out = relay
+                .publish_part_object(&video, Some((91_000_000_091, 0)), PublicationClass::Video)
+                .await
+                .unwrap();
+            assert!(audio_out.repair_symbols >= 2 && video_out.repair_symbols >= 2);
+            let audio_all = audio_out.source_symbols + audio_out.repair_symbols;
+            lanes.push((
+                receive_wires(&primary_audio, audio_all).await,
+                receive_wires(&secondary_audio, audio_all).await,
+                receive_wires(&primary_video, video_out.source_symbols).await,
+                receive_wires(
+                    &secondary_video,
+                    video_out.source_symbols + video_out.repair_symbols,
+                )
+                .await,
+            ));
+            for socket in [&primary_audio, &secondary_audio, &primary_video] {
+                assert_silent(socket).await;
+            }
+            // Sources lead on every lane.
+            let limits = RelayLimits::default();
+            let (primary_audio_wires, _, _, secondary_video_wires) = lanes.last().unwrap();
+            for (wires, sources) in [
+                (primary_audio_wires, audio_out.source_symbols),
+                (secondary_video_wires, video_out.source_symbols),
+            ] {
+                let roles = wires
+                    .iter()
+                    .map(|wire| relay_session::decode_datagram(wire, limits).unwrap().role)
+                    .collect::<Vec<_>>();
+                assert!(roles[..sources]
+                    .iter()
+                    .all(|role| *role == MediaDatagramRole::Source));
+                assert!(roles[sources..]
+                    .iter()
+                    .all(|role| *role == MediaDatagramRole::Repair));
+            }
+        }
+        assert_eq!(lanes[0], lanes[1]);
+    }
+
+    /// Source first takes no encoder lock: a part leaves while
+    /// relay-session's encoders are held (as a 4K encode held them).
+    #[tokio::test]
+    async fn source_first_parts_never_wait_for_an_encoder_lock() {
+        let (receiver, _video_receiver) = class_port_receivers().await;
+        for shard_mix in [true, false] {
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(receiver.local_addr().unwrap());
+            args.publication_shard_mix = shard_mix;
+            assert!(args.relay_source_first);
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            let held_audio = relay.encoder(PublicationClass::Audio).try_lock().ok();
+            let held_video = relay.encoder(PublicationClass::Video).try_lock().ok();
+            assert!(held_audio.is_some() || held_video.is_some());
+            for (object, class) in [
+                (test_audio_object(4_001, 300), PublicationClass::Audio),
+                (test_video_object(1, 0, 1), PublicationClass::Video),
+            ] {
+                let outcome = timeout(
+                    Duration::from_millis(500),
+                    relay.publish_part_object(&object, None, class),
+                )
+                .await
+                .expect("a source-first part waited for an encoder lock")
+                .unwrap();
+                assert!(outcome.source_symbols > 0);
+            }
+            drop((held_audio, held_video));
+        }
+    }
+
+    /// The flags: source first on by default, the video symbol size off.
+    #[test]
+    fn source_first_is_on_by_default_and_the_video_symbol_size_is_off() {
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert!(parsed.relay_source_first);
+        assert_eq!(parsed.relay_video_symbol_size, 0);
+        let parsed = Args::try_parse_from([
+            "av-contrib",
+            "--relay-source-first",
+            "false",
+            "--relay-video-symbol-size",
+            "1088",
+        ])
+        .unwrap();
+        assert!(!parsed.relay_source_first);
+        assert_eq!(parsed.relay_video_symbol_size, 1_088);
+    }
+
     /// The audio hot path with repair on both lanes: the primary alone
     /// recovers a part whose source symbol it lost, both lanes carry the
     /// same packet sequences, and `sent_first` leads `sent`.
@@ -14900,6 +15549,428 @@ mod tests {
             snapshot.relay_session.repair_datagrams,
             (outcome.repair_symbols * 2) as u64
         );
+    }
+
+    /// Not a check, a benchmark (wave 5 W1): wall time of an audio part's
+    /// publication on the audio hot path with the deploy's lanes (class
+    /// lanes, repair on both lanes, seeded secondary), from the call to
+    /// `sent` (the journal) and to the return, with relay-session's encoder
+    /// and with source first; and the steps of relay-session's path (the
+    /// canonical object, validation, envelope, its encode, the RLS1
+    /// datagrams). Run with
+    /// `cargo test --release --bin av-contrib hot_path_breakdown -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "benchmark"]
+    async fn hot_path_breakdown_of_an_audio_part() {
+        const PARTS: u32 = 4_000;
+        let journal = test_hop_journal();
+        for (source_first, min_repair) in [(false, 0), (true, 0), (false, 2), (true, 2)] {
+            let (primary_audio, _primary_video) = class_port_receivers().await;
+            let (secondary_audio, _secondary_video) = class_port_receivers().await;
+            for socket in [&primary_audio, &secondary_audio] {
+                SockRef::from(socket)
+                    .set_recv_buffer_size(64 << 20)
+                    .unwrap();
+            }
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+            args.relay_secondary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_seed_source = true;
+            args.relay_exclusive = true;
+            args.relay_deadline_ms = 5_000;
+            args.relay_source_first = source_first;
+            args.relay_min_repair_symbols = min_repair;
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let relay = RelaySessionPublisher::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap()
+                .unwrap();
+            let drain = |socket: &UdpSocket| {
+                let mut wire = [0_u8; 2_048];
+                while socket.try_recv_from(&mut wire).is_ok() {}
+            };
+            for (label, bytes) in [
+                ("opus 2.5 ms", 16 + 100),
+                ("pcm 1 ms", 16 + 288),
+                ("pcm 5 ms", 16 + 1_440),
+            ] {
+                let stream = 91_000_700 + u64::from(source_first) * 10 + u64::from(min_repair);
+                let mut encoder = relay.encoder(PublicationClass::Audio).lock().await.clone();
+                let mut totals = [0_u128; 5];
+                let mut to_sent = Vec::with_capacity(PARTS as usize);
+                let mut to_return = Vec::with_capacity(PARTS as usize);
+                let mut symbols = 0;
+                for sequence in 0..PARTS {
+                    let mut part = test_opaque_part(stream);
+                    part.sequence = u64::from(sequence);
+                    part.bytes = Bytes::from(vec![(sequence % 251) as u8; bytes]);
+                    let t0 = std::time::Instant::now();
+                    let object =
+                        build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 5_000, 1_000).unwrap();
+                    let t1 = std::time::Instant::now();
+                    object.validate().unwrap();
+                    let t2 = std::time::Instant::now();
+                    let envelope = media_object::encode(&object).unwrap();
+                    let t3 = std::time::Instant::now();
+                    let deadline = relay_deadline_for_object(&object).unwrap();
+                    let encoded = encoder
+                        .encode_object_with_inferred_priority(
+                            &object,
+                            relay.generation,
+                            relay.subscription_id,
+                            deadline,
+                        )
+                        .unwrap();
+                    let t4 = std::time::Instant::now();
+                    let mut wires = Vec::new();
+                    for symbol in encoded
+                        .source_symbols
+                        .iter()
+                        .chain(encoded.repair_symbols.iter())
+                    {
+                        wires.push(encode_relay_datagram(symbol, RelayLimits::default()).unwrap());
+                    }
+                    let t5 = std::time::Instant::now();
+                    std::hint::black_box((&envelope, &wires));
+                    let seq = u64::from(sequence) + u64::from(PARTS) * bytes as u64;
+                    let called_us = hop_journal::now_unix_us();
+                    let outcome = relay
+                        .publish_part_object(&object, Some((stream, seq)), PublicationClass::Audio)
+                        .await
+                        .unwrap();
+                    let returned_us = hop_journal::now_unix_us();
+                    symbols += outcome.source_symbols + outcome.repair_symbols;
+                    let sent_us = journal
+                        .query(Some(called_us), Some(stream))
+                        .into_iter()
+                        .find(|event| event.stage == HopStage::Sent && event.seq == seq)
+                        .map(|event| event.t_us)
+                        .unwrap();
+                    to_sent.push(sent_us - called_us);
+                    to_return.push(returned_us - called_us);
+                    drain(&primary_audio);
+                    drain(&secondary_audio);
+                    for (total, (from, to)) in
+                        totals
+                            .iter_mut()
+                            .zip([(t0, t1), (t1, t2), (t2, t3), (t3, t4), (t4, t5)])
+                    {
+                        *total += to.duration_since(from).as_nanos();
+                    }
+                }
+                to_sent.sort_unstable();
+                to_return.sort_unstable();
+                let pct = |values: &[u64], q: f64| values[((values.len() - 1) as f64 * q) as usize];
+                let per = |index: usize| totals[index] / u128::from(PARTS);
+                eprintln!(
+                    "source_first={source_first} min_repair={min_repair} {label} ({:.1} symbols): \
+                     call->sent p50/p99 {}/{} us, call->return p50/p99 {}/{} us | relay-session \
+                     steps: object {} ns, validate {} ns, envelope {} ns, encode {} ns, RLS1 {} ns",
+                    symbols as f64 / f64::from(PARTS),
+                    pct(&to_sent, 0.5),
+                    pct(&to_sent, 0.99),
+                    pct(&to_return, 0.5),
+                    pct(&to_return, 0.99),
+                    per(0),
+                    per(1),
+                    per(2),
+                    per(3),
+                    per(4),
+                );
+            }
+        }
+    }
+
+    /// Not a check, a benchmark (wave 5 W1): the journal's `packaged` ->
+    /// `sent` of three audio renditions (PCM 1 ms, FLAC, Opus 2.5 ms sizes)
+    /// whose parts are cut at the same instant on three threads, as the
+    /// lab's DAW renditions are, through the inline publication and the
+    /// deploy's lanes; relay-session's encoder against source first. Run
+    /// with `cargo test --release --bin av-contrib renditions_packaged_to_sent
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn renditions_packaged_to_sent() {
+        const PARTS: u64 = 3_000;
+        let journal = test_hop_journal();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for source_first in [false, true] {
+            let (receivers, publisher, _shutdown) = runtime.block_on(async {
+                let (primary_audio, primary_video) = class_port_receivers().await;
+                let (secondary_audio, secondary_video) = class_port_receivers().await;
+                for socket in [&primary_audio, &secondary_audio] {
+                    SockRef::from(socket)
+                        .set_recv_buffer_size(64 << 20)
+                        .unwrap();
+                }
+                let mut args = contrib_status_args();
+                args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+                args.relay_primary_bind = Some(reserved_loopback_addr());
+                args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+                args.relay_secondary_bind = Some(reserved_loopback_addr());
+                args.relay_secondary_seed_source = true;
+                args.relay_exclusive = true;
+                args.relay_deadline_ms = 5_000;
+                args.relay_source_first = source_first;
+                let telemetry = Arc::new(IngestTelemetry::default());
+                let forwarder: Arc<dyn Fmp4PartPublisher> = Arc::new(
+                    MeshForwarder::new(&args, Arc::clone(&telemetry))
+                        .await
+                        .unwrap(),
+                );
+                let (shutdown_tx, shutdown_rx) = watch::channel(());
+                let (publisher, _tasks) = start_bounded_publication_pipeline(
+                    forwarder,
+                    telemetry,
+                    StampDurations {
+                        video_part_us: 0,
+                        video_segment_us: 2_000_000,
+                        audio_part_us: 0,
+                        audio_segment_us: 1_000_000,
+                    },
+                    true,
+                    true,
+                    shutdown_rx,
+                );
+                (
+                    [
+                        primary_audio,
+                        primary_video,
+                        secondary_audio,
+                        secondary_video,
+                    ],
+                    publisher,
+                    shutdown_tx,
+                )
+            });
+            let receivers = receivers
+                .into_iter()
+                .map(|socket| socket.into_std().unwrap())
+                .collect::<Vec<_>>();
+            let stop = Arc::new(AtomicBool::new(false));
+            let drains = receivers
+                .into_iter()
+                .map(|socket| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_millis(20)))
+                            .unwrap();
+                        let mut wire = [0_u8; 2_048];
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = socket.recv_from(&mut wire);
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let base = 92_000_000 + u64::from(source_first) * 10;
+            let renditions = [(base, 16 + 288), (base + 1, 16 + 600), (base + 2, 16 + 100)]
+                .into_iter()
+                .map(|(stream, bytes)| {
+                    let publisher = Arc::clone(&publisher);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        for sequence in 0..PARTS {
+                            barrier.wait();
+                            let mut part = test_opaque_part(stream);
+                            part.duration_us = 1_000;
+                            part.duration_samples = Some(48);
+                            part.bytes = Bytes::from(vec![(sequence % 251) as u8; bytes]);
+                            part.packaged_at_unix_ns = now_unix_ns();
+                            part.published_at_unix_ns = part.packaged_at_unix_ns;
+                            runtime
+                                .block_on(publisher.publish_opaque_part(part))
+                                .unwrap();
+                            std::thread::sleep(Duration::from_micros(500));
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for rendition in renditions {
+                rendition.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            for drain in drains {
+                drain.join().unwrap();
+            }
+            let mut all = Vec::new();
+            for stream in base..base + 3 {
+                let events = journal.query(None, Some(stream));
+                let at = |stage: HopStage| {
+                    events
+                        .iter()
+                        .filter(|event| event.stage == stage)
+                        .map(|event| (event.seq, event.t_us))
+                        .collect::<HashMap<_, _>>()
+                };
+                let packaged = at(HopStage::Packaged);
+                let sent = at(HopStage::Sent);
+                let median_between = |from: HopStage, to: HopStage| {
+                    let from = at(from);
+                    let to = at(to);
+                    let mut deltas = from
+                        .iter()
+                        .filter_map(|(seq, from)| Some(to.get(seq)?.saturating_sub(*from)))
+                        .collect::<Vec<_>>();
+                    deltas.sort_unstable();
+                    deltas.get(deltas.len() / 2).copied().unwrap_or_default()
+                };
+                eprintln!(
+                    "  medians: packaged->enqueued {} us, enqueued->dequeued {} us, \
+                     dequeued->encoded {} us, encoded->sent_first {} us, sent_first->sent {} us",
+                    median_between(HopStage::Packaged, HopStage::Enqueued),
+                    median_between(HopStage::Enqueued, HopStage::Dequeued),
+                    median_between(HopStage::Dequeued, HopStage::Encoded),
+                    median_between(HopStage::Encoded, HopStage::SentFirst),
+                    median_between(HopStage::SentFirst, HopStage::Sent),
+                );
+                let mut deltas = packaged
+                    .iter()
+                    .filter_map(|(seq, packaged)| Some(sent.get(seq)?.saturating_sub(*packaged)))
+                    .collect::<Vec<_>>();
+                deltas.sort_unstable();
+                all.extend_from_slice(&deltas);
+                let pct = |q: f64| deltas[((deltas.len() - 1) as f64 * q) as usize];
+                eprintln!(
+                    "source_first={source_first} stream {stream}: {} parts, packaged->sent p50/p95/p99/max {}/{}/{}/{} us",
+                    deltas.len(),
+                    pct(0.5),
+                    pct(0.95),
+                    pct(0.99),
+                    deltas[deltas.len() - 1],
+                );
+            }
+            all.sort_unstable();
+            let pct = |q: f64| all[((all.len() - 1) as f64 * q) as usize];
+            eprintln!(
+                "source_first={source_first} all renditions: packaged->sent p50/p95/p99 {}/{}/{} us",
+                pct(0.5),
+                pct(0.95),
+                pct(0.99)
+            );
+        }
+    }
+
+    /// Thread CPU time in nanoseconds, for the benchmarks.
+    fn thread_cpu_ns() -> u64 {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes the timespec it is given.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) };
+        spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
+    }
+
+    /// Not a check, a benchmark (wave 5 W3): the contributor's cost of a 4K
+    /// part on the video lanes (class lanes, a seeded secondary that also
+    /// carries the repair) at 25, 80 and 200 Mbit/s of 50 fps parts: the
+    /// call's wall time to `sent` and to its return, and its thread CPU,
+    /// with relay-session's encoder or source first, GSO off or on. Run with
+    /// `cargo test --release --bin av-contrib video_lane_cost -- --ignored --nocapture`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "benchmark"]
+    async fn video_lane_cost_per_part() {
+        let journal = test_hop_journal();
+        for (source_first, gso, symbol_size) in [
+            (false, false, 0),
+            (true, false, 0),
+            (true, true, 0),
+            (true, true, 1_088),
+        ] {
+            let (primary_audio, primary_video) = class_port_receivers().await;
+            let (secondary_audio, secondary_video) = class_port_receivers().await;
+            for socket in [&primary_video, &secondary_video] {
+                SockRef::from(socket)
+                    .set_recv_buffer_size(64 << 20)
+                    .unwrap();
+            }
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+            args.relay_secondary_bind = Some(reserved_loopback_addr());
+            args.relay_secondary_seed_source = true;
+            args.relay_exclusive = true;
+            args.relay_deadline_ms = 5_000;
+            args.relay_source_first = source_first;
+            args.relay_video_gso = gso;
+            args.relay_video_symbol_size = symbol_size;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            let primary_video = primary_video.into_std().unwrap();
+            let secondary_video = secondary_video.into_std().unwrap();
+            let drain = |socket: &std::net::UdpSocket| {
+                let mut wire = [0_u8; 2_048];
+                let mut count = 0;
+                while socket.recv_from(&mut wire).is_ok() {
+                    count += 1;
+                }
+                count
+            };
+            for (label, bytes, parts) in [
+                ("25 Mbit/s", 62_500, 200_u64),
+                ("80 Mbit/s", 200_000, 100),
+                ("200 Mbit/s", 500_000, 50),
+            ] {
+                let stream = 93_000_000 + bytes as u64;
+                let objects = (0..parts)
+                    .map(|sequence| test_video_object_of(stream, sequence, 1, bytes))
+                    .collect::<Vec<_>>();
+                let mut to_sent = Vec::new();
+                let mut wall = Vec::new();
+                let mut cpu = 0;
+                let mut received = 0;
+                for (sequence, object) in objects.iter().enumerate() {
+                    let seq = sequence as u64
+                        + u64::from(source_first) * 1_000_000
+                        + u64::from(gso) * 2_000_000
+                        + u64::from(symbol_size) * 10_000_000;
+                    let called_us = hop_journal::now_unix_us();
+                    let cpu_before = thread_cpu_ns();
+                    relay
+                        .publish_part_object(object, Some((stream, seq)), PublicationClass::Video)
+                        .await
+                        .unwrap();
+                    cpu += thread_cpu_ns() - cpu_before;
+                    wall.push(hop_journal::now_unix_us() - called_us);
+                    let sent_us = journal
+                        .query(Some(called_us), Some(stream))
+                        .into_iter()
+                        .find(|event| event.stage == HopStage::Sent && event.seq == seq)
+                        .map(|event| event.t_us)
+                        .unwrap();
+                    to_sent.push(sent_us - called_us);
+                    received += drain(&primary_video) + drain(&secondary_video);
+                }
+                to_sent.sort_unstable();
+                wall.sort_unstable();
+                eprintln!(
+                    "source_first={source_first} gso={gso} symbol={symbol_size} 4K {label} \
+                     ({bytes} B parts): call->sent p50 {} us, call->return p50 {} us, thread CPU \
+                     {} us/part = {:.1}% of a core at 50 fps; {} datagrams received/part",
+                    to_sent[to_sent.len() / 2],
+                    wall[wall.len() / 2],
+                    cpu / parts / 1_000,
+                    (cpu / parts) as f64 * 50.0 / 1e7,
+                    received / parts as usize,
+                );
+            }
+            drop((primary_audio, secondary_audio));
+        }
     }
 
     /// While a lane has a part waiting for room in its socket buffer, the
@@ -15315,8 +16386,8 @@ mod tests {
         let (socket, peer) = relay.primary.class_socket(PublicationClass::Audio);
         let part = BacklogPart {
             wires: vec![
-                (MediaDatagramRole::Source, vec![1_u8; 32]),
-                (MediaDatagramRole::Repair, vec![2_u8; 32]),
+                (MediaDatagramRole::Source, Bytes::from(vec![1_u8; 32])),
+                (MediaDatagramRole::Repair, Bytes::from(vec![2_u8; 32])),
             ],
             sources: 1,
             deadline: MediaDeadline::from_micros(now_unix_us() - 1_000),
@@ -15326,6 +16397,7 @@ mod tests {
             stage: HopStage::Sent,
             peer,
             path: RelayCarrierPath::Primary,
+            records_outcome: true,
         };
         send_backlog_part(socket, &telemetry, part);
         let snapshot = telemetry.snapshot().relay_session;
@@ -15336,7 +16408,7 @@ mod tests {
 
         // A live part is sent, and the lane records it delivered.
         let part = BacklogPart {
-            wires: vec![(MediaDatagramRole::Source, vec![3_u8; 32])],
+            wires: vec![(MediaDatagramRole::Source, Bytes::from(vec![3_u8; 32]))],
             sources: 1,
             deadline: MediaDeadline::from_micros(now_unix_us() + 1_000_000),
             journal: None,
@@ -15345,6 +16417,7 @@ mod tests {
             stage: HopStage::Sent,
             peer,
             path: RelayCarrierPath::Primary,
+            records_outcome: true,
         };
         send_backlog_part(socket, &telemetry, part);
         let mut wire = [0_u8; 64];

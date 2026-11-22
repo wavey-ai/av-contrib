@@ -44,6 +44,7 @@ music-audio-session = "0.1.2"
 playlists = "0.1.6"
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
+raptorq = "2.0.1"
 relay-session = "0.1.1"
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "614c10ab03fb37e25b7d892a2224caaddcbb89a6", optional = true }
 rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", rev = "614c10ab03fb37e25b7d892a2224caaddcbb89a6", optional = true }

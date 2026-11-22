@@ -380,6 +380,35 @@ hundreds of symbols never hold an audio part back:
   0 (default) is one per `--daw-hls-formats` format, at most as many as
   there are CPUs from `--audio-hot-cpu` on.
 
+Each part's RelaySession symbols are encoded source first:
+
+- `--relay-source-first` (default `true`, needs `--relay-send-batch`): a
+  part's source symbols are cut straight from its envelope (RaptorQ is
+  systematic) and handed to every lane that carries them before its repair
+  symbols are computed; the repair then uses `raptorq`'s cached encoding
+  plan for the part's symbol count. relay-session's encoder generates that
+  plan for every object and solves the whole block before the first symbol
+  can leave, which was most of an audio part's `packaged` -> `sent` (about
+  0.2 ms of the 0.23 ms median with three DAW renditions cut together, in
+  the in-process bench `renditions_packaged_to_sent`) and about 5 ms of a
+  500 kB 4K frame. The datagrams are byte for byte relay-session's
+  (tested), each RLS1 datagram is built once for every lane, and the
+  encoder's block ids and packet sequences are atomics, so no publishing
+  thread waits for another's encode. The journal's `encoded` is the
+  source symbols ready; `sent` is still the last source symbol with the
+  kernel on the primary.
+- `--relay-video-symbol-size` (default `0`, the largest symbol that fits a
+  1,472-byte datagram): the RaptorQ symbol size of non-audio objects (video
+  parts and initializations). 1,088 keeps an edge's fast-lane datagram to
+  a client at 1,128 bytes, which fits a WebTransport datagram; it costs
+  about 15% more datagrams per 4K part.
+
+The benchmarks behind these numbers are ignored tests:
+`cargo test --release --bin av-contrib -- --ignored --nocapture
+--test-threads 1` (`hot_path_breakdown_of_an_audio_part`,
+`renditions_packaged_to_sent`, `video_lane_cost_per_part`) and
+`cargo test --release --lib source_first_bench -- --ignored --nocapture`.
+
 The stdin senders are kept for local smoke tests and protocol debugging:
 
 ```sh

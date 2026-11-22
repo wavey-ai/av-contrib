@@ -234,6 +234,7 @@ dependencies = [
  "media-object",
  "music-audio-session",
  "playlists 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "raptorq",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "relay-session",
