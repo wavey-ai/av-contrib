@@ -846,6 +846,21 @@ struct Args {
     )]
     relay_send_batch: bool,
 
+    /// Hand a 4K part's RelaySession symbols to the kernel as UDP GSO
+    /// messages (UDP_SEGMENT: up to 64 symbols in one pass through the
+    /// stack, cut into the same datagrams by the kernel) on the video lanes,
+    /// instead of one `sendmmsg` entry per symbol. Every hop of the 4K
+    /// plane pays per datagram; this is the contributor's share. A host
+    /// without UDP GSO is detected on the first send and the lanes go on
+    /// without it. Needs --relay-send-batch.
+    #[arg(
+        long,
+        env = "AV_RELAY_VIDEO_GSO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_video_gso: bool,
+
     /// Recover each AEP1 epoch once: the LL-HLS worker's FEC receiver hands
     /// every completed epoch to the SoundKit v2 normaliser of the mesh lane,
     /// which then only re-frames it. With `false` the normaliser runs its own
@@ -1883,6 +1898,9 @@ struct RelaySessionPublisher {
     /// `--relay-send-batch`: the symbols of a part leave each lane in one
     /// `sendmmsg` call.
     send_batch: bool,
+    /// `--relay-video-gso`: a video part's symbols leave each lane as UDP
+    /// GSO messages. Cleared for good when the host refuses UDP GSO.
+    video_gso: AtomicBool,
     /// `--relay-audio-inline`: an audio part's lanes are each handed their
     /// symbols without waiting, one after the other, with no join.
     audio_inline: bool,
@@ -2055,6 +2073,7 @@ impl RelaySessionPublisher {
             secondary_seed_source: args.relay_secondary_seed_source,
             direct,
             send_batch: args.relay_send_batch,
+            video_gso: AtomicBool::new(args.relay_send_batch && args.relay_video_gso),
             audio_inline: args.relay_audio_inline,
             repair_both_lanes: args.relay_repair_both_lanes,
             class_lanes: classes.enabled(),
@@ -2677,7 +2696,44 @@ impl RelaySessionPublisher {
             .iter()
             .map(|(_, wire)| udp_batch::Outbound::connected(wire))
             .collect::<Vec<_>>();
-        if let Err(error) = udp_batch::send_all(socket, &messages, true).await {
+        let mut from = 0;
+        if class == PublicationClass::Video && self.video_gso.load(Ordering::Relaxed) {
+            match udp_batch::send_all_gso(socket, &messages).await {
+                Ok(sent) => {
+                    self.telemetry
+                        .relay_gso_messages
+                        .fetch_add(sent.messages as u64, Ordering::Relaxed);
+                    self.telemetry
+                        .relay_gso_datagrams
+                        .fetch_add(messages.len() as u64, Ordering::Relaxed);
+                    from = messages.len();
+                }
+                Err(stopped) if udp_batch::gso_unsupported(&stopped.error) => {
+                    // The rest goes without GSO, now and from now on.
+                    if self.video_gso.swap(false, Ordering::Relaxed) {
+                        warn!(
+                            error = %stopped.error,
+                            "UDP GSO is unavailable: video symbols leave one datagram each"
+                        );
+                    }
+                    from = stopped.sent;
+                }
+                Err(stopped) => {
+                    for (role, wire) in &wires[..stopped.sent] {
+                        self.telemetry
+                            .record_relay_session_send_success(*role, wire.len() as u64);
+                    }
+                    let role = wires
+                        .get(stopped.sent)
+                        .map_or(MediaDatagramRole::Source, |(role, _)| *role);
+                    self.telemetry.record_relay_session_send_error(role);
+                    return Err(stopped.error).with_context(|| {
+                        format!("failed to send RelaySession datagrams to {peer}")
+                    });
+                }
+            }
+        }
+        if let Err(error) = udp_batch::send_all(socket, &messages[from..], true).await {
             let role = wires
                 .first()
                 .map_or(MediaDatagramRole::Source, |(role, _)| *role);
@@ -5580,6 +5636,9 @@ struct IngestTelemetry {
     relay_direct_send_duration: AtomicDurationHistogram,
     relay_expired_objects: AtomicU64,
     relay_expired_symbols: AtomicU64,
+    /// `--relay-video-gso`: GSO messages, and the datagrams they carried.
+    relay_gso_messages: AtomicU64,
+    relay_gso_datagrams: AtomicU64,
     relay_deadline_hits: AtomicU64,
     relay_deadline_misses: AtomicU64,
     relay_last_deadline_unix_us: AtomicU64,
@@ -6425,6 +6484,8 @@ impl IngestTelemetry {
                 direct_send: self.relay_direct_send_duration.snapshot(),
                 expired_objects: self.relay_expired_objects.load(Ordering::Relaxed),
                 expired_symbols: self.relay_expired_symbols.load(Ordering::Relaxed),
+                gso_messages: self.relay_gso_messages.load(Ordering::Relaxed),
+                gso_datagrams: self.relay_gso_datagrams.load(Ordering::Relaxed),
                 deadline_hits: self.relay_deadline_hits.load(Ordering::Relaxed),
                 deadline_misses: self.relay_deadline_misses.load(Ordering::Relaxed),
                 last_deadline_unix_us: nonzero_unix_us(
@@ -6804,6 +6865,7 @@ impl ContribStatusConfig {
                 relay_direct_bind: args.relay_direct_bind.map(|bind| bind.to_string()),
                 relay_direct_repair: args.relay_direct_repair,
                 relay_send_batch: args.relay_send_batch,
+                relay_video_gso: args.relay_send_batch && args.relay_video_gso,
                 relay_class_lanes: args.relay_class_lanes,
                 relay_class_port_offset: args.relay_class_port_offset,
                 relay_audio_inline: args.relay_audio_inline,
@@ -8459,6 +8521,10 @@ struct RelaySessionRuntimeSnapshot {
     direct_send: DurationHistogramSnapshot,
     expired_objects: u64,
     expired_symbols: u64,
+    /// `--relay-video-gso`: UDP GSO messages of the video lanes, and the
+    /// datagrams the kernel cut them into.
+    gso_messages: u64,
+    gso_datagrams: u64,
     deadline_hits: u64,
     deadline_misses: u64,
     last_deadline_unix_us: Option<u64>,
@@ -8749,6 +8815,9 @@ struct MeshTargetStatus {
     relay_direct_repair: bool,
     /// `--relay-send-batch`.
     relay_send_batch: bool,
+    /// `--relay-video-gso` (with `--relay-send-batch`); the runtime's
+    /// `gso_messages` say whether the host took it.
+    relay_video_gso: bool,
     /// `--relay-class-lanes` and `--relay-class-port-offset`.
     relay_class_lanes: bool,
     relay_class_port_offset: u16,
@@ -12005,12 +12074,27 @@ mod tests {
 
     #[tokio::test]
     async fn relay_session_routes_source_and_secondary_repair_and_recovers_exact_object() {
-        relay_session_routes_source_and_secondary_repair(true).await;
+        relay_session_routes_source_and_secondary_repair(true, true).await;
     }
 
     #[tokio::test]
     async fn relay_session_without_send_batching_sends_the_same_symbols() {
-        relay_session_routes_source_and_secondary_repair(false).await;
+        relay_session_routes_source_and_secondary_repair(false, true).await;
+    }
+
+    /// `--relay-video-gso false`: the video lanes send one datagram per
+    /// symbol, and the receivers see exactly what they see with GSO.
+    #[tokio::test]
+    async fn relay_session_video_without_gso_sends_the_same_symbols() {
+        relay_session_routes_source_and_secondary_repair(true, false).await;
+    }
+
+    #[test]
+    fn the_relay_video_gso_flag_defaults_on_and_can_be_turned_off() {
+        let parsed = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert!(parsed.relay_video_gso);
+        let parsed = Args::try_parse_from(["av-contrib", "--relay-video-gso", "false"]).unwrap();
+        assert!(!parsed.relay_video_gso);
     }
 
     fn reserved_loopback_addr() -> SocketAddr {
@@ -12268,7 +12352,7 @@ mod tests {
 
     /// With `--relay-send-batch` and without it, each lane carries the same
     /// symbols in the same order; only the number of send calls differs.
-    async fn relay_session_routes_source_and_secondary_repair(send_batch: bool) {
+    async fn relay_session_routes_source_and_secondary_repair(send_batch: bool, video_gso: bool) {
         let primary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let secondary_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let primary_sender_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -12283,6 +12367,7 @@ mod tests {
         args.relay_secondary_bind = Some(secondary_bind);
         args.relay_secondary_seed_source = true;
         args.relay_send_batch = send_batch;
+        args.relay_video_gso = video_gso;
         // Today's lanes: one socket per lane, no repair on the primary.
         // The class lanes and repair on both lanes have their own tests.
         args.relay_class_lanes = false;
@@ -12353,7 +12438,7 @@ mod tests {
         let journal = test_hop_journal();
         let before_us = hop_journal::now_unix_us();
         // A stream id of this test only: other tests share the process journal.
-        let journal_stream = 77_000_000_077 + u64::from(send_batch);
+        let journal_stream = 77_000_000_077 + u64::from(send_batch) + 2 * u64::from(video_gso);
         let outcome = relay
             .publish_part_object(&object, Some((journal_stream, 42)), PublicationClass::Video)
             .await
@@ -12495,6 +12580,17 @@ mod tests {
             snapshot.relay_session.source_datagrams,
             (primary.len() + secondary_source.len()) as u64
         );
+        // A video part: with GSO (where the host has it) each lane's
+        // symbols leave in a few GSO messages; without it, none.
+        let symbols = (primary.len() + secondary_source.len() + secondary_repair.len()) as u64;
+        if send_batch && video_gso && relay.video_gso.load(Ordering::Relaxed) {
+            assert_eq!(snapshot.relay_session.gso_datagrams, symbols);
+            assert!(snapshot.relay_session.gso_messages >= 2);
+            assert!(snapshot.relay_session.gso_messages * 4 <= symbols);
+        } else {
+            assert_eq!(snapshot.relay_session.gso_messages, 0);
+            assert_eq!(snapshot.relay_session.gso_datagrams, 0);
+        }
         assert_eq!(
             snapshot.relay_session.repair_datagrams,
             secondary_repair.len() as u64
@@ -13124,6 +13220,7 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
+            relay_video_gso: true,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -13221,6 +13318,7 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
+            relay_video_gso: true,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -13823,6 +13921,7 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
+            relay_video_gso: true,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14060,6 +14159,7 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
+            relay_video_gso: true,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,
@@ -14197,6 +14297,7 @@ mod tests {
             playlist_buffer_kb: 800,
             publication_shard_mix: true,
             relay_send_batch: true,
+            relay_video_gso: true,
             aep1_shared_recovery: true,
             relay_direct_targets: Vec::new(),
             relay_direct_bind: None,

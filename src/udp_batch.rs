@@ -273,9 +273,108 @@ async fn send_each_until_refused(
     Ok(messages.len())
 }
 
+/// Datagrams of one UDP GSO message at most (UDP_MAX_SEGMENTS is 64 on
+/// older kernels).
+pub const GSO_MAX_SEGMENTS: usize = 64;
+/// Payload bytes of one UDP GSO message at most, below an IPv4 datagram's
+/// 65,507 with a margin.
+pub const GSO_MAX_BYTES: usize = 63 * 1024;
+/// GSO messages handed to the kernel in one `sendmmsg` call at most.
+const GSO_MESSAGES_PER_CALL: usize = 16;
+
+/// The runs of `messages` that one UDP GSO message each can carry:
+/// consecutive datagrams to one target, every one but the last exactly as
+/// long as the first, within [`GSO_MAX_SEGMENTS`] and [`GSO_MAX_BYTES`].
+/// `(first, count)` of each run, in order, covering every message once.
+pub fn gso_runs(messages: &[Outbound<'_>]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let first = &messages[index];
+        let size = first.bytes.len();
+        let mut length = 1;
+        let mut bytes = size;
+        if size > 0 {
+            while index + length < messages.len() && length < GSO_MAX_SEGMENTS {
+                let next = &messages[index + length];
+                let next_size = next.bytes.len();
+                if next.target != first.target
+                    || next_size == 0
+                    || next_size > size
+                    || bytes + next_size > GSO_MAX_BYTES
+                {
+                    break;
+                }
+                length += 1;
+                bytes += next_size;
+                if next_size < size {
+                    break;
+                }
+            }
+        }
+        runs.push((index, length));
+        index += length;
+    }
+    runs
+}
+
+/// Whether a send failed because this host cannot do UDP GSO on the socket
+/// (no `UDP_SEGMENT`, or a device without checksum offload): send without
+/// it from then on.
+pub fn gso_unsupported(error: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EIO | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOPROTOOPT)
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        true
+    }
+}
+
+/// What [`send_all_gso`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GsoSent {
+    /// `sendmmsg` calls.
+    pub calls: usize,
+    /// GSO messages: passes through the stack, each cut by the kernel into
+    /// up to [`GSO_MAX_SEGMENTS`] datagrams.
+    pub messages: usize,
+}
+
+/// [`send_all`] with UDP GSO: each run of [`gso_runs`] is one message that
+/// the kernel cuts into the run's datagrams (`UDP_SEGMENT`), so the symbols
+/// of a 4K part cost a few passes through the stack instead of one each.
+/// The receiver sees exactly the datagrams of [`send_all`], in order. Waits
+/// for room in the socket's buffer as [`send_all`] does. A [`Stopped`]
+/// error says how many datagrams went before it; with
+/// [`gso_unsupported`] and none sent, send the batch with [`send_all`].
+pub async fn send_all_gso(
+    socket: &UdpSocket,
+    messages: &[Outbound<'_>],
+) -> Result<GsoSent, Stopped> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::send_all_gso(socket, messages).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (socket, messages);
+        Err(Stopped {
+            sent: 0,
+            calls: 0,
+            error: io::Error::new(io::ErrorKind::Unsupported, "UDP GSO is Linux only"),
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Outbound, Stopped, MESSAGES_PER_CALL};
+    use super::{GsoSent, Outbound, Stopped, GSO_MESSAGES_PER_CALL, MESSAGES_PER_CALL};
     use std::io;
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
@@ -322,6 +421,134 @@ mod linux {
             }
         }
         Ok(calls)
+    }
+
+    pub(super) async fn send_all_gso(
+        socket: &UdpSocket,
+        messages: &[Outbound<'_>],
+    ) -> Result<GsoSent, Stopped> {
+        let runs = super::gso_runs(messages);
+        let mut done = GsoSent::default();
+        let mut next_run = 0;
+        let mut sent = 0;
+        while next_run < runs.len() {
+            let end = (next_run + GSO_MESSAGES_PER_CALL).min(runs.len());
+            match socket.try_io(Interest::WRITABLE, || {
+                sendmmsg_gso(socket, messages, &runs[next_run..end])
+            }) {
+                Ok(0) => {
+                    return Err(Stopped {
+                        sent,
+                        calls: done.calls + 1,
+                        error: io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "sendmmsg took no GSO message",
+                        ),
+                    })
+                }
+                Ok(taken) => {
+                    done.calls += 1;
+                    done.messages += taken;
+                    sent += runs[next_run..next_run + taken]
+                        .iter()
+                        .map(|run| run.1)
+                        .sum::<usize>();
+                    next_run += taken;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(error) = socket.writable().await {
+                        return Err(Stopped {
+                            sent,
+                            calls: done.calls,
+                            error,
+                        });
+                    }
+                }
+                Err(error) => {
+                    return Err(Stopped {
+                        sent,
+                        calls: done.calls + 1,
+                        error,
+                    })
+                }
+            }
+        }
+        Ok(done)
+    }
+
+    /// One `sendmmsg` call of GSO messages, one per run. Returns how many
+    /// runs the kernel took.
+    fn sendmmsg_gso(
+        socket: &UdpSocket,
+        messages: &[Outbound<'_>],
+        runs: &[(usize, usize)],
+    ) -> io::Result<usize> {
+        const CONTROL: usize = 32;
+        #[repr(C, align(8))]
+        #[derive(Clone, Copy)]
+        struct Control([u8; CONTROL]);
+        let count = runs.len().min(GSO_MESSAGES_PER_CALL);
+        if count == 0 {
+            return Ok(0);
+        }
+        let datagrams: usize = runs[..count].iter().map(|run| run.1).sum();
+        let addresses = runs[..count]
+            .iter()
+            .map(|run| messages[run.0].target.map(socket2::SockAddr::from))
+            .collect::<Vec<_>>();
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(datagrams);
+        // SAFETY: zeroed mmsghdr values and byte arrays are valid; every
+        // pointer stored below is to memory that outlives the call
+        // (`messages`, `addresses`, `iovecs` which is never reallocated
+        // after its pointers are taken, `controls`), and the kernel only
+        // reads the buffers of a send.
+        unsafe {
+            for run in &runs[..count] {
+                for message in &messages[run.0..run.0 + run.1] {
+                    iovecs.push(libc::iovec {
+                        iov_base: message.bytes.as_ptr() as *mut libc::c_void,
+                        iov_len: message.bytes.len(),
+                    });
+                }
+            }
+            let mut headers: [libc::mmsghdr; GSO_MESSAGES_PER_CALL] = std::mem::zeroed();
+            let mut controls = [Control([0; CONTROL]); GSO_MESSAGES_PER_CALL];
+            let space = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize;
+            debug_assert!(space <= CONTROL);
+            let mut first_iov = 0;
+            for (slot, run) in runs[..count].iter().enumerate() {
+                let header = &mut headers[slot].msg_hdr;
+                if let Some(address) = &addresses[slot] {
+                    header.msg_name = address.as_ptr() as *mut libc::c_void;
+                    header.msg_namelen = address.len();
+                }
+                header.msg_iov = iovecs.as_mut_ptr().add(first_iov);
+                header.msg_iovlen = run.1 as _;
+                first_iov += run.1;
+                if run.1 > 1 {
+                    let segment = u16::try_from(messages[run.0].bytes.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "GSO segment over 64 KiB")
+                    })?;
+                    header.msg_control = controls[slot].0.as_mut_ptr().cast();
+                    header.msg_controllen = space as _;
+                    let cmsg = libc::CMSG_FIRSTHDR(header);
+                    (*cmsg).cmsg_level = libc::SOL_UDP;
+                    (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+                    (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+                    std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), segment);
+                }
+            }
+            let rc = libc::sendmmsg(
+                socket.as_raw_fd(),
+                headers.as_mut_ptr(),
+                count as libc::c_uint,
+                0,
+            );
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(rc as usize)
+        }
     }
 
     /// One `sendmmsg` call for up to [`MESSAGES_PER_CALL`] messages. Returns
@@ -442,6 +669,73 @@ mod tests {
                 assert_eq!(bytes, data[index], "datagram {index}, batch {batch}");
                 assert_eq!(from, sender.local_addr().unwrap());
             }
+        }
+    }
+
+    #[test]
+    fn gso_runs_join_equal_datagrams_to_one_target_within_the_limits() {
+        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let full = vec![1_u8; 1_200];
+        let short = vec![2_u8; 300];
+        let mut messages = vec![Outbound::connected(&full); 10];
+        messages.push(Outbound::connected(&short));
+        messages.push(Outbound::connected(&full));
+        messages.extend([
+            Outbound::to(a, &full),
+            Outbound::to(a, &full),
+            Outbound::to(b, &full),
+        ]);
+        assert_eq!(
+            gso_runs(&messages),
+            vec![(0, 11), (11, 1), (12, 2), (14, 1)]
+        );
+        let longer = vec![3_u8; 1_300];
+        let grow = [Outbound::connected(&full), Outbound::connected(&longer)];
+        assert_eq!(gso_runs(&grow), vec![(0, 1), (1, 1)]);
+        let many = vec![Outbound::connected(&full); 200];
+        let runs = gso_runs(&many);
+        assert!(runs.iter().all(|run| run.1 <= GSO_MAX_SEGMENTS));
+        assert!(runs.iter().all(|run| run.1 * full.len() <= GSO_MAX_BYTES));
+        assert_eq!(runs.iter().map(|run| run.1).sum::<usize>(), 200);
+        assert!(gso_runs(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gso_batch_arrives_as_the_same_datagrams_in_order() {
+        let receiver = receiver().await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        // A 4K part's symbols: 400 of one size, then a short last one, as
+        // RLS1 datagrams of one object are.
+        let data: Vec<Vec<u8>> = (0..401_usize)
+            .map(|index| {
+                let len = if index == 400 { 77 } else { 1_190 };
+                (0..len).map(|byte| (byte * 3 + index) as u8).collect()
+            })
+            .collect();
+        let messages = data
+            .iter()
+            .map(|bytes| Outbound::connected(bytes))
+            .collect::<Vec<_>>();
+        let sent = match send_all_gso(&sender, &messages).await {
+            Ok(sent) => sent,
+            Err(stopped) if stopped.sent == 0 && gso_unsupported(&stopped.error) => {
+                eprintln!("UDP GSO is not available here: {}", stopped.error);
+                return;
+            }
+            Err(stopped) => panic!("GSO send failed: {:?}", stopped.error),
+        };
+        // 401 datagrams in 8 messages (runs of 52 by bytes) and one call.
+        assert!(sent.messages <= 8, "{sent:?}");
+        assert!(sent.calls <= 1, "{sent:?}");
+        let received = receive(&receiver, data.len()).await;
+        for (index, (bytes, from)) in received.into_iter().enumerate() {
+            assert_eq!(bytes, data[index], "datagram {index}");
+            assert_eq!(from, sender.local_addr().unwrap());
         }
     }
 
