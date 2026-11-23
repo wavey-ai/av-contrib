@@ -11653,7 +11653,8 @@ async fn main() -> Result<()> {
         if let Some(task) = daw_media_task {
             let _ = task.await;
         }
-        // The packagers end; a short part is not flushed.
+        // The packagers end, each through its own `finish`: that decides
+        // what becomes of an open short part (A 2.6: it is not flushed).
         if let Some(task) = audio_epoch_hls_task {
             let _ = task.await;
         }
