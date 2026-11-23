@@ -541,6 +541,9 @@ const DEFAULT_RELAY_VIDEO_GSO_SEGMENTS: u16 = 16;
 /// `video_gso_cpu_and_bursts`: off, 23 to 28 datagrams in any 100 us and
 /// 172 to 190 in any 1 ms; paced at 2,000, 24 and 152 to 160).
 const DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS: u64 = 2_000;
+/// `--shutdown-grace-ms`: half a second for the lanes' backlogs, well
+/// inside the unit's stop timeout.
+const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 500;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -602,6 +605,15 @@ struct Args {
     /// The node's region in `GET /api/node`, as the deploy names it.
     #[arg(long, env = "AV_REGION", default_value = "")]
     region: String,
+
+    /// After SIGTERM or SIGINT, the longest the stop waits for the lanes'
+    /// backlogs to drain before the last ledger goes out on each lane.
+    #[arg(
+        long,
+        env = "AV_SHUTDOWN_GRACE_MS",
+        default_value_t = DEFAULT_SHUTDOWN_GRACE_MS
+    )]
+    shutdown_grace_ms: u64,
 
     #[arg(
         long,
@@ -1492,6 +1504,9 @@ fn encode_lane_ledger(sent: u64) -> [u8; 16] {
 
 /// How often each lane sends its forwarder its ledger.
 const LANE_LEDGER_INTERVAL_US: u64 = 250_000;
+
+/// How often a stop looks at the lanes' backlogs while they drain.
+const LANE_DRAIN_POLL: Duration = Duration::from_millis(2);
 
 /// `--relay-demand-renditions`: groups of renditions of one source.
 fn parse_rendition_groups(value: &str) -> Result<Vec<Vec<u64>>> {
@@ -2699,6 +2714,32 @@ impl RelaySessionPublisher {
                 path,
             );
         }
+    }
+
+    /// The end of a stop: wait until no lane has a part in its backlog, or
+    /// until `grace_ends`; then send each lane's forwarder its ledger (RLL1)
+    /// once more, so that it counts the lane's last datagrams as sent, not
+    /// as lost. Returns the parts still queued.
+    async fn finish_lanes(&self, grace_ends: tokio::time::Instant) -> usize {
+        let lanes = || {
+            [Some(&self.primary), self.secondary.as_ref()]
+                .into_iter()
+                .flatten()
+        };
+        let queued = || {
+            lanes()
+                .map(|lane| lane.backlog.pending.load(Ordering::Acquire))
+                .sum::<usize>()
+        };
+        while queued() > 0 && tokio::time::Instant::now() < grace_ends {
+            tokio::time::sleep(LANE_DRAIN_POLL).await;
+        }
+        if self.lane_ledger {
+            for lane in lanes() {
+                lane.send_ledger();
+            }
+        }
+        queued()
     }
 
     /// The lanes as `GET /api/node` shows them at `now_unix_us`; `ids` are
@@ -4268,6 +4309,16 @@ impl MeshForwarder {
             relay_exclusive: args.relay_exclusive,
             telemetry,
         })
+    }
+
+    /// The end of a stop for the RelaySession lanes (see
+    /// [`RelaySessionPublisher::finish_lanes`]); nothing to do without
+    /// `--relay-primary-target`.
+    async fn finish_lanes(&self, grace_ends: tokio::time::Instant) -> usize {
+        match &self.relay {
+            Some(relay) => relay.finish_lanes(grace_ends).await,
+            None => 0,
+        }
     }
 
     /// The RelaySession lanes as `GET /api/node` shows them; none without
@@ -11085,6 +11136,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // Taken before anything binds: from here a signal is a graceful stop.
+    let mut stop_signals = StopSignals::new()?;
     let node = contributor_node(&args);
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
     if let Some(warning) = args.legacy_audio_part_warning() {
@@ -11476,44 +11529,94 @@ async fn main() -> Result<()> {
     );
     println!("health:  https://127.0.0.1:{}/up", args.http_port);
 
-    tokio::signal::ctrl_c().await?;
-    let _ = handle.shutdown_tx.send(());
-    let _ = shutdown_tx.send(());
-    if let Some(shutdown) = rist_shutdown {
-        let _ = shutdown.send(());
-    }
-    #[cfg(feature = "srt-ingest")]
-    if let Some(shutdown) = srt_shutdown {
-        let _ = shutdown.send(());
-    }
-    if let Some(shutdown) = rtmp_shutdown {
-        let _ = shutdown.send(());
-    }
-    let _ = handle.finished_rx.await;
-    if let Some(finished) = rtmp_finished {
-        let _ = finished.await;
-    }
-    if let Some(task) = rtmp_task {
-        let _ = task.await;
-    }
-    if let Some(task) = daw_media_task {
-        let _ = task.await;
-    }
-    if let Some(task) = audio_epoch_hls_task {
-        let _ = task.await;
-    }
-    if let Some(task) = audio_epoch_normalizer_task {
-        let _ = task.await;
-    }
-    if let Some(task) = audio_epoch_mesh_task {
-        let _ = task.await;
-    }
-    let _ = publication_shutdown_tx.send(());
-    drop(publisher);
-    for task in publication_tasks {
-        let _ = task.await;
+    let signal = stop_signals.recv().await;
+    let grace_ends = tokio::time::Instant::now() + Duration::from_millis(args.shutdown_grace_ms);
+    info!(
+        signal,
+        shutdown_grace_ms = args.shutdown_grace_ms,
+        "stopping: ingest ends, the lanes drain, a last ledger goes out on each lane"
+    );
+    node.stop(now_unix_us());
+    let stop = async {
+        // Ingest ends: no new datagram, access unit or upload is taken.
+        let _ = shutdown_tx.send(());
+        if let Some(shutdown) = rist_shutdown {
+            let _ = shutdown.send(());
+        }
+        #[cfg(feature = "srt-ingest")]
+        if let Some(shutdown) = srt_shutdown {
+            let _ = shutdown.send(());
+        }
+        if let Some(shutdown) = rtmp_shutdown {
+            let _ = shutdown.send(());
+        }
+        if let Some(finished) = rtmp_finished {
+            let _ = finished.await;
+        }
+        if let Some(task) = rtmp_task {
+            let _ = task.await;
+        }
+        if let Some(task) = daw_media_task {
+            let _ = task.await;
+        }
+        // The packagers end; a short part is not flushed.
+        if let Some(task) = audio_epoch_hls_task {
+            let _ = task.await;
+        }
+        if let Some(task) = audio_epoch_normalizer_task {
+            let _ = task.await;
+        }
+        if let Some(task) = audio_epoch_mesh_task {
+            let _ = task.await;
+        }
+        // The publication queues empty into the lanes.
+        let _ = publication_shutdown_tx.send(());
+        drop(publisher);
+        for task in publication_tasks {
+            let _ = task.await;
+        }
+        let left = forwarder.finish_lanes(grace_ends).await;
+        // The HTTP server last: GET /api/node says `stopping` until here.
+        let _ = handle.shutdown_tx.send(());
+        let _ = handle.finished_rx.await;
+        left
+    };
+    tokio::select! {
+        biased;
+        second = stop_signals.recv() => {
+            warn!(signal = second, "a second stop signal: exiting at once");
+            std::process::exit(0);
+        }
+        left = stop => {
+            info!(parts_left_in_lane_backlogs = left, "stop complete");
+        }
     }
     Ok(())
+}
+
+/// SIGTERM and SIGINT: each asks for the graceful stop; one that comes
+/// during the stop ends the process at once.
+struct StopSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate()).context("failed to handle SIGTERM")?,
+            interrupt: signal(SignalKind::interrupt()).context("failed to handle SIGINT")?,
+        })
+    }
+
+    /// The next signal's name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.interrupt.recv() => "SIGINT",
+        }
+    }
 }
 
 /// This process's status for `GET /api/node`, `starting` until its lanes
@@ -14702,6 +14805,61 @@ mod tests {
         assert_eq!(datagrams, expected, "the ledger came behind them");
     }
 
+    /// The end of a stop (AC7): the lanes' backlogs drain until the grace
+    /// ends, then every lane sends its ledger once more.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_backlogs_until_the_grace_ends_then_sends_each_ledger() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary.local_addr().unwrap());
+        args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+        args.relay_class_lanes = false;
+        args.relay_lane_ledger = true;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, telemetry)
+            .await
+            .unwrap()
+            .unwrap();
+        relay.primary.count_sent(&relay.primary.socket, 5);
+        let ledger = |socket: &UdpSocket| {
+            let mut wire = [0_u8; 64];
+            let len = socket.try_recv(&mut wire).expect("a ledger is waiting");
+            assert_eq!((len, &wire[..5]), (16, &b"RLL1\x01"[..]));
+            u64::from_be_bytes(wire[8..16].try_into().unwrap())
+        };
+
+        // A part that cannot leave holds the stop until the grace ends.
+        let held = &relay.secondary.as_ref().unwrap().backlog.pending;
+        held.store(1, Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let left = relay
+            .finish_lanes(started + Duration::from_millis(60))
+            .await;
+        assert_eq!(left, 1);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        primary.readable().await.unwrap();
+        secondary.readable().await.unwrap();
+        assert_eq!((ledger(&primary), ledger(&secondary)), (5, 0));
+
+        // With nothing queued it does not wait.
+        held.store(0, Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let left = relay.finish_lanes(started + Duration::from_secs(10)).await;
+        assert_eq!(left, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        primary.readable().await.unwrap();
+        assert_eq!(ledger(&primary), 5);
+    }
+
+    #[test]
+    fn the_shutdown_grace_is_half_a_second() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(args.shutdown_grace_ms, 500);
+        let args = Args::try_parse_from(["av-contrib", "--shutdown-grace-ms", "0"]).unwrap();
+        assert_eq!(args.shutdown_grace_ms, 0);
+    }
+
     /// Wave 7 review: with --relay-secondary-seed-source off and no copies
     /// (a clean lane), the secondary still carries a one-symbol audio part:
     /// its source. With a copy it carries the copy, as before.
@@ -14950,6 +15108,7 @@ mod tests {
             relay_local_id: "av-contrib-test".to_owned(),
             node_id: None,
             region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -15062,6 +15221,7 @@ mod tests {
             relay_local_id: "av-contrib-test".to_owned(),
             node_id: None,
             region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16024,6 +16184,7 @@ mod tests {
             relay_local_id: "av-contrib-test".to_owned(),
             node_id: None,
             region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16276,6 +16437,7 @@ mod tests {
             relay_local_id: "av-contrib-test".to_owned(),
             node_id: None,
             region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16428,6 +16590,7 @@ mod tests {
             relay_local_id: "av-contrib-test".to_owned(),
             node_id: None,
             region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
