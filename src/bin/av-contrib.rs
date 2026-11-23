@@ -5300,6 +5300,12 @@ struct StreamPublication {
     class: Option<PublicationClass>,
     /// Parts of the stream handed to `shard` and not yet published.
     in_flight: Arc<AtomicUsize>,
+    /// The key epoch of the stream's last ingest session on this process;
+    /// 0 before the first.
+    session_epoch: u64,
+    /// The lowest first Media Sequence Number of the stream's next stamper:
+    /// above the last number an earlier ingest session stamped.
+    first_msn_floor: u64,
 }
 
 impl StreamPublication {
@@ -5311,7 +5317,26 @@ impl StreamPublication {
             shard: None,
             class: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            session_epoch: 0,
+            first_msn_floor: 0,
         }
+    }
+
+    /// A new ingest session of the stream begins at `now_unix_us`: its
+    /// publication starts again (part count, stamper, first-segment clock)
+    /// under a key epoch above every epoch the process used for the stream,
+    /// with its first Media Sequence Number above the last one stamped. The
+    /// worker and the parts in flight stay, so that parts leave in order.
+    /// Returns the epoch.
+    fn begin_ingest_session(&mut self, now_unix_us: u64) -> u64 {
+        let epoch = now_unix_us.max(self.session_epoch.saturating_add(1));
+        self.session_epoch = epoch;
+        if let Some(last) = self.stamper.take().and_then(|stamper| stamper.msn()) {
+            self.first_msn_floor = self.first_msn_floor.max(last.saturating_add(1));
+        }
+        self.video_started_unix_us = None;
+        self.next_sequence = 0;
+        epoch
     }
 }
 
@@ -5599,12 +5624,14 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             if has_video && stream.stamper.is_none() {
                 stream.video_started_unix_us = Some(started_unix_us);
             }
+            let first_msn_floor = stream.first_msn_floor;
             let stamper = stream.stamper.get_or_insert_with(|| {
                 if has_video {
                     StreamStamper::new(durations.video_part_us, durations.video_segment_us)
                 } else {
                     StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
                 }
+                .with_first_msn_floor(first_msn_floor)
             });
             part.hls = Some(stamper.stamp(
                 part.duration_us,
@@ -5676,6 +5703,16 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
 
     fn record_mpeg_ts_payload_drop(&self, drop: MpegTsPayloadDrop) {
         self.telemetry.record_mpeg_ts_payload_drop(drop);
+    }
+
+    fn begin_ingest_session(&self, stream_id: u64) -> Option<u64> {
+        let entry = self.streams.entry(stream_id);
+        let mut stream = entry.publication();
+        let epoch = stream.begin_ingest_session(hop_journal::now_unix_us());
+        // The stream's first segment is numbered from its new first part,
+        // not from the clock of the earlier session's.
+        self.streams.video_starts().remove(&stream_id);
+        Some(epoch)
     }
 
     async fn publish_opaque_part(
@@ -6519,34 +6556,24 @@ async fn run_upload_response_ts_bridge(
                                         None,
                                         None,
                                     );
-                                    state.bridge = Some(
-                                        if public_stream_id == output_stream_id {
-                                            if let Some(sink) = &access_unit_sink {
-                                                if publish_source {
-                                                    TsFmp4Bridge::new_publish_only_with_access_unit_sink(
-                                                        public_stream_id,
-                                                        public_stream_idx,
-                                                        playlists.clone(),
-                                                        min_part_ms,
-                                                        publisher.clone(),
-                                                        sink.clone(),
-                                                    )
-                                                } else {
-                                                    TsFmp4Bridge::new_access_unit_sink_only(
-                                                        public_stream_id,
-                                                        public_stream_idx,
-                                                        playlists.clone(),
-                                                        min_part_ms,
-                                                        sink.clone(),
-                                                    )
-                                                }
-                                            } else {
-                                                TsFmp4Bridge::new_publish_only(
+                                    let mut bridge = if public_stream_id == output_stream_id {
+                                        if let Some(sink) = &access_unit_sink {
+                                            if publish_source {
+                                                TsFmp4Bridge::new_publish_only_with_access_unit_sink(
                                                     public_stream_id,
                                                     public_stream_idx,
                                                     playlists.clone(),
                                                     min_part_ms,
                                                     publisher.clone(),
+                                                    sink.clone(),
+                                                )
+                                            } else {
+                                                TsFmp4Bridge::new_access_unit_sink_only(
+                                                    public_stream_id,
+                                                    public_stream_idx,
+                                                    playlists.clone(),
+                                                    min_part_ms,
+                                                    sink.clone(),
                                                 )
                                             }
                                         } else {
@@ -6557,8 +6584,27 @@ async fn run_upload_response_ts_bridge(
                                                 min_part_ms,
                                                 publisher.clone(),
                                             )
-                                        },
-                                    );
+                                        }
+                                    } else {
+                                        TsFmp4Bridge::new_publish_only(
+                                            public_stream_id,
+                                            public_stream_idx,
+                                            playlists.clone(),
+                                            min_part_ms,
+                                            publisher.clone(),
+                                        )
+                                    };
+                                    // Each feed is an ingest session of its
+                                    // own: a new key epoch, and Media Sequence
+                                    // Numbers above the earlier session's.
+                                    if bridge.publishes_source() {
+                                        if let Some(epoch) =
+                                            publisher.begin_ingest_session(public_stream_id)
+                                        {
+                                            bridge.set_source_epoch(epoch);
+                                        }
+                                    }
+                                    state.bridge = Some(bridge);
                                     debug!(
                                         stream_id,
                                         output_stream_id = public_stream_id,
@@ -6716,18 +6762,25 @@ async fn run_rtmp_hls_bridge(
                         output_stream_idx,
                         "RTMP ingest bridged to fMP4 LL-HLS"
                     );
+                    let mut segmenter = Fmp4Segmenter::new_publish_only(
+                        output_stream_id,
+                        output_stream_idx,
+                        playlists.clone(),
+                        TimestampInput::Millis,
+                        min_part_ms,
+                        publisher.clone(),
+                    );
+                    // Each RTMP stream is an ingest session of its own: a
+                    // new key epoch, and Media Sequence Numbers above the
+                    // earlier session's.
+                    if let Some(epoch) = publisher.begin_ingest_session(output_stream_id) {
+                        segmenter.set_source_epoch(epoch);
+                    }
                     segmenters.insert(
                         stream.id,
                         RtmpSegmenterState {
                             output_stream_id,
-                            segmenter: Fmp4Segmenter::new_publish_only(
-                                output_stream_id,
-                                output_stream_idx,
-                                playlists.clone(),
-                                TimestampInput::Millis,
-                                min_part_ms,
-                                publisher.clone(),
-                            ),
+                            segmenter,
                         },
                     );
                 }
@@ -12589,6 +12642,176 @@ mod tests {
             }
         }
         stamps
+    }
+
+    /// Part number, key epoch and Media Sequence Number of each part
+    /// queued, in order.
+    fn drained_numbers(
+        receivers: &mut [mpsc::Receiver<QueuedPublication>],
+    ) -> Vec<(u64, u64, u64)> {
+        let mut numbers = Vec::new();
+        for receiver in receivers.iter_mut() {
+            while let Ok(publication) = receiver.try_recv() {
+                if let QueuedPublication::Fmp4 { part, .. } = publication {
+                    let epoch = part.source_epoch.expect("a session's part has its epoch");
+                    numbers.push((part.sequence, epoch, part.hls.unwrap().msn));
+                }
+            }
+        }
+        numbers
+    }
+
+    /// One ingest session of video stream 1 on `publisher`, as a bridge
+    /// runs it: `parts` key-frame parts of 66.7 ms, published from
+    /// `from_ns` on the wall clock. Returns the session's epoch and each
+    /// part's numbers.
+    async fn video_session(
+        publisher: &BoundedFmp4Publisher,
+        receivers: &mut [mpsc::Receiver<QueuedPublication>],
+        from_ns: i64,
+        parts: i64,
+    ) -> (u64, Vec<(u64, u64, u64)>) {
+        let epoch = publisher.begin_ingest_session(1).unwrap();
+        for index in 0..parts {
+            let mut part = test_fmp4_part(
+                1,
+                0,
+                true,
+                2,
+                0,
+                None,
+                Bytes::from_static(b"frame"),
+                from_ns + index * 66_733_000,
+            );
+            part.source_epoch = Some(epoch);
+            publisher.publish_fmp4_part(part).await.unwrap();
+        }
+        (epoch, drained_numbers(receivers))
+    }
+
+    #[tokio::test]
+    async fn two_sessions_on_one_process_get_rising_epochs_and_numbers() {
+        let durations = Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .stamp_durations();
+        let segment_ns = i64::try_from(durations.video_segment_us * 1_000).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(durations);
+        let start_ns = 1_763_924_000_000_000_000_i64;
+        let (first_epoch, first) = video_session(&publisher, &mut receivers, start_ns, 90).await;
+        let clock_msn = start_ns as u64 / 1_000 / durations.video_segment_us;
+        assert_eq!(first[0], (0, first_epoch, clock_msn));
+        let last_msn = first.last().unwrap().2;
+        assert!(last_msn >= first[0].2 + 2, "{first:?}");
+
+        // The feed comes back at once, with a source clock a segment
+        // behind: its first segment is still numbered above the first
+        // session's last, and its parts are counted from 0 under a higher
+        // epoch.
+        let (second_epoch, second) =
+            video_session(&publisher, &mut receivers, start_ns - segment_ns, 90).await;
+        assert!(second_epoch > first_epoch);
+        assert_eq!(second[0], (0, second_epoch, last_msn + 1));
+        assert!(
+            second.windows(2).all(|pair| pair[0].2 <= pair[1].2),
+            "{second:?}"
+        );
+        assert_eq!(second.last().unwrap().0, 89);
+
+        // A third session at once: the epoch rises even when the clock has
+        // not, and a session with no part leaves the floor where it was.
+        let (third_epoch, third) = video_session(&publisher, &mut receivers, start_ns, 0).await;
+        assert!(third_epoch > second_epoch);
+        assert!(third.is_empty());
+        assert!(publisher.streams.video_starts().get(&1).is_none());
+        let (fourth_epoch, fourth) = video_session(&publisher, &mut receivers, start_ns, 1).await;
+        assert!(fourth_epoch > third_epoch);
+        assert_eq!(fourth[0], (0, fourth_epoch, second.last().unwrap().2 + 1));
+        // The new session's first part started the stream's clock anew.
+        assert_eq!(
+            publisher.streams.video_starts().get(&1).copied(),
+            Some(start_ns as u64 / 1_000)
+        );
+    }
+
+    /// The call site of the RTMP bridge: each RTMP stream of one output
+    /// stream is an ingest session of its own.
+    #[tokio::test]
+    async fn each_rtmp_stream_is_an_ingest_session_of_its_own() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let publisher: Arc<dyn Fmp4PartPublisher> = Arc::new(publisher);
+        let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+        let (events, rx) = mpsc::channel(1_024);
+        let bridge = tokio::spawn(run_rtmp_hls_bridge(
+            rx,
+            playlists,
+            publisher,
+            Arc::new(IngestTelemetry::default()),
+            9,
+            args.video_part_ms(),
+        ));
+        // The encoder connects, drops and connects again on the same key.
+        for connection in [1, 2] {
+            let stream = RtmpStreamInfo {
+                key: "9".to_owned(),
+                id: connection,
+            };
+            for index in 0..20 {
+                let mut access_unit = aac_frame(index);
+                (access_unit.pts, access_unit.dts) = (index * 21, index * 21);
+                events
+                    .send(RtmpIngestEvent::AccessUnit {
+                        stream: stream.clone(),
+                        access_unit,
+                    })
+                    .await
+                    .unwrap();
+            }
+            events.send(RtmpIngestEvent::End { stream }).await.unwrap();
+        }
+        drop(events);
+        bridge.await.unwrap();
+
+        let numbers = drained_numbers(&mut receivers);
+        let first_epoch = numbers[0].1;
+        let split = numbers
+            .iter()
+            .position(|numbers| numbers.1 != first_epoch)
+            .expect("the second connection publishes under its own epoch");
+        let (first, second) = numbers.split_at(split);
+        assert!(second.iter().all(|numbers| numbers.1 == second[0].1));
+        assert!(second[0].1 > first_epoch);
+        assert_eq!((first[0].0, second[0].0), (0, 0), "{numbers:?}");
+        assert!(second[0].2 > first.last().unwrap().2, "{numbers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_feed_that_returns_does_not_step_the_sequence_back() {
+        // Contributors A and B, the feed on A, then B, then A again, ten
+        // seconds apart on clocks that agree.
+        let durations = Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .stamp_durations();
+        let (a, mut a_receivers) = stamping_publisher(durations);
+        let (b, mut b_receivers) = stamping_publisher(durations);
+        let start_ns = 1_763_924_000_000_000_000_i64;
+        let ten_s = 10_000_000_000_i64;
+        let (a_epoch, on_a) = video_session(&a, &mut a_receivers, start_ns, 60).await;
+        let (_, on_b) = video_session(&b, &mut b_receivers, start_ns + ten_s, 60).await;
+        let (a_again_epoch, on_a_again) =
+            video_session(&a, &mut a_receivers, start_ns + 2 * ten_s, 60).await;
+        assert!(a_again_epoch > a_epoch);
+        let msns = on_a
+            .iter()
+            .chain(&on_b)
+            .chain(&on_a_again)
+            .map(|numbers| numbers.2)
+            .collect::<Vec<_>>();
+        assert!(msns.windows(2).all(|pair| pair[0] <= pair[1]), "{msns:?}");
+        assert!(on_a_again[0].2 > on_b.last().unwrap().2);
+        // Without a new session A would have gone on from its own last
+        // number, below B's.
+        assert!(on_a.last().unwrap().2 + 1 < on_b.last().unwrap().2);
     }
 
     #[tokio::test]

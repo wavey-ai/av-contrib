@@ -177,6 +177,16 @@ pub trait Fmp4PartPublisher: Send + Sync {
         Err("opaque part publication is not supported by this publisher".to_string())
     }
 
+    /// A new ingest session of `stream_id` begins (a feed connected, or
+    /// connected again): the publisher starts the stream's publication anew
+    /// under a new key epoch, above every epoch and Media Sequence Number it
+    /// used for the stream, and returns the epoch for the session's parts.
+    /// `None`: this publisher keeps no publication state, and the parts
+    /// keep the epoch that it gives them.
+    fn begin_ingest_session(&self, _stream_id: u64) -> Option<u64> {
+        None
+    }
+
     fn record_mpeg_ts_continuity_issue(&self, _issue: MpegTsContinuityIssue) {}
 
     fn record_mpeg_ts_payload_drop(&self, _drop: MpegTsPayloadDrop) {}
@@ -383,6 +393,18 @@ impl TsFmp4Bridge {
         for access_unit in access_units {
             self.dispatch_access_unit(access_unit, false).await;
         }
+    }
+
+    /// Whether the bridge publishes the stream it demultiplexes (and not
+    /// only hands its access units to a sink).
+    pub fn publishes_source(&self) -> bool {
+        self.publish_source
+    }
+
+    /// Set the canonical source epoch for all parts that the bridge
+    /// publishes: its ingest session's.
+    pub fn set_source_epoch(&mut self, source_epoch: u64) {
+        self.segmenter.set_source_epoch(source_epoch);
     }
 
     pub async fn finish(&mut self) {
