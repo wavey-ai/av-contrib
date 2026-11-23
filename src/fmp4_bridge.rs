@@ -130,6 +130,10 @@ pub struct PublishedFmp4Part {
 /// One immutable opaque media part. The bytes are recovered from contributor
 /// transport and are not parsed or transformed by the LL-HLS publication
 /// path. Producers and consumers own any framing inside the payload.
+///
+/// The part is every epoch of part `anchor.part_number()` of its AEP1
+/// session, in order; `sequence` and `source_epoch` are that number and the
+/// session's key epoch.
 #[derive(Debug, Clone)]
 pub struct PublishedOpaquePart {
     pub stream_id: u64,
@@ -155,6 +159,8 @@ pub struct PublishedOpaquePart {
     /// AEP1 arrival and recovery times of the part's source, for the hop
     /// journal.
     pub source_times: crate::hop_journal::PartSourceTimes,
+    /// Where the part sits on its source's timeline: what names it.
+    pub anchor: crate::part_timing::SourceAnchor,
 }
 
 #[derive(Debug, Clone, Copy)]

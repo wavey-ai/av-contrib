@@ -11904,6 +11904,7 @@ mod tests {
         assert_eq!(rtmp_output_stream_id(&stream("0", 995), 1, true), 1);
     }
     use av_contrib::hls_stamp::HlsStamp;
+    use av_contrib::part_timing::SourceAnchor;
     use music_audio_session::{MultichannelAudioSender, MultichannelAudioSessionConfig};
     use raptorq_datagram_fec::{
         AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch, MultichannelAudioFecConfig,
@@ -12185,6 +12186,19 @@ mod tests {
             audio_units: 1,
             hls: None,
             source_times: Default::default(),
+            anchor: test_anchor(0, 240),
+        }
+    }
+
+    /// The anchor of part `number` of a session of one-epoch parts of
+    /// `samples` at 48 kHz.
+    fn test_anchor(number: u64, samples: u64) -> SourceAnchor {
+        SourceAnchor {
+            session_id_ns: 1_721_000_000_000_000_000,
+            first_pts_samples: number * samples,
+            last_pts_samples: number * samples,
+            part_samples: samples,
+            sample_rate: 48_000,
         }
     }
 
@@ -13159,6 +13173,7 @@ mod tests {
                 target_duration_us: 1_000_000,
             }),
             source_times: Default::default(),
+            anchor: test_anchor(17, 120),
         };
         let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
         // The place of the part in the playlist travels with the object.

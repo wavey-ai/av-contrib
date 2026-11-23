@@ -5,13 +5,22 @@
 //! not inspect recovered group bytes. The fMP4 policy boxes supported elementary
 //! audio and removes an unencrypted SoundKit header from Opus. Publication uses
 //! one worker for each session, group, and audio format.
+//!
+//! An opaque part is named from its source alone. The epoch with sample count
+//! `pts` belongs to part `pts / P` of its session (`P` samples a part), a part
+//! is published only with every one of its epochs, and its number, place and
+//! times are arithmetic on the AEP1 header ([`SourceAnchor`]). Nothing counts
+//! what this process has seen, so a contributor that starts in the middle of
+//! a session, or loses an epoch, publishes every other part exactly as one
+//! that did not. Input that would put other bytes under a number already
+//! published is not published and is counted ([`OpaqueStreamCounts`]).
 
 use crate::fmp4_bridge::{
     Fmp4PartPublisher, Fmp4Segmenter, PublishedOpaquePart, TimestampInput, DEFAULT_MIN_PART_MS,
 };
 use crate::hop_journal::{now_unix_us, PartSourceTimes};
 pub use crate::part_timing::AudioPartSize;
-use crate::part_timing::{legacy_ms, samples_to_us};
+use crate::part_timing::{legacy_ms, part_place, part_samples, samples_to_us, SourceAnchor};
 use crate::soundkit_v2::{terminalize_soundkit_group, SoundKitV2StreamRef};
 use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS, PSI_STREAM_PRIVATE_DATA};
 use boxer::fmp4::{
@@ -26,7 +35,7 @@ use music_audio_session::{
 use playlists::Playlists;
 use raptorq_datagram_fec::{AudioPayloadKind, AudioSampleFormat};
 use raptorq_fec_transport::MultichannelAudioTransportAdapter;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{
@@ -66,6 +75,16 @@ const PCM_RENDITION_STREAM_OFFSET: u64 = 2_000;
 /// the hop journal, in a table indexed by block id: 512 ms of the smallest
 /// epochs, 10 s of 5 ms epochs.
 const FIRST_ARRIVAL_BLOCKS: usize = 2_048;
+/// Part numbers below a rendition's highest that are remembered one by one:
+/// a part completed late inside them still takes its own number, and a number
+/// published before is never published again. 8.2 s of 1 ms parts.
+const NUMBER_WINDOW_PARTS: u64 = 8_192;
+const NUMBER_WINDOW_WORDS: usize = (NUMBER_WINDOW_PARTS / 64) as usize;
+/// A part whose source time is this far ahead of this host's clock is
+/// counted (`time_ahead`): its session's sample count did not start at 0, or
+/// followed a transport position. It is published all the same: no host's
+/// clock decides what a contributor publishes.
+const SOURCE_TIME_AHEAD_NS: i64 = 2_000_000_000;
 static WORKER_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
 static WORKER_GROUPS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static WORKER_RAPTORQ_FRAGMENTS_RECOVERED: AtomicU64 = AtomicU64::new(0);
@@ -159,6 +178,83 @@ pub struct AudioEpochHlsConfig {
     /// Runtimes that the rendition workers run on, in turn (the audio hot
     /// threads); `None`: the caller's runtime.
     pub rendition_runtimes: Option<RenditionRuntimes>,
+    /// What the opaque packaging counts for each stream.
+    pub opaque_streams: Arc<OpaqueStreamTable>,
+}
+
+/// Counts of the opaque packaging of one stream, since the process started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpaqueStreamCounts {
+    pub stream_id: u64,
+    /// Parts dropped unpublished because an epoch of a later part arrived
+    /// while one of theirs was still missing.
+    pub parts_skipped: u64,
+    /// Parts published below the stream's highest number: completed late
+    /// (an epoch recovered by a late repair, a late track of the source).
+    pub late_fills: u64,
+    /// Epochs not published because their part number was published before
+    /// or is too far below the highest to tell: the source reused a sample
+    /// count within a session.
+    pub numbers_reused: u64,
+    /// Epochs not published because their frame count or sample rate is not
+    /// that of their session's first epoch.
+    pub geometry_changed: u64,
+    /// Parts published whose source time was more than 2 s ahead of this
+    /// host's clock.
+    pub time_ahead: u64,
+}
+
+/// The counters behind [`OpaqueStreamCounts`]: one set a stream, shared by
+/// the stream's sessions.
+#[derive(Debug, Default)]
+struct OpaqueStreamCounters {
+    parts_skipped: AtomicU64,
+    late_fills: AtomicU64,
+    numbers_reused: AtomicU64,
+    geometry_changed: AtomicU64,
+    time_ahead: AtomicU64,
+}
+
+/// Add one to `counter` and return the new count.
+fn count(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The opaque streams of one worker and their counters. The lock is taken
+/// when a rendition starts and by a reader, never for a part.
+#[derive(Debug, Default)]
+pub struct OpaqueStreamTable {
+    streams: std::sync::Mutex<BTreeMap<u64, Arc<OpaqueStreamCounters>>>,
+}
+
+impl OpaqueStreamTable {
+    fn stream(&self, stream_id: u64) -> Arc<OpaqueStreamCounters> {
+        Arc::clone(
+            self.streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(stream_id)
+                .or_default(),
+        )
+    }
+
+    /// The counts of every stream that has had an opaque rendition, by
+    /// stream id.
+    pub fn snapshot(&self) -> Vec<OpaqueStreamCounts> {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(stream_id, counters)| OpaqueStreamCounts {
+                stream_id: *stream_id,
+                parts_skipped: counters.parts_skipped.load(Ordering::Relaxed),
+                late_fills: counters.late_fills.load(Ordering::Relaxed),
+                numbers_reused: counters.numbers_reused.load(Ordering::Relaxed),
+                geometry_changed: counters.geometry_changed.load(Ordering::Relaxed),
+                time_ahead: counters.time_ahead.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
 }
 
 /// The runtimes of the rendition workers: each new worker goes to the next
@@ -228,6 +324,7 @@ impl AudioEpochHlsConfig {
             publisher,
             recovered_epochs: None,
             rendition_runtimes: None,
+            opaque_streams: Arc::default(),
         }
     }
 
@@ -294,9 +391,14 @@ struct RenditionFormat {
 }
 
 struct RenditionState {
+    /// The format of the fMP4 continuity segment, and the sample count its
+    /// next group is expected at. Opaque parts are cut on the sample count
+    /// itself and read neither.
     format: RenditionFormat,
     expected_pts_samples: Option<u64>,
     packager: RenditionPackager,
+    /// The opaque part numbers of the session handed to the publisher.
+    numbers: NumberWindow,
     /// Opus groups refused because their frame does not fit the packaging
     /// (an Opus Custom frame for fMP4, or a frame that does not divide the
     /// part). The error is returned for the 1st, 2nd, 4th, 8th... refusal.
@@ -486,21 +588,141 @@ async fn push_audio_unit(
     Ok(())
 }
 
+/// Cuts the epochs of one session into parts on absolute boundaries of the
+/// session's sample count: the epoch at `pts` is in part `pts / P`.
 struct OpaquePartSegmenter {
     output_stream_id: u64,
     output_stream_idx: usize,
-    source_epoch: u64,
+    /// The AEP1 session id: the session's start in Unix nanoseconds.
+    session_id_ns: u64,
     part: AudioPartSize,
     /// FLAC parts keep FLAC's floor of 32 samples.
     flac: bool,
     publisher: Arc<dyn Fmp4PartPublisher>,
-    bytes: BytesMut,
-    /// Samples in the part, at `sample_rate`.
-    samples: u64,
+    counters: Arc<OpaqueStreamCounters>,
+    /// Set by the session's first epoch.
+    geometry: Option<PartGeometry>,
+    /// The one part being gathered, when a part is several epochs.
+    open: Option<OpenPart>,
+}
+
+/// The epoch and part sizes of a session: those of its first epoch, which
+/// every later epoch must keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartGeometry {
+    frame_count: u32,
     sample_rate: u32,
-    audio_units: usize,
-    published_parts: u64,
+    /// Samples of a part: whole epochs.
+    part_samples: u64,
+}
+
+impl PartGeometry {
+    fn epochs_per_part(&self) -> usize {
+        usize::try_from(self.part_samples / u64::from(self.frame_count.max(1))).unwrap_or(1)
+    }
+}
+
+/// A part of several epochs while some are missing.
+struct OpenPart {
+    number: u64,
+    /// The epochs' payloads by place in the part.
+    epochs: Vec<Option<Bytes>>,
+    missing: usize,
+    /// `pts_samples` of the epochs at the first and the last place.
+    first_pts_samples: u64,
+    last_pts_samples: u64,
     source_times: PartSourceTimes,
+}
+
+/// A part with every one of its epochs, ready to publish.
+struct GatheredPart {
+    anchor: SourceAnchor,
+    bytes: Bytes,
+    audio_units: usize,
+    source_times: PartSourceTimes,
+}
+
+/// The part numbers of one session that were handed to the publisher (a part
+/// held for want of demand counts): the highest, and which of the
+/// [`NUMBER_WINDOW_PARTS`] below it.
+struct NumberWindow {
+    highest: Option<u64>,
+    /// Bit `n % NUMBER_WINDOW_PARTS`: number `n` of the window was handed.
+    handed: [u64; NUMBER_WINDOW_WORDS],
+}
+
+/// What a part number is to the numbers handed so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumberVerdict {
+    /// Above every number handed so far.
+    New,
+    /// Inside the window and not handed: a part completed late.
+    LateFill,
+    /// Handed before, or below the window. Publishing it would put other
+    /// bytes under a number the mesh may already hold: the first forwarders
+    /// take the first arrival of a number without comparing payloads.
+    Reused,
+}
+
+impl NumberWindow {
+    fn new() -> Self {
+        Self {
+            highest: None,
+            handed: [0; NUMBER_WINDOW_WORDS],
+        }
+    }
+
+    fn bit(number: u64) -> (usize, u64) {
+        let index = number % NUMBER_WINDOW_PARTS;
+        ((index / 64) as usize, 1 << (index % 64))
+    }
+
+    fn verdict(&self, number: u64) -> NumberVerdict {
+        match self.highest {
+            None => NumberVerdict::New,
+            Some(highest) if number > highest => NumberVerdict::New,
+            Some(highest) if number == highest || highest - number > NUMBER_WINDOW_PARTS => {
+                NumberVerdict::Reused
+            }
+            Some(_) => {
+                let (word, mask) = Self::bit(number);
+                if self.handed[word] & mask == 0 {
+                    NumberVerdict::LateFill
+                } else {
+                    NumberVerdict::Reused
+                }
+            }
+        }
+    }
+
+    /// Note that `number` was handed to the publisher.
+    fn hand(&mut self, number: u64) {
+        match self.highest {
+            None => self.highest = Some(number),
+            Some(highest) if number > highest => {
+                if number - highest > NUMBER_WINDOW_PARTS {
+                    // Nothing of the old window is in the new one.
+                    self.handed = [0; NUMBER_WINDOW_WORDS];
+                } else {
+                    // The numbers passed over enter the window not handed,
+                    // the old highest handed. Their places are distinct:
+                    // fewer than a window of numbers.
+                    for skipped in highest + 1..number {
+                        let (word, mask) = Self::bit(skipped);
+                        self.handed[word] &= !mask;
+                    }
+                    let (word, mask) = Self::bit(highest);
+                    self.handed[word] |= mask;
+                }
+                self.highest = Some(number);
+            }
+            Some(highest) if number < highest && highest - number <= NUMBER_WINDOW_PARTS => {
+                let (word, mask) = Self::bit(number);
+                self.handed[word] |= mask;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// A recovered AEP1 group and when its datagrams arrived.
@@ -597,15 +819,11 @@ impl std::fmt::Debug for RenditionState {
 impl RenditionPackager {
     async fn finish(&mut self) -> Result<(), String> {
         match self {
-            Self::Opaque(segmenter) => segmenter.finish().await,
+            Self::Opaque(segmenter) => {
+                segmenter.finish();
+                Ok(())
+            }
             Self::Fmp4(rendition) => rendition.finish().await,
-        }
-    }
-
-    fn reset(&mut self) {
-        match self {
-            Self::Opaque(segmenter) => segmenter.reset(),
-            Self::Fmp4(rendition) => rendition.reset(),
         }
     }
 
@@ -628,102 +846,153 @@ impl OpaquePartSegmenter {
     fn new(
         output_stream_id: u64,
         output_stream_idx: usize,
-        source_epoch: u64,
+        session_id_ns: u64,
         part: AudioPartSize,
         flac: bool,
         publisher: Arc<dyn Fmp4PartPublisher>,
+        counters: Arc<OpaqueStreamCounters>,
     ) -> Self {
         Self {
             output_stream_id,
             output_stream_idx,
-            source_epoch: source_epoch.max(1),
+            session_id_ns,
             part,
             flac,
             publisher,
-            bytes: BytesMut::new(),
-            samples: 0,
-            sample_rate: 0,
-            audio_units: 0,
-            published_parts: 0,
-            source_times: PartSourceTimes::default(),
+            counters,
+            geometry: None,
+            open: None,
         }
     }
 
-    /// Add one recovered epoch of `frame_count` samples at `sample_rate`.
-    /// With one epoch per part (the default) the part leaves at once, as
-    /// the epoch's own bytes: no copy and no allocation.
-    async fn push(
+    /// The session's geometry, set by its first epoch, when an epoch of
+    /// `frame_count` samples at `sample_rate` keeps it; `None` when it does
+    /// not.
+    fn geometry_of(&mut self, frame_count: u32, sample_rate: u32) -> Option<PartGeometry> {
+        let geometry = *self.geometry.get_or_insert_with(|| PartGeometry {
+            frame_count,
+            sample_rate,
+            part_samples: part_samples(self.part, sample_rate, frame_count, self.flac),
+        });
+        (geometry.frame_count == frame_count && geometry.sample_rate == sample_rate)
+            .then_some(geometry)
+    }
+
+    /// Add the recovered epoch at `pts_samples`, which is in part `number`
+    /// at `place`, and return the part when this epoch completes it. With
+    /// one epoch per part (the default) the part is the epoch's own bytes:
+    /// no copy and no allocation.
+    ///
+    /// One part is open at a time. An epoch of a later part drops the open
+    /// one, which is then never published here (another contributor that has
+    /// its epochs publishes it); an epoch of an earlier part is dropped.
+    fn push(
         &mut self,
+        geometry: PartGeometry,
+        (number, place): (u64, u64),
         packet: Bytes,
-        frame_count: u32,
-        sample_rate: u32,
+        pts_samples: u64,
         source_times: PartSourceTimes,
-    ) -> Result<(), String> {
-        if self.sample_rate != sample_rate && self.audio_units > 0 {
-            self.flush().await?;
-        }
-        self.sample_rate = sample_rate;
-        self.source_times.merge(&source_times);
-        self.samples = self.samples.saturating_add(u64::from(frame_count));
-        self.audio_units = self.audio_units.saturating_add(1);
-        let complete = match self.part.target_samples(sample_rate, self.flac) {
-            None => true,
-            Some(target) => self.samples >= target,
+    ) -> Option<GatheredPart> {
+        let anchor = |first_pts_samples, last_pts_samples| SourceAnchor {
+            session_id_ns: self.session_id_ns,
+            first_pts_samples,
+            last_pts_samples,
+            part_samples: geometry.part_samples,
+            sample_rate: geometry.sample_rate,
         };
-        if complete && self.audio_units == 1 {
-            // A part of this one epoch: the recovered payload is already
-            // a refcounted buffer of its own.
-            return self.publish(packet).await;
+        let places = geometry.epochs_per_part();
+        if places <= 1 {
+            return Some(GatheredPart {
+                anchor: anchor(pts_samples, pts_samples),
+                bytes: packet,
+                audio_units: 1,
+                source_times,
+            });
         }
-        self.bytes.extend_from_slice(&packet);
-        if complete {
-            self.flush().await?;
+        match self.open.as_ref().map(|open| open.number) {
+            Some(open) if number < open => return None,
+            Some(open) if number > open => {
+                count(&self.counters.parts_skipped);
+                self.open = None;
+            }
+            _ => {}
         }
-        Ok(())
-    }
-
-    async fn finish(&mut self) -> Result<(), String> {
-        self.flush().await
-    }
-
-    fn reset(&mut self) {
-        self.bytes.clear();
-        self.samples = 0;
-        self.audio_units = 0;
-        self.source_times = PartSourceTimes::default();
-    }
-
-    /// Publish the epochs gathered so far.
-    async fn flush(&mut self) -> Result<(), String> {
-        if self.audio_units == 0 {
-            return Ok(());
+        let open = self.open.get_or_insert_with(|| OpenPart {
+            number,
+            epochs: vec![None; places],
+            missing: places,
+            first_pts_samples: pts_samples,
+            last_pts_samples: pts_samples,
+            source_times: PartSourceTimes::default(),
+        });
+        let place = usize::try_from(place).ok()?;
+        // The epoch again (a source may send one twice): the first stays.
+        let slot = open.epochs.get_mut(place).filter(|slot| slot.is_none())?;
+        *slot = Some(packet);
+        open.missing -= 1;
+        open.source_times.merge(&source_times);
+        if place == 0 {
+            open.first_pts_samples = pts_samples;
         }
-        let bytes = self.bytes.split().freeze();
-        self.publish(bytes).await
+        if place + 1 == places {
+            open.last_pts_samples = pts_samples;
+        }
+        if open.missing > 0 {
+            return None;
+        }
+        let open = self.open.take()?;
+        let mut bytes = BytesMut::with_capacity(
+            open.epochs
+                .iter()
+                .map(|epoch| epoch.as_ref().map_or(0, Bytes::len))
+                .sum(),
+        );
+        for epoch in open.epochs.iter().flatten() {
+            bytes.extend_from_slice(epoch);
+        }
+        Some(GatheredPart {
+            anchor: anchor(open.first_pts_samples, open.last_pts_samples),
+            bytes: bytes.freeze(),
+            audio_units: places,
+            source_times: open.source_times,
+        })
     }
 
-    /// Publish `bytes` as the part of the epochs counted so far.
-    async fn publish(&mut self, bytes: Bytes) -> Result<(), String> {
-        let packaged_at_unix_ns = now_unix_ns();
-        let duration_us = samples_to_us(self.samples, self.sample_rate);
+    /// The session ended. A part that lacks an epoch is never published: a
+    /// short part would have other bytes than the whole part that another
+    /// contributor publishes under the same number.
+    fn finish(&mut self) {
+        self.open = None;
+    }
+
+    /// Publish a whole part, gathered at `packaged_at_unix_ns` by this
+    /// host's clock, under the number, epoch and anchor of its source.
+    async fn publish(&self, part: GatheredPart, packaged_at_unix_ns: i64) -> Result<(), String> {
+        let GatheredPart {
+            anchor,
+            bytes,
+            audio_units,
+            source_times,
+        } = part;
+        let duration_us = samples_to_us(anchor.part_samples, anchor.sample_rate);
         let part = PublishedOpaquePart {
             stream_id: self.output_stream_id,
             stream_idx: self.output_stream_idx,
-            source_epoch: Some(self.source_epoch),
-            sequence: self.published_parts,
+            source_epoch: Some(anchor.key_epoch()),
+            sequence: anchor.part_number(),
             duration_ms: legacy_ms(duration_us).max(1),
             duration_us,
-            duration_samples: Some(self.samples),
-            sample_rate: Some(self.sample_rate),
+            duration_samples: Some(anchor.part_samples),
+            sample_rate: Some(anchor.sample_rate),
             packaged_at_unix_ns,
             published_at_unix_ns: now_unix_ns(),
             bytes,
-            audio_units: std::mem::take(&mut self.audio_units),
+            audio_units,
             hls: None,
-            source_times: std::mem::take(&mut self.source_times),
+            source_times,
+            anchor,
         };
-        self.samples = 0;
-        self.published_parts = self.published_parts.saturating_add(1);
         self.publisher.publish_opaque_part(part).await
     }
 }
@@ -1072,18 +1341,19 @@ fn new_rendition_packager(
     payload_kind: AudioPayloadKind,
     sample_rate: u32,
 ) -> RenditionPackager {
-    let source_epoch = session_id.saturating_div(1_000).max(1);
     let flac = payload_kind == AudioPayloadKind::Flac;
     match config.packaging {
         AudioEpochHlsPackaging::Opaque => RenditionPackager::Opaque(OpaquePartSegmenter::new(
             output_stream_id,
             output_stream_idx,
-            source_epoch,
+            session_id,
             config.part,
             flac,
             Arc::clone(&config.publisher),
+            config.opaque_streams.stream(output_stream_id),
         )),
         AudioEpochHlsPackaging::Fmp4 => {
+            let source_epoch = session_id.saturating_div(1_000).max(1);
             // The boxer takes millisecond timestamps (TimestampInput is
             // MillisAbsolute); the part is closed on its sample count.
             let mut segmenter = Fmp4Segmenter::new_publish_only(
@@ -1167,6 +1437,7 @@ async fn package_group_with_times(
                 format,
                 expected_pts_samples: None,
                 refused_opus_groups: 0,
+                numbers: NumberWindow::new(),
                 packager: new_rendition_packager(
                     config,
                     output_stream_id,
@@ -1211,21 +1482,24 @@ async fn package_group_with_times(
         }
     }
 
+    if config.packaging == AudioEpochHlsPackaging::Opaque {
+        return package_group_as_opaque(state, group, times).await;
+    }
+
     let pts_discontinuity = state
         .expected_pts_samples
         .is_some_and(|expected| expected != group.pts_samples);
     let format_changed = state.format != format;
     if format_changed || pts_discontinuity || group.flags & AUDIO_GROUP_FLAG_DISCONTINUITY != 0 {
-        state.packager.finish().await?;
-        state.packager.reset();
+        let rendition = state.packager.fmp4()?;
+        rendition.finish().await?;
+        rendition.reset();
+        rendition.segmenter.set_min_part_us(fmp4_min_part_us(
+            config,
+            group.payload_kind,
+            group.sample_rate,
+        ));
         state.format = format;
-        if let RenditionPackager::Fmp4(rendition) = &mut state.packager {
-            rendition.segmenter.set_min_part_us(fmp4_min_part_us(
-                config,
-                group.payload_kind,
-                group.sample_rate,
-            ));
-        }
         debug!(
             session_id = group.session_id,
             group_id = group.group_id,
@@ -1241,17 +1515,90 @@ async fn package_group_with_times(
             .checked_add(u64::from(group.frame_count))
             .ok_or_else(|| "AEP1 audio PTS overflow".to_string())?,
     );
+    package_group_as_fmp4(state, group, times).await
+}
 
-    match config.packaging {
-        AudioEpochHlsPackaging::Opaque => {
-            state
-                .packager
-                .opaque()?
-                .push(group.payload, group.frame_count, group.sample_rate, times)
-                .await
+/// Publish the opaque part that this epoch completes, if it completes one
+/// and its source kept the AEP1 source contract.
+///
+/// The part an epoch belongs to, and everything that names the part, comes
+/// from the epoch's session id and sample count: there is no continuity to
+/// reset, and a gap in the sample count is a hole in the numbers. Input
+/// outside the contract is counted and not published; nothing here is an
+/// error, so a source that loops does not log a line an epoch.
+async fn package_group_as_opaque(
+    state: &mut RenditionState,
+    group: DecodedMultichannelAudioGroup,
+    times: PartSourceTimes,
+) -> Result<(), String> {
+    let RenditionState {
+        packager, numbers, ..
+    } = state;
+    let segmenter = packager.opaque()?;
+    let stream_id = segmenter.output_stream_id;
+    let Some(geometry) = segmenter.geometry_of(group.frame_count, group.sample_rate) else {
+        // A session keeps the frame count and rate of its first epoch: part
+        // numbers of another geometry would name other samples.
+        let dropped = count(&segmenter.counters.geometry_changed);
+        if dropped.is_power_of_two() {
+            warn!(
+                stream_id,
+                session_id = group.session_id,
+                frame_count = group.frame_count,
+                sample_rate = group.sample_rate,
+                dropped,
+                "AEP1 epoch geometry changed inside a session: not published until a new session"
+            );
         }
-        AudioEpochHlsPackaging::Fmp4 => package_group_as_fmp4(state, group, times).await,
+        return Ok(());
+    };
+    let (number, place) = part_place(group.pts_samples, geometry.part_samples, group.frame_count);
+    if numbers.verdict(number) == NumberVerdict::Reused {
+        let dropped = count(&segmenter.counters.numbers_reused);
+        if dropped.is_power_of_two() {
+            warn!(
+                stream_id,
+                session_id = group.session_id,
+                pts_samples = group.pts_samples,
+                part = number,
+                dropped,
+                "AEP1 sample count reuses a part number of its session: not published"
+            );
+        }
+        return Ok(());
     }
+    let Some(part) = segmenter.push(
+        geometry,
+        (number, place),
+        group.payload,
+        group.pts_samples,
+        times,
+    ) else {
+        return Ok(());
+    };
+    if numbers.verdict(number) == NumberVerdict::LateFill {
+        count(&segmenter.counters.late_fills);
+    }
+    numbers.hand(number);
+    let packaged_at_unix_ns = now_unix_ns();
+    if part
+        .anchor
+        .source_time_ns()
+        .saturating_sub(packaged_at_unix_ns)
+        > SOURCE_TIME_AHEAD_NS
+    {
+        let ahead = count(&segmenter.counters.time_ahead);
+        if ahead.is_power_of_two() {
+            warn!(
+                stream_id,
+                session_id = group.session_id,
+                pts_samples = group.pts_samples,
+                ahead,
+                "AEP1 source time is ahead of this host's clock: published all the same"
+            );
+        }
+    }
+    segmenter.publish(part, packaged_at_unix_ns).await
 }
 
 async fn package_group_as_fmp4(
@@ -2105,6 +2452,19 @@ mod tests {
         assert_eq!(parts[0].duration_ms, 100);
         assert_eq!(parts[0].audio_units, 20);
         assert_eq!(parts[0].bytes.as_ref(), expected);
+        // The part is named by its source: part 0 of session 101, from the
+        // sample count of its first epoch to that of its last.
+        assert_eq!(parts[0].sequence, 0);
+        assert_eq!(
+            parts[0].anchor,
+            SourceAnchor {
+                session_id_ns: 101,
+                first_pts_samples: 0,
+                last_pts_samples: 19 * 240,
+                part_samples: 4_800,
+                sample_rate: 48_000,
+            }
+        );
     }
 
     /// The AEP1 datagrams of one epoch of one 3,000-byte group.
@@ -2313,8 +2673,10 @@ mod tests {
 
         let parts = captured.opaque_parts.lock().unwrap();
         assert_eq!(parts.len(), 2);
+        // Each stream numbers its parts from its own sample count: the PCM
+        // epoch at 0 is part 0, the Opus epoch at 240 part 1 of its stream.
         assert_eq!(parts[0].sequence, 0);
-        assert_eq!(parts[1].sequence, 0);
+        assert_eq!(parts[1].sequence, 1);
         assert_eq!(parts[0].stream_id, 2_007);
         assert_eq!(parts[1].stream_id, 1_007);
         assert_eq!(parts[0].bytes.as_ref(), b"first opaque payload");
@@ -2642,10 +3004,14 @@ mod tests {
         {
             let parts = captured.opaque_parts.lock().unwrap();
             assert_eq!(parts.len(), 2);
-            for part in parts.iter() {
+            for (number, part) in parts.iter().enumerate() {
                 assert_eq!(part.audio_units, 4);
                 assert_eq!(part.duration_samples, Some(48));
                 assert_eq!(part.duration_us, 1_000);
+                assert_eq!(part.sequence, number as u64);
+                assert_eq!(part.anchor.part_samples, 48);
+                assert_eq!(part.anchor.first_pts_samples, number as u64 * 48);
+                assert_eq!(part.anchor.last_pts_samples, number as u64 * 48 + 36);
             }
             assert_eq!(parts[0].bytes.as_ref(), [0, 1, 2, 3]);
         }
@@ -2993,6 +3359,628 @@ mod tests {
         assert_eq!(sink_rx.recv().await.unwrap().epoch.epoch_id, 3);
         assert!(sink_rx.recv().await.is_none());
         assert!(worker_stats().recovered_epochs_dropped >= dropped_before + 2);
+    }
+
+    /// Epoch `index` of session `session_id`: `frame_count` samples at
+    /// `index * frame_count`, its payload a pattern of the index.
+    fn session_group(
+        session_id: u64,
+        index: u64,
+        frame_count: u32,
+        payload_kind: AudioPayloadKind,
+    ) -> DecodedMultichannelAudioGroup {
+        let payload = (0..40_u64)
+            .map(|byte| (index * 7 + byte * 13 + 1) as u8)
+            .collect();
+        let mut group = sized_group(index, frame_count, payload_kind, payload);
+        group.session_id = session_id;
+        group
+    }
+
+    /// What names a part and what it carries: everything of it but this
+    /// host's clocks.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PartIdentity {
+        stream_id: u64,
+        source_epoch: Option<u64>,
+        sequence: u64,
+        duration_us: u64,
+        duration_samples: Option<u64>,
+        sample_rate: Option<u32>,
+        audio_units: usize,
+        anchor: SourceAnchor,
+        bytes: Bytes,
+    }
+
+    fn identities(captured: &CapturingPublisher) -> Vec<PartIdentity> {
+        captured
+            .opaque_parts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|part| PartIdentity {
+                stream_id: part.stream_id,
+                source_epoch: part.source_epoch,
+                sequence: part.sequence,
+                duration_us: part.duration_us,
+                duration_samples: part.duration_samples,
+                sample_rate: part.sample_rate,
+                audio_units: part.audio_units,
+                anchor: part.anchor,
+                bytes: part.bytes.clone(),
+            })
+            .collect()
+    }
+
+    fn counts(config: &AudioEpochHlsConfig, payload_kind: AudioPayloadKind) -> OpaqueStreamCounts {
+        let stream_id = rendition_stream_id(config.base_stream_id, 0, payload_kind).unwrap();
+        config
+            .opaque_streams
+            .snapshot()
+            .into_iter()
+            .find(|counts| counts.stream_id == stream_id)
+            .unwrap_or_default()
+    }
+
+    const SESSION: u64 = 1_700_000_000_000_000_000;
+
+    #[test]
+    fn the_number_window_remembers_what_was_handed() {
+        let mut window = NumberWindow::new();
+        assert_eq!(window.verdict(0), NumberVerdict::New);
+        assert_eq!(window.verdict(u64::MAX), NumberVerdict::New);
+        // A session joined at number 500: everything below is a late fill
+        // until it is handed, within the window.
+        window.hand(500);
+        assert_eq!(window.verdict(500), NumberVerdict::Reused);
+        assert_eq!(window.verdict(501), NumberVerdict::New);
+        assert_eq!(window.verdict(499), NumberVerdict::LateFill);
+        window.hand(499);
+        assert_eq!(window.verdict(499), NumberVerdict::Reused);
+        // 502 is passed over, then handed late, once.
+        window.hand(501);
+        window.hand(503);
+        assert_eq!(window.verdict(500), NumberVerdict::Reused);
+        assert_eq!(window.verdict(501), NumberVerdict::Reused);
+        assert_eq!(window.verdict(502), NumberVerdict::LateFill);
+        window.hand(502);
+        assert_eq!(window.verdict(502), NumberVerdict::Reused);
+        assert_eq!(window.verdict(503), NumberVerdict::Reused);
+
+        // The window is the 8,192 numbers below the highest: one more is
+        // too far below to tell, and counts as reused.
+        let mut window = NumberWindow::new();
+        window.hand(10);
+        window.hand(11);
+        window.hand(11 + NUMBER_WINDOW_PARTS);
+        assert_eq!(window.verdict(11), NumberVerdict::Reused);
+        assert_eq!(window.verdict(12), NumberVerdict::LateFill);
+        assert_eq!(window.verdict(10), NumberVerdict::Reused);
+        window.hand(12 + NUMBER_WINDOW_PARTS);
+        // 11 left the window; 12 is its lowest number, still not handed.
+        assert_eq!(window.verdict(11), NumberVerdict::Reused);
+        assert_eq!(window.verdict(12), NumberVerdict::LateFill);
+        window.hand(12);
+        assert_eq!(window.verdict(12), NumberVerdict::Reused);
+
+        // Every number keeps its own answer as the ring goes round, for
+        // steps of one and of several.
+        let mut window = NumberWindow::new();
+        let mut handed = std::collections::BTreeSet::new();
+        let mut number = 0_u64;
+        for step in 0..40_000_u64 {
+            number += 1 + (step % 7 == 0) as u64 * (step % 5);
+            window.hand(number);
+            handed.insert(number);
+        }
+        for below in 0..=NUMBER_WINDOW_PARTS + 4 {
+            let candidate = number - below;
+            let expected = if below > NUMBER_WINDOW_PARTS || handed.contains(&candidate) {
+                NumberVerdict::Reused
+            } else {
+                NumberVerdict::LateFill
+            };
+            assert_eq!(window.verdict(candidate), expected, "{below} below");
+        }
+        // A jump of more than a window forgets the old one: all below the
+        // new highest inside the window are late fills.
+        window.hand(number + 3 * NUMBER_WINDOW_PARTS);
+        assert_eq!(
+            window.verdict(number + 2 * NUMBER_WINDOW_PARTS),
+            NumberVerdict::LateFill
+        );
+        assert_eq!(window.verdict(number), NumberVerdict::Reused);
+    }
+
+    #[tokio::test]
+    async fn two_packagers_one_joining_at_epoch_500_publish_equal_parts() {
+        // (part, epoch samples, format, first epoch the late packager
+        // gets, its first part).
+        for (part, frame_count, kind, joins_at, first_part) in [
+            (
+                AudioPartSize::Epoch,
+                48_u32,
+                AudioPayloadKind::Pcm,
+                500_u64,
+                500_u64,
+            ),
+            (AudioPartSize::Epoch, 48, AudioPayloadKind::Opus, 500, 500),
+            (AudioPartSize::Epoch, 120, AudioPayloadKind::Opus, 500, 500),
+            (AudioPartSize::Epoch, 240, AudioPayloadKind::Flac, 500, 500),
+            // Parts of five epochs: one that joins inside part 100 (epochs
+            // 500..=504) publishes from part 101.
+            (
+                AudioPartSize::Samples(240),
+                48,
+                AudioPayloadKind::Pcm,
+                502,
+                101,
+            ),
+        ] {
+            let (early_config, early) = epoch_config(part, AudioEpochHlsPackaging::Opaque);
+            let (late_config, late) = epoch_config(part, AudioEpochHlsPackaging::Opaque);
+            let mut early_renditions = HashMap::new();
+            let mut late_renditions = HashMap::new();
+            for index in 0..1_000_u64 {
+                let group = session_group(SESSION, index, frame_count, kind);
+                if index >= joins_at {
+                    package_group(&late_config, &mut late_renditions, group.clone())
+                        .await
+                        .unwrap();
+                }
+                package_group(&early_config, &mut early_renditions, group)
+                    .await
+                    .unwrap();
+            }
+            let early = identities(&early);
+            let late = identities(&late);
+            let epochs_per_part =
+                part_samples(part, 48_000, frame_count, kind == AudioPayloadKind::Flac)
+                    / u64::from(frame_count);
+            assert_eq!(early.len() as u64, 1_000 / epochs_per_part);
+            assert_eq!(late[0].sequence, first_part, "{part} {frame_count}");
+            assert_eq!(
+                late.len() as u64,
+                1_000 / epochs_per_part - first_part,
+                "{part} {frame_count}"
+            );
+            // Every part of the late packager is the early one's part of
+            // that number, field for field and byte for byte.
+            for part in &late {
+                assert_eq!(part, &early[part.sequence as usize]);
+                assert_eq!(part.source_epoch, Some(SESSION / 1_000));
+                assert_eq!(
+                    part.anchor.first_pts_samples,
+                    part.sequence * epochs_per_part * u64::from(frame_count)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_epoch_leaves_the_other_numbers_alone() {
+        for part in [AudioPartSize::Epoch, AudioPartSize::Samples(240)] {
+            let (whole_config, whole) = epoch_config(part, AudioEpochHlsPackaging::Opaque);
+            let (lossy_config, lossy) = epoch_config(part, AudioEpochHlsPackaging::Opaque);
+            let mut whole_renditions = HashMap::new();
+            let mut lossy_renditions = HashMap::new();
+            for index in 0..40_u64 {
+                let group = session_group(SESSION, index, 48, AudioPayloadKind::Pcm);
+                if index != 7 {
+                    package_group(&lossy_config, &mut lossy_renditions, group.clone())
+                        .await
+                        .unwrap();
+                }
+                package_group(&whole_config, &mut whole_renditions, group)
+                    .await
+                    .unwrap();
+            }
+            let whole = identities(&whole);
+            let lossy = identities(&lossy);
+            // Epoch 7 is part 7 of one-epoch parts and in part 1 of
+            // five-epoch parts: that number is a hole, and no other part
+            // moved or changed.
+            let hole = if part == AudioPartSize::Epoch { 7 } else { 1 };
+            assert_eq!(lossy.len(), whole.len() - 1);
+            assert!(lossy.iter().all(|part| part.sequence != hole));
+            for part in &lossy {
+                assert_eq!(part, &whole[part.sequence as usize]);
+            }
+            let skipped = u64::from(part != AudioPartSize::Epoch);
+            assert_eq!(
+                counts(&lossy_config, AudioPayloadKind::Pcm),
+                OpaqueStreamCounts {
+                    stream_id: 2_030,
+                    parts_skipped: skipped,
+                    ..OpaqueStreamCounts::default()
+                }
+            );
+            assert_eq!(
+                counts(&whole_config, AudioPayloadKind::Pcm).parts_skipped,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_part_of_five_epochs_is_cut_on_absolute_boundaries() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(240), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        let payload = |index: u64| session_group(SESSION, index, 48, AudioPayloadKind::Pcm).payload;
+        // The first epoch seen is epoch 3: epochs 3 and 4 are the end of
+        // part 0, which is never whole. Part 1 is epochs 5..=9, wherever
+        // the packager started.
+        for index in 3..10_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        // Part 2 arrives with its epochs out of order (11 completed by a
+        // late repair, after 12; 14 before 13): its bytes are in the order
+        // of the source all the same.
+        for index in [10_u64, 12, 11, 14, 13] {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = identities(&captured);
+        assert_eq!(parts.len(), 2);
+        for (part, number) in parts.iter().zip([1_u64, 2]) {
+            let first = number * 5;
+            assert_eq!(part.sequence, number);
+            assert_eq!(part.audio_units, 5);
+            assert_eq!(part.duration_samples, Some(240));
+            assert_eq!(part.duration_us, 5_000);
+            assert_eq!(
+                part.anchor,
+                SourceAnchor {
+                    session_id_ns: SESSION,
+                    first_pts_samples: first * 48,
+                    last_pts_samples: (first + 4) * 48,
+                    part_samples: 240,
+                    sample_rate: 48_000,
+                }
+            );
+            let expected = (first..first + 5)
+                .flat_map(|index| payload(index))
+                .collect::<Vec<_>>();
+            assert_eq!(part.bytes.as_ref(), expected);
+        }
+        assert_eq!(counts(&config, AudioPayloadKind::Pcm).parts_skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_short_part_is_never_flushed() {
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(240), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        // Seven epochs: one part of five and two epochs of the next.
+        for index in 0..7_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(captured.opaque_parts.lock().unwrap().len(), 1);
+        // The session ends (the worker stops, or retires the rendition).
+        for rendition in renditions.values_mut() {
+            rendition.packager.finish().await.unwrap();
+        }
+        let parts = identities(&captured);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].sequence, 0);
+        assert_eq!(parts[0].audio_units, 5);
+        // And a worker that drains its queue and stops publishes no more.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(240), AudioEpochHlsPackaging::Opaque);
+        let (sender, receiver) = mpsc::channel(16);
+        let key = RenditionKey {
+            session_id: SESSION,
+            group_id: 0,
+            payload_kind: AudioPayloadKind::Pcm,
+        };
+        for index in 0..7_u64 {
+            sender
+                .send((
+                    session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+                    PartSourceTimes::default(),
+                ))
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        run_rendition_worker(config, key, receiver).await;
+        assert_eq!(captured.opaque_parts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_late_epoch_fills_its_own_number() {
+        let (config, captured) = epoch_config(AudioPartSize::Epoch, AudioEpochHlsPackaging::Opaque);
+        let (ordered_config, ordered) =
+            epoch_config(AudioPartSize::Epoch, AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        let mut ordered_renditions = HashMap::new();
+        // Epoch 2 is completed by a late repair, after epochs 3 and 4.
+        for index in [0_u64, 1, 3, 4, 2, 5] {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Opus),
+            )
+            .await
+            .unwrap();
+        }
+        for index in 0..6_u64 {
+            package_group(
+                &ordered_config,
+                &mut ordered_renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Opus),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = identities(&captured);
+        let ordered = identities(&ordered);
+        assert_eq!(
+            parts.iter().map(|part| part.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 3, 4, 2, 5]
+        );
+        // The late part is the part a packager that had it in time made.
+        for part in &parts {
+            assert_eq!(part, &ordered[part.sequence as usize]);
+        }
+        assert_eq!(
+            counts(&config, AudioPayloadKind::Opus),
+            OpaqueStreamCounts {
+                stream_id: 1_030,
+                late_fills: 1,
+                ..OpaqueStreamCounts::default()
+            }
+        );
+        assert_eq!(
+            counts(&ordered_config, AudioPayloadKind::Opus).late_fills,
+            0
+        );
+
+        // A part of several epochs is filled late too, when no later part
+        // is open: here part 1 after part 2 was published whole.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(240), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for index in (0..5_u64).chain(10..15).chain(5..10) {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            identities(&captured)
+                .iter()
+                .map(|part| part.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 1]
+        );
+        assert_eq!(counts(&config, AudioPayloadKind::Pcm).late_fills, 1);
+    }
+
+    #[tokio::test]
+    async fn a_reused_number_is_not_published() {
+        let (config, captured) = epoch_config(AudioPartSize::Epoch, AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for index in 0..10_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        // The source steps its sample count back (a DAW that loops, or
+        // follows a locate): the same numbers with other audio. Not an
+        // error, and nothing is published.
+        for index in 5..8_u64 {
+            let mut group = session_group(SESSION, index, 48, AudioPayloadKind::Pcm);
+            group.payload = Bytes::from(vec![0xee; 40]);
+            package_group(&config, &mut renditions, group)
+                .await
+                .unwrap();
+        }
+        assert_eq!(captured.opaque_parts.lock().unwrap().len(), 10);
+        assert_eq!(counts(&config, AudioPayloadKind::Pcm).numbers_reused, 3);
+
+        // A step forward of more than the window, then numbers far below
+        // it: too old to tell whether they were published, so they are not.
+        package_group(
+            &config,
+            &mut renditions,
+            session_group(SESSION, 20_000, 48, AudioPayloadKind::Pcm),
+        )
+        .await
+        .unwrap();
+        for index in [10_u64, 11, 20_000 - NUMBER_WINDOW_PARTS - 1] {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        // Inside the window a number that was never published is a late
+        // fill, published once.
+        for _ in 0..2 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, 19_000, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = identities(&captured);
+        assert_eq!(parts.len(), 12);
+        assert_eq!(parts[10].sequence, 20_000);
+        assert_eq!(parts[11].sequence, 19_000);
+        assert_eq!(
+            counts(&config, AudioPayloadKind::Pcm),
+            OpaqueStreamCounts {
+                stream_id: 2_030,
+                numbers_reused: 7,
+                late_fills: 1,
+                ..OpaqueStreamCounts::default()
+            }
+        );
+
+        // A part of several epochs: an epoch of a part already published
+        // does not open it again.
+        let (config, captured) =
+            epoch_config(AudioPartSize::Samples(240), AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for index in (0..12_u64).chain(5..10).chain(12..15) {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            identities(&captured)
+                .iter()
+                .map(|part| part.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let counts = counts(&config, AudioPayloadKind::Pcm);
+        assert_eq!(counts.numbers_reused, 5);
+        // Part 2, open with epochs 10 and 11, was not dropped for them.
+        assert_eq!(counts.parts_skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn a_changed_frame_count_publishes_nothing_until_a_new_session() {
+        let (config, captured) = epoch_config(AudioPartSize::Epoch, AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        for index in 0..4_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        // The source doubles its epoch inside the session: from sample 192,
+        // epochs of 96 samples. Their numbers (192 / 96 = 2, 3, ...) would
+        // name other samples than parts 2 and 3 already published.
+        for index in 2..6_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(SESSION, index, 96, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        // A rate change is the same.
+        let mut resampled = session_group(SESSION, 12, 48, AudioPayloadKind::Pcm);
+        resampled.sample_rate = 44_100;
+        package_group(&config, &mut renditions, resampled)
+            .await
+            .unwrap();
+        assert_eq!(captured.opaque_parts.lock().unwrap().len(), 4);
+        assert_eq!(
+            counts(&config, AudioPayloadKind::Pcm),
+            OpaqueStreamCounts {
+                stream_id: 2_030,
+                geometry_changed: 5,
+                ..OpaqueStreamCounts::default()
+            }
+        );
+        // A new session takes the new epoch size, from its own first epoch.
+        let later = SESSION + 5_000_000_000;
+        for index in 0..3_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(later, index, 96, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = identities(&captured);
+        assert_eq!(parts.len(), 7);
+        for (index, part) in parts[4..].iter().enumerate() {
+            assert_eq!(part.sequence, index as u64);
+            assert_eq!(part.source_epoch, Some(later / 1_000));
+            assert_eq!(part.duration_samples, Some(96));
+            assert_eq!(part.anchor.part_samples, 96);
+        }
+        assert_eq!(counts(&config, AudioPayloadKind::Pcm).geometry_changed, 5);
+    }
+
+    #[tokio::test]
+    async fn a_source_ahead_of_the_clock_is_counted_and_published() {
+        let (config, captured) = epoch_config(AudioPartSize::Epoch, AudioEpochHlsPackaging::Opaque);
+        let mut renditions = HashMap::new();
+        let now_ns = u64::try_from(now_unix_ns()).unwrap();
+        // A session that began now: its first epochs are not ahead.
+        for index in 0..3_u64 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(now_ns, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(counts(&config, AudioPayloadKind::Pcm).time_ahead, 0);
+        // Its sample count then jumps an hour (it follows a transport
+        // locate, against the contract): the parts carry a source time an
+        // hour ahead. This host's clock does not decide what is published,
+        // so they go out, counted.
+        let hour = 3_600 * 1_000_u64;
+        for index in hour..hour + 3 {
+            package_group(
+                &config,
+                &mut renditions,
+                session_group(now_ns, index, 48, AudioPayloadKind::Pcm),
+            )
+            .await
+            .unwrap();
+        }
+        let parts = identities(&captured);
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[5].sequence, hour + 2);
+        assert_eq!(
+            parts[5].anchor.source_time_ns(),
+            (now_ns + (hour + 2) * 1_000_000) as i64
+        );
+        assert_eq!(
+            counts(&config, AudioPayloadKind::Pcm),
+            OpaqueStreamCounts {
+                stream_id: 2_030,
+                time_ahead: 3,
+                ..OpaqueStreamCounts::default()
+            }
+        );
     }
 
     /// Thread CPU time, for the benchmark below.
