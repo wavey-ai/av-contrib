@@ -12,6 +12,8 @@ pub mod part_timing;
 pub mod quadra_renditions;
 pub mod soundkit_v2;
 pub mod source_first;
+pub mod source_timing;
+pub mod stall_journal;
 pub mod synchronized_stem_ingress;
 pub mod talkback_publish;
 pub mod udp_batch;

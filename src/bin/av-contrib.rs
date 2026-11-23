@@ -20,6 +20,7 @@ use av_contrib::ingress_authorization::{
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
+use av_contrib::memory::{self, LockMode};
 use av_contrib::part_timing::{AudioPartSize, VideoPartSize};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
@@ -28,6 +29,10 @@ use av_contrib::quadra_renditions::{
 };
 use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
 use av_contrib::source_first::SourceFirstEncoder;
+use av_contrib::source_timing::{self, ReceiveTiming};
+use av_contrib::stall_journal::{
+    self, StallJournal, StallKind, StallSnapshot, StallThread, TickConfig,
+};
 use av_contrib::udp_batch;
 use av_contrib::{codec_name, MediaAccessUnitParams};
 use bytes::{Bytes, BytesMut};
@@ -91,6 +96,8 @@ const NEEDLETAIL_AEP1_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
 const NEEDLETAIL_AEP1_MAX_BUFFER_BYTES: usize = 256 * 1024;
 const CONTRIB_STATUS_PATH: &str = "/api/status";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
+/// The stall journal, D-hunt 2.1's NDJSON (`?since_us=`).
+const CONTRIB_STALLS_PATH: &str = "/api/stalls";
 const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
@@ -898,6 +905,49 @@ struct Args {
         default_value_t = DEFAULT_HOP_JOURNAL_CAPACITY
     )]
     hop_journal_capacity: usize,
+
+    /// Events that the stall journal keeps and serves on /api/stalls: tick
+    /// threads that woke late, AEP1 epochs that arrived late after the one
+    /// before (`src_gap`), datagrams that waited in the DAW socket
+    /// (`rx_wait`), long inline publications and slow lane sends, each
+    /// dated and with its cause. Zero turns the journal and its tick
+    /// threads off.
+    #[arg(
+        long,
+        env = "AV_STALL_JOURNAL_CAPACITY",
+        default_value_t = stall_journal::DEFAULT_CAPACITY
+    )]
+    stall_journal_capacity: usize,
+
+    /// The period in microseconds of the stall journal's tick threads: one
+    /// on each CPU the process may run on, at normal scheduling, that
+    /// sleeps to a deadline every period and books how late it woke. Zero
+    /// starts none, and nothing in the journal can then be told to be a
+    /// stopped CPU.
+    #[arg(
+        long,
+        env = "AV_STALL_TICK_US",
+        default_value_t = stall_journal::DEFAULT_TICK_US
+    )]
+    stall_tick_us: u64,
+
+    /// What is locked in memory: `rings` locks each ring that is written on
+    /// a deadline (the hop journal's) when it is built, `off` nothing. A
+    /// lock the kernel refuses (RLIMIT_MEMLOCK below the ring) is counted
+    /// in /api/status `memory`, and the ring stays faulted in.
+    #[arg(long, env = "AV_MLOCK", default_value_t = LockMode::Rings)]
+    mlock: LockMode,
+
+    /// glibc's heap trim threshold fixed at 256 MB and mmap threshold at
+    /// 32 MB, so that freed memory stays in the heaps for the next
+    /// allocation instead of coming back as page faults.
+    #[arg(long, env = "AV_MALLOC_TUNE", default_value_t = true, action = clap::ArgAction::Set)]
+    malloc_tune: bool,
+
+    /// Fault in the pages of the rings (the hop journal) at start, not one
+    /// by one while the first session fills them.
+    #[arg(long, env = "AV_PREFAULT", default_value_t = true, action = clap::ArgAction::Set)]
+    prefault: bool,
 
     /// Give each new stream the next publication worker of its pool, audio
     /// and video in separate pools, instead of `stream_id % 8`, and give
@@ -3697,7 +3747,14 @@ impl RelaySessionPublisher {
             .iter()
             .map(|(_, wire)| udp_batch::Outbound::connected(wire))
             .collect::<Vec<_>>();
+        let send_started = Instant::now();
         let outcome = udp_batch::try_send_all(socket, &messages);
+        stall_journal::note(
+            StallKind::LaneSend,
+            StallThread::Lane,
+            send_started.elapsed().as_micros() as u64,
+            None,
+        );
         drop(messages);
         lane.count_sent(socket, outcome.sent);
         if outcome.sent > 0
@@ -4774,6 +4831,16 @@ async fn run_daw_media_udp_ingest(
     let bind = socket.local_addr()?;
     let mut decoders = HashMap::<SocketAddr, MediaFecDecoder>::new();
     let mut buf = vec![0u8; 65_536];
+    // A datagram's arrival is the kernel's stamp of it; the read less the
+    // stamp is its `rx_wait` (D-hunt S2).
+    if let Err(error) = source_timing::enable_kernel_stamps(&socket) {
+        warn!(
+            bind = %bind,
+            %error,
+            "DAW media UDP socket has no kernel receive stamps: arrivals are read times"
+        );
+    }
+    let mut reads = ReceiveTiming::new(bind);
 
     loop {
         tokio::select! {
@@ -4781,9 +4848,11 @@ async fn run_daw_media_udp_ingest(
                 info!(bind = %bind, "DAW media UDP relay shutting down");
                 return Ok(());
             }
-            received = socket.recv_from(&mut buf) => {
-                let (len, peer) = received?;
-                let received_unix_us = hop_journal::now_unix_us();
+            received = socket.async_io(tokio::io::Interest::READABLE, || {
+                source_timing::recv_stamped(&socket, &mut buf)
+            }) => {
+                let (len, peer, kernel_us) = received?;
+                let received_unix_us = reads.datagram(kernel_us, hop_journal::now_unix_us());
                 if len == 0 {
                     continue;
                 }
@@ -5367,6 +5436,12 @@ impl BoundedFmp4Publisher {
         .await;
         let held = started.elapsed();
         PUBLICATION_INLINE_MAX_US.fetch_max(held.as_micros() as u64, Ordering::Relaxed);
+        stall_journal::note(
+            StallKind::InlinePublish,
+            StallThread::Publish,
+            held.as_micros() as u64,
+            None,
+        );
         if held >= INLINE_PUBLISH_SLOW {
             let slow = PUBLICATION_INLINE_SLOW.fetch_add(1, Ordering::Relaxed) + 1;
             warn!(
@@ -5703,10 +5778,39 @@ fn start_bounded_publication_pipeline(
     )
 }
 
+/// What an audio hot thread got of its real-time settings, for the status.
+#[derive(Debug, Clone, Serialize)]
+struct HotThreadScheduling {
+    thread: String,
+    /// `--audio-hot-fifo-priority` granted.
+    realtime: bool,
+    fifo_priority: Option<u8>,
+    /// Pinned to its `--audio-hot-cpu`.
+    pinned: bool,
+    cpu: Option<usize>,
+    /// Why a setting was refused, one entry each.
+    refused: Vec<String>,
+}
+
+/// One entry per audio hot thread, in the order they started.
+static AUDIO_HOT_SCHEDULING: std::sync::Mutex<Vec<HotThreadScheduling>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Pin the calling thread and give it SCHED_FIFO, as far as the host
-/// allows; one info line either way.
+/// allows; one info line either way, and the outcome in the status.
 fn make_audio_hot_thread_realtime(cpu: Option<usize>, fifo_priority: u8, what: &str) {
     let outcome = class_lanes::make_current_thread_realtime(cpu, fifo_priority);
+    AUDIO_HOT_SCHEDULING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(HotThreadScheduling {
+            thread: std::thread::current().name().unwrap_or("").to_owned(),
+            realtime: outcome.fifo_priority.is_some(),
+            fifo_priority: outcome.fifo_priority,
+            pinned: outcome.pinned_cpu.is_some(),
+            cpu: outcome.pinned_cpu,
+            refused: outcome.refused.clone(),
+        });
     if outcome.refused.is_empty() {
         info!(
             cpu = ?outcome.pinned_cpu,
@@ -8169,6 +8273,15 @@ impl ContribStatusConfig {
             alerts,
             health,
             activity: self.telemetry.recent_activity(),
+            memory: memory::report(),
+            scheduling: AUDIO_HOT_SCHEDULING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            stall: stall_journal::installed()
+                .filter(|journal| journal.is_enabled())
+                .map(|journal| journal.snapshot()),
+            source_timing: source_timing::snapshot(),
         }
     }
 
@@ -9485,6 +9598,15 @@ struct ContribStatusSnapshot {
     alerts: Vec<ContribAlert>,
     health: ContribHealthStatus,
     activity: Vec<ContribActivity>,
+    /// Rings faulted in and locked, and the process's sizes (D-hunt S2).
+    memory: memory::MemoryReport,
+    /// What each audio hot thread got of its real-time settings.
+    scheduling: Vec<HotThreadScheduling>,
+    /// The stall journal's counters; `None` when it is off.
+    stall: Option<StallSnapshot>,
+    /// The last whole second of the DAW socket's reads and of each AEP1
+    /// source session's arrivals.
+    source_timing: source_timing::SourceTimingSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10428,6 +10550,49 @@ async fn hop_journal_response(
     }
 }
 
+/// `GET /api/stalls?since_us=T`: the stall journal as NDJSON, oldest
+/// first, in D-hunt 2.1's format; empty when the journal is off.
+async fn stalls_response(
+    journal: Option<Arc<StallJournal>>,
+    query: Option<&str>,
+) -> HandlerResponse {
+    let mut since_us = None;
+    for (key, value) in form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        if key == "since_us" {
+            let Ok(value) = value.parse::<u64>() else {
+                return response(
+                    StatusCode::BAD_REQUEST,
+                    Some(Bytes::from_static(
+                        b"since_us must be an unsigned integer\n",
+                    )),
+                    Some("text/plain; charset=utf-8"),
+                );
+            };
+            since_us = Some(value);
+        }
+    }
+    let body = match journal {
+        Some(journal) => {
+            match tokio::task::spawn_blocking(move || journal.render_ndjson(since_us)).await {
+                Ok(body) => body,
+                Err(error) => {
+                    return response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Some(Bytes::from(format!("stall journal read failed: {error}\n"))),
+                        Some("text/plain; charset=utf-8"),
+                    )
+                }
+            }
+        }
+        None => String::new(),
+    };
+    response(
+        StatusCode::OK,
+        Some(Bytes::from(body)),
+        Some(HOP_JOURNAL_CONTENT_TYPE),
+    )
+}
+
 fn needletail_ingest_response(status: StatusCode) -> HandlerResponse {
     let body = serde_json::to_vec(&serde_json::json!({
         "error": "needletail_ingest_rejected",
@@ -10489,6 +10654,11 @@ impl Router for ContribRouter {
             HOP_JOURNAL_PATH => {
                 Ok(hop_journal_response(hop_journal::global(), req.uri().query()).await)
             }
+            CONTRIB_STALLS_PATH => Ok(stalls_response(
+                stall_journal::installed().cloned(),
+                req.uri().query(),
+            )
+            .await),
             CONTRIB_METRICS_PATH => {
                 let mut metrics = self.status.prometheus_metrics().to_vec();
                 if let Some(gate) = &self.publish_ingress_gate {
@@ -10975,6 +11145,36 @@ async fn main() -> Result<()> {
     // Audio-only parts out of the video ingests (RTMP, SRT, RIST, MPEG-TS)
     // are cut to the audio part, which the stamper declares for them.
     av_contrib::fmp4_bridge::set_default_audio_only_part_us(Some(args.audio_only_part_us()));
+    // Memory before the first session, not in it (D-hunt S2): the
+    // allocator keeps what is freed, and the rings built from here on are
+    // faulted in and locked as the flags say.
+    if args.malloc_tune {
+        match memory::tune_allocator() {
+            Ok(()) => info!(
+                trim_threshold = memory::TRIM_THRESHOLD,
+                mmap_threshold = memory::MMAP_THRESHOLD,
+                "allocator keeps freed memory in its heaps (--malloc-tune)"
+            ),
+            Err(reason) => info!(%reason, "allocator thresholds as glibc sets them"),
+        }
+    }
+    memory::configure(args.prefault, args.mlock);
+    // The stall journal runs from the first second, its tick threads
+    // started before any thread is pinned or made real-time.
+    let stalls = stall_journal::install(Arc::new(StallJournal::new(
+        args.relay_local_id.clone(),
+        args.stall_journal_capacity,
+    )));
+    let stall_ticks = stall_journal::spawn_ticks(stalls, TickConfig::every(args.stall_tick_us));
+    info!(
+        capacity = args.stall_journal_capacity,
+        ring_locked = stalls.ring_locked(),
+        tick_us = args.stall_tick_us,
+        tick_threads = stall_ticks.threads().len(),
+        tick_pinned = stall_ticks.pinned(),
+        run_delay_known = stall_ticks.threads().iter().all(|thread| thread.run_delay),
+        "stall journal"
+    );
     hop_journal::install(HopJournal::new(
         args.relay_local_id.clone(),
         args.hop_journal_capacity,
@@ -10989,6 +11189,15 @@ async fn main() -> Result<()> {
              (--hop-journal-capacity)"
         );
     }
+    let rings = memory::report();
+    info!(
+        mode = rings.mode,
+        prefaulted_bytes = rings.prefaulted_bytes,
+        locked_bytes = rings.locked_bytes,
+        lock_refused_bytes = rings.lock_refused_bytes,
+        thp = %rings.thp,
+        "rings in memory (--prefault, --mlock)"
+    );
     validate_compiled_ingress_features(&args)?;
     let publish_ingress_gate = load_publish_ingress_gate()?;
     validate_enforced_ingress_adapters(&args, publish_ingress_gate.as_deref())?;
@@ -12230,6 +12439,89 @@ mod tests {
             }
         }
         shards
+    }
+
+    #[test]
+    fn the_hardening_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(args.mlock, LockMode::Rings);
+        assert!(args.malloc_tune);
+        assert!(args.prefault);
+        assert_eq!(args.stall_journal_capacity, stall_journal::DEFAULT_CAPACITY);
+        assert_eq!(args.stall_tick_us, stall_journal::DEFAULT_TICK_US);
+        let args = Args::try_parse_from([
+            "av-contrib",
+            "--mlock",
+            "off",
+            "--malloc-tune",
+            "false",
+            "--prefault",
+            "false",
+            "--stall-journal-capacity",
+            "0",
+            "--stall-tick-us",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(args.mlock, LockMode::Off);
+        assert!(!args.malloc_tune);
+        assert!(!args.prefault);
+        assert_eq!(args.stall_journal_capacity, 0);
+        assert_eq!(args.stall_tick_us, 0);
+        assert!(Args::try_parse_from(["av-contrib", "--mlock", "all"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn stalls_endpoint_filters_by_since_us() {
+        let journal = Arc::new(StallJournal::new("contrib-test", 64));
+        journal.record(StallKind::SrcGap, StallThread::Receive, 7_500, 0, 0);
+        let between = stall_journal::realtime_us() + 1;
+        std::thread::sleep(Duration::from_millis(2));
+        // Events of one kind and thread closer than 10 ms merge: another
+        // kind is a line of its own.
+        journal.record(StallKind::RxWait, StallThread::Receive, 31_000, 0, 0);
+        journal.record(StallKind::InlinePublish, StallThread::Publish, 20_350, 0, 0);
+        journal.record(StallKind::LaneSend, StallThread::Lane, 1_200, 0, 0);
+
+        let lines = |response: HandlerResponse| {
+            assert_eq!(response.status, StatusCode::OK);
+            String::from_utf8(response.body.unwrap().to_vec())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let all = lines(stalls_response(Some(Arc::clone(&journal)), None).await);
+        let kinds = all
+            .iter()
+            .map(|line| line["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["src_gap", "rx_wait", "inline_publish", "lane_send"]);
+        assert_eq!(all[0]["node"], "contrib-test");
+        assert_eq!(all[0]["thread"], "receive");
+        assert_eq!(all[0]["dur_us"], 7_500);
+        // No tick thread was running: the source's gap was a wait.
+        assert_eq!(all[0]["cause"], "waited");
+        assert_eq!(all[2]["thread"], "publish");
+        assert_eq!(all[2]["cause"], "own");
+        assert_eq!(all[3]["thread"], "lane");
+
+        let later = lines(
+            stalls_response(
+                Some(Arc::clone(&journal)),
+                Some(&format!("since_us={between}")),
+            )
+            .await,
+        );
+        assert_eq!(later.len(), 3);
+        assert_eq!(later[0]["kind"], "rx_wait");
+        assert_eq!(
+            stalls_response(Some(journal), Some("since_us=x"))
+                .await
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(lines(stalls_response(None, None).await).is_empty());
     }
 
     #[test]
@@ -14879,6 +15171,11 @@ mod tests {
             audio_hot_fifo_priority: 0,
             audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
+            stall_journal_capacity: stall_journal::DEFAULT_CAPACITY,
+            stall_tick_us: stall_journal::DEFAULT_TICK_US,
+            mlock: LockMode::Rings,
+            malloc_tune: true,
+            prefault: true,
         }
     }
 
@@ -14989,6 +15286,11 @@ mod tests {
             audio_hot_fifo_priority: 0,
             audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
+            stall_journal_capacity: stall_journal::DEFAULT_CAPACITY,
+            stall_tick_us: stall_journal::DEFAULT_TICK_US,
+            mlock: LockMode::Rings,
+            malloc_tune: true,
+            prefault: true,
         };
 
         let telemetry = Arc::new(IngestTelemetry::default());
@@ -15673,6 +15975,33 @@ mod tests {
     }
 
     #[test]
+    fn the_status_reports_memory_scheduling_and_source_timing() {
+        let args = contrib_status_args();
+        let status_config =
+            ContribStatusConfig::from_args(&args, Arc::new(IngestTelemetry::default()));
+        std::thread::Builder::new()
+            .name("audio-hot-status".to_owned())
+            .spawn(|| make_audio_hot_thread_realtime(None, 0, "status test thread"))
+            .unwrap()
+            .join()
+            .unwrap();
+        let json = serde_json::to_value(status_config.snapshot()).unwrap();
+        assert!(json["memory"]["vm_rss_kb"].as_u64().unwrap() > 0);
+        assert!(["off", "rings"].contains(&json["memory"]["mode"].as_str().unwrap()));
+        let thread = json["scheduling"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|thread| thread["thread"] == "audio-hot-status")
+            .expect("the thread's outcome is in the status");
+        assert_eq!(thread["realtime"], false);
+        assert_eq!(thread["pinned"], false);
+        assert!(json["source_timing"]["receive"].is_array());
+        assert!(json["source_timing"]["sources"].is_array());
+        assert!(json.get("stall").is_some());
+    }
+
+    #[test]
     fn contrib_status_reports_mesh_forward_errors() {
         let args = contrib_status_args();
         let stream_id_text = args.stream_id.to_string();
@@ -15865,6 +16194,11 @@ mod tests {
             audio_hot_fifo_priority: 0,
             audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
+            stall_journal_capacity: stall_journal::DEFAULT_CAPACITY,
+            stall_tick_us: stall_journal::DEFAULT_TICK_US,
+            mlock: LockMode::Rings,
+            malloc_tune: true,
+            prefault: true,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
@@ -16115,6 +16449,11 @@ mod tests {
             audio_hot_fifo_priority: 0,
             audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
+            stall_journal_capacity: stall_journal::DEFAULT_CAPACITY,
+            stall_tick_us: stall_journal::DEFAULT_TICK_US,
+            mlock: LockMode::Rings,
+            malloc_tune: true,
+            prefault: true,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
@@ -16265,6 +16604,11 @@ mod tests {
             audio_hot_fifo_priority: 0,
             audio_hot_workers: 1,
             hop_journal_capacity: DEFAULT_HOP_JOURNAL_CAPACITY,
+            stall_journal_capacity: stall_journal::DEFAULT_CAPACITY,
+            stall_tick_us: stall_journal::DEFAULT_TICK_US,
+            mlock: LockMode::Rings,
+            malloc_tune: true,
+            prefault: true,
         };
         let telemetry = Arc::new(IngestTelemetry::default());
         let forwarder = Arc::new(MeshForwarder::new(&args, telemetry).await.unwrap());
