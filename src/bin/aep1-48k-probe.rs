@@ -2,8 +2,12 @@ use anyhow::{bail, Context, Result};
 use av_contrib::fixture_replay::{
     capture_fixture, replay_fixture, CaptureFixtureOptions, ReplayFixtureOptions,
 };
+use av_contrib::memory;
 use av_contrib::opus_custom::{
     lane_opus_decoder_matches, new_lane_opus_decoder, new_lane_opus_encoder, opus_mode,
+};
+use av_contrib::pacing_journal::{
+    EpochTiming, JournalTotals, PacingJournal, PacingRecorder, DEFAULT_LATE_THRESHOLD_US,
 };
 use boxer::fmp4::opus_packet_info;
 use bytes::{Buf, Bytes, BytesMut};
@@ -166,6 +170,39 @@ enum Command {
         /// of one epoch, which needs epochs of at least 1 ms.
         #[arg(long, value_enum, default_value_t = SendPace::Precise)]
         pace: SendPace,
+        /// Write the lateness journal to PATH while sending (NDJSON): a
+        /// `late` line for every epoch that leaves --lateness-journal-us or
+        /// more after its deadline, and a `sec` line a second with the
+        /// lateness and encode figures and the pacing thread's faults,
+        /// involuntary context switches and run delay. The pacer never waits
+        /// for it. Needs --pace precise.
+        #[arg(long, value_name = "PATH")]
+        lateness_journal: Option<PathBuf>,
+        /// Microseconds after its deadline from which an epoch gets a `late`
+        /// line in the journal.
+        #[arg(long, default_value_t = DEFAULT_LATE_THRESHOLD_US, value_name = "US")]
+        lateness_journal_us: u64,
+        /// SCHED_FIFO priority of the pacing thread (0: normal scheduling).
+        /// Needs CAP_SYS_NICE or root; a refusal is one line and the sender
+        /// runs on as it was.
+        #[arg(long, default_value_t = 20,
+              value_parser = clap::value_parser!(u8).range(0..=99))]
+        realtime_priority: u8,
+        /// Pin the pacing thread to this CPU. A thread refused SCHED_FIFO
+        /// is not pinned either. Needs --pace precise.
+        #[arg(long, value_name = "CPU")]
+        pace_cpu: Option<usize>,
+        /// Lock the process's memory (mlockall, now and for later mappings)
+        /// once the PCM file is read and the encoders exist, where the
+        /// process may lock without a limit (root, or RLIMIT_MEMLOCK
+        /// infinite). A refusal is one line.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        mlock: bool,
+        /// Epochs that a scratch encoder makes and drops before epoch 0, so
+        /// that the first epochs of the stream do not pay for the encoder's
+        /// first use. The stream's bytes do not change. 0: none.
+        #[arg(long, default_value_t = 200)]
+        preroll_epochs: u64,
     },
     /// Capture immutable codec-valid SoundKit v2 FLAC+Opus records from a live publication.
     CaptureFixture {
@@ -806,6 +843,18 @@ struct SendReport {
     send_complete_lateness_ms: Percentiles,
     /// Time to make the datagrams of each epoch, included in the lateness.
     encode_ms: Percentiles,
+    /// The pacing thread runs SCHED_FIFO (`--realtime-priority`).
+    realtime: bool,
+    /// The CPU the pacing thread is pinned to (`--pace-cpu`).
+    pinned: Option<usize>,
+    /// The process's memory is locked (`--mlock`).
+    memory_locked: bool,
+    /// Epochs that the scratch encoder made before epoch 0
+    /// (`--preroll-epochs`, fewer when the session was about to start).
+    preroll_epochs: u64,
+    /// What the lateness journal wrote (`--lateness-journal`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lateness_journal: Option<JournalTotals>,
 }
 
 /// What one `--target` of the sender was sent.
@@ -2309,6 +2358,12 @@ async fn main() -> Result<()> {
             repair_percent,
             min_repair_symbols,
             pace,
+            lateness_journal,
+            lateness_journal_us,
+            realtime_priority,
+            pace_cpu,
+            mlock,
+            preroll_epochs,
         } => {
             let report = send(SendOptions {
                 targets,
@@ -2325,6 +2380,14 @@ async fn main() -> Result<()> {
                 repair_percent,
                 min_repair_symbols,
                 pace,
+                lateness_journal: lateness_journal.as_deref(),
+                lateness_journal_us,
+                hardening: PacerHardening {
+                    realtime_priority,
+                    pace_cpu,
+                    mlock,
+                    preroll_epochs,
+                },
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2772,6 +2835,9 @@ struct SendOptions<'a> {
     repair_percent: u32,
     min_repair_symbols: u32,
     pace: SendPace,
+    lateness_journal: Option<&'a Path>,
+    lateness_journal_us: u64,
+    hardening: PacerHardening,
 }
 
 async fn send(options: SendOptions<'_>) -> Result<SendReport> {
@@ -2790,6 +2856,9 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         repair_percent,
         min_repair_symbols,
         pace,
+        lateness_journal,
+        lateness_journal_us,
+        hardening,
     } = options;
     if duration_seconds == 0 {
         bail!("--duration-seconds must be positive");
@@ -2812,6 +2881,12 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     if pace == SendPace::Tokio && epoch.duration_ns() < 1_000_000 {
         bail!("--pace tokio needs epochs of at least 1 ms: tokio timers tick in milliseconds");
     }
+    if pace == SendPace::Tokio && lateness_journal.is_some() {
+        bail!("--lateness-journal needs --pace precise: it follows the pacing thread");
+    }
+    if pace == SendPace::Tokio && hardening.pace_cpu.is_some() {
+        bail!("--pace-cpu needs --pace precise: --pace tokio has no pacing thread");
+    }
     let session_id = session_id.unwrap_or(now_unix_ns()?.saturating_add(1_000_000_000));
     let now_ns = now_unix_ns()?;
     if session_id.saturating_add(60_000_000_000) < now_ns {
@@ -2831,16 +2906,27 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         min_repair_symbols,
     };
     let epochs = epoch.epochs_in(duration_seconds);
+    // Freed memory stays in the heaps: the encoders' allocations of every
+    // epoch do not go back to the kernel and return as page faults.
+    if let Err(reason) = memory::tune_allocator() {
+        eprintln!("aep1-48k-probe: allocator thresholds as glibc sets them: {reason}");
+    }
+    // The journal's thread starts here, with normal scheduling, not from
+    // the pacing thread, whose SCHED_FIFO and CPU it would inherit.
+    let journal = lateness_journal
+        .map(|path| {
+            PacingJournal::create(path, lateness_journal_us).with_context(|| {
+                format!("failed to create the lateness journal {}", path.display())
+            })
+        })
+        .transpose()?;
+    let recorder = journal.as_ref().map(PacingJournal::recorder);
     let started = Instant::now();
     // A harness that stops the sender with SIGTERM (or SIGINT) still gets
     // the report of the epochs that were sent.
     let stop = stop_on_signal();
-    let SendOutcome {
-        encoder,
-        lateness: stats,
-        targets,
-    } = match pace {
-        SendPace::Tokio => send_tokio_paced(source, &targets, epochs, &stop).await?,
+    let outcome = match pace {
+        SendPace::Tokio => send_tokio_paced(source, &targets, epochs, &stop, &hardening).await,
         SendPace::Precise => {
             // The pacer owns an OS thread: a tokio timer fires on 1 ms ticks
             // and shares its worker with the rest of the runtime.
@@ -2849,14 +2935,38 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             std::thread::Builder::new()
                 .name("aep1-pacer".into())
                 .spawn(move || {
-                    let _ = done_tx.send(send_precise_paced(source, &targets, epochs, &pacer_stop));
+                    let outcome = send_precise_paced(
+                        source,
+                        &targets,
+                        epochs,
+                        &pacer_stop,
+                        &hardening,
+                        recorder.as_ref(),
+                    );
+                    // The journal ends when its last recorder is gone.
+                    drop(recorder);
+                    let _ = done_tx.send(outcome);
                 })
                 .context("failed to start the AEP1 pacing thread")?;
             done_rx
                 .await
-                .context("the AEP1 pacing thread stopped without a result")??
+                .context("the AEP1 pacing thread stopped without a result")
+                .and_then(|outcome| outcome)
         }
     };
+    // The journal is finished whatever the sender came to: a run that
+    // failed keeps the lines of the epochs it sent.
+    let lateness_journal = journal
+        .map(PacingJournal::finish)
+        .transpose()
+        .context("failed to write the lateness journal");
+    let SendOutcome {
+        encoder,
+        lateness: stats,
+        targets,
+        pacer,
+    } = outcome?;
+    let lateness_journal = lateness_journal?;
     let stopped_by_signal = stop.load(AtomicOrdering::Acquire);
     let epochs = stats.epochs;
     let targets = targets
@@ -2908,6 +3018,11 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         send_lateness_ms: stats.first_datagram.summary(),
         send_complete_lateness_ms: stats.last_datagram.summary(),
         encode_ms: stats.encode.summary(),
+        realtime: pacer.realtime,
+        pinned: pacer.pinned,
+        memory_locked: pacer.memory_locked,
+        preroll_epochs: pacer.preroll_epochs,
+        lateness_journal,
     })
 }
 
@@ -3035,16 +3150,18 @@ fn stop_on_signal() -> Arc<AtomicBool> {
     stop
 }
 
-/// Block the calling thread until the Unix time reaches `deadline_ns`, or
-/// until `stop` is set (`false`). It sleeps until `spin_ns` before the
+/// Block the calling thread until the Unix time reaches `deadline_ns`, and
+/// return the time at which it was seen to (at or after the deadline), or
+/// `None` when `stop` was set first. It sleeps until `spin_ns` before the
 /// deadline and spins the rest.
-fn wait_until_unix_ns(deadline_ns: u64, spin_ns: u64, stop: &AtomicBool) -> Result<bool> {
+fn wait_until_unix_ns(deadline_ns: u64, spin_ns: u64, stop: &AtomicBool) -> Result<Option<u64>> {
     loop {
         if stop.load(AtomicOrdering::Acquire) {
-            return Ok(false);
+            return Ok(None);
         }
-        match pace_step(now_unix_ns()?, deadline_ns, spin_ns) {
-            PaceStep::Send => return Ok(true),
+        let now_ns = now_unix_ns()?;
+        match pace_step(now_ns, deadline_ns, spin_ns) {
+            PaceStep::Send => return Ok(Some(now_ns)),
             PaceStep::Sleep(duration) => std::thread::sleep(duration.min(STOP_POLL)),
             PaceStep::Spin => std::hint::spin_loop(),
         }
@@ -3476,11 +3593,107 @@ fn sender_bind_address(target: SocketAddr) -> SocketAddr {
 }
 
 /// What a sender did: its encoder (with the stream's counts), how late the
-/// epochs left, and what each target was sent.
+/// epochs left, what each target was sent, and what the pacer got of its
+/// scheduling and memory settings.
 struct SendOutcome {
     encoder: EpochEncoder,
     lateness: SendLateness,
     targets: Vec<TargetCounts>,
+    pacer: PacerOutcome,
+}
+
+/// What the sender does for its own scheduling and memory, so that an
+/// epoch is not late because of the sender's host: all of it best effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PacerHardening {
+    /// SCHED_FIFO priority of the pacing thread (0: normal scheduling).
+    realtime_priority: u8,
+    /// The CPU the pacing thread is pinned to.
+    pace_cpu: Option<usize>,
+    /// mlockall once the PCM file and the encoders exist.
+    mlock: bool,
+    /// Epochs a scratch encoder makes before epoch 0.
+    preroll_epochs: u64,
+}
+
+/// What the pacer got of [`PacerHardening`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PacerOutcome {
+    realtime: bool,
+    pinned: Option<usize>,
+    memory_locked: bool,
+    preroll_epochs: u64,
+}
+
+impl PacerHardening {
+    /// Give the calling thread, the pacer, SCHED_FIFO and its CPU; one
+    /// line says what it got.
+    fn make_current_thread_the_pacer(&self, outcome: &mut PacerOutcome) {
+        if self.realtime_priority == 0 && self.pace_cpu.is_none() {
+            return;
+        }
+        let got = av_contrib::class_lanes::make_current_thread_realtime(
+            self.pace_cpu,
+            self.realtime_priority,
+        );
+        outcome.realtime = got.fifo_priority.is_some();
+        outcome.pinned = got.pinned_cpu;
+        let scheduling = got
+            .fifo_priority
+            .map_or("normal scheduling".to_owned(), |priority| {
+                format!("SCHED_FIFO {priority}")
+            });
+        let cpu = got
+            .pinned_cpu
+            .map_or(String::new(), |cpu| format!(", pinned to CPU {cpu}"));
+        let refused = if got.refused.is_empty() {
+            String::new()
+        } else {
+            format!(" (refused: {})", got.refused.join("; "))
+        };
+        eprintln!("aep1-48k-probe: pacing thread: {scheduling}{cpu}{refused}");
+    }
+
+    /// Lock the process's memory, now that the PCM file and the encoders
+    /// exist; one line says whether it is.
+    fn lock_memory(&self, outcome: &mut PacerOutcome) {
+        if !self.mlock {
+            return;
+        }
+        match memory::lock_all() {
+            Ok(()) => {
+                outcome.memory_locked = true;
+                eprintln!("aep1-48k-probe: memory locked (mlockall, now and for later mappings)");
+            }
+            Err(reason) => eprintln!("aep1-48k-probe: memory not locked: {reason}"),
+        }
+    }
+}
+
+/// The preroll stops this long before the session starts: epoch 0 is not
+/// made late by the warm-up meant to keep it on time.
+const PREROLL_MARGIN_NS: u64 = 20_000_000;
+
+/// Run a scratch encoder over the first `epochs` epochs of the stream and
+/// drop it: the codec's code and tables, the allocator's heaps and the PCM
+/// are in memory and in the caches before epoch 0. The stream's own encoder
+/// is not touched, so its bytes are what they would have been. Returns the
+/// epochs made: fewer when the session is about to start, or on `stop`.
+fn preroll(options: &EpochSourceOptions, epochs: u64, stop: &AtomicBool) -> Result<u64> {
+    let session_is_near = |now_ns: u64| now_ns.saturating_add(PREROLL_MARGIN_NS) >= options.session_id;
+    if epochs == 0 || session_is_near(now_unix_ns()?) {
+        return Ok(0);
+    }
+    let mut scratch = EpochEncoder::new(options)?;
+    let mut made = 0;
+    for epoch_id in 0..epochs {
+        if stop.load(AtomicOrdering::Acquire) || session_is_near(now_unix_ns()?) {
+            break;
+        }
+        scratch.encode(epoch_id)?;
+        made += 1;
+    }
+    Ok(made)
 }
 
 /// The sender as it was: a tokio interval from the session id. The source
@@ -3492,10 +3705,15 @@ async fn send_tokio_paced(
     targets: &[SocketAddr],
     epochs: u64,
     stop: &AtomicBool,
+    hardening: &PacerHardening,
 ) -> Result<SendOutcome> {
     let session_id = options.session_id;
     let epoch = EpochGeometry::new(options.epoch_samples);
     let mut encoder = EpochEncoder::new(&options)?;
+    // No pacing thread here to schedule or pin: the memory only.
+    let mut pacer = PacerOutcome::default();
+    hardening.lock_memory(&mut pacer);
+    pacer.preroll_epochs = preroll(&options, hardening.preroll_epochs, stop)?;
     // One connected socket per target: the kernel reports a target's
     // failure to that target's socket only.
     let mut lanes = Vec::with_capacity(targets.len());
@@ -3558,21 +3776,33 @@ async fn send_tokio_paced(
         encoder,
         lateness,
         targets: lanes.into_iter().map(|(_, counts)| counts).collect(),
+        pacer,
     })
 }
 
 /// The sender on absolute wall-clock deadlines: epoch k leaves at
 /// `epoch_deadline_ns(session_id, k, epoch)` whatever happened to epoch
 /// k - 1. Each datagram goes to every target, in order, before the next.
+///
+/// The calling thread is the pacer: it takes the scheduling of `hardening`
+/// first (so the encoder's memory is first touched on its CPU), and every
+/// epoch's timing goes to `journal` without waiting for it.
 fn send_precise_paced(
     options: EpochSourceOptions,
     targets: &[SocketAddr],
     epochs: u64,
     stop: &AtomicBool,
+    hardening: &PacerHardening,
+    journal: Option<&PacingRecorder>,
 ) -> Result<SendOutcome> {
     let session_id = options.session_id;
     let epoch = EpochGeometry::new(options.epoch_samples);
     let spin_ns = epoch.spin_budget_ns();
+    let mut pacer = PacerOutcome::default();
+    hardening.make_current_thread_the_pacer(&mut pacer);
+    if let Some(journal) = journal {
+        journal.attach_current_thread();
+    }
     let mut encoder = EpochEncoder::new(&options)?;
     // One connected socket per target: the kernel reports a target's
     // failure to that target's socket only.
@@ -3584,19 +3814,20 @@ fn send_precise_paced(
             .with_context(|| format!("no way to send to --target {target}"))?;
         lanes.push((socket, TargetCounts::new(*target)));
     }
+    hardening.lock_memory(&mut pacer);
+    pacer.preroll_epochs = preroll(&options, hardening.preroll_epochs, stop)?;
     let mut lateness = SendLateness::default();
     for epoch_id in 0..epochs {
         let deadline_ns = epoch_deadline_ns(session_id, epoch_id, epoch);
-        if !wait_until_unix_ns(deadline_ns, spin_ns, stop)? {
+        let Some(woke_ns) = wait_until_unix_ns(deadline_ns, spin_ns, stop)? else {
             break;
-        }
+        };
         // The epoch is encoded when its last sample has been spoken, as a
         // live source would, so the encode is part of the measured lateness.
         let encode_started = Instant::now();
         let datagrams = encoder.encode(epoch_id)?;
-        lateness
-            .encode
-            .record(encode_started.elapsed().as_nanos() as u64);
+        let encode_ns = encode_started.elapsed().as_nanos() as u64;
+        lateness.encode.record(encode_ns);
         let mut first_sent_ns = None;
         let mut last_sent_ns = 0;
         for (payload, source) in datagrams {
@@ -3614,16 +3845,24 @@ fn send_precise_paced(
             }
             encoder.count_datagram(payload.len(), source);
         }
-        lateness.record(
-            deadline_ns,
-            first_sent_ns.unwrap_or(last_sent_ns),
-            last_sent_ns,
-        );
+        let first_sent_ns = first_sent_ns.unwrap_or(last_sent_ns);
+        lateness.record(deadline_ns, first_sent_ns, last_sent_ns);
+        if let Some(journal) = journal {
+            journal.record(EpochTiming {
+                epoch: epoch_id,
+                deadline_ns,
+                woke_ns,
+                encode_ns,
+                first_sent_ns,
+                last_sent_ns,
+            });
+        }
     }
     Ok(SendOutcome {
         encoder,
         lateness,
         targets: lanes.into_iter().map(|(_, counts)| counts).collect(),
+        pacer,
     })
 }
 
@@ -8238,7 +8477,15 @@ mod tests {
         let epoch = EpochGeometry::new(12);
         let SendOutcome {
             encoder, lateness, ..
-        } = send_precise_paced(options, &[target], epochs, &AtomicBool::new(false)).unwrap();
+        } = send_precise_paced(
+            options,
+            &[target],
+            epochs,
+            &AtomicBool::new(false),
+            &NO_HARDENING,
+            None,
+        )
+        .unwrap();
         let finished = now_unix_ns().unwrap();
         assert_eq!(lateness.epochs, epochs);
         // 400 epochs of 250 µs: 100 ms, ending on the last deadline.
@@ -8280,7 +8527,15 @@ mod tests {
         let session_id = options.session_id;
         let SendOutcome {
             encoder, lateness, ..
-        } = send_precise_paced(options, &[target], epochs, &AtomicBool::new(false)).unwrap();
+        } = send_precise_paced(
+            options,
+            &[target],
+            epochs,
+            &AtomicBool::new(false),
+            &NO_HARDENING,
+            None,
+        )
+        .unwrap();
         let finished = now_unix_ns().unwrap();
         assert_eq!(lateness.epochs, epochs);
         // The run ends with the last deadline, not later by the sum of the
@@ -8294,6 +8549,14 @@ mod tests {
             receiver.recv_from(&mut buffer).unwrap();
         }
     }
+
+    /// A sender that leaves its thread and the test process as they are.
+    const NO_HARDENING: PacerHardening = PacerHardening {
+        realtime_priority: 0,
+        pace_cpu: None,
+        mlock: false,
+        preroll_epochs: 0,
+    };
 
     /// A loopback receiver and its address.
     fn loopback_receiver() -> (std::net::UdpSocket, SocketAddr) {
@@ -8342,11 +8605,14 @@ mod tests {
             encoder,
             lateness,
             targets,
+            ..
         } = send_precise_paced(
             one_ms_pcm(session_id),
             &[first_address, second_address],
             epochs,
             &AtomicBool::new(false),
+            &NO_HARDENING,
+            None,
         )
         .unwrap();
         assert_eq!(lateness.epochs, epochs);
@@ -8389,6 +8655,7 @@ mod tests {
             &[first_address, second_address],
             epochs,
             &AtomicBool::new(false),
+            &NO_HARDENING,
         )
         .await
         .unwrap();
@@ -8418,6 +8685,8 @@ mod tests {
             &[refused_address, live_address],
             epochs,
             &AtomicBool::new(false),
+            &NO_HARDENING,
+            None,
         )
         .unwrap();
         assert_eq!(lateness.epochs, epochs);
@@ -8502,6 +8771,9 @@ mod tests {
             repair_percent: 12,
             min_repair_symbols: 1,
             pace: SendPace::Precise,
+            lateness_journal: None,
+            lateness_journal_us: DEFAULT_LATE_THRESHOLD_US,
+            hardening: NO_HARDENING,
         })
         .await;
         let error = result.err().expect("a repeated target was accepted");
@@ -8510,6 +8782,234 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
         assert!(drain(&receiver).is_empty());
+    }
+
+    #[test]
+    fn the_sender_s_hardening_flags_have_their_defaults() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["aep1-48k-probe", "send", "--target", "10.77.1.6:27100"];
+            args.extend(extra);
+            match Args::try_parse_from(args).map(|args| args.command) {
+                Ok(Command::Send {
+                    lateness_journal,
+                    lateness_journal_us,
+                    realtime_priority,
+                    pace_cpu,
+                    mlock,
+                    preroll_epochs,
+                    ..
+                }) => Ok((
+                    lateness_journal,
+                    lateness_journal_us,
+                    PacerHardening {
+                        realtime_priority,
+                        pace_cpu,
+                        mlock,
+                        preroll_epochs,
+                    },
+                )),
+                Ok(_) => panic!("not a send command"),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        assert_eq!(
+            parse(&[]).unwrap(),
+            (
+                None,
+                500,
+                PacerHardening {
+                    realtime_priority: 20,
+                    pace_cpu: None,
+                    mlock: true,
+                    preroll_epochs: 200,
+                }
+            )
+        );
+        assert_eq!(
+            parse(&[
+                "--lateness-journal",
+                "/run/aep1-late.ndjson",
+                "--lateness-journal-us",
+                "250",
+                "--realtime-priority",
+                "0",
+                "--pace-cpu",
+                "3",
+                "--mlock",
+                "false",
+                "--preroll-epochs",
+                "0",
+            ])
+            .unwrap(),
+            (
+                Some(PathBuf::from("/run/aep1-late.ndjson")),
+                250,
+                PacerHardening {
+                    realtime_priority: 0,
+                    pace_cpu: Some(3),
+                    mlock: false,
+                    preroll_epochs: 0,
+                }
+            )
+        );
+        // SCHED_FIFO has priorities 1 to 99.
+        assert!(parse(&["--realtime-priority", "100"]).is_err());
+        // Encoding an epoch before its samples exist is not offered.
+        assert!(parse(&["--encode-at", "ahead"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_journal_and_the_pace_cpu_need_the_precise_pacer() {
+        fn tokio_paced(lateness_journal: Option<&Path>, pace_cpu: Option<usize>) -> SendOptions<'_> {
+            SendOptions {
+                targets: vec!["127.0.0.1:9".parse().unwrap()],
+                duration_seconds: 1,
+                session_id: None,
+                payload_kind: ProbePayload::Pcm,
+                epoch_samples: None,
+                opus_bitrate: PROBE_OPUS_BITRATE,
+                channels: 2,
+                group_channels: 8,
+                signal: ProbeSignal::Sine,
+                pcm_s24le_file: None,
+                group_id: 0,
+                repair_percent: 12,
+                min_repair_symbols: 1,
+                pace: SendPace::Tokio,
+                lateness_journal,
+                lateness_journal_us: DEFAULT_LATE_THRESHOLD_US,
+                hardening: PacerHardening {
+                    pace_cpu,
+                    ..NO_HARDENING
+                },
+            }
+        }
+        // Both are refused before anything is created or sent.
+        let journal = Path::new("/nonexistent/aep1-late.ndjson");
+        let error = send(tokio_paced(Some(journal), None)).await.err().unwrap();
+        assert!(
+            error.to_string().contains("--lateness-journal needs"),
+            "{error}"
+        );
+        let error = send(tokio_paced(None, Some(1))).await.err().unwrap();
+        assert!(error.to_string().contains("--pace-cpu needs"), "{error}");
+    }
+
+    #[test]
+    fn preroll_leaves_the_stream_s_bytes_unchanged() {
+        let never = AtomicBool::new(false);
+        for (payload_kind, epoch_samples) in [
+            (ProbePayload::Pcm, 48),
+            (ProbePayload::Opus, 48),
+            (ProbePayload::Opus, 120),
+            (ProbePayload::Flac, 48),
+        ] {
+            let options = EpochSourceOptions {
+                payload_kind,
+                epoch_samples,
+                ..sine_source(now_unix_ns().unwrap() + 60_000_000_000)
+            };
+            let expected = stream_datagrams(&options, 12);
+            // The sender's order: its encoder exists, then the scratch
+            // encoder runs and is dropped, then the stream starts.
+            let mut encoder = EpochEncoder::new(&options).unwrap();
+            assert_eq!(preroll(&options, 200, &never).unwrap(), 200);
+            let after = (0..12)
+                .flat_map(|epoch_id| encoder.encode(epoch_id).unwrap())
+                .map(|(datagram, _)| datagram.to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(after, expected, "{payload_kind:?} {epoch_samples}");
+        }
+        // No preroll into the session's start, and none when asked to stop.
+        let near = sine_source(now_unix_ns().unwrap() + PREROLL_MARGIN_NS / 2);
+        assert_eq!(preroll(&near, 200, &never).unwrap(), 0);
+        let far = sine_source(now_unix_ns().unwrap() + 60_000_000_000);
+        assert_eq!(preroll(&far, 200, &AtomicBool::new(true)).unwrap(), 0);
+        assert_eq!(preroll(&far, 0, &never).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_sender_that_starts_behind_journals_each_overdue_epoch() {
+        let (_receiver, target) = loopback_receiver();
+        let path = std::env::temp_dir().join(format!(
+            "aep1-probe-late-{}.ndjson",
+            std::process::id()
+        ));
+        let journal = PacingJournal::create(&path, DEFAULT_LATE_THRESHOLD_US).unwrap();
+        let recorder = journal.recorder();
+        // The session began 30 ms ago: epochs 0 to 29 are overdue when the
+        // pacer starts and leave at once, each 1 ms less late than the one
+        // before; the later epochs are on their own deadlines.
+        let behind_us = 30_000;
+        let session_id = now_unix_ns().unwrap() - behind_us * 1_000;
+        let epochs = 60;
+        let SendOutcome {
+            lateness, pacer, ..
+        } = send_precise_paced(
+            one_ms_pcm(session_id),
+            &[target],
+            epochs,
+            &AtomicBool::new(false),
+            &PacerHardening {
+                preroll_epochs: 200,
+                ..NO_HARDENING
+            },
+            Some(&recorder),
+        )
+        .unwrap();
+        drop(recorder);
+        let totals = journal.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(lateness.epochs, epochs);
+        // A session already under way gets no preroll, and a sender that
+        // asked for nothing got nothing.
+        assert_eq!(pacer, PacerOutcome::default());
+        assert_eq!(totals.epochs, epochs);
+        assert_eq!(totals.dropped, 0);
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let late = lines
+            .iter()
+            .filter(|line| line["kind"] == "late")
+            .map(|line| (line["epoch"].as_u64().unwrap(), line))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(late.len() as u64, totals.late_lines);
+        for epoch_id in 0..25_u64 {
+            let line = late
+                .get(&epoch_id)
+                .unwrap_or_else(|| panic!("no late line for epoch {epoch_id}"));
+            let overdue_us = behind_us - epoch_id * 1_000;
+            assert_eq!(line["deadline_us"], session_id / 1_000 + epoch_id * 1_000);
+            // The wait ended late by what the epoch was overdue, and the
+            // first datagram left after that.
+            let woke_late_us = line["woke_late_us"].as_u64().unwrap();
+            let late_first_us = line["late_first_us"].as_u64().unwrap();
+            assert!(woke_late_us >= overdue_us, "epoch {epoch_id}: {line}");
+            assert!(late_first_us >= woke_late_us, "epoch {epoch_id}: {line}");
+            assert!(line["late_last_us"].as_u64().unwrap() >= late_first_us);
+        }
+        let seconds = lines
+            .iter()
+            .filter(|line| line["kind"] == "sec")
+            .collect::<Vec<_>>();
+        assert_eq!(seconds.len() as u64, totals.sec_lines);
+        assert_eq!(
+            seconds
+                .iter()
+                .map(|line| line["epochs"].as_u64().unwrap())
+                .sum::<u64>(),
+            epochs
+        );
+        assert!(
+            seconds
+                .iter()
+                .map(|line| line["over_5ms"].as_u64().unwrap())
+                .sum::<u64>()
+                >= 25
+        );
     }
 
     fn sine_source(session_id: u64) -> EpochSourceOptions {
@@ -8542,7 +9042,15 @@ mod tests {
         });
         let started = Instant::now();
         let SendOutcome { lateness, .. } =
-            send_precise_paced(sine_source(session_id), &[target], 200_000, &stop).unwrap();
+            send_precise_paced(
+                sine_source(session_id),
+                &[target],
+                200_000,
+                &stop,
+                &NO_HARDENING,
+                None,
+            )
+            .unwrap();
         stopper.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         let sent = lateness.epochs as usize;
@@ -8553,7 +9061,8 @@ mod tests {
         let stop = AtomicBool::new(true);
         let far = now_unix_ns().unwrap() + 30_000_000_000;
         let SendOutcome { lateness, .. } =
-            send_precise_paced(sine_source(far), &[target], 10, &stop).unwrap();
+            send_precise_paced(sine_source(far), &[target], 10, &stop, &NO_HARDENING, None)
+                .unwrap();
         assert_eq!(lateness.epochs, 0);
     }
 
@@ -8567,7 +9076,13 @@ mod tests {
         options.pcm_s24le_file = Some(PathBuf::from("/nonexistent/aep1-probe-audio.s24le"));
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            send_tokio_paced(options, &[target], 10, &AtomicBool::new(false)),
+            send_tokio_paced(
+                options,
+                &[target],
+                10,
+                &AtomicBool::new(false),
+                &NO_HARDENING,
+            ),
         )
         .await
         .expect("the tokio sender waited for the session before reading its source");
@@ -8583,7 +9098,13 @@ mod tests {
         let session_id = now_unix_ns().unwrap() + 10_000_000;
         let SendOutcome { lateness, .. } = tokio::time::timeout(
             Duration::from_secs(5),
-            send_tokio_paced(sine_source(session_id), &[target], 200_000, &stop),
+            send_tokio_paced(
+                sine_source(session_id),
+                &[target],
+                200_000,
+                &stop,
+                &NO_HARDENING,
+            ),
         )
         .await
         .unwrap()
