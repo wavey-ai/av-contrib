@@ -132,16 +132,14 @@ pub struct PublishedFmp4Part {
 /// path. Producers and consumers own any framing inside the payload.
 ///
 /// The part is every epoch of part `anchor.part_number()` of its AEP1
-/// session, in order; `sequence` and `source_epoch` are that number and the
-/// session's key epoch.
+/// session, in order. Its canonical object is named and timed from `anchor`
+/// alone: the key epoch is `anchor.key_epoch()`, and no time of this host
+/// enters it.
 #[derive(Debug, Clone)]
 pub struct PublishedOpaquePart {
     pub stream_id: u64,
     pub stream_idx: usize,
-    /// Canonical source epoch for this media session.
-    ///
-    /// A value of `None` uses the publisher process epoch.
-    pub source_epoch: Option<u64>,
+    /// The part number, `anchor.part_number()`.
     pub sequence: u64,
     /// Duration in whole milliseconds, rounded and never 0, for caches that
     /// do not read `duration_us`.
@@ -150,11 +148,14 @@ pub struct PublishedOpaquePart {
     pub duration_us: u64,
     pub duration_samples: Option<u64>,
     pub sample_rate: Option<u32>,
+    /// This host's clock when the part was gathered and when it was handed
+    /// to its publisher: for the hop journal, never for the object.
     pub packaged_at_unix_ns: i64,
     pub published_at_unix_ns: i64,
     pub bytes: Bytes,
     pub audio_units: usize,
-    /// Place of the part in the Media Playlist.
+    /// Place of the part in the Media Playlist
+    /// ([`crate::hls_stamp::anchored_stamp`] of `anchor`).
     pub hls: Option<crate::hls_stamp::HlsStamp>,
     /// AEP1 arrival and recovery times of the part's source, for the hop
     /// journal.

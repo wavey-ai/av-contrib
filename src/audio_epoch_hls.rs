@@ -979,7 +979,6 @@ impl OpaquePartSegmenter {
         let part = PublishedOpaquePart {
             stream_id: self.output_stream_id,
             stream_idx: self.output_stream_idx,
-            source_epoch: Some(anchor.key_epoch()),
             sequence: anchor.part_number(),
             duration_ms: legacy_ms(duration_us).max(1),
             duration_us,
@@ -3382,7 +3381,6 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PartIdentity {
         stream_id: u64,
-        source_epoch: Option<u64>,
         sequence: u64,
         duration_us: u64,
         duration_samples: Option<u64>,
@@ -3400,7 +3398,6 @@ mod tests {
             .iter()
             .map(|part| PartIdentity {
                 stream_id: part.stream_id,
-                source_epoch: part.source_epoch,
                 sequence: part.sequence,
                 duration_us: part.duration_us,
                 duration_samples: part.duration_samples,
@@ -3548,7 +3545,7 @@ mod tests {
             // that number, field for field and byte for byte.
             for part in &late {
                 assert_eq!(part, &early[part.sequence as usize]);
-                assert_eq!(part.source_epoch, Some(SESSION / 1_000));
+                assert_eq!(part.anchor.key_epoch(), SESSION / 1_000);
                 assert_eq!(
                     part.anchor.first_pts_samples,
                     part.sequence * epochs_per_part * u64::from(frame_count)
@@ -3929,7 +3926,7 @@ mod tests {
         assert_eq!(parts.len(), 7);
         for (index, part) in parts[4..].iter().enumerate() {
             assert_eq!(part.sequence, index as u64);
-            assert_eq!(part.source_epoch, Some(later / 1_000));
+            assert_eq!(part.anchor.key_epoch(), later / 1_000);
             assert_eq!(part.duration_samples, Some(96));
             assert_eq!(part.anchor.part_samples, 96);
         }
