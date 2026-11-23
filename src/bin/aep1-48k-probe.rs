@@ -107,7 +107,7 @@ const MAX_LATENCY_SAMPLES: usize = 65_536;
 const MAX_LATE_BUNDLE_OBSERVATIONS: usize = 512;
 
 #[derive(Debug, Parser)]
-#[command(name = "aep1-48k-probe")]
+#[command(name = "aep1-48k-probe", version = av_contrib::build::VERSION)]
 #[command(about = "Generate or receive a deterministic 48 kHz lossless AEP1 stream")]
 struct Args {
     #[command(subcommand)]
@@ -8210,6 +8210,16 @@ mod tests {
         assert_eq!(summary.p95, 4.0);
         assert_eq!(summary.p99, 4.0);
         assert_eq!(summary.max, 4.0);
+    }
+
+    #[test]
+    fn the_version_names_the_probe_the_commit_and_the_time() {
+        let error = Args::try_parse_from(["aep1-48k-probe", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("aep1-48k-probe {}\n", av_contrib::build::VERSION)
+        );
     }
 
     #[test]

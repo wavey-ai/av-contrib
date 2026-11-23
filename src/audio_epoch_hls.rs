@@ -796,6 +796,11 @@ pub async fn run_audio_epoch_hls_worker(
                 match outcome {
                     Ok((completed_groups, completed_epoch)) => {
                         WORKER_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
+                        crate::node_status::counters().source_datagram(
+                            message.peer,
+                            message.received_unix_us,
+                            completed_epoch.as_ref(),
+                        );
                         share_recovered_epoch(&config, message.peer, completed_epoch);
                         for (group, times) in completed_groups {
                             WORKER_GROUPS_COMPLETED.fetch_add(1, Ordering::Relaxed);
@@ -813,6 +818,14 @@ pub async fn run_audio_epoch_hls_worker(
                             };
                             if !config.formats.contains(&group.payload_kind) {
                                 continue;
+                            }
+                            if let Ok(stream_id) = rendition_stream_id(
+                                config.base_stream_id,
+                                group.group_id,
+                                group.payload_kind,
+                            ) {
+                                crate::node_status::counters()
+                                    .epoch_recovered(stream_id, message.received_unix_us);
                             }
                             if let Err(error) = dispatch_group_to_rendition_worker(
                                 &config,

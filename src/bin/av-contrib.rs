@@ -20,6 +20,7 @@ use av_contrib::ingress_authorization::{
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
+use av_contrib::node_status::{self, LaneSample, NodeStatus, PublishedPart};
 use av_contrib::part_timing::{AudioPartSize, VideoPartSize};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
@@ -90,6 +91,7 @@ const NEEDLETAIL_AEP1_CONTENT_TYPE: &str = "application/x-needletail-aep1-stream
 const NEEDLETAIL_AEP1_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
 const NEEDLETAIL_AEP1_MAX_BUFFER_BYTES: usize = 256 * 1024;
 const CONTRIB_STATUS_PATH: &str = "/api/status";
+const CONTRIB_NODE_PATH: &str = "/api/node";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
 const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -543,6 +545,7 @@ const DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS: u64 = 2_000;
 #[derive(Debug, Parser)]
 #[command(
     name = "av-contrib",
+    version = av_contrib::build::VERSION,
     about = "Run a contributor-facing AV service that forwards bytes into av-mesh"
 )]
 struct Args {
@@ -590,6 +593,15 @@ struct Args {
 
     #[arg(long, env = "AV_RELAY_LOCAL_ID", default_value = "av-contrib")]
     relay_local_id: String,
+
+    /// The node's name in `GET /api/node`, as the deploy and its tools know
+    /// it (`contrib-lon`, `contrib-lon-b`). Defaults to --relay-local-id.
+    #[arg(long, env = "AV_NODE_ID")]
+    node_id: Option<String>,
+
+    /// The node's region in `GET /api/node`, as the deploy names it.
+    #[arg(long, env = "AV_REGION", default_value = "")]
+    region: String,
 
     #[arg(
         long,
@@ -1253,6 +1265,13 @@ const NOMINAL_EPOCH_US: u64 = 1_000;
 const MIN_OPUS_FRAME_US: u64 = 1_000;
 
 impl Args {
+    /// The node's name: `--node-id`, else `--relay-local-id`.
+    fn node_id(&self) -> String {
+        self.node_id
+            .clone()
+            .unwrap_or_else(|| self.relay_local_id.clone())
+    }
+
     /// Size of an audio part: `--audio-part`, else `--fmp4-part-ms`, else one
     /// epoch per part.
     fn audio_part(&self) -> AudioPartSize {
@@ -2682,6 +2701,53 @@ impl RelaySessionPublisher {
         }
     }
 
+    /// The lanes as `GET /api/node` shows them at `now_unix_us`; `ids` are
+    /// the node ids of the primary and the secondary forwarder.
+    fn lane_samples(&self, ids: &[String; 2], now_unix_us: u64) -> Vec<LaneSample> {
+        let telemetry = &self.telemetry;
+        [
+            (
+                Some(&self.primary),
+                "primary",
+                &ids[0],
+                &telemetry.relay_primary_lane_last_success_unix_ms,
+                &telemetry.relay_primary_lane_last_failure_unix_ms,
+            ),
+            (
+                self.secondary.as_ref(),
+                "secondary",
+                &ids[1],
+                &telemetry.relay_secondary_lane_last_success_unix_ms,
+                &telemetry.relay_secondary_lane_last_failure_unix_ms,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(lane, path, id, last_success, last_failure)| {
+            let lane = lane?;
+            let reported_us = lane.reported_loss.at_us.load(Ordering::Relaxed);
+            let report_age_ms =
+                (reported_us != 0).then(|| now_unix_us.saturating_sub(reported_us) / 1_000);
+            Some(LaneSample {
+                path,
+                id: id.clone(),
+                target: lane.peer_addr,
+                state: relay_lane_state(
+                    now_unix_us / 1_000,
+                    last_success.load(Ordering::Acquire),
+                    last_failure.load(Ordering::Acquire),
+                )
+                .as_str(),
+                sent: lane.backlog.sent.load(Ordering::Acquire),
+                loss_ppm: report_age_ms
+                    .filter(|age_ms| *age_ms <= node_status::LANE_REPORT_MAX_AGE_MS)
+                    .map(|_| lane.reported_loss.ppm.load(Ordering::Relaxed)),
+                report_age_ms,
+                backlog_parts: lane.backlog.pending.load(Ordering::Acquire) as u64,
+            })
+        })
+        .collect()
+    }
+
     /// Whether a part of `stream` goes out on the lanes now
     /// (`--relay-demand-renditions`): yes unless every lane has a fresh
     /// demand report and none reads it while one reads a sibling.
@@ -3105,6 +3171,9 @@ impl RelaySessionPublisher {
         if class == PublicationClass::Audio && encoded.source_wires().len() == 1 {
             RELAY_COMPACT_AUDIO_PARTS[usize::from(!encoded.is_compact())]
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if let (PublicationClass::Audio, Some((stream_id, _))) = (class, part) {
+            node_status::counters().part_form(stream_id, encoded.is_compact());
         }
         let encoded = Arc::new(encoded);
         let hot = self.audio_inline && class == PublicationClass::Audio;
@@ -4201,6 +4270,14 @@ impl MeshForwarder {
         })
     }
 
+    /// The RelaySession lanes as `GET /api/node` shows them; none without
+    /// `--relay-primary-target`.
+    fn lane_samples(&self, ids: &[String; 2], now_unix_us: u64) -> Vec<LaneSample> {
+        self.relay
+            .as_ref()
+            .map_or_else(Vec::new, |relay| relay.lane_samples(ids, now_unix_us))
+    }
+
     fn allocate_media_sequence(&self) -> u64 {
         self.next_media_sequence.fetch_add(1, Ordering::Relaxed)
     }
@@ -5007,6 +5084,16 @@ impl Fmp4PartPublisher for MeshForwarder {
                 "published canonical fMP4 object through RelaySession"
             );
         }
+        node_status::counters().part_published(
+            part.stream_id,
+            PublishedPart {
+                video: class == PublicationClass::Video,
+                epoch: source_epoch,
+                number: part.sequence,
+                epochs: None,
+                now_unix_us: hop_journal::now_unix_us(),
+            },
+        );
         Ok(())
     }
 
@@ -5023,6 +5110,11 @@ impl Fmp4PartPublisher for MeshForwarder {
             // A rendition that no forwarder reads (item 5): not built, not
             // sent.
             RELAY_DEMAND_HELD_PARTS.fetch_add(1, Ordering::Relaxed);
+            node_status::counters().part_held(
+                part.stream_id,
+                part.audio_units as u64,
+                hop_journal::now_unix_us(),
+            );
             return Ok(());
         }
         let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
@@ -5061,6 +5153,16 @@ impl Fmp4PartPublisher for MeshForwarder {
                 "published canonical opaque audio part through RelaySession"
             );
         }
+        node_status::counters().part_published(
+            part.stream_id,
+            PublishedPart {
+                video: false,
+                epoch: object.key().epoch(),
+                number: part.sequence,
+                epochs: Some(part.audio_units as u64),
+                now_unix_us: hop_journal::now_unix_us(),
+            },
+        );
         Ok(())
     }
 }
@@ -10204,6 +10306,7 @@ struct ContribRouter {
     forwarder: Arc<MeshForwarder>,
     default_stream_id: u64,
     status: Arc<ContribStatusConfig>,
+    node: Arc<NodeStatus>,
     publish_ingress_gate: Option<Arc<PublishIngressGate>>,
     needletail_authorizer: Option<NeedletailSessionAuthorizer>,
     audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
@@ -10212,10 +10315,12 @@ struct ContribRouter {
 }
 
 impl ContribRouter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         forwarder: Arc<MeshForwarder>,
         default_stream_id: u64,
         status: Arc<ContribStatusConfig>,
+        node: Arc<NodeStatus>,
         publish_ingress_gate: Option<Arc<PublishIngressGate>>,
         needletail_authorizer: Option<NeedletailSessionAuthorizer>,
         audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
@@ -10225,6 +10330,7 @@ impl ContribRouter {
             forwarder,
             default_stream_id,
             status,
+            node,
             publish_ingress_gate,
             needletail_authorizer,
             audio_epoch_hls_tx,
@@ -10477,6 +10583,16 @@ impl Router for ContribRouter {
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
+            CONTRIB_NODE_PATH => {
+                // The report of the last sample, at most 100 ms old.
+                let json = serde_json::to_vec(self.node.report().as_ref())
+                    .map_err(|err| ServerError::Handler(Box::new(err)))?;
+                Ok(response(
+                    StatusCode::OK,
+                    Some(Bytes::from(json)),
+                    Some("application/json"),
+                ))
+            }
             CONTRIB_STATUS_PATH => {
                 let json = serde_json::to_vec(&self.status.snapshot())
                     .map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -10491,6 +10607,7 @@ impl Router for ContribRouter {
             }
             CONTRIB_METRICS_PATH => {
                 let mut metrics = self.status.prometheus_metrics().to_vec();
+                metrics.extend_from_slice(self.node.prometheus_metrics().as_bytes());
                 if let Some(gate) = &self.publish_ingress_gate {
                     metrics.extend_from_slice(gate.prometheus_metrics().as_bytes());
                 }
@@ -10968,6 +11085,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let node = contributor_node(&args);
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
     if let Some(warning) = args.legacy_audio_part_warning() {
         warn!("{warning}");
@@ -10996,6 +11114,15 @@ async fn main() -> Result<()> {
     let (publication_shutdown_tx, publication_shutdown_rx) = watch::channel(());
     let telemetry = Arc::new(IngestTelemetry::default());
     let forwarder = Arc::new(MeshForwarder::new(&args, Arc::clone(&telemetry)).await?);
+    {
+        let forwarder = forwarder.clone();
+        let lane_ids = [
+            args.relay_primary_id.clone(),
+            args.relay_secondary_id.clone(),
+        ];
+        node.lanes_bound(move |now_unix_us| forwarder.lane_samples(&lane_ids, now_unix_us));
+    }
+    tokio::spawn(Arc::clone(&node).run());
     let mesh_publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
     let (publisher, publication_tasks) = start_bounded_publication_pipeline(
         mesh_publisher,
@@ -11274,6 +11401,7 @@ async fn main() -> Result<()> {
         forwarder.clone(),
         args.stream_id,
         status,
+        Arc::clone(&node),
         publish_ingress_gate,
         needletail_authorizer,
         router_audio_epoch_hls_tx,
@@ -11341,6 +11469,7 @@ async fn main() -> Result<()> {
         println!("daw:     udp+daw-media://{}", bind);
     }
     println!("status:  https://127.0.0.1:{}/api/status", args.http_port);
+    println!("node:    https://127.0.0.1:{}/api/node", args.http_port);
     println!(
         "events:  https://127.0.0.1:{}/api/status/events",
         args.http_port
@@ -11385,6 +11514,23 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     Ok(())
+}
+
+/// This process's status for `GET /api/node`, `starting` until its lanes
+/// are bound.
+fn contributor_node(args: &Args) -> Arc<NodeStatus> {
+    NodeStatus::new(
+        node_status::Node {
+            node_id: args.node_id(),
+            region: args.region.clone(),
+            build: node_status::Build::of_this_binary(),
+            pid: std::process::id(),
+            boot_unix_us: now_unix_us(),
+            args_sha256: node_status::args_sha256(std::env::args_os()),
+            cpus: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        },
+        Arc::clone(node_status::counters()),
+    )
 }
 
 fn response(
@@ -14802,6 +14948,8 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -14912,6 +15060,8 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -15519,6 +15669,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            contributor_node(&args),
             None,
             None,
             None,
@@ -15541,6 +15692,88 @@ mod tests {
         assert!(metrics.contains("av_contrib_raw_http_bytes_total 1024\n"));
     }
 
+    #[test]
+    fn the_version_names_the_binary_the_commit_and_the_time() {
+        let error = Args::try_parse_from(["av-contrib", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "av-contrib {} ({} {})\n",
+                av_contrib::build::CRATE_VERSION,
+                av_contrib::build::GIT,
+                av_contrib::build::UNIX
+            )
+        );
+    }
+
+    #[test]
+    fn the_node_is_named_by_node_id_else_by_the_relay_local_id() {
+        let args = Args::try_parse_from(["av-contrib", "--relay-local-id", "contrib"]).unwrap();
+        assert_eq!(
+            (args.node_id(), args.region.as_str()),
+            ("contrib".to_owned(), "")
+        );
+        let args = Args::try_parse_from([
+            "av-contrib",
+            "--relay-local-id",
+            "contrib-b",
+            "--node-id",
+            "contrib-lon-b",
+            "--region",
+            "london",
+        ])
+        .unwrap();
+        assert_eq!(
+            (args.node_id(), args.region.as_str()),
+            ("contrib-lon-b".to_owned(), "london")
+        );
+    }
+
+    #[tokio::test]
+    async fn contrib_node_route_serves_the_node_report() {
+        let mut args = contrib_status_args();
+        args.node_id = Some("contrib-lon-b".to_owned());
+        args.region = "london".to_owned();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(
+            MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap(),
+        );
+        let router = ContribRouter::new(
+            forwarder,
+            args.stream_id,
+            Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            contributor_node(&args),
+            None,
+            None,
+            None,
+            None,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(CONTRIB_NODE_PATH)
+            .body(())
+            .unwrap();
+
+        let response = router.route(req).await.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        let node: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
+        assert_eq!(node["schema"], "needletail.node.v1");
+        assert_eq!(node["node_id"], "contrib-lon-b");
+        assert_eq!(node["region"], "london");
+        assert_eq!(node["role"], "contributor");
+        assert_eq!(node["build"]["git"], av_contrib::build::GIT);
+        assert_eq!(node["build"]["built_unix"], av_contrib::build::UNIX);
+        assert_eq!(node["process"]["pid"], std::process::id());
+        // Nothing has bound the lanes of this router's status.
+        assert_eq!(node["state"], "starting");
+        assert_eq!(node["ready"], false);
+    }
+
     #[tokio::test]
     async fn contributor_http_does_not_serve_viewer_media() {
         let args = contrib_status_args();
@@ -15554,6 +15787,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            contributor_node(&args),
             None,
             None,
             None,
@@ -15788,6 +16022,8 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16038,6 +16274,8 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16188,6 +16426,8 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
