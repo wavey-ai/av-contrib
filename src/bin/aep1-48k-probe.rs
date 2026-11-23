@@ -117,8 +117,13 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     Send {
-        #[arg(long)]
-        target: SocketAddr,
+        /// Where the AEP1 datagrams go: a contributor's DAW media address.
+        /// Repeatable (two contributors fed by one encoder): each datagram
+        /// goes to every target, in the order given, before the next
+        /// datagram. A send that fails is counted for its target and stops
+        /// nothing.
+        #[arg(long = "target", required = true, value_name = "ADDR")]
+        targets: Vec<SocketAddr>,
         #[arg(long, default_value_t = 10)]
         duration_seconds: u64,
         /// Also defines the origin Unix-nanosecond clock. Defaults one second ahead.
@@ -772,9 +777,15 @@ struct SendReport {
     epoch_duration_us: f64,
     duration_seconds: u64,
     epochs: u64,
+    /// The stream's datagrams and their bytes, each counted once however
+    /// many targets it went to; `targets` has what each target was sent.
     source_datagrams: u64,
     repair_datagrams: u64,
     wire_bytes: u64,
+    /// One entry per `--target`, in the order given.
+    targets: Vec<TargetReport>,
+    /// Sends that failed, over all targets.
+    target_errors: u64,
     lossless_payload_bytes: u64,
     pcm_reference_bytes: u64,
     wire_overhead_ratio: f64,
@@ -795,6 +806,20 @@ struct SendReport {
     send_complete_lateness_ms: Percentiles,
     /// Time to make the datagrams of each epoch, included in the lateness.
     encode_ms: Percentiles,
+}
+
+/// What one `--target` of the sender was sent.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct TargetReport {
+    target: SocketAddr,
+    /// Datagrams handed to the kernel for this target, and their bytes.
+    datagrams: u64,
+    wire_bytes: u64,
+    /// Sends to this target that failed.
+    errors: u64,
+    /// The last of those errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2270,7 +2295,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
         Command::Send {
-            target,
+            targets,
             duration_seconds,
             session_id,
             payload,
@@ -2286,7 +2311,7 @@ async fn main() -> Result<()> {
             pace,
         } => {
             let report = send(SendOptions {
-                target,
+                targets,
                 duration_seconds,
                 session_id,
                 payload_kind: payload,
@@ -2733,7 +2758,7 @@ fn h3_preload_at_ns(session_id: u64, start_offset_ms: u64) -> u64 {
 }
 
 struct SendOptions<'a> {
-    target: SocketAddr,
+    targets: Vec<SocketAddr>,
     duration_seconds: u64,
     session_id: Option<u64>,
     payload_kind: ProbePayload,
@@ -2751,7 +2776,7 @@ struct SendOptions<'a> {
 
 async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     let SendOptions {
-        target,
+        targets,
         duration_seconds,
         session_id,
         payload_kind,
@@ -2768,6 +2793,16 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     } = options;
     if duration_seconds == 0 {
         bail!("--duration-seconds must be positive");
+    }
+    if targets.is_empty() {
+        bail!("the sender needs at least one --target");
+    }
+    if let Some(twice) = targets
+        .iter()
+        .enumerate()
+        .find_map(|(index, target)| targets[..index].contains(target).then_some(target))
+    {
+        bail!("--target {twice} is given twice: it would get every datagram twice");
     }
     let epoch_samples = payload_kind.epoch_samples(epoch_samples)?;
     if let Some(note) = receiver_epoch_note(epoch_samples) {
@@ -2800,8 +2835,12 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     // A harness that stops the sender with SIGTERM (or SIGINT) still gets
     // the report of the epochs that were sent.
     let stop = stop_on_signal();
-    let (encoder, stats) = match pace {
-        SendPace::Tokio => send_tokio_paced(source, target, epochs, &stop).await?,
+    let SendOutcome {
+        encoder,
+        lateness: stats,
+        targets,
+    } = match pace {
+        SendPace::Tokio => send_tokio_paced(source, &targets, epochs, &stop).await?,
         SendPace::Precise => {
             // The pacer owns an OS thread: a tokio timer fires on 1 ms ticks
             // and shares its worker with the rest of the runtime.
@@ -2810,7 +2849,7 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
             std::thread::Builder::new()
                 .name("aep1-pacer".into())
                 .spawn(move || {
-                    let _ = done_tx.send(send_precise_paced(source, target, epochs, &pacer_stop));
+                    let _ = done_tx.send(send_precise_paced(source, &targets, epochs, &pacer_stop));
                 })
                 .context("failed to start the AEP1 pacing thread")?;
             done_rx
@@ -2820,13 +2859,18 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
     };
     let stopped_by_signal = stop.load(AtomicOrdering::Acquire);
     let epochs = stats.epochs;
+    let targets = targets
+        .into_iter()
+        .map(TargetCounts::report)
+        .collect::<Vec<_>>();
+    let target_errors = targets.iter().map(|target| target.errors).sum();
 
     let pcm_reference_bytes = epochs
         .saturating_mul(u64::from(epoch_samples))
         .saturating_mul(u64::from(channels))
         .saturating_mul(3);
     Ok(SendReport {
-        schema: "needletail.aep1-48k-probe.send.v3",
+        schema: "needletail.aep1-48k-probe.send.v4",
         lane: "source",
         payload: payload_kind.as_str(),
         signal: encoder.pcm_source.label(),
@@ -2850,6 +2894,8 @@ async fn send(options: SendOptions<'_>) -> Result<SendReport> {
         source_datagrams: encoder.source_datagrams,
         repair_datagrams: encoder.repair_datagrams,
         wire_bytes: encoder.wire_bytes,
+        targets,
+        target_errors,
         lossless_payload_bytes: encoder.lossless_payload_bytes,
         pcm_reference_bytes,
         wire_overhead_ratio: encoder.wire_bytes as f64
@@ -3318,7 +3364,8 @@ impl EpochEncoder {
             .collect())
     }
 
-    fn count_sent(&mut self, bytes: usize, source: bool) {
+    /// Count one datagram of the stream, once however many targets get it.
+    fn count_datagram(&mut self, bytes: usize, source: bool) {
         self.wire_bytes = self.wire_bytes.saturating_add(bytes as u64);
         if source {
             self.source_datagrams = self.source_datagrams.saturating_add(1);
@@ -3338,32 +3385,128 @@ fn effective_group_channels(payload_kind: ProbePayload, group_channels: u16) -> 
     }
 }
 
-fn check_full_send(sent: usize, expected: usize) -> Result<()> {
-    if sent != expected {
-        bail!("partial AEP1 datagram send: {sent} of {expected}");
+/// What one target of the sender was sent, and what the kernel refused.
+#[derive(Debug)]
+struct TargetCounts {
+    target: SocketAddr,
+    /// Datagrams handed to the kernel, and their bytes.
+    datagrams: u64,
+    wire_bytes: u64,
+    /// Sends that failed.
+    errors: u64,
+    last_error: Option<io::Error>,
+}
+
+/// What to do after a send to a target was booked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterSend {
+    /// On to the next target.
+    Next,
+    /// Send the same datagram to the same target once more.
+    Again,
+}
+
+impl TargetCounts {
+    fn new(target: SocketAddr) -> Self {
+        Self {
+            target,
+            datagrams: 0,
+            wire_bytes: 0,
+            errors: 0,
+            last_error: None,
+        }
     }
-    Ok(())
+
+    /// Book the result of sending a datagram of `expected` bytes to the
+    /// target. A failure is counted and never ends the run: the other
+    /// targets get the datagram, and this one gets the next.
+    ///
+    /// `ConnectionRefused` on a connected UDP socket is the kernel's report
+    /// that the target answered an earlier datagram with "port unreachable"
+    /// (nothing listens there), and the datagram of this call was not sent.
+    /// The first such failure of a datagram asks for one more send, so that
+    /// a target that has just come back misses nothing because of a report
+    /// about the time it was away.
+    fn book(&mut self, result: io::Result<usize>, expected: usize, first_try: bool) -> AfterSend {
+        match result {
+            Ok(sent) if sent == expected => {
+                self.datagrams = self.datagrams.saturating_add(1);
+                self.wire_bytes = self.wire_bytes.saturating_add(sent as u64);
+                AfterSend::Next
+            }
+            Ok(sent) => {
+                self.errors = self.errors.saturating_add(1);
+                self.last_error = Some(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("partial AEP1 datagram send: {sent} of {expected}"),
+                ));
+                AfterSend::Next
+            }
+            Err(error) => {
+                self.errors = self.errors.saturating_add(1);
+                let again = first_try && error.kind() == io::ErrorKind::ConnectionRefused;
+                self.last_error = Some(error);
+                if again {
+                    AfterSend::Again
+                } else {
+                    AfterSend::Next
+                }
+            }
+        }
+    }
+
+    fn report(self) -> TargetReport {
+        TargetReport {
+            target: self.target,
+            datagrams: self.datagrams,
+            wire_bytes: self.wire_bytes,
+            errors: self.errors,
+            last_error: self.last_error.map(|error| error.to_string()),
+        }
+    }
+}
+
+/// The address a sender's socket binds to reach `target`.
+fn sender_bind_address(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0_u16; 8], 0))
+    }
+}
+
+/// What a sender did: its encoder (with the stream's counts), how late the
+/// epochs left, and what each target was sent.
+struct SendOutcome {
+    encoder: EpochEncoder,
+    lateness: SendLateness,
+    targets: Vec<TargetCounts>,
 }
 
 /// The sender as it was: a tokio interval from the session id. The source
-/// (the PCM file is read whole) and the socket are made before the wait for
+/// (the PCM file is read whole) and the sockets are made before the wait for
 /// the session id, as they were, so that only the pacing differs from
 /// `--pace precise`.
 async fn send_tokio_paced(
     options: EpochSourceOptions,
-    target: SocketAddr,
+    targets: &[SocketAddr],
     epochs: u64,
     stop: &AtomicBool,
-) -> Result<(EpochEncoder, SendLateness)> {
+) -> Result<SendOutcome> {
     let session_id = options.session_id;
     let epoch = EpochGeometry::new(options.epoch_samples);
     let mut encoder = EpochEncoder::new(&options)?;
-    let socket = UdpSocket::bind(if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .await?;
+    // One connected socket per target: the kernel reports a target's
+    // failure to that target's socket only.
+    let mut lanes = Vec::with_capacity(targets.len());
+    for target in targets {
+        let socket = UdpSocket::bind(sender_bind_address(*target)).await?;
+        socket
+            .connect(target)
+            .await
+            .with_context(|| format!("no way to send to --target {target}"))?;
+        lanes.push((socket, TargetCounts::new(*target)));
+    }
     let mut lateness = SendLateness::default();
     loop {
         let now_ns = now_unix_ns()?;
@@ -3391,11 +3534,19 @@ async fn send_tokio_paced(
         let mut first_sent_ns = None;
         let mut last_sent_ns = 0;
         for (payload, source) in datagrams {
-            let sent = socket.send_to(&payload, target).await?;
-            last_sent_ns = now_unix_ns()?;
-            first_sent_ns.get_or_insert(last_sent_ns);
-            check_full_send(sent, payload.len())?;
-            encoder.count_sent(sent, source);
+            for (socket, counts) in &mut lanes {
+                let mut first_try = true;
+                loop {
+                    let result = socket.send(&payload).await;
+                    if counts.book(result, payload.len(), first_try) == AfterSend::Next {
+                        break;
+                    }
+                    first_try = false;
+                }
+                last_sent_ns = now_unix_ns()?;
+                first_sent_ns.get_or_insert(last_sent_ns);
+            }
+            encoder.count_datagram(payload.len(), source);
         }
         lateness.record(
             epoch_deadline_ns(session_id, epoch_id, epoch),
@@ -3403,27 +3554,36 @@ async fn send_tokio_paced(
             last_sent_ns,
         );
     }
-    Ok((encoder, lateness))
+    Ok(SendOutcome {
+        encoder,
+        lateness,
+        targets: lanes.into_iter().map(|(_, counts)| counts).collect(),
+    })
 }
 
 /// The sender on absolute wall-clock deadlines: epoch k leaves at
 /// `epoch_deadline_ns(session_id, k, epoch)` whatever happened to epoch
-/// k - 1.
+/// k - 1. Each datagram goes to every target, in order, before the next.
 fn send_precise_paced(
     options: EpochSourceOptions,
-    target: SocketAddr,
+    targets: &[SocketAddr],
     epochs: u64,
     stop: &AtomicBool,
-) -> Result<(EpochEncoder, SendLateness)> {
+) -> Result<SendOutcome> {
     let session_id = options.session_id;
     let epoch = EpochGeometry::new(options.epoch_samples);
     let spin_ns = epoch.spin_budget_ns();
     let mut encoder = EpochEncoder::new(&options)?;
-    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })?;
+    // One connected socket per target: the kernel reports a target's
+    // failure to that target's socket only.
+    let mut lanes = Vec::with_capacity(targets.len());
+    for target in targets {
+        let socket = std::net::UdpSocket::bind(sender_bind_address(*target))?;
+        socket
+            .connect(target)
+            .with_context(|| format!("no way to send to --target {target}"))?;
+        lanes.push((socket, TargetCounts::new(*target)));
+    }
     let mut lateness = SendLateness::default();
     for epoch_id in 0..epochs {
         let deadline_ns = epoch_deadline_ns(session_id, epoch_id, epoch);
@@ -3440,11 +3600,19 @@ fn send_precise_paced(
         let mut first_sent_ns = None;
         let mut last_sent_ns = 0;
         for (payload, source) in datagrams {
-            let sent = socket.send_to(&payload, target)?;
-            last_sent_ns = now_unix_ns()?;
-            first_sent_ns.get_or_insert(last_sent_ns);
-            check_full_send(sent, payload.len())?;
-            encoder.count_sent(sent, source);
+            for (socket, counts) in &mut lanes {
+                let mut first_try = true;
+                loop {
+                    let result = socket.send(&payload);
+                    if counts.book(result, payload.len(), first_try) == AfterSend::Next {
+                        break;
+                    }
+                    first_try = false;
+                }
+                last_sent_ns = now_unix_ns()?;
+                first_sent_ns.get_or_insert(last_sent_ns);
+            }
+            encoder.count_datagram(payload.len(), source);
         }
         lateness.record(
             deadline_ns,
@@ -3452,7 +3620,11 @@ fn send_precise_paced(
             last_sent_ns,
         );
     }
-    Ok((encoder, lateness))
+    Ok(SendOutcome {
+        encoder,
+        lateness,
+        targets: lanes.into_iter().map(|(_, counts)| counts).collect(),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8064,8 +8236,9 @@ mod tests {
         options.epoch_samples = 12;
         let session_id = options.session_id;
         let epoch = EpochGeometry::new(12);
-        let (encoder, lateness) =
-            send_precise_paced(options, target, epochs, &AtomicBool::new(false)).unwrap();
+        let SendOutcome {
+            encoder, lateness, ..
+        } = send_precise_paced(options, &[target], epochs, &AtomicBool::new(false)).unwrap();
         let finished = now_unix_ns().unwrap();
         assert_eq!(lateness.epochs, epochs);
         // 400 epochs of 250 µs: 100 ms, ending on the last deadline.
@@ -8105,8 +8278,9 @@ mod tests {
             min_repair_symbols: 1,
         };
         let session_id = options.session_id;
-        let (encoder, lateness) =
-            send_precise_paced(options, target, epochs, &AtomicBool::new(false)).unwrap();
+        let SendOutcome {
+            encoder, lateness, ..
+        } = send_precise_paced(options, &[target], epochs, &AtomicBool::new(false)).unwrap();
         let finished = now_unix_ns().unwrap();
         assert_eq!(lateness.epochs, epochs);
         // The run ends with the last deadline, not later by the sum of the
@@ -8119,6 +8293,223 @@ mod tests {
         for _ in 0..datagrams {
             receiver.recv_from(&mut buffer).unwrap();
         }
+    }
+
+    /// A loopback receiver and its address.
+    fn loopback_receiver() -> (std::net::UdpSocket, SocketAddr) {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let address = receiver.local_addr().unwrap();
+        (receiver, address)
+    }
+
+    /// Every datagram waiting at `receiver`, in arrival order.
+    fn drain(receiver: &std::net::UdpSocket) -> Vec<Vec<u8>> {
+        let mut buffer = [0_u8; 2_048];
+        let mut datagrams = Vec::new();
+        while let Ok((len, _)) = receiver.recv_from(&mut buffer) {
+            datagrams.push(buffer[..len].to_vec());
+        }
+        datagrams
+    }
+
+    /// The datagrams of the first `epochs` epochs of `options`' stream.
+    fn stream_datagrams(options: &EpochSourceOptions, epochs: u64) -> Vec<Vec<u8>> {
+        let mut encoder = EpochEncoder::new(options).unwrap();
+        (0..epochs)
+            .flat_map(|epoch_id| encoder.encode(epoch_id).unwrap())
+            .map(|(datagram, _)| datagram.to_vec())
+            .collect()
+    }
+
+    fn one_ms_pcm(session_id: u64) -> EpochSourceOptions {
+        EpochSourceOptions {
+            epoch_samples: 48,
+            ..sine_source(session_id)
+        }
+    }
+
+    #[test]
+    fn two_targets_receive_identical_datagram_sequences() {
+        let (first, first_address) = loopback_receiver();
+        let (second, second_address) = loopback_receiver();
+        let epochs = 40;
+        let session_id = now_unix_ns().unwrap() + 10_000_000;
+        let expected = stream_datagrams(&one_ms_pcm(session_id), epochs);
+        let SendOutcome {
+            encoder,
+            lateness,
+            targets,
+        } = send_precise_paced(
+            one_ms_pcm(session_id),
+            &[first_address, second_address],
+            epochs,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(lateness.epochs, epochs);
+        // One encoder: both targets get the stream's datagrams, byte for
+        // byte and in the stream's order.
+        let at_first = drain(&first);
+        let at_second = drain(&second);
+        assert_eq!(at_first, expected);
+        assert_eq!(at_second, expected);
+        // The stream's counts are of the stream, once; each target has its own.
+        let stream = encoder.source_datagrams + encoder.repair_datagrams;
+        let bytes = expected.iter().map(Vec::len).sum::<usize>() as u64;
+        assert_eq!(stream, expected.len() as u64);
+        assert_eq!(encoder.wire_bytes, bytes);
+        let reports = targets
+            .into_iter()
+            .map(TargetCounts::report)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reports,
+            [first_address, second_address].map(|target| TargetReport {
+                target,
+                datagrams: stream,
+                wire_bytes: bytes,
+                errors: 0,
+                last_error: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tokio_sender_feeds_every_target_too() {
+        let (first, first_address) = loopback_receiver();
+        let (second, second_address) = loopback_receiver();
+        let epochs = 20;
+        let session_id = now_unix_ns().unwrap() + 10_000_000;
+        let expected = stream_datagrams(&one_ms_pcm(session_id), epochs);
+        let SendOutcome { targets, .. } = send_tokio_paced(
+            one_ms_pcm(session_id),
+            &[first_address, second_address],
+            epochs,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(drain(&first), expected);
+        assert_eq!(drain(&second), expected);
+        for counts in targets {
+            assert_eq!(counts.datagrams, expected.len() as u64);
+            assert_eq!(counts.errors, 0);
+        }
+    }
+
+    #[test]
+    fn a_refused_target_does_not_stop_the_other() {
+        let (live, live_address) = loopback_receiver();
+        // A port that nothing listens on: the kernel answers each datagram
+        // with "port unreachable", and the next send to it is refused.
+        let refused_address = loopback_receiver().1;
+        let epochs = 40;
+        let session_id = now_unix_ns().unwrap() + 10_000_000;
+        let expected = stream_datagrams(&one_ms_pcm(session_id), epochs);
+        // The refused target first: its failures come before the live
+        // target's send of every datagram.
+        let SendOutcome {
+            lateness, targets, ..
+        } = send_precise_paced(
+            one_ms_pcm(session_id),
+            &[refused_address, live_address],
+            epochs,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(lateness.epochs, epochs);
+        assert_eq!(drain(&live), expected);
+        let [refused, live] = <[TargetCounts; 2]>::try_from(targets).unwrap();
+        assert_eq!(live.datagrams, expected.len() as u64);
+        assert_eq!(live.errors, 0);
+        assert!(refused.errors > 0, "no refusal was counted");
+        assert_eq!(
+            refused.last_error.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::ConnectionRefused)
+        );
+        // Every datagram was tried for the refused target as well.
+        assert!(refused.datagrams + refused.errors >= expected.len() as u64);
+        let report = refused.report();
+        assert_eq!(report.target, refused_address);
+        assert!(report.last_error.is_some());
+    }
+
+    #[test]
+    fn a_failed_send_is_booked_to_its_target_and_tried_again_only_when_refused() {
+        let target: SocketAddr = "192.0.2.7:27100".parse().unwrap();
+        let mut counts = TargetCounts::new(target);
+        assert_eq!(counts.book(Ok(300), 300, true), AfterSend::Next);
+        assert_eq!((counts.datagrams, counts.wire_bytes, counts.errors), (1, 300, 0));
+        // A refusal reports an earlier datagram: this one goes again, once.
+        let refused = || Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(counts.book(refused(), 300, true), AfterSend::Again);
+        assert_eq!(counts.book(refused(), 300, false), AfterSend::Next);
+        assert_eq!((counts.datagrams, counts.errors), (1, 2));
+        // Any other failure is counted and the sender moves on.
+        let unreachable = Err(io::Error::from(io::ErrorKind::HostUnreachable));
+        assert_eq!(counts.book(unreachable, 300, true), AfterSend::Next);
+        assert_eq!(counts.book(Ok(120), 300, true), AfterSend::Next);
+        assert_eq!((counts.datagrams, counts.wire_bytes, counts.errors), (1, 300, 4));
+        let report = counts.report();
+        assert_eq!(report.errors, 4);
+        assert_eq!(
+            report.last_error.as_deref(),
+            Some("partial AEP1 datagram send: 120 of 300")
+        );
+    }
+
+    #[test]
+    fn the_send_target_is_repeatable_and_needed() {
+        let parse = |targets: &[&str]| {
+            let mut args = vec!["aep1-48k-probe", "send"];
+            for target in targets {
+                args.extend(["--target", target]);
+            }
+            Args::try_parse_from(args)
+        };
+        assert!(parse(&[]).is_err());
+        for count in 1..=3 {
+            let given = ["10.77.1.6:27100", "10.77.1.7:27100", "[::1]:27100"];
+            let Command::Send { targets, .. } = parse(&given[..count]).unwrap().command else {
+                panic!("not a send command");
+            };
+            let expected = given[..count]
+                .iter()
+                .map(|target| target.parse().unwrap())
+                .collect::<Vec<SocketAddr>>();
+            assert_eq!(targets, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_given_twice_is_refused_before_anything_is_sent() {
+        let (receiver, target) = loopback_receiver();
+        let result = send(SendOptions {
+            targets: vec![target, target],
+            duration_seconds: 1,
+            session_id: None,
+            payload_kind: ProbePayload::Pcm,
+            epoch_samples: None,
+            opus_bitrate: PROBE_OPUS_BITRATE,
+            channels: 2,
+            group_channels: 8,
+            signal: ProbeSignal::Sine,
+            pcm_s24le_file: None,
+            group_id: 0,
+            repair_percent: 12,
+            min_repair_symbols: 1,
+            pace: SendPace::Precise,
+        })
+        .await;
+        let error = result.err().expect("a repeated target was accepted");
+        assert!(error.to_string().contains("given twice"), "{error}");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        assert!(drain(&receiver).is_empty());
     }
 
     fn sine_source(session_id: u64) -> EpochSourceOptions {
@@ -8150,8 +8541,8 @@ mod tests {
             flag.store(true, AtomicOrdering::Release);
         });
         let started = Instant::now();
-        let (_, lateness) =
-            send_precise_paced(sine_source(session_id), target, 200_000, &stop).unwrap();
+        let SendOutcome { lateness, .. } =
+            send_precise_paced(sine_source(session_id), &[target], 200_000, &stop).unwrap();
         stopper.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         let sent = lateness.epochs as usize;
@@ -8161,7 +8552,8 @@ mod tests {
         // A stop during the wait for the session id ends the wait.
         let stop = AtomicBool::new(true);
         let far = now_unix_ns().unwrap() + 30_000_000_000;
-        let (_, lateness) = send_precise_paced(sine_source(far), target, 10, &stop).unwrap();
+        let SendOutcome { lateness, .. } =
+            send_precise_paced(sine_source(far), &[target], 10, &stop).unwrap();
         assert_eq!(lateness.epochs, 0);
     }
 
@@ -8175,7 +8567,7 @@ mod tests {
         options.pcm_s24le_file = Some(PathBuf::from("/nonexistent/aep1-probe-audio.s24le"));
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            send_tokio_paced(options, target, 10, &AtomicBool::new(false)),
+            send_tokio_paced(options, &[target], 10, &AtomicBool::new(false)),
         )
         .await
         .expect("the tokio sender waited for the session before reading its source");
@@ -8189,9 +8581,9 @@ mod tests {
             flag.store(true, AtomicOrdering::Release);
         });
         let session_id = now_unix_ns().unwrap() + 10_000_000;
-        let (_, lateness) = tokio::time::timeout(
+        let SendOutcome { lateness, .. } = tokio::time::timeout(
             Duration::from_secs(5),
-            send_tokio_paced(sine_source(session_id), target, 200_000, &stop),
+            send_tokio_paced(sine_source(session_id), &[target], 200_000, &stop),
         )
         .await
         .unwrap()
