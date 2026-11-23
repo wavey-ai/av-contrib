@@ -13524,25 +13524,14 @@ mod tests {
     }
 
     /// The canonical envelope of every opaque part by (stream, part number),
-    /// built as the mesh forwarder builds it; with `wire`, also the part's
-    /// datagrams as the source-first publication encodes them.
+    /// built as the mesh forwarder builds it.
     #[derive(Default)]
     struct EnvelopeCapture {
         envelopes: StdMutex<std::collections::BTreeMap<(u64, u64), Vec<u8>>>,
-        wire: Option<WireCapture>,
     }
 
-    /// A contributor's source-first encoder, as RelaySessionPublisher::new
-    /// builds it (100 ms compact cells, the policy giving a part of several
-    /// symbols two repair symbols), the copies its lanes' loss gives a
-    /// one-symbol part, and every datagram of every part it encoded.
-    struct WireCapture {
-        encoder: SourceFirstEncoder,
-        copies: u32,
-        datagrams: StdMutex<std::collections::BTreeMap<(u64, u64), EncodedPart>>,
-    }
-
-    /// One part's datagrams, sources first, and whether it went compact.
+    /// One part's datagrams as its lane received them, sources first, and
+    /// whether it went compact.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct EncodedPart {
         compact: bool,
@@ -13550,44 +13539,158 @@ mod tests {
         wires: Vec<Bytes>,
     }
 
-    impl WireCapture {
-        fn new(copies: u32) -> Self {
-            let policy = AdaptiveFecPolicy {
-                min_repair_symbols: 2,
-                ..AdaptiveFecPolicy::default()
-            };
-            let encoder = SourceFirstEncoder::new(
-                AdaptiveFecController::new(policy, CongestionConfig::default()),
-                RelayLimits::default(),
-            )
-            .unwrap()
-            .with_compact_audio(Some(100_000));
+    /// A contributor's publication of opaque audio as `main` builds it, from
+    /// the packager's hand-off to the wire: `MeshForwarder::new` of the
+    /// contributor's arguments (its relay publisher, source-first encoder,
+    /// compact audio and configured copies), its primary lane sending to a
+    /// loopback socket of this test, which a thread of its own empties so
+    /// that no datagram is lost to a full receive buffer.
+    struct LaneCapture {
+        args: Args,
+        forwarder: Arc<MeshForwarder>,
+        stop: Arc<AtomicBool>,
+        receiver: std::thread::JoinHandle<Vec<Bytes>>,
+    }
+
+    impl LaneCapture {
+        /// A contributor whose lanes ask for `copies` copies of a one-symbol
+        /// part (`--relay-audio-copies configured`, a clean path and
+        /// `--relay-min-repair-symbols`), which is also the repair count of
+        /// a part of several symbols; `budget_ms` is `--relay-deadline-ms`.
+        async fn start(budget_ms: u64, copies: u32) -> Self {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            SockRef::from(&socket)
+                .set_recv_buffer_size(4 << 20)
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(socket.local_addr().unwrap());
+            args.relay_exclusive = true;
+            args.relay_compact_audio = true;
+            args.relay_audio_copies = RelayAudioCopies::Configured;
+            args.relay_min_repair_symbols = copies;
+            args.relay_deadline_ms = budget_ms;
+            args.wall_clock_estimated_error_ms = IDENTITY_CLOCK_ERROR_NS / 1_000_000;
+            args.fmp4_segment_ms = u32::try_from(IDENTITY_SEGMENT_US / 1_000).unwrap();
+            assert!(args.relay_send_batch && args.relay_source_first && args.relay_audio_inline);
+            let forwarder = Arc::new(
+                MeshForwarder::new(&args, Arc::new(IngestTelemetry::default()))
+                    .await
+                    .unwrap(),
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let receiver = std::thread::spawn(move || {
+                let mut wire = vec![0_u8; 65_536];
+                let mut received = Vec::new();
+                loop {
+                    match socket.recv(&mut wire) {
+                        Ok(len) => received.push(Bytes::copy_from_slice(&wire[..len])),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            // Empty: done once every datagram was sent.
+                            if stopped.load(Ordering::Acquire) {
+                                return received;
+                            }
+                        }
+                        Err(error) => panic!("lane receive: {error}"),
+                    }
+                }
+            });
             Self {
-                encoder,
-                copies,
-                datagrams: StdMutex::default(),
+                args,
+                forwarder,
+                stop,
+                receiver,
             }
         }
 
-        /// What publish_source_first hands the lanes for `part`.
-        fn encode(&self, object: &MediaObject, part: &PublishedOpaquePart) -> EncodedPart {
-            let encoded = self
-                .encoder
-                .encode_sources_with(
-                    object,
-                    TopologyGeneration::new(DEFAULT_RELAY_TOPOLOGY_GENERATION).unwrap(),
-                    SubscriptionId::new(1).unwrap(),
-                    relay_deadline_for_object(object).unwrap(),
-                    Some(self.copies),
-                    Some(self.encoder.part_ids(&part.anchor)),
-                )
+        /// Every datagram the lane sent, by (stream, part number), once its
+        /// backlog is empty.
+        async fn finish(self) -> std::collections::BTreeMap<(u64, u64), EncodedPart> {
+            let relay = self.forwarder.relay.as_ref().unwrap();
+            for _ in 0..400 {
+                if !relay.primary.backlog.busy() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(!relay.primary.backlog.busy(), "the lane's backlog drains");
+            let sent = relay.primary.backlog.sent.load(Ordering::Acquire);
+            self.stop.store(true, Ordering::Release);
+            let receiver = self.receiver;
+            let received = tokio::task::spawn_blocking(move || receiver.join().unwrap())
+                .await
                 .unwrap();
-            let mut wires = encoded.source_wires().to_vec();
-            wires.extend(encoded.repair_wires().unwrap());
-            EncodedPart {
-                compact: encoded.is_compact(),
-                sources: encoded.source_wires().len(),
-                wires,
+            assert_eq!(received.len() as u64, sent, "every datagram the lane sent");
+            let mut parts = std::collections::BTreeMap::<(u64, u64), EncodedPart>::new();
+            for wire in received {
+                let (stream, number, source, compact) = if wire.starts_with(b"RLC1") {
+                    let (header, _) = playlists::compact_object::parse_datagram(&wire).unwrap();
+                    (
+                        header.stream.parse::<u64>().unwrap(),
+                        header.object,
+                        header.role == 0,
+                        true,
+                    )
+                } else {
+                    let datagram =
+                        relay_session::decode_datagram(&wire, RelayLimits::default()).unwrap();
+                    (
+                        datagram.object_key.stream().parse::<u64>().unwrap(),
+                        datagram.object_key.object(),
+                        datagram.role == MediaDatagramRole::Source,
+                        false,
+                    )
+                };
+                let part = parts.entry((stream, number)).or_insert(EncodedPart {
+                    compact,
+                    sources: 0,
+                    wires: Vec::new(),
+                });
+                assert_eq!(
+                    part.compact, compact,
+                    "part {number} of {stream} in one form"
+                );
+                if source {
+                    assert_eq!(part.sources, part.wires.len(), "the sources lead");
+                    part.sources += 1;
+                }
+                part.wires.push(wire);
+            }
+            parts
+        }
+    }
+
+    /// The ids of part `number`'s datagrams are its number's (A 2.2): block
+    /// id `N`, and datagram `i` of the part (sources, then repair or
+    /// copies) packet sequence `N + i`; a compact copy `j` has ESI `1 + j`.
+    fn assert_named_by_number(stream: u64, number: u64, part: &EncodedPart) {
+        let first = number as u32;
+        for (index, wire) in part.wires.iter().enumerate() {
+            let sequence = first.wrapping_add(index as u32);
+            if part.compact {
+                let (header, _) = playlists::compact_object::parse_datagram(wire).unwrap();
+                assert_eq!(
+                    (header.packet_sequence, header.esi),
+                    (sequence, index as u32),
+                    "stream {stream} part {number} datagram {index}"
+                );
+            } else {
+                let datagram =
+                    relay_session::decode_datagram(wire, RelayLimits::default()).unwrap();
+                let fec = raptorq_datagram_fec::decode_header(&datagram.fec_datagram).unwrap();
+                assert_eq!(
+                    (fec.block_id, fec.packet_sequence),
+                    (first, sequence),
+                    "stream {stream} part {number} datagram {index}"
+                );
             }
         }
     }
@@ -13619,51 +13722,78 @@ mod tests {
                 .unwrap()
                 .insert((part.stream_id, part.sequence), envelope);
             assert!(earlier.is_none(), "part {} twice", part.sequence);
-            if let Some(wire) = &self.wire {
-                let encoded = wire.encode(&object, &part);
-                wire.datagrams
-                    .lock()
-                    .unwrap()
-                    .insert((part.stream_id, part.sequence), encoded);
-            }
             Ok(())
         }
     }
 
     /// One contributor in this process, from AEP1 datagrams to canonical
-    /// envelopes: the AEP1 recovery and packaging worker and the bounded
-    /// publisher of the binary (audio published on the packager's task),
-    /// with nothing shared between two of them.
+    /// envelopes or to the datagrams of its relay lane: the AEP1 recovery
+    /// and packaging worker and the bounded publisher of the binary (audio
+    /// published on the packager's task), with nothing shared between two
+    /// of them.
     struct IdentityContributor {
         input: mpsc::Sender<AudioEpochHlsDatagram>,
         worker: tokio::task::JoinHandle<()>,
-        captured: Arc<EnvelopeCapture>,
+        output: IdentityOutput,
         _shutdown: watch::Sender<()>,
+    }
+
+    /// Where an [`IdentityContributor`]'s parts go.
+    enum IdentityOutput {
+        /// Each part's canonical envelope, built as the mesh forwarder
+        /// builds it.
+        Envelopes(Arc<EnvelopeCapture>),
+        /// The contributor's own mesh forwarder and relay lane.
+        Lane(LaneCapture),
     }
 
     impl IdentityContributor {
         fn start(part: AudioPartSize) -> Self {
-            Self::start_with(part, None)
-        }
-
-        /// A contributor that also encodes every part's datagrams.
-        fn start_with(part: AudioPartSize, wire: Option<WireCapture>) -> Self {
-            let captured = Arc::new(EnvelopeCapture {
-                wire,
-                ..EnvelopeCapture::default()
-            });
-            let (shutdown, shutdown_rx) = watch::channel(());
-            let (publisher, _workers) = start_bounded_publication_pipeline(
+            let captured = Arc::new(EnvelopeCapture::default());
+            Self::start_on(
+                part,
                 captured.clone(),
-                Arc::new(IngestTelemetry::default()),
                 StampDurations {
                     video_part_us: 0,
                     video_segment_us: 2_000_000,
                     audio_part_us: 0,
                     audio_segment_us: IDENTITY_SEGMENT_US,
                 },
-                true,
-                true,
+                (true, true),
+                IdentityOutput::Envelopes(captured),
+            )
+        }
+
+        /// A contributor publishing on a relay lane as `main` wires it
+        /// ([`LaneCapture::start`]).
+        async fn start_on_lane(part: AudioPartSize, budget_ms: u64, copies: u32) -> Self {
+            let lane = LaneCapture::start(budget_ms, copies).await;
+            Self::start_on(
+                part,
+                lane.forwarder.clone(),
+                lane.args.stamp_durations(),
+                (
+                    lane.args.publication_shard_mix,
+                    lane.args.relay_audio_inline,
+                ),
+                IdentityOutput::Lane(lane),
+            )
+        }
+
+        fn start_on(
+            part: AudioPartSize,
+            inner: Arc<dyn Fmp4PartPublisher>,
+            durations: StampDurations,
+            (shard_mix, audio_inline): (bool, bool),
+            output: IdentityOutput,
+        ) -> Self {
+            let (shutdown, shutdown_rx) = watch::channel(());
+            let (publisher, _workers) = start_bounded_publication_pipeline(
+                inner,
+                Arc::new(IngestTelemetry::default()),
+                durations,
+                shard_mix,
+                audio_inline,
                 shutdown_rx.clone(),
             );
             let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
@@ -13684,7 +13814,7 @@ mod tests {
             Self {
                 input,
                 worker,
-                captured,
+                output,
                 _shutdown: shutdown,
             }
         }
@@ -13702,22 +13832,30 @@ mod tests {
             }
         }
 
-        /// The envelopes of every part of what was fed, once the worker has
-        /// packaged it all.
-        async fn finish(self) -> std::collections::BTreeMap<(u64, u64), Vec<u8>> {
+        /// Where the parts went, once the worker has packaged and published
+        /// all that was fed.
+        async fn stop(self) -> IdentityOutput {
             drop(self.input);
             self.worker.await.unwrap();
-            std::mem::take(&mut *self.captured.envelopes.lock().unwrap())
+            self.output
         }
 
-        /// The datagrams of every part of what was fed (a contributor
-        /// started with a [`WireCapture`]).
-        async fn finish_wire(self) -> std::collections::BTreeMap<(u64, u64), EncodedPart> {
-            let captured = Arc::clone(&self.captured);
-            self.finish().await;
-            let wire = captured.wire.as_ref().expect("started with a wire capture");
-            let datagrams = std::mem::take(&mut *wire.datagrams.lock().unwrap());
-            datagrams
+        /// The envelopes of every part of what was fed.
+        async fn finish(self) -> std::collections::BTreeMap<(u64, u64), Vec<u8>> {
+            let IdentityOutput::Envelopes(captured) = self.stop().await else {
+                panic!("a contributor on a lane: finish_lane");
+            };
+            let envelopes = std::mem::take(&mut *captured.envelopes.lock().unwrap());
+            envelopes
+        }
+
+        /// The datagrams of every part of what was fed, as its lane sent
+        /// them (a contributor started on a lane).
+        async fn finish_lane(self) -> std::collections::BTreeMap<(u64, u64), EncodedPart> {
+            let IdentityOutput::Lane(lane) = self.stop().await else {
+                panic!("a contributor of envelopes: finish");
+            };
+            lane.finish().await
         }
     }
 
@@ -13823,25 +13961,30 @@ mod tests {
     /// The heart of the two-contributor design on the wire: contributors
     /// fed the same AEP1 datagrams send the same datagrams for every part,
     /// RLC1 and RLS1, sources, repair and copies, whatever each one's
-    /// history and however many copies its lanes ask for. One is there from
-    /// the session's first epoch (three copies); one starts at epoch 123 of
-    /// the running session (none); one loses two epochs outright and
-    /// recovers a third from repair (two). The only difference allowed is
-    /// the form of the late joiner's first part: its first part goes whole
-    /// where the others are inside a cell they opened whole. The FLAC lane's
-    /// parts are three RLS1 symbols and their repair.
+    /// history and however many copies and repair symbols its lanes ask
+    /// for. Each contributor is the binary's own publication (bounded
+    /// publisher, mesh forwarder, relay publisher, source-first encoder)
+    /// and what is compared is what its relay lane put on the wire. One is
+    /// there from the session's first epoch (three copies, three repair
+    /// symbols); one starts at epoch 123 of the running session (none); one
+    /// loses two epochs outright and recovers a third from repair (two).
+    /// The only difference allowed is the form of the late joiner's first
+    /// part: its first part goes whole where the others are inside a cell
+    /// they opened whole. The FLAC lane's parts are three RLS1 symbols and
+    /// their repair, whose symbol `j` is the same bytes whatever the count.
     #[tokio::test]
     async fn two_encoders_emit_identical_datagrams() {
         const EPOCHS: u64 = 300;
         const JOINS_AT: u64 = 123;
         const LOST: [u64; 2] = [41, 200];
         const REPAIRED: u64 = 77;
+        // The same budget on all three (a loaded test host never expires a
+        // part here); the golden files pin the default one.
+        const BUDGET_MS: u64 = 60_000;
         let mut sources = IdentitySource::lanes();
-        let whole =
-            IdentityContributor::start_with(AudioPartSize::Epoch, Some(WireCapture::new(3)));
-        let late = IdentityContributor::start_with(AudioPartSize::Epoch, Some(WireCapture::new(0)));
-        let lossy =
-            IdentityContributor::start_with(AudioPartSize::Epoch, Some(WireCapture::new(2)));
+        let whole = IdentityContributor::start_on_lane(AudioPartSize::Epoch, BUDGET_MS, 3).await;
+        let late = IdentityContributor::start_on_lane(AudioPartSize::Epoch, BUDGET_MS, 0).await;
+        let lossy = IdentityContributor::start_on_lane(AudioPartSize::Epoch, BUDGET_MS, 2).await;
         for index in 0..EPOCHS {
             for source in &mut sources {
                 let datagrams = source.datagrams(index);
@@ -13856,9 +13999,16 @@ mod tests {
                 }
             }
         }
-        let whole = whole.finish_wire().await;
-        let late = late.finish_wire().await;
-        let lossy = lossy.finish_wire().await;
+        let whole = whole.finish_lane().await;
+        let late = late.finish_lane().await;
+        let lossy = lossy.finish_lane().await;
+        // Every datagram of every part on every lane is named by its part's
+        // number, not by what that contributor sent before it.
+        for encoded in [&whole, &late, &lossy] {
+            for ((stream, number), part) in encoded {
+                assert_named_by_number(*stream, *number, part);
+            }
+        }
 
         for source in &sources {
             let stream = source.stream_id();
@@ -13899,11 +14049,20 @@ mod tests {
                 for (number, part) in &other {
                     let expected = &reference[number];
                     if flac {
-                        // Three source symbols and the policy's repair:
-                        // never compact, every datagram equal.
+                        // Three source symbols and as many repair symbols
+                        // as each contributor's lanes ask for (3, 0 and 2):
+                        // never compact, and the shorter set of datagrams
+                        // is the start of the longer, byte for byte.
                         assert_eq!(part.sources, 3, "{name} part {number}");
+                        assert_eq!(expected.sources, 3);
                         assert!(!part.compact && !expected.compact);
-                        assert_eq!(part, expected, "{name} FLAC part {number}");
+                        assert_eq!(part.wires.len(), 3 + copies, "{name} part {number}");
+                        assert_eq!(expected.wires.len(), 3 + 3);
+                        assert_eq!(
+                            part.wires[..],
+                            expected.wires[..part.wires.len()],
+                            "{name} FLAC part {number}"
+                        );
                         continue;
                     }
                     assert_eq!(part.sources, 1, "{name} stream {stream} part {number}");
@@ -13947,21 +14106,22 @@ mod tests {
 
     /// The datagrams of fixed parts are the bytes of
     /// `tests/golden/wire-*.hex`: parts 0, 1, 123456789 and 123456790 of
-    /// each lane through recovery, packaging, the canonical object and the
-    /// source-first encoder with two copies: whole (the first of a cell)
-    /// then compact for the one-symbol lanes, three symbols and two repair
-    /// for FLAC.
+    /// each lane through recovery, packaging and the binary's publication
+    /// to its relay lane, with two copies: whole (the first of a cell) then
+    /// compact for the one-symbol lanes, three symbols and two repair for
+    /// FLAC.
     #[tokio::test]
     async fn opaque_datagrams_match_the_golden_bytes() {
         const EPOCHS: [u64; 4] = [0, 1, 123_456_789, 123_456_790];
         for (name, title, mut source) in golden_sources() {
             let contributor =
-                IdentityContributor::start_with(AudioPartSize::Epoch, Some(WireCapture::new(2)));
+                IdentityContributor::start_on_lane(AudioPartSize::Epoch, IDENTITY_BUDGET_MS, 2)
+                    .await;
             for index in EPOCHS {
                 let datagrams = source.datagrams(index);
                 contributor.feed(source.peer, &datagrams).await;
             }
-            let encoded = contributor.finish_wire().await;
+            let encoded = contributor.finish_lane().await;
             let stream = source.stream_id();
             assert_eq!(
                 encoded.keys().copied().collect::<Vec<_>>(),
