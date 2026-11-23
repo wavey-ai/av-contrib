@@ -2252,18 +2252,23 @@ mod tests {
             .set_recv_buffer_size(4 << 20)
             .unwrap();
         let target = socket.local_addr().unwrap();
+        // The source keeps a 5 ms pace and measures how late it sent each
+        // epoch: on a loaded machine its own lateness is a real gap.
         let source = std::thread::spawn(move || {
             let out = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let start = Instant::now();
+            let mut late_max = Duration::ZERO;
             for (index, datagrams) in epochs.iter().enumerate() {
                 let due = start + Duration::from_millis(5 * index as u64);
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }
+                late_max = late_max.max(Instant::now().saturating_duration_since(due));
                 for datagram in datagrams {
                     out.send_to(datagram, target).unwrap();
                 }
             }
+            late_max
         });
 
         let mut reads = ReceiveTiming::new(target);
@@ -2293,7 +2298,7 @@ mod tests {
                 Err(error) => panic!("{error}"),
             }
         }
-        source.join().unwrap();
+        let source_late_max_us = source.join().unwrap().as_micros() as u64;
         assert_eq!(completed, 20);
         assert!(rx_wait_max_us >= 60_000, "rx_wait {rx_wait_max_us} us");
         let report = journal.query(Some(since_us));
@@ -2307,8 +2312,12 @@ mod tests {
                 .unwrap_or(0)
         };
         assert!(longest(StallKind::RxWait) >= 60_000, "{report:?}");
-        // The source kept time: no epoch came anywhere near the stop late.
-        assert!(longest(StallKind::SrcGap) < 20_000, "{report:?}");
+        // No epoch came later after its turn than the source itself sent
+        // it: nothing of the reader's 80 ms stop is booked to the source.
+        assert!(
+            longest(StallKind::SrcGap) <= source_late_max_us + 2_000,
+            "source late at most {source_late_max_us} us: {report:?}"
+        );
     }
 
     #[tokio::test]

@@ -98,6 +98,9 @@ const CONTRIB_STATUS_PATH: &str = "/api/status";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
 /// The stall journal, D-hunt 2.1's NDJSON (`?since_us=`).
 const CONTRIB_STALLS_PATH: &str = "/api/stalls";
+/// The pacing record, D-hunt 2.8's per-second figures of the DAW socket's
+/// reads and of each AEP1 source session (`?since_s=`).
+const CONTRIB_PACING_PATH: &str = "/api/pacing";
 const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const DAW_MEDIA_RECEIVE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
@@ -8281,7 +8284,6 @@ impl ContribStatusConfig {
             stall: stall_journal::installed()
                 .filter(|journal| journal.is_enabled())
                 .map(|journal| journal.snapshot()),
-            source_timing: source_timing::snapshot(),
         }
     }
 
@@ -9604,9 +9606,6 @@ struct ContribStatusSnapshot {
     scheduling: Vec<HotThreadScheduling>,
     /// The stall journal's counters; `None` when it is off.
     stall: Option<StallSnapshot>,
-    /// The last whole second of the DAW socket's reads and of each AEP1
-    /// source session's arrivals.
-    source_timing: source_timing::SourceTimingSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10593,6 +10592,39 @@ async fn stalls_response(
     )
 }
 
+/// `GET /api/pacing?since_s=S`: every kept second (D-hunt 2.8) of the DAW
+/// socket's reads and of each AEP1 source session from Unix second `S` on,
+/// oldest first, as one JSON document. A reader that comes back with
+/// `since_s` one after the last `unix_s` it saw misses nothing.
+fn pacing_response(query: Option<&str>) -> HandlerResponse {
+    let mut since_s = None;
+    for (key, value) in form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        if key == "since_s" {
+            let Ok(value) = value.parse::<u64>() else {
+                return response(
+                    StatusCode::BAD_REQUEST,
+                    Some(Bytes::from_static(b"since_s must be an unsigned integer\n")),
+                    Some("text/plain; charset=utf-8"),
+                );
+            };
+            since_s = Some(value);
+        }
+    }
+    let now_s = hop_journal::now_unix_us() / 1_000_000;
+    match serde_json::to_vec(&source_timing::record(since_s, now_s)) {
+        Ok(body) => response(
+            StatusCode::OK,
+            Some(Bytes::from(body)),
+            Some("application/json"),
+        ),
+        Err(error) => response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(Bytes::from(format!("pacing record failed: {error}\n"))),
+            Some("text/plain; charset=utf-8"),
+        ),
+    }
+}
+
 fn needletail_ingest_response(status: StatusCode) -> HandlerResponse {
     let body = serde_json::to_vec(&serde_json::json!({
         "error": "needletail_ingest_rejected",
@@ -10654,6 +10686,7 @@ impl Router for ContribRouter {
             HOP_JOURNAL_PATH => {
                 Ok(hop_journal_response(hop_journal::global(), req.uri().query()).await)
             }
+            CONTRIB_PACING_PATH => Ok(pacing_response(req.uri().query())),
             CONTRIB_STALLS_PATH => Ok(stalls_response(
                 stall_journal::installed().cloned(),
                 req.uri().query(),
@@ -15975,7 +16008,7 @@ mod tests {
     }
 
     #[test]
-    fn the_status_reports_memory_scheduling_and_source_timing() {
+    fn the_status_reports_memory_and_scheduling() {
         let args = contrib_status_args();
         let status_config =
             ContribStatusConfig::from_args(&args, Arc::new(IngestTelemetry::default()));
@@ -15996,9 +16029,46 @@ mod tests {
             .expect("the thread's outcome is in the status");
         assert_eq!(thread["realtime"], false);
         assert_eq!(thread["pinned"], false);
-        assert!(json["source_timing"]["receive"].is_array());
-        assert!(json["source_timing"]["sources"].is_array());
         assert!(json.get("stall").is_some());
+    }
+
+    #[test]
+    fn pacing_endpoint_serves_every_kept_second_from_since_s() {
+        // Three seconds of a socket's reads, each closed by the next.
+        let bind: SocketAddr = "192.0.2.78:27100".parse().unwrap();
+        let base_s = now_unix_ms() / 1_000;
+        let mut reads = ReceiveTiming::new(bind);
+        for second in 0..4 {
+            let stamp = (base_s + second) * 1_000_000;
+            reads.datagram(Some(stamp), stamp + 40);
+        }
+        let seconds = |query: &str| {
+            let response = pacing_response(Some(query));
+            assert_eq!(response.status, StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
+            assert_eq!(body["kept_s"], source_timing::PACING_KEPT_S);
+            assert!(body["sources"].is_array());
+            body["receive"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["bind"] == bind.to_string())
+                .map(|row| {
+                    assert_eq!(row["rx_wait_p999_us"], 40);
+                    row["unix_s"].as_u64().unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seconds(&format!("since_s={base_s}")),
+            [base_s, base_s + 1, base_s + 2]
+        );
+        assert_eq!(seconds(&format!("since_s={}", base_s + 2)), [base_s + 2]);
+        assert_eq!(seconds(""), [base_s, base_s + 1, base_s + 2]);
+        assert_eq!(
+            pacing_response(Some("since_s=soon")).status,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
