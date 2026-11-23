@@ -14287,57 +14287,104 @@ mod tests {
     /// point on its source's timeline: a source whose clock is ten minutes
     /// slow or fast (or a DAW that paused) has every part sent, and a part
     /// expires here only by this host's own clock, a budget after it was
-    /// recovered.
+    /// recovered. Every place the lanes look at a part's expiry is run: the
+    /// audio hot path's hand-offs (`--relay-audio-inline`), the joined
+    /// batches without it, and the lanes' backlogs (a lane with a part
+    /// already waiting for room in its socket's buffer queues the next one
+    /// behind it), each for the source and the repair of a part on a primary
+    /// and a secondary lane.
     #[tokio::test]
     async fn a_drifting_source_clock_expires_nothing_locally() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut args = contrib_status_args();
-        args.relay_primary_target = Some(receiver.local_addr().unwrap());
-        args.relay_exclusive = true;
-        args.relay_audio_copies = RelayAudioCopies::Configured;
-        let telemetry = Arc::new(IngestTelemetry::default());
-        let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
-            .await
-            .unwrap();
-        let budget_us = args.relay_deadline_ms * 1_000;
-        let now_ns = u64::try_from(now_unix_ns()).unwrap();
-        let ten_minutes_ns = 600_000_000_000_u64;
-        for session_id_ns in [now_ns - ten_minutes_ns, now_ns, now_ns + ten_minutes_ns] {
-            let mut part = test_opaque_part_at(4_001, test_anchor(session_id_ns, 5, 48));
-            part.source_times.recovered_us = Some(hop_journal::now_unix_us());
-            forwarder.publish_opaque_part(part).await.unwrap();
-            let received = receive_relay_datagrams(&receiver, 1).await;
-            // What the datagram carries is the source's: a budget after the
-            // instant the source sent the part's last epoch (5 ms in).
+        for mode in ["inline", "batch", "backlog"] {
+            let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let secondary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary.local_addr().unwrap());
+            args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+            args.relay_exclusive = true;
+            args.relay_audio_inline = mode != "batch";
+            // One copy: the primary carries the source and the copy, the
+            // secondary the copy.
+            args.relay_audio_copies = RelayAudioCopies::Configured;
+            args.relay_min_repair_symbols = 1;
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap();
+            let relay = forwarder.relay.as_ref().unwrap();
+            if mode == "backlog" {
+                for lane in [&relay.primary, relay.secondary.as_ref().unwrap()] {
+                    lane.backlog.pending.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            let budget_us = args.relay_deadline_ms * 1_000;
+            let receive = |object: u64, session_id_ns: u64| {
+                let (primary, secondary) = (&primary, &secondary);
+                async move {
+                    let mut received = receive_relay_datagrams(primary, 2).await;
+                    received.extend(receive_relay_datagrams(secondary, 1).await);
+                    for (datagram, _) in &received {
+                        // What the datagram carries is the source's: a
+                        // budget after the instant the source sent the
+                        // part's last epoch (`object` epochs of 1 ms in).
+                        assert_eq!(
+                            datagram.deadline.expires_at_us,
+                            (session_id_ns + object * 1_000_000).div_ceil(1_000) + budget_us,
+                            "{mode}"
+                        );
+                        assert_eq!(datagram.object_key.epoch(), session_id_ns / 1_000);
+                        assert_eq!(datagram.object_key.object(), object);
+                    }
+                }
+            };
+            let now_ns = u64::try_from(now_unix_ns()).unwrap();
+            let ten_minutes_ns = 600_000_000_000_u64;
+            for session_id_ns in [now_ns - ten_minutes_ns, now_ns, now_ns + ten_minutes_ns] {
+                let mut part = test_opaque_part_at(4_001, test_anchor(session_id_ns, 5, 48));
+                part.source_times.recovered_us = Some(hop_journal::now_unix_us());
+                forwarder.publish_opaque_part(part).await.unwrap();
+                receive(5, session_id_ns).await;
+            }
             assert_eq!(
-                received[0].0.deadline.expires_at_us,
-                (session_id_ns + 5_000_000).div_ceil(1_000) + budget_us
+                telemetry.relay_expired_objects.load(Ordering::Relaxed),
+                0,
+                "{mode}"
             );
-            assert_eq!(received[0].0.object_key.epoch(), session_id_ns / 1_000);
-            assert_eq!(received[0].0.object_key.object(), 5);
-        }
-        assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 0);
-        assert_eq!(telemetry.relay_objects_sent.load(Ordering::Relaxed), 3);
+            assert_eq!(telemetry.relay_objects_sent.load(Ordering::Relaxed), 3);
+            assert_eq!(
+                telemetry.relay_lane_backlog_parts.load(Ordering::Relaxed) > 0,
+                mode == "backlog",
+                "{mode}"
+            );
 
-        // A part recovered here two budgets ago has expired on this host,
-        // whatever its source's clock says of it.
-        let mut stale = test_opaque_part_at(4_001, test_anchor(now_ns + ten_minutes_ns, 6, 48));
-        stale.source_times.recovered_us = Some(hop_journal::now_unix_us() - 2 * budget_us);
-        let error = forwarder.publish_opaque_part(stale).await.unwrap_err();
-        assert!(error.contains("expired"), "{error}");
-        assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 1);
-        // A part with no recovery time is timed from when it was gathered.
-        let mut gathered = test_opaque_part_at(4_001, test_anchor(now_ns - ten_minutes_ns, 7, 48));
-        gathered.packaged_at_unix_ns = now_unix_ns();
-        forwarder
-            .publish_opaque_part(gathered.clone())
-            .await
-            .unwrap();
-        receive_relay_datagrams(&receiver, 1).await;
-        gathered.anchor = test_anchor(now_ns - ten_minutes_ns, 8, 48);
-        gathered.packaged_at_unix_ns -= 2 * i64::try_from(budget_us).unwrap() * 1_000;
-        assert!(forwarder.publish_opaque_part(gathered).await.is_err());
-        assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 2);
+            // A part recovered here two budgets ago has expired on this
+            // host, whatever its source's clock says of it.
+            let mut stale = test_opaque_part_at(4_001, test_anchor(now_ns + ten_minutes_ns, 6, 48));
+            stale.source_times.recovered_us = Some(hop_journal::now_unix_us() - 2 * budget_us);
+            let error = forwarder.publish_opaque_part(stale).await.unwrap_err();
+            assert!(error.contains("expired"), "{error}");
+            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 1);
+            // A part with no recovery time is timed from when it was
+            // gathered.
+            let session_id_ns = now_ns - ten_minutes_ns;
+            let mut gathered = test_opaque_part_at(4_001, test_anchor(session_id_ns, 7, 48));
+            gathered.packaged_at_unix_ns = now_unix_ns();
+            forwarder
+                .publish_opaque_part(gathered.clone())
+                .await
+                .unwrap();
+            receive(7, session_id_ns).await;
+            gathered.anchor = test_anchor(session_id_ns, 8, 48);
+            gathered.packaged_at_unix_ns -= 2 * i64::try_from(budget_us).unwrap() * 1_000;
+            assert!(forwarder.publish_opaque_part(gathered).await.is_err());
+            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 2);
+            // No lane and no backlog let a live part expire.
+            assert_eq!(
+                telemetry.relay_expired_symbols.load(Ordering::Relaxed),
+                0,
+                "{mode}"
+            );
+        }
     }
 
     /// Opaque audio parts have one encoder path. A contributor that takes
