@@ -5058,8 +5058,15 @@ impl Fmp4PartPublisher for MeshForwarder {
                     );
                 }
                 let key = object.key().clone();
+                // A stream keeps the initialization of its newest key epoch
+                // only: an ingest session's epoch makes the earlier ones'
+                // parts stale.
+                let current = |&(stream, epoch): &StreamSourceEpoch| {
+                    stream != part.stream_id || epoch >= source_epoch
+                };
                 self.fmp4_initializations.rcu(|index| {
                     let mut index = HashMap::clone(index);
+                    index.retain(|stream_epoch, _| current(stream_epoch));
                     index.insert(stream_epoch, (key.clone(), epoch));
                     index
                 });
@@ -5068,22 +5075,30 @@ impl Fmp4PartPublisher for MeshForwarder {
                 })?;
                 self.fmp4_initialization_payloads.rcu(|index| {
                     let mut index = HashMap::clone(index);
+                    index.retain(|stream_epoch, _| current(stream_epoch));
                     index.insert(stream_epoch, init.clone());
                     index
                 });
                 (key, epoch, init)
             } else {
-                let (key, epoch) = self
-                    .fmp4_initializations
-                    .load()
-                    .get(&stream_epoch)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "fMP4 media part {} for stream {} has no initialization dependency",
-                            part.sequence, part.stream_id
-                        )
-                    })?;
+                let initializations = self.fmp4_initializations.load();
+                let Some((key, epoch)) = initializations.get(&stream_epoch).cloned() else {
+                    // A part of an earlier key epoch of a stream that has a
+                    // newer one is stale, as at the first hop (A 4).
+                    if initializations
+                        .keys()
+                        .any(|&(stream, epoch)| stream == part.stream_id && epoch > source_epoch)
+                    {
+                        self.telemetry
+                            .fmp4_stale_session_parts
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "fMP4 media part {} for stream {} has no initialization dependency",
+                        part.sequence, part.stream_id
+                    ));
+                };
                 let init = self
                     .fmp4_initialization_payloads
                     .load()
@@ -5603,6 +5618,15 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let publication = 'inline: {
             let mut guard = entry.publication();
             let stream = &mut *guard;
+            // A part of an earlier ingest session (the old connection's
+            // tail, flushed after a new one began) is stale: it takes no
+            // number or stamp of the new session.
+            if part.source_epoch.unwrap_or(0) < stream.session_epoch {
+                self.telemetry
+                    .fmp4_stale_session_parts
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             let has_video = part.video_units > 0;
             let published_unix_us = u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0);
             let known = stream.stamper.is_some();
@@ -6805,7 +6829,14 @@ async fn run_rtmp_hls_bridge(
             RtmpIngestEvent::End { stream } => {
                 if let Some(mut state) = segmenters.remove(&stream.id) {
                     state.segmenter.finish().await;
-                    playlists.fin(state.output_stream_id);
+                    // A connection that ends after its successor on the same
+                    // key began leaves the successor's stream open.
+                    if !segmenters
+                        .values()
+                        .any(|other| other.output_stream_id == state.output_stream_id)
+                    {
+                        playlists.fin(state.output_stream_id);
+                    }
                     tracing::info!(
                         key = %stream.key,
                         rtmp_stream_id = stream.id,
@@ -7054,6 +7085,9 @@ struct IngestTelemetry {
     fmp4_bytes: AtomicU64,
     fmp4_init_bytes: AtomicU64,
     fmp4_publish_errors: AtomicU64,
+    /// Parts of an earlier ingest session of their stream, refused: the
+    /// old connection's tail after a new one began (A 4).
+    fmp4_stale_session_parts: AtomicU64,
     fmp4_last_publish_unix_ms: AtomicU64,
     fmp4_video_width: AtomicU64,
     fmp4_video_height: AtomicU64,
@@ -7924,6 +7958,7 @@ impl IngestTelemetry {
                 bytes: self.fmp4_bytes.load(Ordering::Relaxed),
                 init_bytes: self.fmp4_init_bytes.load(Ordering::Relaxed),
                 publish_errors: self.fmp4_publish_errors.load(Ordering::Relaxed),
+                stale_session_parts: self.fmp4_stale_session_parts.load(Ordering::Relaxed),
                 last_publish_unix_ms: nonzero_unix_ms(
                     self.fmp4_last_publish_unix_ms.load(Ordering::Relaxed),
                 ),
@@ -9162,6 +9197,11 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "CMAF/fMP4 publish failures.",
             runtime.fmp4.publish_errors,
         ),
+        (
+            "av_contrib_fmp4_stale_session_parts_total",
+            "CMAF/fMP4 parts of an earlier ingest session of their stream, not published.",
+            runtime.fmp4.stale_session_parts,
+        ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
         output.push_str(&format!("{name} {value}\n"));
@@ -10024,6 +10064,7 @@ struct Fmp4RuntimeSnapshot {
     bytes: u64,
     init_bytes: u64,
     publish_errors: u64,
+    stale_session_parts: u64,
     last_publish_unix_ms: Option<u64>,
     last_publish_age_ms: Option<u64>,
     video_codec: Option<&'static str>,
@@ -12783,6 +12824,250 @@ mod tests {
         assert!(second[0].1 > first_epoch);
         assert_eq!((first[0].0, second[0].0), (0, 0), "{numbers:?}");
         assert!(second[0].2 > first.last().unwrap().2, "{numbers:?}");
+    }
+
+    /// One key-frame part of video stream 1 of `epoch`, published at
+    /// `at_ns`.
+    async fn publish_video_part(publisher: &BoundedFmp4Publisher, epoch: u64, at_ns: i64) {
+        let mut part = test_fmp4_part(1, 0, true, 2, 0, None, Bytes::from_static(b"frame"), at_ns);
+        part.source_epoch = Some(epoch);
+        publisher.publish_fmp4_part(part).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_part_of_an_earlier_session_takes_no_number_of_the_new_one() {
+        let durations = Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .stamp_durations();
+        let (publisher, mut receivers) = stamping_publisher(durations);
+        let start_ns = 1_763_924_000_000_000_000_i64;
+        let part_ns = 66_733_000_i64;
+        let (first_epoch, first) = video_session(&publisher, &mut receivers, start_ns, 3).await;
+        let (second_epoch, mut second) =
+            video_session(&publisher, &mut receivers, start_ns + 3 * part_ns, 2).await;
+        // The old connection's tail arrives after the new session began.
+        publish_video_part(&publisher, first_epoch, start_ns + 5 * part_ns).await;
+        assert!(
+            drained_numbers(&mut receivers).is_empty(),
+            "it is not queued"
+        );
+        assert_eq!(
+            publisher
+                .telemetry
+                .fmp4_stale_session_parts
+                .load(Ordering::Relaxed),
+            1
+        );
+        publish_video_part(&publisher, second_epoch, start_ns + 6 * part_ns).await;
+        second.extend(drained_numbers(&mut receivers));
+        assert_eq!(
+            second.iter().map(|numbers| numbers.0).collect::<Vec<_>>(),
+            [0, 1, 2],
+            "{second:?}"
+        );
+        assert!(second.iter().all(|numbers| numbers.1 == second_epoch));
+        // The stamper counted the new session's parts only.
+        let last_first_msn = first.last().unwrap().2;
+        assert!(
+            second.iter().all(|numbers| numbers.2 == last_first_msn + 1),
+            "{first:?} {second:?}"
+        );
+        // A stream that never began a session refuses nothing.
+        let mut part = test_fmp4_part(2, 0, true, 2, 0, None, Bytes::from_static(b"f"), start_ns);
+        part.source_epoch = None;
+        publisher.publish_fmp4_part(part).await.unwrap();
+        assert_eq!(drained_numbers_any(&mut receivers), 1);
+    }
+
+    /// A reconnecting feed leaves one initialization a stream, not one a
+    /// session; a part of an epoch whose initialization went is stale.
+    #[tokio::test]
+    async fn a_stream_keeps_the_initialization_of_its_newest_epoch_only() {
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.mesh_fec_target = sink.local_addr().unwrap();
+        args.mesh_media_fec_target = sink.local_addr().unwrap();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap();
+        let part = |stream_id, epoch, sequence: u64| {
+            let init = (sequence == 0).then(|| Bytes::from_static(b"init"));
+            let mut part = test_fmp4_part(
+                stream_id,
+                sequence,
+                true,
+                2,
+                0,
+                init,
+                Bytes::from_static(b"frame"),
+                now_unix_ns(),
+            );
+            part.source_epoch = Some(epoch);
+            part
+        };
+        forwarder.publish_fmp4_part(part(2, 5, 0)).await.unwrap();
+        for epoch in [10, 20, 30] {
+            forwarder
+                .publish_fmp4_part(part(1, epoch, 0))
+                .await
+                .unwrap();
+            forwarder
+                .publish_fmp4_part(part(1, epoch, 1))
+                .await
+                .unwrap();
+        }
+        let mut kept = forwarder
+            .fmp4_initializations
+            .load()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        kept.sort_unstable();
+        assert_eq!(kept, [(1, 30), (2, 5)]);
+        let mut kept = forwarder
+            .fmp4_initialization_payloads
+            .load()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        kept.sort_unstable();
+        assert_eq!(kept, [(1, 30), (2, 5)]);
+
+        // The tail of an earlier session: counted, not published, no error.
+        forwarder.publish_fmp4_part(part(1, 20, 2)).await.unwrap();
+        assert_eq!(
+            telemetry.fmp4_stale_session_parts.load(Ordering::Relaxed),
+            1
+        );
+        // A part with no initialization and no newer epoch is still an
+        // error.
+        assert!(forwarder.publish_fmp4_part(part(3, 7, 1)).await.is_err());
+    }
+
+    /// Parts queued, of any stream and epoch.
+    fn drained_numbers_any(receivers: &mut [mpsc::Receiver<QueuedPublication>]) -> usize {
+        receivers
+            .iter_mut()
+            .map(|receiver| std::iter::from_fn(|| receiver.try_recv().ok()).count())
+            .sum()
+    }
+
+    /// An encoder reconnects on the same key before the server has seen its
+    /// old connection end, and the old connection still delivers what it
+    /// had buffered: none of it takes a number of the new session, and the
+    /// old connection's end leaves the new session's stream open.
+    #[tokio::test]
+    async fn an_old_connection_that_ends_late_does_not_publish_into_the_new_session() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let publisher = Arc::new(publisher);
+        let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+        let (events, rx) = mpsc::channel(1_024);
+        let bridge = tokio::spawn(run_rtmp_hls_bridge(
+            rx,
+            playlists,
+            Arc::clone(&publisher) as Arc<dyn Fmp4PartPublisher>,
+            Arc::new(IngestTelemetry::default()),
+            9,
+            args.video_part_ms(),
+        ));
+        let old = RtmpStreamInfo {
+            key: "9".to_owned(),
+            id: 1,
+        };
+        let new = RtmpStreamInfo {
+            key: "9".to_owned(),
+            id: 2,
+        };
+        let frames = [(&old, 0..10), (&new, 0..10), (&old, 10..15), (&new, 10..20)];
+        for (stream, indexes) in frames {
+            for index in indexes {
+                let mut access_unit = aac_frame(index);
+                (access_unit.pts, access_unit.dts) = (index * 21, index * 21);
+                events
+                    .send(RtmpIngestEvent::AccessUnit {
+                        stream: stream.clone(),
+                        access_unit,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        for stream in [old, new] {
+            events.send(RtmpIngestEvent::End { stream }).await.unwrap();
+        }
+        drop(events);
+        bridge.await.unwrap();
+
+        let numbers = drained_numbers(&mut receivers);
+        let first_epoch = numbers[0].1;
+        let split = numbers
+            .iter()
+            .position(|numbers| numbers.1 != first_epoch)
+            .expect("the new connection publishes under its own epoch");
+        let (first, second) = numbers.split_at(split);
+        assert!(
+            second.iter().all(|numbers| numbers.1 == second[0].1),
+            "no part of the old session follows the new one's first: {numbers:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .enumerate()
+                .all(|(index, numbers)| numbers.0 == index as u64),
+            "the new session's numbers have no gap: {numbers:?}"
+        );
+        assert!(
+            second.windows(2).all(|pair| pair[0].2 <= pair[1].2),
+            "{numbers:?}"
+        );
+        let stale = publisher
+            .telemetry
+            .fmp4_stale_session_parts
+            .load(Ordering::Relaxed);
+        // The old connection's five late frames went nowhere.
+        assert!(stale >= 1, "{numbers:?}");
+        assert_eq!(
+            first.len() as u64 + stale,
+            drained_parts_of_one_connection(&args, 15).await,
+            "{numbers:?}"
+        );
+    }
+
+    /// The parts that one RTMP connection of `frames` AAC frames publishes
+    /// on its own.
+    async fn drained_parts_of_one_connection(args: &Args, frames: u64) -> u64 {
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+        let (events, rx) = mpsc::channel(1_024);
+        let bridge = tokio::spawn(run_rtmp_hls_bridge(
+            rx,
+            playlists,
+            Arc::new(publisher),
+            Arc::new(IngestTelemetry::default()),
+            9,
+            args.video_part_ms(),
+        ));
+        let stream = RtmpStreamInfo {
+            key: "9".to_owned(),
+            id: 1,
+        };
+        for index in 0..frames {
+            let mut access_unit = aac_frame(index);
+            (access_unit.pts, access_unit.dts) = (index * 21, index * 21);
+            events
+                .send(RtmpIngestEvent::AccessUnit {
+                    stream: stream.clone(),
+                    access_unit,
+                })
+                .await
+                .unwrap();
+        }
+        events.send(RtmpIngestEvent::End { stream }).await.unwrap();
+        drop(events);
+        bridge.await.unwrap();
+        drained_numbers(&mut receivers).len() as u64
     }
 
     #[tokio::test]
