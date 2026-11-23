@@ -688,6 +688,9 @@ impl ProbeSignal {
     }
 }
 
+/// The stream's PCM. A clone shares the file's bytes: the preroll's
+/// scratch encoder reads the same memory as the stream's.
+#[derive(Clone)]
 enum PcmSource {
     Generated(ProbeSignal),
     File(LoopingPcm),
@@ -737,8 +740,9 @@ impl PcmSource {
     }
 }
 
+#[derive(Clone)]
 struct LoopingPcm {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     channels: usize,
     frames: usize,
 }
@@ -761,7 +765,7 @@ impl LoopingPcm {
         }
         Ok(Self {
             frames: bytes.len() / frame_bytes,
-            bytes,
+            bytes: Arc::new(bytes),
             channels,
         })
     }
@@ -3279,7 +3283,18 @@ struct EpochEncoder {
 }
 
 impl EpochEncoder {
+    /// The stream's encoder: the PCM file, if any, is read whole here.
     fn new(options: &EpochSourceOptions) -> Result<Self> {
+        let pcm_source = PcmSource::new(
+            options.signal,
+            options.pcm_s24le_file.as_deref(),
+            options.channels,
+        )?;
+        Self::with_source(options, pcm_source)
+    }
+
+    /// An encoder over PCM that is already in memory.
+    fn with_source(options: &EpochSourceOptions, pcm_source: PcmSource) -> Result<Self> {
         let epoch_samples = options
             .payload_kind
             .epoch_samples(Some(options.epoch_samples))?;
@@ -3287,11 +3302,6 @@ impl EpochEncoder {
             options.group_id,
             options.channels,
             effective_group_channels(options.payload_kind, options.group_channels),
-        )?;
-        let pcm_source = PcmSource::new(
-            options.signal,
-            options.pcm_s24le_file.as_deref(),
-            options.channels,
         )?;
         let transport = MultichannelAudioTransportAdapter::udp(MAX_DATAGRAM_BYTES);
         let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
@@ -3538,12 +3548,14 @@ impl TargetCounts {
     /// target. A failure is counted and never ends the run: the other
     /// targets get the datagram, and this one gets the next.
     ///
-    /// `ConnectionRefused` on a connected UDP socket is the kernel's report
-    /// that the target answered an earlier datagram with "port unreachable"
-    /// (nothing listens there), and the datagram of this call was not sent.
-    /// The first such failure of a datagram asks for one more send, so that
-    /// a target that has just come back misses nothing because of a report
-    /// about the time it was away.
+    /// On a connected UDP socket an ICMP error about an earlier datagram
+    /// (port unreachable: `ECONNREFUSED`; host or network unreachable,
+    /// unknown or prohibited: `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`,
+    /// `ENONET`) is returned by the next send, and the datagram of that
+    /// call is not sent. The first such failure of a datagram asks for one
+    /// more send, so that a target that has just come back misses nothing
+    /// because of a report about the time it was away. A second failure is
+    /// booked as it is.
     fn book(&mut self, result: io::Result<usize>, expected: usize, first_try: bool) -> AfterSend {
         match result {
             Ok(sent) if sent == expected => {
@@ -3561,7 +3573,7 @@ impl TargetCounts {
             }
             Err(error) => {
                 self.errors = self.errors.saturating_add(1);
-                let again = first_try && error.kind() == io::ErrorKind::ConnectionRefused;
+                let again = first_try && reports_an_earlier_datagram(&error);
                 self.last_error = Some(error);
                 if again {
                     AfterSend::Again
@@ -3581,6 +3593,21 @@ impl TargetCounts {
             last_error: self.last_error.map(|error| error.to_string()),
         }
     }
+}
+
+/// Whether a send failed only because the socket held an ICMP error about
+/// an earlier datagram (see [`TargetCounts::book`]).
+fn reports_an_earlier_datagram(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ECONNREFUSED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::EHOSTDOWN
+                | libc::ENONET
+        )
+    )
 }
 
 /// The address a sender's socket binds to reach `target`.
@@ -3676,15 +3703,23 @@ const PREROLL_MARGIN_NS: u64 = 20_000_000;
 
 /// Run a scratch encoder over the first `epochs` epochs of the stream and
 /// drop it: the codec's code and tables, the allocator's heaps and the PCM
-/// are in memory and in the caches before epoch 0. The stream's own encoder
-/// is not touched, so its bytes are what they would have been. Returns the
-/// epochs made: fewer when the session is about to start, or on `stop`.
-fn preroll(options: &EpochSourceOptions, epochs: u64, stop: &AtomicBool) -> Result<u64> {
-    let session_is_near = |now_ns: u64| now_ns.saturating_add(PREROLL_MARGIN_NS) >= options.session_id;
+/// are in memory and in the caches before epoch 0. The scratch encoder
+/// reads the stream's own PCM (`source`, shared, not read again), and the
+/// stream's encoder is not touched, so its bytes are what they would have
+/// been. Returns the epochs made: fewer when the session is about to
+/// start, or on `stop`.
+fn preroll(
+    options: &EpochSourceOptions,
+    source: &PcmSource,
+    epochs: u64,
+    stop: &AtomicBool,
+) -> Result<u64> {
+    let session_is_near =
+        |now_ns: u64| now_ns.saturating_add(PREROLL_MARGIN_NS) >= options.session_id;
     if epochs == 0 || session_is_near(now_unix_ns()?) {
         return Ok(0);
     }
-    let mut scratch = EpochEncoder::new(options)?;
+    let mut scratch = EpochEncoder::with_source(options, source.clone())?;
     let mut made = 0;
     for epoch_id in 0..epochs {
         if stop.load(AtomicOrdering::Acquire) || session_is_near(now_unix_ns()?) {
@@ -3713,7 +3748,12 @@ async fn send_tokio_paced(
     // No pacing thread here to schedule or pin: the memory only.
     let mut pacer = PacerOutcome::default();
     hardening.lock_memory(&mut pacer);
-    pacer.preroll_epochs = preroll(&options, hardening.preroll_epochs, stop)?;
+    pacer.preroll_epochs = preroll(
+        &options,
+        &encoder.pcm_source,
+        hardening.preroll_epochs,
+        stop,
+    )?;
     // One connected socket per target: the kernel reports a target's
     // failure to that target's socket only.
     let mut lanes = Vec::with_capacity(targets.len());
@@ -3815,7 +3855,12 @@ fn send_precise_paced(
         lanes.push((socket, TargetCounts::new(*target)));
     }
     hardening.lock_memory(&mut pacer);
-    pacer.preroll_epochs = preroll(&options, hardening.preroll_epochs, stop)?;
+    pacer.preroll_epochs = preroll(
+        &options,
+        &encoder.pcm_source,
+        hardening.preroll_epochs,
+        stop,
+    )?;
     let mut lateness = SendLateness::default();
     for epoch_id in 0..epochs {
         let deadline_ns = epoch_deadline_ns(session_id, epoch_id, epoch);
@@ -8707,23 +8752,46 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_send_is_booked_to_its_target_and_tried_again_only_when_refused() {
+    fn a_failed_send_is_booked_to_its_target_and_tried_again_only_after_an_icmp_report() {
         let target: SocketAddr = "192.0.2.7:27100".parse().unwrap();
         let mut counts = TargetCounts::new(target);
         assert_eq!(counts.book(Ok(300), 300, true), AfterSend::Next);
-        assert_eq!((counts.datagrams, counts.wire_bytes, counts.errors), (1, 300, 0));
-        // A refusal reports an earlier datagram: this one goes again, once.
-        let refused = || Err(io::Error::from(io::ErrorKind::ConnectionRefused));
-        assert_eq!(counts.book(refused(), 300, true), AfterSend::Again);
-        assert_eq!(counts.book(refused(), 300, false), AfterSend::Next);
-        assert_eq!((counts.datagrams, counts.errors), (1, 2));
+        assert_eq!(
+            (counts.datagrams, counts.wire_bytes, counts.errors),
+            (1, 300, 0)
+        );
+        // An ICMP report about an earlier datagram: this one goes again,
+        // once.
+        for errno in [
+            libc::ECONNREFUSED,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+        ] {
+            let reported = || Err(io::Error::from_raw_os_error(errno));
+            assert_eq!(
+                counts.book(reported(), 300, true),
+                AfterSend::Again,
+                "{errno}"
+            );
+            assert_eq!(
+                counts.book(reported(), 300, false),
+                AfterSend::Next,
+                "{errno}"
+            );
+        }
+        assert_eq!((counts.datagrams, counts.errors), (1, 10));
         // Any other failure is counted and the sender moves on.
-        let unreachable = Err(io::Error::from(io::ErrorKind::HostUnreachable));
-        assert_eq!(counts.book(unreachable, 300, true), AfterSend::Next);
+        let full = Err(io::Error::from_raw_os_error(libc::ENOBUFS));
+        assert_eq!(counts.book(full, 300, true), AfterSend::Next);
         assert_eq!(counts.book(Ok(120), 300, true), AfterSend::Next);
-        assert_eq!((counts.datagrams, counts.wire_bytes, counts.errors), (1, 300, 4));
+        assert_eq!(
+            (counts.datagrams, counts.wire_bytes, counts.errors),
+            (1, 300, 12)
+        );
         let report = counts.report();
-        assert_eq!(report.errors, 4);
+        assert_eq!(report.errors, 12);
         assert_eq!(
             report.last_error.as_deref(),
             Some("partial AEP1 datagram send: 120 of 300")
@@ -8860,7 +8928,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_journal_and_the_pace_cpu_need_the_precise_pacer() {
-        fn tokio_paced(lateness_journal: Option<&Path>, pace_cpu: Option<usize>) -> SendOptions<'_> {
+        fn tokio_paced(
+            lateness_journal: Option<&Path>,
+            pace_cpu: Option<usize>,
+        ) -> SendOptions<'_> {
             SendOptions {
                 targets: vec!["127.0.0.1:9".parse().unwrap()],
                 duration_seconds: 1,
@@ -8913,7 +8984,10 @@ mod tests {
             // The sender's order: its encoder exists, then the scratch
             // encoder runs and is dropped, then the stream starts.
             let mut encoder = EpochEncoder::new(&options).unwrap();
-            assert_eq!(preroll(&options, 200, &never).unwrap(), 200);
+            assert_eq!(
+                preroll(&options, &encoder.pcm_source, 200, &never).unwrap(),
+                200
+            );
             let after = (0..12)
                 .flat_map(|epoch_id| encoder.encode(epoch_id).unwrap())
                 .map(|(datagram, _)| datagram.to_vec())
@@ -8921,20 +8995,59 @@ mod tests {
             assert_eq!(after, expected, "{payload_kind:?} {epoch_samples}");
         }
         // No preroll into the session's start, and none when asked to stop.
+        let sine = PcmSource::Generated(ProbeSignal::Sine);
         let near = sine_source(now_unix_ns().unwrap() + PREROLL_MARGIN_NS / 2);
-        assert_eq!(preroll(&near, 200, &never).unwrap(), 0);
+        assert_eq!(preroll(&near, &sine, 200, &never).unwrap(), 0);
         let far = sine_source(now_unix_ns().unwrap() + 60_000_000_000);
-        assert_eq!(preroll(&far, 200, &AtomicBool::new(true)).unwrap(), 0);
-        assert_eq!(preroll(&far, 0, &never).unwrap(), 0);
+        assert_eq!(
+            preroll(&far, &sine, 200, &AtomicBool::new(true)).unwrap(),
+            0
+        );
+        assert_eq!(preroll(&far, &sine, 0, &never).unwrap(), 0);
+    }
+
+    /// The preroll runs on the pacing thread, after mlockall: it reads the
+    /// stream's PCM from memory, never the file a second time.
+    #[test]
+    fn the_preroll_reads_the_stream_s_pcm_and_not_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("aep1-probe-preroll-{}.s24le", std::process::id()));
+        // 0.1 s of stereo s24le that is not the probe's own signal.
+        let pcm = (0..4_800 * 2 * 3)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &pcm).unwrap();
+        let options = EpochSourceOptions {
+            epoch_samples: 48,
+            pcm_s24le_file: Some(path.clone()),
+            ..sine_source(now_unix_ns().unwrap() + 60_000_000_000)
+        };
+        let expected = stream_datagrams(&options, 12);
+        let mut encoder = EpochEncoder::new(&options).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let never = AtomicBool::new(false);
+        assert_eq!(
+            preroll(&options, &encoder.pcm_source, 200, &never).unwrap(),
+            200
+        );
+        let after = (0..12)
+            .flat_map(|epoch_id| encoder.encode(epoch_id).unwrap())
+            .map(|(datagram, _)| datagram.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(after, expected);
+        // The scratch encoder shared the bytes, and they are freed with
+        // the stream's encoder alone.
+        let PcmSource::File(file) = &encoder.pcm_source else {
+            panic!("the stream reads its file");
+        };
+        assert_eq!(Arc::strong_count(&file.bytes), 1);
     }
 
     #[test]
     fn a_sender_that_starts_behind_journals_each_overdue_epoch() {
         let (_receiver, target) = loopback_receiver();
-        let path = std::env::temp_dir().join(format!(
-            "aep1-probe-late-{}.ndjson",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("aep1-probe-late-{}.ndjson", std::process::id()));
         let journal = PacingJournal::create(&path, DEFAULT_LATE_THRESHOLD_US).unwrap();
         let recorder = journal.recorder();
         // The session began 30 ms ago: epochs 0 to 29 are overdue when the
@@ -9041,16 +9154,15 @@ mod tests {
             flag.store(true, AtomicOrdering::Release);
         });
         let started = Instant::now();
-        let SendOutcome { lateness, .. } =
-            send_precise_paced(
-                sine_source(session_id),
-                &[target],
-                200_000,
-                &stop,
-                &NO_HARDENING,
-                None,
-            )
-            .unwrap();
+        let SendOutcome { lateness, .. } = send_precise_paced(
+            sine_source(session_id),
+            &[target],
+            200_000,
+            &stop,
+            &NO_HARDENING,
+            None,
+        )
+        .unwrap();
         stopper.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         let sent = lateness.epochs as usize;
