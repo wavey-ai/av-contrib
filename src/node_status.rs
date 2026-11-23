@@ -31,7 +31,8 @@ pub const ROLE: &str = "contributor";
 
 /// No AEP1 datagram for this long: the contributor is standing by.
 pub const SOURCE_SILENT_MS: u64 = 2_000;
-/// A stream with a part this recent is one that the proof looks at.
+/// A stream with a part, or a recovered AEP1 epoch, this recent is one
+/// that the proof looks at.
 pub const STREAM_LIVE_MS: u64 = 2_000;
 /// The oldest that the last part of such a stream may be.
 pub const PART_AGE_MAX_MS: u64 = 250;
@@ -390,10 +391,15 @@ impl StreamSample {
             .is_some_and(|age| age <= STREAM_LIVE_MS)
     }
 
-    /// A part of it was published or held in the last [`STREAM_LIVE_MS`].
+    /// A part of it was published or held, or an AEP1 epoch of it was
+    /// recovered, in the last [`STREAM_LIVE_MS`]. A stream whose source
+    /// still sends stays in the proof when its parts stop; one whose
+    /// source stopped sending it leaves the proof 2 s later.
     fn live(&self) -> bool {
-        self.last_part_age_ms
-            .is_some_and(|age| age <= STREAM_LIVE_MS)
+        [self.last_part_age_ms, self.source_age_ms]
+            .into_iter()
+            .flatten()
+            .any(|age| age <= STREAM_LIVE_MS)
     }
 }
 
@@ -423,15 +429,6 @@ impl LaneSample {
             && self
                 .report_age_ms
                 .is_some_and(|age| age <= LANE_REPORT_MAX_AGE_MS)
-    }
-
-    fn fault(&self) -> String {
-        let what = if self.state == "healthy" {
-            "no loss report"
-        } else {
-            self.state
-        };
-        format!("lane {} ({}): {what}", self.id, self.path)
     }
 }
 
@@ -475,8 +472,9 @@ pub struct Verdict {
     pub state: State,
     /// What keeps the node from `ready`, in words; empty when ready.
     pub not_ready: Vec<String>,
-    /// The lanes that do not carry while another does (an ingress is
-    /// down): `lane <id> (<path>): <what>`.
+    /// The ids (the forwarder's node id) of the lanes that do not carry
+    /// while another does: an ingress is down. Why is in the lane's
+    /// `state` and `report_age_ms`.
     pub degraded: Vec<String>,
 }
 
@@ -494,7 +492,8 @@ impl Verdict {
 /// before it, and how long it holds now.
 ///
 /// The proof: at least one stream has a part going out; every stream with a
-/// part (published or held) in the last 2 s has its last part within 250 ms
+/// part (published or held) or a recovered epoch in the last 2 s has its
+/// last part within 250 ms
 /// and, when its parts are AEP1 epochs, published or held nine tenths of the
 /// epochs recovered for it in the last second; and at least one lane is
 /// healthy with a loss report no older than 3 s. `ready` is the proof held
@@ -524,9 +523,12 @@ pub fn evaluate(snapshot: &Snapshot, proof: Proof) -> (Proof, Verdict) {
     }
     for stream in snapshot.streams.iter().filter(|stream| stream.live()) {
         let id = stream.stream_id;
-        let age = stream.last_part_age_ms.unwrap_or(u64::MAX);
-        if age > PART_AGE_MAX_MS {
-            failing.push(format!("stream {id} last part {age} ms ago"));
+        match stream.last_part_age_ms {
+            Some(age) if age > PART_AGE_MAX_MS => {
+                failing.push(format!("stream {id} last part {age} ms ago"));
+            }
+            Some(_) => {}
+            None => failing.push(format!("stream {id} has no part")),
         }
         let done = stream.published_epochs_last_second + stream.held_epochs_last_second;
         if stream.opaque && done * 100 < stream.recovered_last_second * PUBLISHED_PERCENT {
@@ -545,7 +547,7 @@ pub fn evaluate(snapshot: &Snapshot, proof: Proof) -> (Proof, Verdict) {
             .lanes
             .iter()
             .filter(|lane| !lane.carries())
-            .map(LaneSample::fault)
+            .map(|lane| lane.id.clone())
             .collect()
     };
     if !failing.is_empty() {
@@ -1232,7 +1234,7 @@ mod tests {
         snapshot.lanes[1].state = "impaired";
         let verdict = after(5_000, &snapshot);
         assert_eq!(verdict.state, State::Ready);
-        assert_eq!(verdict.degraded, ["lane lon-dist-b (secondary): impaired"]);
+        assert_eq!(verdict.degraded, ["lon-dist-b"]);
 
         // The primary's forwarder stopped reporting: nothing says it hears.
         let mut snapshot = publishing();
@@ -1240,10 +1242,7 @@ mod tests {
         snapshot.lanes[0].loss_ppm = None;
         let verdict = after(5_000, &snapshot);
         assert_eq!(verdict.state, State::Ready);
-        assert_eq!(
-            verdict.degraded,
-            ["lane lon-dist-a (primary): no loss report"]
-        );
+        assert_eq!(verdict.degraded, ["lon-dist-a"]);
 
         // A report of exactly 3,000 ms still counts.
         let mut snapshot = publishing();
@@ -1334,14 +1333,55 @@ mod tests {
         let verdict = after(5_000, &snapshot);
         assert_eq!(reasons(&verdict), ["stream 3001 last part 251 ms ago"]);
 
-        // A stream whose last part is over 2 s old has ended: it is not
-        // looked at, and another stream's parts keep the node ready.
+        // A stream whose last part and last source epoch are over 2 s old
+        // has ended: it is not looked at, and another stream's parts keep
+        // the node ready.
         let mut ended = audio(4_001);
         ended.last_part_age_ms = Some(STREAM_LIVE_MS + 1);
         ended.published_age_ms = Some(STREAM_LIVE_MS + 1);
+        ended.source_age_ms = Some(STREAM_LIVE_MS + 1);
         ended.published_epochs_last_second = 0;
+        ended.recovered_last_second = 0;
         let mut snapshot = publishing();
         snapshot.streams.push(ended);
+        assert_eq!(after(5_000, &snapshot).state, State::Ready);
+    }
+
+    #[test]
+    fn a_stream_whose_source_still_sends_stays_in_the_proof() {
+        // FLAC's rendition worker wedged: the source still sends 4001, and
+        // nothing of it has gone out for 2.5 s. Opus 3001 publishes.
+        let mut wedged = audio(4_001);
+        wedged.last_part_age_ms = Some(2_500);
+        wedged.published_age_ms = Some(2_500);
+        wedged.published_epochs_last_second = 0;
+        let mut snapshot = publishing();
+        snapshot.streams.push(wedged);
+        let verdict = after(5_000, &snapshot);
+        assert_eq!(verdict.state, State::Proving);
+        assert_eq!(
+            reasons(&verdict),
+            [
+                "stream 4001 last part 2500 ms ago",
+                "stream 4001 published 0 of 1000 epochs"
+            ]
+        );
+
+        // Recovered and never published at all.
+        snapshot.streams[1].last_part_age_ms = None;
+        snapshot.streams[1].published_age_ms = None;
+        let verdict = after(5_000, &snapshot);
+        assert_eq!(
+            reasons(&verdict),
+            [
+                "stream 4001 has no part",
+                "stream 4001 published 0 of 1000 epochs"
+            ]
+        );
+
+        // The source stopped sending it 2 s ago: it has left the proof.
+        snapshot.streams[1].source_age_ms = Some(STREAM_LIVE_MS + 1);
+        snapshot.streams[1].recovered_last_second = 0;
         assert_eq!(after(5_000, &snapshot).state, State::Ready);
     }
 
