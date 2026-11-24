@@ -1,10 +1,12 @@
 pub mod audio_epoch_hls;
+pub mod build;
 pub mod class_lanes;
 pub mod fixture_replay;
 pub mod fmp4_bridge;
 pub mod hls_stamp;
 pub mod hop_journal;
 pub mod ingress_authorization;
+pub mod node_status;
 pub mod opus_custom;
 pub mod part_timing;
 pub mod quadra_renditions;

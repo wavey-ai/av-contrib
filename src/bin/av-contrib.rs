@@ -20,6 +20,7 @@ use av_contrib::ingress_authorization::{
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
+use av_contrib::node_status::{self, LaneSample, NodeStatus, PublishedPart};
 use av_contrib::part_timing::{AudioPartSize, SourceAnchor, VideoPartSize};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
@@ -90,6 +91,7 @@ const NEEDLETAIL_AEP1_CONTENT_TYPE: &str = "application/x-needletail-aep1-stream
 const NEEDLETAIL_AEP1_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
 const NEEDLETAIL_AEP1_MAX_BUFFER_BYTES: usize = 256 * 1024;
 const CONTRIB_STATUS_PATH: &str = "/api/status";
+const CONTRIB_NODE_PATH: &str = "/api/node";
 const CONTRIB_STATUS_EVENTS_PATH: &str = "/api/status/events";
 const CONTRIB_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -583,10 +585,14 @@ const DEFAULT_RELAY_VIDEO_GSO_SEGMENTS: u16 = 16;
 /// `video_gso_cpu_and_bursts`: off, 23 to 28 datagrams in any 100 us and
 /// 172 to 190 in any 1 ms; paced at 2,000, 24 and 152 to 160).
 const DEFAULT_RELAY_VIDEO_GSO_PACE_MBPS: u64 = 2_000;
+/// `--shutdown-grace-ms`: half a second for the lanes' backlogs, well
+/// inside the unit's stop timeout.
+const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 500;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "av-contrib",
+    version = av_contrib::build::VERSION,
     about = "Run a contributor-facing AV service that forwards bytes into av-mesh"
 )]
 struct Args {
@@ -634,6 +640,24 @@ struct Args {
 
     #[arg(long, env = "AV_RELAY_LOCAL_ID", default_value = "av-contrib")]
     relay_local_id: String,
+
+    /// The node's name in `GET /api/node`, as the deploy and its tools know
+    /// it (`contrib-lon`, `contrib-lon-b`). Defaults to --relay-local-id.
+    #[arg(long, env = "AV_NODE_ID")]
+    node_id: Option<String>,
+
+    /// The node's region in `GET /api/node`, as the deploy names it.
+    #[arg(long, env = "AV_REGION", default_value = "")]
+    region: String,
+
+    /// After SIGTERM or SIGINT, the longest the stop waits for the lanes'
+    /// backlogs to drain before the last ledger goes out on each lane.
+    #[arg(
+        long,
+        env = "AV_SHUTDOWN_GRACE_MS",
+        default_value_t = DEFAULT_SHUTDOWN_GRACE_MS
+    )]
+    shutdown_grace_ms: u64,
 
     #[arg(
         long,
@@ -1297,6 +1321,13 @@ const NOMINAL_EPOCH_US: u64 = 1_000;
 const MIN_OPUS_FRAME_US: u64 = 1_000;
 
 impl Args {
+    /// The node's name: `--node-id`, else `--relay-local-id`.
+    fn node_id(&self) -> String {
+        self.node_id
+            .clone()
+            .unwrap_or_else(|| self.relay_local_id.clone())
+    }
+
     /// Size of an audio part: `--audio-part`, else `--fmp4-part-ms`, else one
     /// epoch per part.
     fn audio_part(&self) -> AudioPartSize {
@@ -1517,6 +1548,9 @@ fn encode_lane_ledger(sent: u64) -> [u8; 16] {
 
 /// How often each lane sends its forwarder its ledger.
 const LANE_LEDGER_INTERVAL_US: u64 = 250_000;
+
+/// How often a stop looks at the lanes' backlogs while they drain.
+const LANE_DRAIN_POLL: Duration = Duration::from_millis(2);
 
 /// `--relay-demand-renditions`: groups of renditions of one source.
 fn parse_rendition_groups(value: &str) -> Result<Vec<Vec<u64>>> {
@@ -2756,6 +2790,79 @@ impl RelaySessionPublisher {
         }
     }
 
+    /// The end of a stop: wait until no lane has a part in its backlog, or
+    /// until `grace_ends`; then send each lane's forwarder its ledger (RLL1)
+    /// once more, so that it counts the lane's last datagrams as sent, not
+    /// as lost. Returns the parts still queued.
+    async fn finish_lanes(&self, grace_ends: tokio::time::Instant) -> usize {
+        let lanes = || {
+            [Some(&self.primary), self.secondary.as_ref()]
+                .into_iter()
+                .flatten()
+        };
+        let queued = || {
+            lanes()
+                .map(|lane| lane.backlog.pending.load(Ordering::Acquire))
+                .sum::<usize>()
+        };
+        while queued() > 0 && tokio::time::Instant::now() < grace_ends {
+            tokio::time::sleep(LANE_DRAIN_POLL).await;
+        }
+        if self.lane_ledger {
+            for lane in lanes() {
+                lane.send_ledger();
+            }
+        }
+        queued()
+    }
+
+    /// The lanes as `GET /api/node` shows them at `now_unix_us`; `ids` are
+    /// the node ids of the primary and the secondary forwarder.
+    fn lane_samples(&self, ids: &[String; 2], now_unix_us: u64) -> Vec<LaneSample> {
+        let telemetry = &self.telemetry;
+        [
+            (
+                Some(&self.primary),
+                "primary",
+                &ids[0],
+                &telemetry.relay_primary_lane_last_success_unix_ms,
+                &telemetry.relay_primary_lane_last_failure_unix_ms,
+            ),
+            (
+                self.secondary.as_ref(),
+                "secondary",
+                &ids[1],
+                &telemetry.relay_secondary_lane_last_success_unix_ms,
+                &telemetry.relay_secondary_lane_last_failure_unix_ms,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(lane, path, id, last_success, last_failure)| {
+            let lane = lane?;
+            let reported_us = lane.reported_loss.at_us.load(Ordering::Relaxed);
+            let report_age_ms =
+                (reported_us != 0).then(|| now_unix_us.saturating_sub(reported_us) / 1_000);
+            Some(LaneSample {
+                path,
+                id: id.clone(),
+                target: lane.peer_addr,
+                state: relay_lane_state(
+                    now_unix_us / 1_000,
+                    last_success.load(Ordering::Acquire),
+                    last_failure.load(Ordering::Acquire),
+                )
+                .as_str(),
+                sent: lane.backlog.sent.load(Ordering::Acquire),
+                loss_ppm: report_age_ms
+                    .filter(|age_ms| *age_ms <= node_status::LANE_REPORT_MAX_AGE_MS)
+                    .map(|_| lane.reported_loss.ppm.load(Ordering::Relaxed)),
+                report_age_ms,
+                backlog_parts: lane.backlog.pending.load(Ordering::Acquire) as u64,
+            })
+        })
+        .collect()
+    }
+
     /// Whether a part of `stream` goes out on the lanes now
     /// (`--relay-demand-renditions`): yes unless every lane has a fresh
     /// demand report and none reads it while one reads a sibling.
@@ -3220,6 +3327,9 @@ impl RelaySessionPublisher {
         if class == PublicationClass::Audio && encoded.source_wires().len() == 1 {
             RELAY_COMPACT_AUDIO_PARTS[usize::from(!encoded.is_compact())]
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if let (PublicationClass::Audio, Some((stream_id, _))) = (class, part) {
+            node_status::counters().part_form(stream_id, encoded.is_compact());
         }
         let encoded = Arc::new(encoded);
         let hot = self.audio_inline && class == PublicationClass::Audio;
@@ -4316,6 +4426,24 @@ impl MeshForwarder {
         })
     }
 
+    /// The end of a stop for the RelaySession lanes (see
+    /// [`RelaySessionPublisher::finish_lanes`]); nothing to do without
+    /// `--relay-primary-target`.
+    async fn finish_lanes(&self, grace_ends: tokio::time::Instant) -> usize {
+        match &self.relay {
+            Some(relay) => relay.finish_lanes(grace_ends).await,
+            None => 0,
+        }
+    }
+
+    /// The RelaySession lanes as `GET /api/node` shows them; none without
+    /// `--relay-primary-target`.
+    fn lane_samples(&self, ids: &[String; 2], now_unix_us: u64) -> Vec<LaneSample> {
+        self.relay
+            .as_ref()
+            .map_or_else(Vec::new, |relay| relay.lane_samples(ids, now_unix_us))
+    }
+
     fn allocate_media_sequence(&self) -> u64 {
         self.next_media_sequence.fetch_add(1, Ordering::Relaxed)
     }
@@ -5045,8 +5173,15 @@ impl Fmp4PartPublisher for MeshForwarder {
                     );
                 }
                 let key = object.key().clone();
+                // A stream keeps the initialization of its newest key epoch
+                // only: an ingest session's epoch makes the earlier ones'
+                // parts stale.
+                let current = |&(stream, epoch): &StreamSourceEpoch| {
+                    stream != part.stream_id || epoch >= source_epoch
+                };
                 self.fmp4_initializations.rcu(|index| {
                     let mut index = HashMap::clone(index);
+                    index.retain(|stream_epoch, _| current(stream_epoch));
                     index.insert(stream_epoch, (key.clone(), epoch));
                     index
                 });
@@ -5055,22 +5190,30 @@ impl Fmp4PartPublisher for MeshForwarder {
                 })?;
                 self.fmp4_initialization_payloads.rcu(|index| {
                     let mut index = HashMap::clone(index);
+                    index.retain(|stream_epoch, _| current(stream_epoch));
                     index.insert(stream_epoch, init.clone());
                     index
                 });
                 (key, epoch, init)
             } else {
-                let (key, epoch) = self
-                    .fmp4_initializations
-                    .load()
-                    .get(&stream_epoch)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "fMP4 media part {} for stream {} has no initialization dependency",
-                            part.sequence, part.stream_id
-                        )
-                    })?;
+                let initializations = self.fmp4_initializations.load();
+                let Some((key, epoch)) = initializations.get(&stream_epoch).cloned() else {
+                    // A part of an earlier key epoch of a stream that has a
+                    // newer one is stale, as at the first hop (A 4).
+                    if initializations
+                        .keys()
+                        .any(|&(stream, epoch)| stream == part.stream_id && epoch > source_epoch)
+                    {
+                        self.telemetry
+                            .fmp4_stale_session_parts
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "fMP4 media part {} for stream {} has no initialization dependency",
+                        part.sequence, part.stream_id
+                    ));
+                };
                 let init = self
                     .fmp4_initialization_payloads
                     .load()
@@ -5122,6 +5265,16 @@ impl Fmp4PartPublisher for MeshForwarder {
                 "published canonical fMP4 object through RelaySession"
             );
         }
+        node_status::counters().part_published(
+            part.stream_id,
+            PublishedPart {
+                video: class == PublicationClass::Video,
+                epoch: source_epoch,
+                number: part.sequence,
+                epochs: None,
+                now_unix_us: hop_journal::now_unix_us(),
+            },
+        );
         Ok(())
     }
 
@@ -5138,6 +5291,11 @@ impl Fmp4PartPublisher for MeshForwarder {
             // A rendition that no forwarder reads (item 5): not built, not
             // sent.
             RELAY_DEMAND_HELD_PARTS.fetch_add(1, Ordering::Relaxed);
+            node_status::counters().part_held(
+                part.stream_id,
+                part.audio_units as u64,
+                hop_journal::now_unix_us(),
+            );
             return Ok(());
         }
         self.telemetry
@@ -5178,6 +5336,16 @@ impl Fmp4PartPublisher for MeshForwarder {
                 "published canonical opaque audio part through RelaySession"
             );
         }
+        node_status::counters().part_published(
+            part.stream_id,
+            PublishedPart {
+                video: false,
+                epoch: object.key().epoch(),
+                number: part.sequence,
+                epochs: Some(part.audio_units as u64),
+                now_unix_us: hop_journal::now_unix_us(),
+            },
+        );
         Ok(())
     }
 }
@@ -5266,6 +5434,12 @@ struct StreamPublication {
     class: Option<PublicationClass>,
     /// Parts of the stream handed to `shard` and not yet published.
     in_flight: Arc<AtomicUsize>,
+    /// The key epoch of the stream's last ingest session on this process;
+    /// 0 before the first.
+    session_epoch: u64,
+    /// The lowest first Media Sequence Number of the stream's next stamper:
+    /// above the last number an earlier ingest session stamped.
+    first_msn_floor: u64,
 }
 
 impl StreamPublication {
@@ -5277,7 +5451,26 @@ impl StreamPublication {
             shard: None,
             class: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            session_epoch: 0,
+            first_msn_floor: 0,
         }
+    }
+
+    /// A new ingest session of the stream begins at `now_unix_us`: its
+    /// publication starts again (part count, stamper, first-segment clock)
+    /// under a key epoch above every epoch the process used for the stream,
+    /// with its first Media Sequence Number above the last one stamped. The
+    /// worker and the parts in flight stay, so that parts leave in order.
+    /// Returns the epoch.
+    fn begin_ingest_session(&mut self, now_unix_us: u64) -> u64 {
+        let epoch = now_unix_us.max(self.session_epoch.saturating_add(1));
+        self.session_epoch = epoch;
+        if let Some(last) = self.stamper.take().and_then(|stamper| stamper.msn()) {
+            self.first_msn_floor = self.first_msn_floor.max(last.saturating_add(1));
+        }
+        self.video_started_unix_us = None;
+        self.next_sequence = 0;
+        epoch
     }
 }
 
@@ -5544,6 +5737,15 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         let publication = 'inline: {
             let mut guard = entry.publication();
             let stream = &mut *guard;
+            // A part of an earlier ingest session (the old connection's
+            // tail, flushed after a new one began) is stale: it takes no
+            // number or stamp of the new session.
+            if part.source_epoch.unwrap_or(0) < stream.session_epoch {
+                self.telemetry
+                    .fmp4_stale_session_parts
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             let has_video = part.video_units > 0;
             let published_unix_us = u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0);
             let known = stream.stamper.is_some();
@@ -5565,12 +5767,14 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
             if has_video && stream.stamper.is_none() {
                 stream.video_started_unix_us = Some(started_unix_us);
             }
+            let first_msn_floor = stream.first_msn_floor;
             let stamper = stream.stamper.get_or_insert_with(|| {
                 if has_video {
                     StreamStamper::new(durations.video_part_us, durations.video_segment_us)
                 } else {
                     StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
                 }
+                .with_first_msn_floor(first_msn_floor)
             });
             part.hls = Some(stamper.stamp(
                 part.duration_us,
@@ -5642,6 +5846,16 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
 
     fn record_mpeg_ts_payload_drop(&self, drop: MpegTsPayloadDrop) {
         self.telemetry.record_mpeg_ts_payload_drop(drop);
+    }
+
+    fn begin_ingest_session(&self, stream_id: u64) -> Option<u64> {
+        let entry = self.streams.entry(stream_id);
+        let mut stream = entry.publication();
+        let epoch = stream.begin_ingest_session(hop_journal::now_unix_us());
+        // The stream's first segment is numbered from its new first part,
+        // not from the clock of the earlier session's.
+        self.streams.video_starts().remove(&stream_id);
+        Some(epoch)
     }
 
     async fn publish_opaque_part(
@@ -6477,34 +6691,24 @@ async fn run_upload_response_ts_bridge(
                                         None,
                                         None,
                                     );
-                                    state.bridge = Some(
-                                        if public_stream_id == output_stream_id {
-                                            if let Some(sink) = &access_unit_sink {
-                                                if publish_source {
-                                                    TsFmp4Bridge::new_publish_only_with_access_unit_sink(
-                                                        public_stream_id,
-                                                        public_stream_idx,
-                                                        playlists.clone(),
-                                                        min_part_ms,
-                                                        publisher.clone(),
-                                                        sink.clone(),
-                                                    )
-                                                } else {
-                                                    TsFmp4Bridge::new_access_unit_sink_only(
-                                                        public_stream_id,
-                                                        public_stream_idx,
-                                                        playlists.clone(),
-                                                        min_part_ms,
-                                                        sink.clone(),
-                                                    )
-                                                }
-                                            } else {
-                                                TsFmp4Bridge::new_publish_only(
+                                    let mut bridge = if public_stream_id == output_stream_id {
+                                        if let Some(sink) = &access_unit_sink {
+                                            if publish_source {
+                                                TsFmp4Bridge::new_publish_only_with_access_unit_sink(
                                                     public_stream_id,
                                                     public_stream_idx,
                                                     playlists.clone(),
                                                     min_part_ms,
                                                     publisher.clone(),
+                                                    sink.clone(),
+                                                )
+                                            } else {
+                                                TsFmp4Bridge::new_access_unit_sink_only(
+                                                    public_stream_id,
+                                                    public_stream_idx,
+                                                    playlists.clone(),
+                                                    min_part_ms,
+                                                    sink.clone(),
                                                 )
                                             }
                                         } else {
@@ -6515,8 +6719,27 @@ async fn run_upload_response_ts_bridge(
                                                 min_part_ms,
                                                 publisher.clone(),
                                             )
-                                        },
-                                    );
+                                        }
+                                    } else {
+                                        TsFmp4Bridge::new_publish_only(
+                                            public_stream_id,
+                                            public_stream_idx,
+                                            playlists.clone(),
+                                            min_part_ms,
+                                            publisher.clone(),
+                                        )
+                                    };
+                                    // Each feed is an ingest session of its
+                                    // own: a new key epoch, and Media Sequence
+                                    // Numbers above the earlier session's.
+                                    if bridge.publishes_source() {
+                                        if let Some(epoch) =
+                                            publisher.begin_ingest_session(public_stream_id)
+                                        {
+                                            bridge.set_source_epoch(epoch);
+                                        }
+                                    }
+                                    state.bridge = Some(bridge);
                                     debug!(
                                         stream_id,
                                         output_stream_id = public_stream_id,
@@ -6674,18 +6897,25 @@ async fn run_rtmp_hls_bridge(
                         output_stream_idx,
                         "RTMP ingest bridged to fMP4 LL-HLS"
                     );
+                    let mut segmenter = Fmp4Segmenter::new_publish_only(
+                        output_stream_id,
+                        output_stream_idx,
+                        playlists.clone(),
+                        TimestampInput::Millis,
+                        min_part_ms,
+                        publisher.clone(),
+                    );
+                    // Each RTMP stream is an ingest session of its own: a
+                    // new key epoch, and Media Sequence Numbers above the
+                    // earlier session's.
+                    if let Some(epoch) = publisher.begin_ingest_session(output_stream_id) {
+                        segmenter.set_source_epoch(epoch);
+                    }
                     segmenters.insert(
                         stream.id,
                         RtmpSegmenterState {
                             output_stream_id,
-                            segmenter: Fmp4Segmenter::new_publish_only(
-                                output_stream_id,
-                                output_stream_idx,
-                                playlists.clone(),
-                                TimestampInput::Millis,
-                                min_part_ms,
-                                publisher.clone(),
-                            ),
+                            segmenter,
                         },
                     );
                 }
@@ -6710,7 +6940,14 @@ async fn run_rtmp_hls_bridge(
             RtmpIngestEvent::End { stream } => {
                 if let Some(mut state) = segmenters.remove(&stream.id) {
                     state.segmenter.finish().await;
-                    playlists.fin(state.output_stream_id);
+                    // A connection that ends after its successor on the same
+                    // key began leaves the successor's stream open.
+                    if !segmenters
+                        .values()
+                        .any(|other| other.output_stream_id == state.output_stream_id)
+                    {
+                        playlists.fin(state.output_stream_id);
+                    }
                     tracing::info!(
                         key = %stream.key,
                         rtmp_stream_id = stream.id,
@@ -6959,6 +7196,9 @@ struct IngestTelemetry {
     fmp4_bytes: AtomicU64,
     fmp4_init_bytes: AtomicU64,
     fmp4_publish_errors: AtomicU64,
+    /// Parts of an earlier ingest session of their stream, refused: the
+    /// old connection's tail after a new one began (A 4).
+    fmp4_stale_session_parts: AtomicU64,
     fmp4_last_publish_unix_ms: AtomicU64,
     fmp4_video_width: AtomicU64,
     fmp4_video_height: AtomicU64,
@@ -7829,6 +8069,7 @@ impl IngestTelemetry {
                 bytes: self.fmp4_bytes.load(Ordering::Relaxed),
                 init_bytes: self.fmp4_init_bytes.load(Ordering::Relaxed),
                 publish_errors: self.fmp4_publish_errors.load(Ordering::Relaxed),
+                stale_session_parts: self.fmp4_stale_session_parts.load(Ordering::Relaxed),
                 last_publish_unix_ms: nonzero_unix_ms(
                     self.fmp4_last_publish_unix_ms.load(Ordering::Relaxed),
                 ),
@@ -9067,6 +9308,11 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "CMAF/fMP4 publish failures.",
             runtime.fmp4.publish_errors,
         ),
+        (
+            "av_contrib_fmp4_stale_session_parts_total",
+            "CMAF/fMP4 parts of an earlier ingest session of their stream, not published.",
+            runtime.fmp4.stale_session_parts,
+        ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
         output.push_str(&format!("{name} {value}\n"));
@@ -9929,6 +10175,7 @@ struct Fmp4RuntimeSnapshot {
     bytes: u64,
     init_bytes: u64,
     publish_errors: u64,
+    stale_session_parts: u64,
     last_publish_unix_ms: Option<u64>,
     last_publish_age_ms: Option<u64>,
     video_codec: Option<&'static str>,
@@ -10315,6 +10562,7 @@ struct ContribRouter {
     forwarder: Arc<MeshForwarder>,
     default_stream_id: u64,
     status: Arc<ContribStatusConfig>,
+    node: Arc<NodeStatus>,
     publish_ingress_gate: Option<Arc<PublishIngressGate>>,
     needletail_authorizer: Option<NeedletailSessionAuthorizer>,
     audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
@@ -10323,10 +10571,12 @@ struct ContribRouter {
 }
 
 impl ContribRouter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         forwarder: Arc<MeshForwarder>,
         default_stream_id: u64,
         status: Arc<ContribStatusConfig>,
+        node: Arc<NodeStatus>,
         publish_ingress_gate: Option<Arc<PublishIngressGate>>,
         needletail_authorizer: Option<NeedletailSessionAuthorizer>,
         audio_epoch_hls_tx: Option<mpsc::Sender<AudioEpochHlsDatagram>>,
@@ -10336,6 +10586,7 @@ impl ContribRouter {
             forwarder,
             default_stream_id,
             status,
+            node,
             publish_ingress_gate,
             needletail_authorizer,
             audio_epoch_hls_tx,
@@ -10588,6 +10839,16 @@ impl Router for ContribRouter {
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
+            CONTRIB_NODE_PATH => {
+                // The report of the last sample, at most 100 ms old.
+                let json = serde_json::to_vec(self.node.report().as_ref())
+                    .map_err(|err| ServerError::Handler(Box::new(err)))?;
+                Ok(response(
+                    StatusCode::OK,
+                    Some(Bytes::from(json)),
+                    Some("application/json"),
+                ))
+            }
             CONTRIB_STATUS_PATH => {
                 let json = serde_json::to_vec(&self.status.snapshot())
                     .map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -10602,6 +10863,7 @@ impl Router for ContribRouter {
             }
             CONTRIB_METRICS_PATH => {
                 let mut metrics = self.status.prometheus_metrics().to_vec();
+                metrics.extend_from_slice(self.node.prometheus_metrics().as_bytes());
                 if let Some(gate) = &self.publish_ingress_gate {
                     metrics.extend_from_slice(gate.prometheus_metrics().as_bytes());
                 }
@@ -11079,6 +11341,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // Taken before anything binds: from here a signal is a graceful stop.
+    let mut stop_signals = StopSignals::new()?;
+    let node = contributor_node(&args);
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
     if let Some(warning) = args.legacy_audio_part_warning() {
         warn!("{warning}");
@@ -11107,6 +11372,15 @@ async fn main() -> Result<()> {
     let (publication_shutdown_tx, publication_shutdown_rx) = watch::channel(());
     let telemetry = Arc::new(IngestTelemetry::default());
     let forwarder = Arc::new(MeshForwarder::new(&args, Arc::clone(&telemetry)).await?);
+    {
+        let forwarder = forwarder.clone();
+        let lane_ids = [
+            args.relay_primary_id.clone(),
+            args.relay_secondary_id.clone(),
+        ];
+        node.lanes_bound(move |now_unix_us| forwarder.lane_samples(&lane_ids, now_unix_us));
+    }
+    tokio::spawn(Arc::clone(&node).run());
     let mesh_publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
     let (publisher, publication_tasks) = start_bounded_publication_pipeline(
         mesh_publisher,
@@ -11385,6 +11659,7 @@ async fn main() -> Result<()> {
         forwarder.clone(),
         args.stream_id,
         status,
+        Arc::clone(&node),
         publish_ingress_gate,
         needletail_authorizer,
         router_audio_epoch_hls_tx,
@@ -11452,50 +11727,119 @@ async fn main() -> Result<()> {
         println!("daw:     udp+daw-media://{}", bind);
     }
     println!("status:  https://127.0.0.1:{}/api/status", args.http_port);
+    println!("node:    https://127.0.0.1:{}/api/node", args.http_port);
     println!(
         "events:  https://127.0.0.1:{}/api/status/events",
         args.http_port
     );
     println!("health:  https://127.0.0.1:{}/up", args.http_port);
 
-    tokio::signal::ctrl_c().await?;
-    let _ = handle.shutdown_tx.send(());
-    let _ = shutdown_tx.send(());
-    if let Some(shutdown) = rist_shutdown {
-        let _ = shutdown.send(());
-    }
-    #[cfg(feature = "srt-ingest")]
-    if let Some(shutdown) = srt_shutdown {
-        let _ = shutdown.send(());
-    }
-    if let Some(shutdown) = rtmp_shutdown {
-        let _ = shutdown.send(());
-    }
-    let _ = handle.finished_rx.await;
-    if let Some(finished) = rtmp_finished {
-        let _ = finished.await;
-    }
-    if let Some(task) = rtmp_task {
-        let _ = task.await;
-    }
-    if let Some(task) = daw_media_task {
-        let _ = task.await;
-    }
-    if let Some(task) = audio_epoch_hls_task {
-        let _ = task.await;
-    }
-    if let Some(task) = audio_epoch_normalizer_task {
-        let _ = task.await;
-    }
-    if let Some(task) = audio_epoch_mesh_task {
-        let _ = task.await;
-    }
-    let _ = publication_shutdown_tx.send(());
-    drop(publisher);
-    for task in publication_tasks {
-        let _ = task.await;
+    let signal = stop_signals.recv().await;
+    let grace_ends = tokio::time::Instant::now() + Duration::from_millis(args.shutdown_grace_ms);
+    info!(
+        signal,
+        shutdown_grace_ms = args.shutdown_grace_ms,
+        "stopping: ingest ends, the lanes drain, a last ledger goes out on each lane"
+    );
+    node.stop(now_unix_us());
+    let stop = async {
+        // Ingest ends: no new datagram, access unit or upload is taken.
+        let _ = shutdown_tx.send(());
+        if let Some(shutdown) = rist_shutdown {
+            let _ = shutdown.send(());
+        }
+        #[cfg(feature = "srt-ingest")]
+        if let Some(shutdown) = srt_shutdown {
+            let _ = shutdown.send(());
+        }
+        if let Some(shutdown) = rtmp_shutdown {
+            let _ = shutdown.send(());
+        }
+        if let Some(finished) = rtmp_finished {
+            let _ = finished.await;
+        }
+        if let Some(task) = rtmp_task {
+            let _ = task.await;
+        }
+        if let Some(task) = daw_media_task {
+            let _ = task.await;
+        }
+        // The packagers end, each through its own `finish`: that decides
+        // what becomes of an open short part (A 2.6: it is not flushed).
+        if let Some(task) = audio_epoch_hls_task {
+            let _ = task.await;
+        }
+        if let Some(task) = audio_epoch_normalizer_task {
+            let _ = task.await;
+        }
+        if let Some(task) = audio_epoch_mesh_task {
+            let _ = task.await;
+        }
+        // The publication queues empty into the lanes.
+        let _ = publication_shutdown_tx.send(());
+        drop(publisher);
+        for task in publication_tasks {
+            let _ = task.await;
+        }
+        let left = forwarder.finish_lanes(grace_ends).await;
+        // The HTTP server last: GET /api/node says `stopping` until here.
+        let _ = handle.shutdown_tx.send(());
+        let _ = handle.finished_rx.await;
+        left
+    };
+    tokio::select! {
+        biased;
+        second = stop_signals.recv() => {
+            warn!(signal = second, "a second stop signal: exiting at once");
+            std::process::exit(0);
+        }
+        left = stop => {
+            info!(parts_left_in_lane_backlogs = left, "stop complete");
+        }
     }
     Ok(())
+}
+
+/// SIGTERM and SIGINT: each asks for the graceful stop; one that comes
+/// during the stop ends the process at once.
+struct StopSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate()).context("failed to handle SIGTERM")?,
+            interrupt: signal(SignalKind::interrupt()).context("failed to handle SIGINT")?,
+        })
+    }
+
+    /// The next signal's name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.interrupt.recv() => "SIGINT",
+        }
+    }
+}
+
+/// This process's status for `GET /api/node`, `starting` until its lanes
+/// are bound.
+fn contributor_node(args: &Args) -> Arc<NodeStatus> {
+    NodeStatus::new(
+        node_status::Node {
+            node_id: args.node_id(),
+            region: args.region.clone(),
+            build: node_status::Build::of_this_binary(),
+            pid: std::process::id(),
+            boot_unix_us: now_unix_us(),
+            args_sha256: node_status::args_sha256(std::env::args_os()),
+            cpus: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        },
+        Arc::clone(node_status::counters()),
+    )
 }
 
 fn response(
@@ -12476,6 +12820,420 @@ mod tests {
             }
         }
         stamps
+    }
+
+    /// Part number, key epoch and Media Sequence Number of each part
+    /// queued, in order.
+    fn drained_numbers(
+        receivers: &mut [mpsc::Receiver<QueuedPublication>],
+    ) -> Vec<(u64, u64, u64)> {
+        let mut numbers = Vec::new();
+        for receiver in receivers.iter_mut() {
+            while let Ok(publication) = receiver.try_recv() {
+                if let QueuedPublication::Fmp4 { part, .. } = publication {
+                    let epoch = part.source_epoch.expect("a session's part has its epoch");
+                    numbers.push((part.sequence, epoch, part.hls.unwrap().msn));
+                }
+            }
+        }
+        numbers
+    }
+
+    /// One ingest session of video stream 1 on `publisher`, as a bridge
+    /// runs it: `parts` key-frame parts of 66.7 ms, published from
+    /// `from_ns` on the wall clock. Returns the session's epoch and each
+    /// part's numbers.
+    async fn video_session(
+        publisher: &BoundedFmp4Publisher,
+        receivers: &mut [mpsc::Receiver<QueuedPublication>],
+        from_ns: i64,
+        parts: i64,
+    ) -> (u64, Vec<(u64, u64, u64)>) {
+        let epoch = publisher.begin_ingest_session(1).unwrap();
+        for index in 0..parts {
+            let mut part = test_fmp4_part(
+                1,
+                0,
+                true,
+                2,
+                0,
+                None,
+                Bytes::from_static(b"frame"),
+                from_ns + index * 66_733_000,
+            );
+            part.source_epoch = Some(epoch);
+            publisher.publish_fmp4_part(part).await.unwrap();
+        }
+        (epoch, drained_numbers(receivers))
+    }
+
+    #[tokio::test]
+    async fn two_sessions_on_one_process_get_rising_epochs_and_numbers() {
+        let durations = Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .stamp_durations();
+        let segment_ns = i64::try_from(durations.video_segment_us * 1_000).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(durations);
+        let start_ns = 1_763_924_000_000_000_000_i64;
+        let (first_epoch, first) = video_session(&publisher, &mut receivers, start_ns, 90).await;
+        let clock_msn = start_ns as u64 / 1_000 / durations.video_segment_us;
+        assert_eq!(first[0], (0, first_epoch, clock_msn));
+        let last_msn = first.last().unwrap().2;
+        assert!(last_msn >= first[0].2 + 2, "{first:?}");
+
+        // The feed comes back at once, with a source clock a segment
+        // behind: its first segment is still numbered above the first
+        // session's last, and its parts are counted from 0 under a higher
+        // epoch.
+        let (second_epoch, second) =
+            video_session(&publisher, &mut receivers, start_ns - segment_ns, 90).await;
+        assert!(second_epoch > first_epoch);
+        assert_eq!(second[0], (0, second_epoch, last_msn + 1));
+        assert!(
+            second.windows(2).all(|pair| pair[0].2 <= pair[1].2),
+            "{second:?}"
+        );
+        assert_eq!(second.last().unwrap().0, 89);
+
+        // A third session at once: the epoch rises even when the clock has
+        // not, and a session with no part leaves the floor where it was.
+        let (third_epoch, third) = video_session(&publisher, &mut receivers, start_ns, 0).await;
+        assert!(third_epoch > second_epoch);
+        assert!(third.is_empty());
+        assert!(publisher.streams.video_starts().get(&1).is_none());
+        let (fourth_epoch, fourth) = video_session(&publisher, &mut receivers, start_ns, 1).await;
+        assert!(fourth_epoch > third_epoch);
+        assert_eq!(fourth[0], (0, fourth_epoch, second.last().unwrap().2 + 1));
+        // The new session's first part started the stream's clock anew.
+        assert_eq!(
+            publisher.streams.video_starts().get(&1).copied(),
+            Some(start_ns as u64 / 1_000)
+        );
+    }
+
+    /// The call site of the RTMP bridge: each RTMP stream of one output
+    /// stream is an ingest session of its own.
+    #[tokio::test]
+    async fn each_rtmp_stream_is_an_ingest_session_of_its_own() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let publisher: Arc<dyn Fmp4PartPublisher> = Arc::new(publisher);
+        let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+        let (events, rx) = mpsc::channel(1_024);
+        let bridge = tokio::spawn(run_rtmp_hls_bridge(
+            rx,
+            playlists,
+            publisher,
+            Arc::new(IngestTelemetry::default()),
+            9,
+            args.video_part_ms(),
+        ));
+        // The encoder connects, drops and connects again on the same key.
+        for connection in [1, 2] {
+            let stream = RtmpStreamInfo {
+                key: "9".to_owned(),
+                id: connection,
+            };
+            for index in 0..20 {
+                let mut access_unit = aac_frame(index);
+                (access_unit.pts, access_unit.dts) = (index * 21, index * 21);
+                events
+                    .send(RtmpIngestEvent::AccessUnit {
+                        stream: stream.clone(),
+                        access_unit,
+                    })
+                    .await
+                    .unwrap();
+            }
+            events.send(RtmpIngestEvent::End { stream }).await.unwrap();
+        }
+        drop(events);
+        bridge.await.unwrap();
+
+        let numbers = drained_numbers(&mut receivers);
+        let first_epoch = numbers[0].1;
+        let split = numbers
+            .iter()
+            .position(|numbers| numbers.1 != first_epoch)
+            .expect("the second connection publishes under its own epoch");
+        let (first, second) = numbers.split_at(split);
+        assert!(second.iter().all(|numbers| numbers.1 == second[0].1));
+        assert!(second[0].1 > first_epoch);
+        assert_eq!((first[0].0, second[0].0), (0, 0), "{numbers:?}");
+        assert!(second[0].2 > first.last().unwrap().2, "{numbers:?}");
+    }
+
+    /// One key-frame part of video stream 1 of `epoch`, published at
+    /// `at_ns`.
+    async fn publish_video_part(publisher: &BoundedFmp4Publisher, epoch: u64, at_ns: i64) {
+        let mut part = test_fmp4_part(1, 0, true, 2, 0, None, Bytes::from_static(b"frame"), at_ns);
+        part.source_epoch = Some(epoch);
+        publisher.publish_fmp4_part(part).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_part_of_an_earlier_session_takes_no_number_of_the_new_one() {
+        let durations = Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .stamp_durations();
+        let (publisher, mut receivers) = stamping_publisher(durations);
+        let start_ns = 1_763_924_000_000_000_000_i64;
+        let part_ns = 66_733_000_i64;
+        let (first_epoch, first) = video_session(&publisher, &mut receivers, start_ns, 3).await;
+        let (second_epoch, mut second) =
+            video_session(&publisher, &mut receivers, start_ns + 3 * part_ns, 2).await;
+        // The old connection's tail arrives after the new session began.
+        publish_video_part(&publisher, first_epoch, start_ns + 5 * part_ns).await;
+        assert!(
+            drained_numbers(&mut receivers).is_empty(),
+            "it is not queued"
+        );
+        assert_eq!(
+            publisher
+                .telemetry
+                .fmp4_stale_session_parts
+                .load(Ordering::Relaxed),
+            1
+        );
+        publish_video_part(&publisher, second_epoch, start_ns + 6 * part_ns).await;
+        second.extend(drained_numbers(&mut receivers));
+        assert_eq!(
+            second.iter().map(|numbers| numbers.0).collect::<Vec<_>>(),
+            [0, 1, 2],
+            "{second:?}"
+        );
+        assert!(second.iter().all(|numbers| numbers.1 == second_epoch));
+        // The stamper counted the new session's parts only.
+        let last_first_msn = first.last().unwrap().2;
+        assert!(
+            second.iter().all(|numbers| numbers.2 == last_first_msn + 1),
+            "{first:?} {second:?}"
+        );
+        // A stream that never began a session refuses nothing.
+        let mut part = test_fmp4_part(2, 0, true, 2, 0, None, Bytes::from_static(b"f"), start_ns);
+        part.source_epoch = None;
+        publisher.publish_fmp4_part(part).await.unwrap();
+        assert_eq!(drained_numbers_any(&mut receivers), 1);
+    }
+
+    /// A reconnecting feed leaves one initialization a stream, not one a
+    /// session; a part of an epoch whose initialization went is stale.
+    #[tokio::test]
+    async fn a_stream_keeps_the_initialization_of_its_newest_epoch_only() {
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.mesh_fec_target = sink.local_addr().unwrap();
+        args.mesh_media_fec_target = sink.local_addr().unwrap();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
+            .await
+            .unwrap();
+        let part = |stream_id, epoch, sequence: u64| {
+            let init = (sequence == 0).then(|| Bytes::from_static(b"init"));
+            let mut part = test_fmp4_part(
+                stream_id,
+                sequence,
+                true,
+                2,
+                0,
+                init,
+                Bytes::from_static(b"frame"),
+                now_unix_ns(),
+            );
+            part.source_epoch = Some(epoch);
+            part
+        };
+        forwarder.publish_fmp4_part(part(2, 5, 0)).await.unwrap();
+        for epoch in [10, 20, 30] {
+            forwarder
+                .publish_fmp4_part(part(1, epoch, 0))
+                .await
+                .unwrap();
+            forwarder
+                .publish_fmp4_part(part(1, epoch, 1))
+                .await
+                .unwrap();
+        }
+        let mut kept = forwarder
+            .fmp4_initializations
+            .load()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        kept.sort_unstable();
+        assert_eq!(kept, [(1, 30), (2, 5)]);
+        let mut kept = forwarder
+            .fmp4_initialization_payloads
+            .load()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        kept.sort_unstable();
+        assert_eq!(kept, [(1, 30), (2, 5)]);
+
+        // The tail of an earlier session: counted, not published, no error.
+        forwarder.publish_fmp4_part(part(1, 20, 2)).await.unwrap();
+        assert_eq!(
+            telemetry.fmp4_stale_session_parts.load(Ordering::Relaxed),
+            1
+        );
+        // A part with no initialization and no newer epoch is still an
+        // error.
+        assert!(forwarder.publish_fmp4_part(part(3, 7, 1)).await.is_err());
+    }
+
+    /// Parts queued, of any stream and epoch.
+    fn drained_numbers_any(receivers: &mut [mpsc::Receiver<QueuedPublication>]) -> usize {
+        receivers
+            .iter_mut()
+            .map(|receiver| std::iter::from_fn(|| receiver.try_recv().ok()).count())
+            .sum()
+    }
+
+    /// An encoder reconnects on the same key before the server has seen its
+    /// old connection end, and the old connection still delivers what it
+    /// had buffered: none of it takes a number of the new session, and the
+    /// old connection's end leaves the new session's stream open.
+    #[tokio::test]
+    async fn an_old_connection_that_ends_late_does_not_publish_into_the_new_session() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let publisher = Arc::new(publisher);
+        let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+        let (events, rx) = mpsc::channel(1_024);
+        let bridge = tokio::spawn(run_rtmp_hls_bridge(
+            rx,
+            playlists,
+            Arc::clone(&publisher) as Arc<dyn Fmp4PartPublisher>,
+            Arc::new(IngestTelemetry::default()),
+            9,
+            args.video_part_ms(),
+        ));
+        let old = RtmpStreamInfo {
+            key: "9".to_owned(),
+            id: 1,
+        };
+        let new = RtmpStreamInfo {
+            key: "9".to_owned(),
+            id: 2,
+        };
+        let frames = [(&old, 0..10), (&new, 0..10), (&old, 10..15), (&new, 10..20)];
+        for (stream, indexes) in frames {
+            for index in indexes {
+                let mut access_unit = aac_frame(index);
+                (access_unit.pts, access_unit.dts) = (index * 21, index * 21);
+                events
+                    .send(RtmpIngestEvent::AccessUnit {
+                        stream: stream.clone(),
+                        access_unit,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        for stream in [old, new] {
+            events.send(RtmpIngestEvent::End { stream }).await.unwrap();
+        }
+        drop(events);
+        bridge.await.unwrap();
+
+        let numbers = drained_numbers(&mut receivers);
+        let first_epoch = numbers[0].1;
+        let split = numbers
+            .iter()
+            .position(|numbers| numbers.1 != first_epoch)
+            .expect("the new connection publishes under its own epoch");
+        let (first, second) = numbers.split_at(split);
+        assert!(
+            second.iter().all(|numbers| numbers.1 == second[0].1),
+            "no part of the old session follows the new one's first: {numbers:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .enumerate()
+                .all(|(index, numbers)| numbers.0 == index as u64),
+            "the new session's numbers have no gap: {numbers:?}"
+        );
+        assert!(
+            second.windows(2).all(|pair| pair[0].2 <= pair[1].2),
+            "{numbers:?}"
+        );
+        let stale = publisher
+            .telemetry
+            .fmp4_stale_session_parts
+            .load(Ordering::Relaxed);
+        // The old connection's five late frames went nowhere.
+        assert!(stale >= 1, "{numbers:?}");
+        assert_eq!(
+            first.len() as u64 + stale,
+            drained_parts_of_one_connection(&args, 15).await,
+            "{numbers:?}"
+        );
+    }
+
+    /// The parts that one RTMP connection of `frames` AAC frames publishes
+    /// on its own.
+    async fn drained_parts_of_one_connection(args: &Args, frames: u64) -> u64 {
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+        let (events, rx) = mpsc::channel(1_024);
+        let bridge = tokio::spawn(run_rtmp_hls_bridge(
+            rx,
+            playlists,
+            Arc::new(publisher),
+            Arc::new(IngestTelemetry::default()),
+            9,
+            args.video_part_ms(),
+        ));
+        let stream = RtmpStreamInfo {
+            key: "9".to_owned(),
+            id: 1,
+        };
+        for index in 0..frames {
+            let mut access_unit = aac_frame(index);
+            (access_unit.pts, access_unit.dts) = (index * 21, index * 21);
+            events
+                .send(RtmpIngestEvent::AccessUnit {
+                    stream: stream.clone(),
+                    access_unit,
+                })
+                .await
+                .unwrap();
+        }
+        events.send(RtmpIngestEvent::End { stream }).await.unwrap();
+        drop(events);
+        bridge.await.unwrap();
+        drained_numbers(&mut receivers).len() as u64
+    }
+
+    #[tokio::test]
+    async fn a_feed_that_returns_does_not_step_the_sequence_back() {
+        // Contributors A and B, the feed on A, then B, then A again, ten
+        // seconds apart on clocks that agree.
+        let durations = Args::try_parse_from(["av-contrib"])
+            .unwrap()
+            .stamp_durations();
+        let (a, mut a_receivers) = stamping_publisher(durations);
+        let (b, mut b_receivers) = stamping_publisher(durations);
+        let start_ns = 1_763_924_000_000_000_000_i64;
+        let ten_s = 10_000_000_000_i64;
+        let (a_epoch, on_a) = video_session(&a, &mut a_receivers, start_ns, 60).await;
+        let (_, on_b) = video_session(&b, &mut b_receivers, start_ns + ten_s, 60).await;
+        let (a_again_epoch, on_a_again) =
+            video_session(&a, &mut a_receivers, start_ns + 2 * ten_s, 60).await;
+        assert!(a_again_epoch > a_epoch);
+        let msns = on_a
+            .iter()
+            .chain(&on_b)
+            .chain(&on_a_again)
+            .map(|numbers| numbers.2)
+            .collect::<Vec<_>>();
+        assert!(msns.windows(2).all(|pair| pair[0] <= pair[1]), "{msns:?}");
+        assert!(on_a_again[0].2 > on_b.last().unwrap().2);
+        // Without a new session A would have gone on from its own last
+        // number, below B's.
+        assert!(on_a.last().unwrap().2 + 1 < on_b.last().unwrap().2);
     }
 
     #[tokio::test]
@@ -15793,6 +16551,61 @@ mod tests {
         assert_eq!(datagrams, expected, "the ledger came behind them");
     }
 
+    /// The end of a stop (AC7): the lanes' backlogs drain until the grace
+    /// ends, then every lane sends its ledger once more.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_backlogs_until_the_grace_ends_then_sends_each_ledger() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary.local_addr().unwrap());
+        args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+        args.relay_class_lanes = false;
+        args.relay_lane_ledger = true;
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let relay = RelaySessionPublisher::new(&args, telemetry)
+            .await
+            .unwrap()
+            .unwrap();
+        relay.primary.count_sent(&relay.primary.socket, 5);
+        let ledger = |socket: &UdpSocket| {
+            let mut wire = [0_u8; 64];
+            let len = socket.try_recv(&mut wire).expect("a ledger is waiting");
+            assert_eq!((len, &wire[..5]), (16, &b"RLL1\x01"[..]));
+            u64::from_be_bytes(wire[8..16].try_into().unwrap())
+        };
+
+        // A part that cannot leave holds the stop until the grace ends.
+        let held = &relay.secondary.as_ref().unwrap().backlog.pending;
+        held.store(1, Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let left = relay
+            .finish_lanes(started + Duration::from_millis(60))
+            .await;
+        assert_eq!(left, 1);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        primary.readable().await.unwrap();
+        secondary.readable().await.unwrap();
+        assert_eq!((ledger(&primary), ledger(&secondary)), (5, 0));
+
+        // With nothing queued it does not wait.
+        held.store(0, Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let left = relay.finish_lanes(started + Duration::from_secs(10)).await;
+        assert_eq!(left, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        primary.readable().await.unwrap();
+        assert_eq!(ledger(&primary), 5);
+    }
+
+    #[test]
+    fn the_shutdown_grace_is_half_a_second() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        assert_eq!(args.shutdown_grace_ms, 500);
+        let args = Args::try_parse_from(["av-contrib", "--shutdown-grace-ms", "0"]).unwrap();
+        assert_eq!(args.shutdown_grace_ms, 0);
+    }
+
     /// Wave 7 review: with --relay-secondary-seed-source off and no copies
     /// (a clean lane), the secondary still carries a one-symbol audio part:
     /// its source. With a copy it carries the copy, as before.
@@ -16037,6 +16850,9 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16147,6 +16963,9 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -16754,6 +17573,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            contributor_node(&args),
             None,
             None,
             None,
@@ -16776,6 +17596,88 @@ mod tests {
         assert!(metrics.contains("av_contrib_raw_http_bytes_total 1024\n"));
     }
 
+    #[test]
+    fn the_version_names_the_binary_the_commit_and_the_time() {
+        let error = Args::try_parse_from(["av-contrib", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "av-contrib {} ({} {})\n",
+                av_contrib::build::CRATE_VERSION,
+                av_contrib::build::GIT,
+                av_contrib::build::UNIX
+            )
+        );
+    }
+
+    #[test]
+    fn the_node_is_named_by_node_id_else_by_the_relay_local_id() {
+        let args = Args::try_parse_from(["av-contrib", "--relay-local-id", "contrib"]).unwrap();
+        assert_eq!(
+            (args.node_id(), args.region.as_str()),
+            ("contrib".to_owned(), "")
+        );
+        let args = Args::try_parse_from([
+            "av-contrib",
+            "--relay-local-id",
+            "contrib-b",
+            "--node-id",
+            "contrib-lon-b",
+            "--region",
+            "london",
+        ])
+        .unwrap();
+        assert_eq!(
+            (args.node_id(), args.region.as_str()),
+            ("contrib-lon-b".to_owned(), "london")
+        );
+    }
+
+    #[tokio::test]
+    async fn contrib_node_route_serves_the_node_report() {
+        let mut args = contrib_status_args();
+        args.node_id = Some("contrib-lon-b".to_owned());
+        args.region = "london".to_owned();
+        let telemetry = Arc::new(IngestTelemetry::default());
+        let forwarder = Arc::new(
+            MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap(),
+        );
+        let router = ContribRouter::new(
+            forwarder,
+            args.stream_id,
+            Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            contributor_node(&args),
+            None,
+            None,
+            None,
+            None,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(CONTRIB_NODE_PATH)
+            .body(())
+            .unwrap();
+
+        let response = router.route(req).await.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        let node: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
+        assert_eq!(node["schema"], "needletail.node.v1");
+        assert_eq!(node["node_id"], "contrib-lon-b");
+        assert_eq!(node["region"], "london");
+        assert_eq!(node["role"], "contributor");
+        assert_eq!(node["build"]["git"], av_contrib::build::GIT);
+        assert_eq!(node["build"]["built_unix"], av_contrib::build::UNIX);
+        assert_eq!(node["process"]["pid"], std::process::id());
+        // Nothing has bound the lanes of this router's status.
+        assert_eq!(node["state"], "starting");
+        assert_eq!(node["ready"], false);
+    }
+
     #[tokio::test]
     async fn contributor_http_does_not_serve_viewer_media() {
         let args = contrib_status_args();
@@ -16789,6 +17691,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
+            contributor_node(&args),
             None,
             None,
             None,
@@ -17023,6 +17926,9 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -17273,6 +18179,9 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -17423,6 +18332,9 @@ mod tests {
             relay_secondary_seed_source: false,
             relay_exclusive: false,
             relay_local_id: "av-contrib-test".to_owned(),
+            node_id: None,
+            region: String::new(),
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,

@@ -112,6 +112,9 @@ pub struct StreamStamper {
     part_us: u64,
     segment_us: u64,
     msn: Option<u64>,
+    /// The lowest first Media Sequence Number: above the last number of
+    /// the stream's earlier ingest session on this process.
+    first_msn_floor: u64,
     part: u32,
     segment_elapsed_us: u64,
     /// `0` until the first part of a stream of one unit per part.
@@ -167,6 +170,7 @@ impl StreamStamper {
             part_us,
             segment_us,
             msn: None,
+            first_msn_floor: 0,
             part: 0,
             segment_elapsed_us: 0,
             part_target_us: part_us,
@@ -179,6 +183,20 @@ impl StreamStamper {
             longer_segments: Vec::with_capacity(LONGER_SEGMENTS_TO_WIDEN),
             segments_since_longer: 0,
         }
+    }
+
+    /// A stamper whose first Media Sequence Number is at least `floor`: a
+    /// new ingest session of a stream numbers its segments above the last
+    /// session's, whatever the wall clock says.
+    pub fn with_first_msn_floor(mut self, floor: u64) -> Self {
+        self.first_msn_floor = floor;
+        self
+    }
+
+    /// The Media Sequence Number of the segment that is open; `None` before
+    /// the first part.
+    pub fn msn(&self) -> Option<u64> {
+        self.msn
     }
 
     fn one_unit_per_part(&self) -> bool {
@@ -302,8 +320,9 @@ impl StreamStamper {
         let msn = match self.msn {
             None => {
                 // The first segment number is the wall clock in segment
-                // durations, so a restart continues above the earlier run.
-                let first = published_unix_us / self.segment_us;
+                // durations, so a restart continues above the earlier run,
+                // and never below an earlier session's on this process.
+                let first = (published_unix_us / self.segment_us).max(self.first_msn_floor);
                 self.msn = Some(first);
                 self.segment_starts_clean = can_start_segment;
                 first
@@ -357,6 +376,26 @@ mod tests {
         fn stamp_ms(&mut self, duration_ms: u32, can_start: bool, unix_ms: u64) -> HlsStamp {
             self.stamp(u64::from(duration_ms) * 1_000, can_start, unix_ms * 1_000)
         }
+    }
+
+    #[test]
+    fn a_first_msn_floor_lifts_the_first_number_and_the_rest_follow() {
+        // The clock says segment 1,000; an earlier session ended at 1,004.
+        let mut stamper = new_ms(500, 1_000).with_first_msn_floor(1_005);
+        assert_eq!(stamper.msn(), None);
+        let stamps = (0..5)
+            .map(|_| stamper.stamp_ms(500, true, 1_000_000))
+            .map(|stamp| (stamp.msn, stamp.part))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stamps,
+            [(1_005, 0), (1_005, 1), (1_006, 0), (1_006, 1), (1_007, 0)]
+        );
+        assert_eq!(stamper.msn(), Some(1_007));
+
+        // A clock above the floor numbers the first segment, as before.
+        let mut stamper = new_ms(500, 1_000).with_first_msn_floor(10);
+        assert_eq!(stamper.stamp_ms(500, true, 1_000_000).msn, 1_000);
     }
 
     #[test]
