@@ -9,6 +9,12 @@
 //! The default part is the smallest unit the source makes: one AEP1 epoch of
 //! audio, whatever its sample count, and one access unit (frame) of video.
 //! A larger part is a setting.
+//!
+//! An opaque audio part is named from its source alone ([`SourceAnchor`]):
+//! its number, its place in the playlist, its times and its deadline are
+//! arithmetic on the AEP1 session id and sample count. Two contributors fed
+//! the same epochs therefore name every part alike, whenever each started
+//! and whatever each lost.
 
 use std::fmt;
 use std::str::FromStr;
@@ -145,6 +151,99 @@ impl FromStr for AudioPartSize {
         Err(format!(
             "audio part {value:?}: expected epoch, <N>samples, <N>us or <N>ms"
         ))
+    }
+}
+
+/// Samples of every part of a rendition whose epochs are `frame_count`
+/// samples: one epoch for [`AudioPartSize::Epoch`], otherwise the configured
+/// size rounded up to whole epochs (a FLAC part keeps its floor). Never 0.
+pub fn part_samples(size: AudioPartSize, sample_rate: u32, frame_count: u32, flac: bool) -> u64 {
+    let frame = u64::from(frame_count.max(1));
+    match size.target_samples(sample_rate, flac) {
+        None => frame,
+        Some(target) => target.div_ceil(frame).max(1).saturating_mul(frame),
+    }
+}
+
+/// The part that the epoch at `pts_samples` belongs to, and the epoch's
+/// place in it, for parts of `part_samples` cut on absolute boundaries of the
+/// session's sample count: part `pts / P`, place `(pts % P) / frame_count`.
+pub fn part_place(pts_samples: u64, part_samples: u64, frame_count: u32) -> (u64, u64) {
+    let part = part_samples.max(1);
+    (
+        pts_samples / part,
+        (pts_samples % part) / u64::from(frame_count.max(1)),
+    )
+}
+
+/// Where one opaque audio part sits on its source's timeline: everything
+/// that names the part. All of it comes from the AEP1 header fields of the
+/// part's epochs and from settings that every contributor of a stream shares,
+/// so two contributors compute the same anchor for the same epochs.
+///
+/// The arithmetic is in `u128` with floor division and then narrowed: a
+/// `u64` product of a sample count and 10^9 wraps after 106 hours at 48 kHz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceAnchor {
+    /// The AEP1 session id: the session's start in Unix nanoseconds.
+    pub session_id_ns: u64,
+    /// `pts_samples` of the part's first epoch: a multiple of
+    /// `part_samples` plus the session's phase.
+    pub first_pts_samples: u64,
+    /// `pts_samples` of the part's last epoch.
+    pub last_pts_samples: u64,
+    /// Samples of every part of the rendition ([`part_samples`]).
+    pub part_samples: u64,
+    pub sample_rate: u32,
+}
+
+impl SourceAnchor {
+    /// The part number: the RelaySession object number, the cache slot id
+    /// and the LL-HLS part number.
+    pub fn part_number(&self) -> u64 {
+        self.first_pts_samples / self.part_samples.max(1)
+    }
+
+    /// The key epoch of the part's session: the session id in microseconds,
+    /// never 0.
+    pub fn key_epoch(&self) -> u64 {
+        (self.session_id_ns / 1_000).max(1)
+    }
+
+    /// `samples` of the session as time at `per_second` units a second.
+    fn media_time(&self, samples: u64, per_second: u128) -> u128 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        u128::from(samples) * per_second / u128::from(self.sample_rate)
+    }
+
+    /// The part's time on the source's clock, in Unix nanoseconds: the
+    /// instant its last epoch is due to leave the source,
+    /// `session_id + last_pts / rate`.
+    pub fn source_time_ns(&self) -> i64 {
+        let ns =
+            u128::from(self.session_id_ns) + self.media_time(self.last_pts_samples, 1_000_000_000);
+        i64::try_from(ns).unwrap_or(i64::MAX)
+    }
+
+    /// The part's deadline, `budget_ms` after its source time: a point on
+    /// the stream's own timeline, not on any host's clock.
+    pub fn deadline_ns(&self, budget_ms: u64) -> i64 {
+        let ns = u128::from(self.session_id_ns)
+            + self.media_time(self.last_pts_samples, 1_000_000_000)
+            + u128::from(budget_ms) * 1_000_000;
+        i64::try_from(ns).unwrap_or(i64::MAX)
+    }
+
+    /// The start of the part's cell on a grid of `cell_us` over the
+    /// session's media time, in microseconds from the session's start. The
+    /// first part a contributor publishes in a cell carries the stream's
+    /// descriptor whole.
+    pub fn grid_us(&self, cell_us: u64) -> u64 {
+        let cell = u128::from(cell_us.max(1));
+        let us = self.media_time(self.last_pts_samples, 1_000_000) / cell * cell;
+        u64::try_from(us).unwrap_or(u64::MAX)
     }
 }
 
@@ -291,6 +390,173 @@ mod tests {
         );
         assert_eq!(AudioPartSize::Samples(120).min_part_us(48_000), 2_500);
         assert_eq!(AudioPartSize::Epoch.min_part_us(48_000), 0);
+    }
+
+    fn anchor(session_id_ns: u64, pts: u64, part: u64) -> SourceAnchor {
+        SourceAnchor {
+            session_id_ns,
+            first_pts_samples: pts,
+            last_pts_samples: pts,
+            part_samples: part,
+            sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn a_part_is_whole_epochs_of_the_source() {
+        // One epoch per part, whatever the epoch.
+        for frame in [12_u32, 48, 72, 120, 240] {
+            assert_eq!(
+                part_samples(AudioPartSize::Epoch, 48_000, frame, false),
+                u64::from(frame)
+            );
+            assert_eq!(
+                part_samples(AudioPartSize::Epoch, 48_000, frame, true),
+                u64::from(frame)
+            );
+        }
+        // A size is rounded up to whole epochs.
+        assert_eq!(
+            part_samples(AudioPartSize::Samples(48), 48_000, 12, false),
+            48
+        );
+        assert_eq!(
+            part_samples(AudioPartSize::Samples(100), 48_000, 48, false),
+            144
+        );
+        assert_eq!(
+            part_samples(AudioPartSize::Micros(5_000), 48_000, 48, false),
+            240
+        );
+        assert_eq!(
+            part_samples(AudioPartSize::Micros(4_000), 48_000, 64, false),
+            192
+        );
+        // FLAC's floor of 32 samples, in whole epochs.
+        assert_eq!(
+            part_samples(AudioPartSize::Samples(12), 48_000, 16, true),
+            32
+        );
+        assert_eq!(
+            part_samples(AudioPartSize::Samples(12), 48_000, 12, true),
+            36
+        );
+        // Never 0, whatever the header says.
+        assert_eq!(part_samples(AudioPartSize::Epoch, 48_000, 0, false), 1);
+    }
+
+    #[test]
+    fn an_epoch_has_one_part_and_one_place_whatever_came_before() {
+        // Parts of five 48-sample epochs.
+        assert_eq!(part_place(0, 240, 48), (0, 0));
+        assert_eq!(part_place(192, 240, 48), (0, 4));
+        assert_eq!(part_place(240, 240, 48), (1, 0));
+        assert_eq!(part_place(500 * 48, 240, 48), (100, 0));
+        assert_eq!(part_place(503 * 48, 240, 48), (100, 3));
+        // One epoch per part: the number is the epoch's index.
+        for frame in [12_u32, 48, 72, 120, 240] {
+            let part = u64::from(frame);
+            assert_eq!(part_place(7 * part, part, frame), (7, 0));
+        }
+        // A session whose pts has a phase that is not a multiple of the
+        // frame still gives every epoch one part and one place.
+        assert_eq!(part_place(7, 48, 48), (0, 0));
+        assert_eq!(part_place(55, 48, 48), (1, 0));
+        assert_eq!(part_place(7, 240, 48), (0, 0));
+        assert_eq!(part_place(199, 240, 48), (0, 4));
+        assert_eq!(part_place(247, 240, 48), (1, 0));
+    }
+
+    #[test]
+    fn a_part_is_numbered_and_timed_from_its_source() {
+        let session = 1_700_000_000_000_000_000_u64;
+        // (epoch samples, epochs a second).
+        for (frame, per_second) in [(12_u64, 4_000_u64), (48, 1_000), (120, 400), (240, 200)] {
+            for index in [0_u64, 1, 499, per_second, 123_456_789] {
+                let part = anchor(session, index * frame, frame);
+                assert_eq!(part.part_number(), index, "{frame}");
+                assert_eq!(part.key_epoch(), 1_700_000_000_000_000);
+                let media_ns = index * 1_000_000_000 / per_second;
+                assert_eq!(part.source_time_ns(), (session + media_ns) as i64);
+                assert_eq!(
+                    part.deadline_ns(1_000),
+                    (session + media_ns + 1_000_000_000) as i64
+                );
+            }
+        }
+        // 72 samples are 1.5 ms: epoch 3 is due 4.5 ms in.
+        let part = anchor(session, 3 * 72, 72);
+        assert_eq!(part.part_number(), 3);
+        assert_eq!(part.source_time_ns(), (session + 4_500_000) as i64);
+        // A part of five epochs: numbered by its first, timed by its last.
+        let part = SourceAnchor {
+            session_id_ns: session,
+            first_pts_samples: 500 * 48,
+            last_pts_samples: 504 * 48,
+            part_samples: 240,
+            sample_rate: 48_000,
+        };
+        assert_eq!(part.part_number(), 100);
+        assert_eq!(part.source_time_ns(), (session + 504_000_000) as i64);
+    }
+
+    #[test]
+    fn a_pts_phase_floors_to_its_part_and_keeps_its_exact_time() {
+        let session = 1_700_000_000_000_000_000_u64;
+        // The session's pts began at 7, not at a multiple of the frame.
+        let part = anchor(session, 7 + 5 * 48, 48);
+        assert_eq!(part.part_number(), 5);
+        // 247 samples: 5,145,833.3 ns, floored.
+        assert_eq!(part.source_time_ns(), (session + 5_145_833) as i64);
+        assert_eq!(part.grid_us(1_000), 5_000);
+    }
+
+    #[test]
+    fn a_long_session_does_not_wrap_the_arithmetic() {
+        let session = 1_700_000_000_000_000_000_u64;
+        // 2^40 samples at 48 kHz are 265 days; times 10^9 it is past u64.
+        let pts = 1_u64 << 40;
+        assert!(pts.checked_mul(1_000_000_000).is_none());
+        let part = anchor(session, pts, 48);
+        assert_eq!(part.part_number(), pts / 48);
+        assert_eq!(
+            part.source_time_ns(),
+            1_700_000_000_000_000_000 + 22_906_492_245_333_333
+        );
+        assert_eq!(
+            part.deadline_ns(1_000),
+            1_700_000_000_000_000_000 + 22_906_492_245_333_333 + 1_000_000_000
+        );
+        assert_eq!(part.grid_us(100_000), 22_906_492_200_000);
+        // Out of range saturates; it never wraps.
+        let part = anchor(u64::MAX, u64::MAX - 47, 48);
+        assert_eq!(part.source_time_ns(), i64::MAX);
+        assert_eq!(part.deadline_ns(u64::MAX), i64::MAX);
+        // A rate of 0 has no media time.
+        let part = SourceAnchor {
+            sample_rate: 0,
+            ..anchor(session, 480, 48)
+        };
+        assert_eq!(part.source_time_ns(), session as i64);
+        assert_eq!(part.grid_us(100_000), 0);
+    }
+
+    #[test]
+    fn the_grid_cell_is_the_same_for_every_part_inside_it() {
+        let session = 1_700_000_000_000_000_000_u64;
+        // 1 ms parts on a 100 ms grid: parts 0..=99 share cell 0.
+        for index in 0..100_u64 {
+            assert_eq!(anchor(session, index * 48, 48).grid_us(100_000), 0);
+        }
+        assert_eq!(anchor(session, 100 * 48, 48).grid_us(100_000), 100_000);
+        assert_eq!(anchor(session, 250 * 48, 48).grid_us(100_000), 200_000);
+        // 2.5 ms parts: 40 a cell.
+        assert_eq!(anchor(session, 39 * 120, 120).grid_us(100_000), 0);
+        assert_eq!(anchor(session, 40 * 120, 120).grid_us(100_000), 100_000);
+        // The session id does not move the grid: it is media time.
+        assert_eq!(anchor(session + 37, 100 * 48, 48).grid_us(100_000), 100_000);
+        // A cell of 0 is taken as 1 µs.
+        assert_eq!(anchor(session, 48, 48).grid_us(0), 1_000);
     }
 
     #[test]

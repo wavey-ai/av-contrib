@@ -10,7 +10,7 @@ use av_contrib::fmp4_bridge::{
     AccessUnitSink, Fmp4PartPublisher, Fmp4Segmenter, MpegTsContinuityIssue, MpegTsPayloadDrop,
     PublishedFmp4Part, PublishedOpaquePart, TimestampInput, TsFmp4Bridge,
 };
-use av_contrib::hls_stamp::StreamStamper;
+use av_contrib::hls_stamp::{anchored_stamp, StreamStamper};
 use av_contrib::hop_journal::{
     self, HopEvent, HopJournal, HopStage, DEFAULT_HOP_JOURNAL_CAPACITY, HOP_JOURNAL_CONTENT_TYPE,
     HOP_JOURNAL_PATH,
@@ -20,7 +20,7 @@ use av_contrib::ingress_authorization::{
     parse_content_length_header, PublishAuthorizationMode, PublishIngressError, PublishIngressGate,
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
-use av_contrib::part_timing::{AudioPartSize, VideoPartSize};
+use av_contrib::part_timing::{AudioPartSize, SourceAnchor, VideoPartSize};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
 use av_contrib::quadra_renditions::{
     start_quadra_rendition_pipeline, QuadraRenditionConfig, QuadraRenditionSpec,
@@ -102,9 +102,17 @@ const FMP4_MEDIA_TRACK: &str = "muxed-fmp4";
 const FMP4_INITIALIZATION_TRACK: &str = "muxed-fmp4-init";
 const OPAQUE_AUDIO_TRACK: &str = "opaque-audio";
 const MEDIA_OBJECT_VERSION: u32 = 1;
+/// Key version of a source-anchored opaque audio part. The high half says
+/// that the part is named from its source; the low 16 bits are for the
+/// fingerprint of what produced its bytes, so that two contributors whose
+/// bytes could differ never share a key.
+const OPAQUE_AUDIO_OBJECT_VERSION: u32 = 2 << 16;
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 const AV_CONTRIB_CLOCK_ID: &str = "system:realtime:av-contrib";
+/// The clock of a source-anchored part's times: the AEP1 source's own, its
+/// session id plus its sample count. No host's wall clock enters them.
+const AEP1_SOURCE_CLOCK_ID: &str = "source:aep1";
 const DEFAULT_WALL_CLOCK_ESTIMATED_ERROR_MS: u64 = 1_000;
 const DEFAULT_RELAY_DEADLINE_MS: u64 = 1_000;
 const DEFAULT_RELAY_TOPOLOGY_GENERATION: u64 = 1;
@@ -393,9 +401,19 @@ fn build_fmp4_media_object(
         .context("invalid canonical fMP4 media object")
 }
 
+/// The canonical object of an opaque audio part.
+///
+/// Every byte of it is a function of the part's payload, its anchor on the
+/// source's timeline, its playlist stamp (itself from the anchor) and of
+/// settings that the contributors of a stream share: `version`, the delivery
+/// budget and the declared clock error. Its number and key epoch are the
+/// anchor's; Packaged and Published are both the part's source time (the
+/// times on this host stay in the hop journal); and its deadline is the
+/// budget after that, a point on the stream's own timeline. Two contributors
+/// that recovered the same epochs build the same object.
 fn build_opaque_media_object(
     part: &PublishedOpaquePart,
-    source_epoch: u64,
+    version: u32,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
 ) -> Result<MediaObject> {
@@ -405,31 +423,28 @@ fn build_opaque_media_object(
     if part.bytes.is_empty() || part.audio_units == 0 || part.duration_us == 0 {
         bail!("opaque audio part must contain timed media units");
     }
+    let anchor = &part.anchor;
     let key = ObjectKey::for_payload(
         MEDIA_OBJECT_TENANT,
         part.stream_id.to_string(),
         OPAQUE_AUDIO_TRACK,
-        source_epoch,
+        anchor.key_epoch(),
         0,
-        part.sequence,
-        MEDIA_OBJECT_VERSION,
+        anchor.part_number(),
+        version,
         &part.bytes,
     )
     .context("invalid canonical opaque-media identity")?;
-    let packaged =
-        canonical_contributor_timestamp(part.packaged_at_unix_ns, estimated_clock_error_ns)?;
-    let published =
-        canonical_contributor_timestamp(part.published_at_unix_ns, estimated_clock_error_ns)?;
-    let deadline_ns = i128::from(part.published_at_unix_ns)
-        .checked_add(i128::from(delivery_budget_ms) * 1_000_000)
-        .and_then(|value| i64::try_from(value).ok())
-        .context("canonical media deadline exceeds Unix-nanosecond range")?;
-    let deadline = canonical_contributor_timestamp(deadline_ns, estimated_clock_error_ns)?;
+    let source_time = aep1_source_timestamp(anchor.source_time_ns(), estimated_clock_error_ns)?;
+    let deadline = aep1_source_timestamp(
+        anchor.deadline_ns(delivery_budget_ms),
+        estimated_clock_error_ns,
+    )?;
 
     let mut builder = MediaObject::builder(key, ObjectKind::Media, part.bytes.to_vec())
         .with_deadline(deadline)
-        .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, packaged))
-        .with_stage_timestamp(StageTimestamp::new(Stage::Published, published))
+        .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, source_time.clone()))
+        .with_stage_timestamp(StageTimestamp::new(Stage::Published, source_time))
         .with_metadata("container", b"opaque".to_vec())
         .with_metadata("duration-ms", part.duration_ms.to_string().into_bytes())
         .with_metadata("duration-us", part.duration_us.to_string().into_bytes())
@@ -474,6 +489,35 @@ fn canonical_contributor_timestamp(
         ClockConfidence::estimated(estimated_clock_error_ns),
     )
     .context("invalid av-contrib wall-clock timestamp")
+}
+
+/// A time on an AEP1 source's clock, with the declared error.
+fn aep1_source_timestamp(
+    unix_time_ns: i64,
+    estimated_clock_error_ns: u64,
+) -> Result<ClockTimestamp> {
+    ClockTimestamp::new(
+        unix_time_ns,
+        AEP1_SOURCE_CLOCK_ID,
+        ClockConfidence::estimated(estimated_clock_error_ns),
+    )
+    .context("invalid AEP1 source timestamp")
+}
+
+/// Until when this host keeps trying to send a source-anchored part: the
+/// delivery budget after the part was recovered here, on this host's clock.
+///
+/// The part's own deadline is a point on its source's timeline and is not
+/// compared with any clock here: a source whose clock runs slow, or a DAW
+/// that paused, would otherwise have every part expire in this process.
+fn local_part_expiry(part: &PublishedOpaquePart, delivery_budget_ms: u64) -> MediaDeadline {
+    let recovered_us = part
+        .source_times
+        .recovered_us
+        .unwrap_or_else(|| u64::try_from(part.packaged_at_unix_ns / 1_000).unwrap_or(0));
+    MediaDeadline::from_micros(
+        recovered_us.saturating_add(delivery_budget_ms.saturating_mul(1_000)),
+    )
 }
 
 fn relay_deadline_for_object(object: &MediaObject) -> Result<MediaDeadline> {
@@ -2380,6 +2424,35 @@ enum LaneHandOff {
     Queued,
 }
 
+/// What the lanes need of a source-anchored part beyond its object.
+#[derive(Debug, Clone, Copy)]
+struct AnchoredSend {
+    /// Until when this host keeps trying to send the part
+    /// ([`local_part_expiry`]): every expiry check of the part's publication
+    /// and of the lanes' backlogs reads this, never the object's deadline.
+    expires: MediaDeadline,
+    /// The part on its source's timeline, from which its datagrams take
+    /// their block id, packet sequences and compact cell
+    /// ([`SourceFirstEncoder::part_ids`]).
+    anchor: SourceAnchor,
+}
+
+/// Opaque audio parts have one encoder path, the source-first one: only it
+/// names a part's datagrams from the part and sends one-datagram parts
+/// compact. relay-session's own encoder would carry them with counters of
+/// this process, and nothing would merge two contributors' datagrams.
+fn refuse_opaque_audio_without_source_first(args: &Args) -> Result<()> {
+    let opaque_audio =
+        args.daw_media_bind.is_some() && matches!(args.daw_hls_packaging, DawHlsPackaging::Opaque);
+    if opaque_audio && !(args.relay_send_batch && args.relay_source_first) {
+        bail!(
+            "--daw-hls-packaging opaque with relay lanes requires --relay-send-batch true and \
+             --relay-source-first true: opaque audio parts are encoded source first only"
+        );
+    }
+    Ok(())
+}
+
 struct RelaySessionPublisher {
     /// One RaptorQ encoder, or with `--publication-shard-mix` one for audio
     /// parts and one for video parts, so that an audio part never waits for
@@ -2470,6 +2543,7 @@ impl RelaySessionPublisher {
         if args.relay_deadline_ms == 0 {
             bail!("--relay-deadline-ms must be positive");
         }
+        refuse_opaque_audio_without_source_first(args)?;
 
         let limits = RelayLimits::default();
         let primary_bind = relay_bind_addr(
@@ -2747,7 +2821,7 @@ impl RelaySessionPublisher {
         class: PublicationClass,
     ) -> Result<RelayPublishOutcome> {
         let class = self.stream_class(stream_id, object.key().epoch(), class);
-        self.publish_classed_object(object, None, class).await
+        self.publish_classed_object(object, None, class, None).await
     }
 
     /// The class of an object of `stream_id` (source epoch `epoch`) whose
@@ -2797,7 +2871,20 @@ impl RelaySessionPublisher {
             Some((stream_id, _)) => self.stream_class(stream_id, object.key().epoch(), class),
             None => class,
         };
-        self.publish_classed_object(object, part, class).await
+        self.publish_classed_object(object, part, class, None).await
+    }
+
+    /// Publish the object of a source-anchored audio part, `part` its
+    /// (stream, number).
+    async fn publish_anchored_part(
+        &self,
+        object: &MediaObject,
+        part: (u64, u64),
+        anchored: AnchoredSend,
+    ) -> Result<RelayPublishOutcome> {
+        let class = self.stream_class(part.0, object.key().epoch(), PublicationClass::Audio);
+        self.publish_classed_object(object, Some(part), class, Some(anchored))
+            .await
     }
 
     async fn publish_classed_object(
@@ -2805,9 +2892,12 @@ impl RelaySessionPublisher {
         object: &MediaObject,
         part: Option<(u64, u64)>,
         class: PublicationClass,
+        anchored: Option<AnchoredSend>,
     ) -> Result<RelayPublishOutcome> {
         let started = Instant::now();
-        let result = self.publish_object_inner(object, part, class).await;
+        let result = self
+            .publish_object_inner(object, part, class, anchored)
+            .await;
         self.telemetry
             .record_relay_session_stage_duration(RelayPipelineStage::Total, started.elapsed());
         result
@@ -2818,6 +2908,7 @@ impl RelaySessionPublisher {
         object: &MediaObject,
         part: Option<(u64, u64)>,
         class: PublicationClass,
+        anchored: Option<AnchoredSend>,
     ) -> Result<RelayPublishOutcome> {
         let journal = part.and_then(|part| hop_journal::global().map(|journal| (journal, part)));
         let journal_hop = |stage: HopStage, peer: Option<SocketAddr>| {
@@ -2827,8 +2918,13 @@ impl RelaySessionPublisher {
                 );
             }
         };
+        // The deadline that the datagrams carry. This host gives up on the
+        // object at `expires`: the same instant for an object stamped by
+        // this host's clock, and for a source-anchored part its own budget
+        // from its recovery here.
         let deadline = relay_deadline_for_object(object)?;
-        if deadline.is_expired_at(now_unix_us()) {
+        let expires = anchored.map_or(deadline, |anchored| anchored.expires);
+        if expires.is_expired_at(now_unix_us()) {
             self.telemetry
                 .relay_expired_objects
                 .fetch_add(1, Ordering::Relaxed);
@@ -2839,8 +2935,19 @@ impl RelaySessionPublisher {
         }
         if let Some(encoder) = self.source_encoder(class) {
             return self
-                .publish_source_first(encoder, object, part, class, deadline, &journal_hop)
+                .publish_source_first(
+                    encoder,
+                    object,
+                    part,
+                    class,
+                    deadline,
+                    anchored,
+                    &journal_hop,
+                )
                 .await;
+        }
+        if anchored.is_some() {
+            bail!("a source-anchored part is encoded source first only");
         }
         let encode_wait_started = Instant::now();
         let mut encoder = self.encoder(class).lock().await;
@@ -3074,6 +3181,11 @@ impl RelaySessionPublisher {
     /// the hot path (each lane handed its symbols without waiting, no join),
     /// other parts the joined batches; `sent` is still the last source
     /// symbol with the kernel on the primary.
+    ///
+    /// `deadline` is what the datagrams carry. A source-anchored part
+    /// (`anchored`) names its datagrams from its anchor and is given up a
+    /// budget after it was recovered here; any other object at `deadline`.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_source_first(
         &self,
         encoder: &SourceFirstEncoder,
@@ -3081,8 +3193,10 @@ impl RelaySessionPublisher {
         part: Option<(u64, u64)>,
         class: PublicationClass,
         deadline: MediaDeadline,
+        anchored: Option<AnchoredSend>,
         journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
     ) -> Result<RelayPublishOutcome> {
+        let expires = anchored.map_or(deadline, |anchored| anchored.expires);
         let encode_started = Instant::now();
         let encoded = encoder.encode_sources_with(
             object,
@@ -3090,6 +3204,7 @@ impl RelaySessionPublisher {
             self.subscription_id,
             deadline,
             self.single_symbol_audio_repair(),
+            anchored.map(|anchored| encoder.part_ids(&anchored.anchor)),
         );
         let mut encode_time = encode_started.elapsed();
         let encoded = match encoded {
@@ -3162,7 +3277,7 @@ impl RelaySessionPublisher {
                 RelayCarrierPath::Primary,
                 sources.clone(),
                 source_count,
-                deadline,
+                expires,
                 part,
                 Some(HopStage::Sent),
                 Some(&sent_first),
@@ -3175,7 +3290,7 @@ impl RelaySessionPublisher {
                     RelayCarrierPath::Secondary,
                     sources.clone(),
                     source_count,
-                    deadline,
+                    expires,
                     part,
                     Some(HopStage::SentSecondary),
                     Some(&sent_first),
@@ -3197,7 +3312,7 @@ impl RelaySessionPublisher {
                     class,
                     RelayCarrierPath::Primary,
                     &sources,
-                    deadline,
+                    expires,
                 )
                 .await?;
                 journal_sent_first(peer);
@@ -3225,7 +3340,7 @@ impl RelaySessionPublisher {
                             class,
                             RelayCarrierPath::Secondary,
                             &sources,
-                            deadline,
+                            expires,
                         )
                         .await?;
                         journal_sent_first(peer);
@@ -3284,7 +3399,7 @@ impl RelaySessionPublisher {
                             RelayCarrierPath::Primary,
                             repair_wires.clone(),
                             repair_wires.len(),
-                            deadline,
+                            expires,
                             part,
                             None,
                             None,
@@ -3299,7 +3414,7 @@ impl RelaySessionPublisher {
                                 RelayCarrierPath::Secondary,
                                 repair_wires.clone(),
                                 repair_wires.len(),
-                                deadline,
+                                expires,
                                 part,
                                 // A secondary without the source set decodes
                                 // from its repair symbols: they are its `sent`.
@@ -3324,7 +3439,7 @@ impl RelaySessionPublisher {
                                 class,
                                 RelayCarrierPath::Primary,
                                 &repair_wires,
-                                deadline,
+                                expires,
                             )
                             .await?;
                         }
@@ -3347,7 +3462,7 @@ impl RelaySessionPublisher {
                                     class,
                                     RelayCarrierPath::Secondary,
                                     &repair_wires,
-                                    deadline,
+                                    expires,
                                 )
                                 .await?;
                                 journal_sent_first(peer);
@@ -3375,7 +3490,7 @@ impl RelaySessionPublisher {
         self.settle_lanes(
             primary_result,
             secondary_result,
-            deadline,
+            expires,
             RelayPublishOutcome {
                 announcement: encoded.announcement.clone(),
                 source_symbols: source_count,
@@ -5025,13 +5140,12 @@ impl Fmp4PartPublisher for MeshForwarder {
             RELAY_DEMAND_HELD_PARTS.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let source_epoch = part.source_epoch.unwrap_or(self.source_epoch).max(1);
         self.telemetry
             .media_object_source_epoch
-            .fetch_max(source_epoch, Ordering::AcqRel);
+            .fetch_max(part.anchor.key_epoch(), Ordering::AcqRel);
         let object = build_opaque_media_object(
             &part,
-            source_epoch,
+            OPAQUE_AUDIO_OBJECT_VERSION,
             self.delivery_budget_ms,
             self.estimated_clock_error_ns,
         )
@@ -5045,10 +5159,13 @@ impl Fmp4PartPublisher for MeshForwarder {
         }
         if let Some(relay) = &self.relay {
             let outcome = relay
-                .publish_part_object(
+                .publish_anchored_part(
                     &object,
-                    Some((part.stream_id, part.sequence)),
-                    PublicationClass::Audio,
+                    (part.stream_id, part.sequence),
+                    AnchoredSend {
+                        expires: local_part_expiry(&part, self.delivery_budget_ms),
+                        anchor: part.anchor,
+                    },
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -5134,7 +5251,9 @@ struct StampDurations {
     audio_segment_us: u64,
 }
 
-/// Canonical sequence and playlist stamper of one stream.
+/// Publication state of one stream. The canonical sequence and the playlist
+/// stamper are those of an fMP4 stream: an opaque audio part takes its
+/// number and its place from its source.
 struct StreamPublication {
     next_sequence: u64,
     stamper: Option<StreamStamper>,
@@ -5530,23 +5649,20 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         mut part: PublishedOpaquePart,
     ) -> std::result::Result<(), String> {
         let stream_id = part.stream_id;
+        // The part's number and its place in the playlist are its source's:
+        // neither counts what this process has published, so a part refused
+        // below leaves a hole and moves no other part.
+        part.sequence = part.anchor.part_number();
+        part.hls = Some(anchored_stamp(
+            &part.anchor,
+            self.durations.audio_segment_us,
+        ));
+        let sequence = part.sequence;
         let entry = self.streams.entry(stream_id);
         // The stream's lock is held only here, never across an await.
         let publication = 'inline: {
             let mut guard = entry.publication();
             let stream = &mut *guard;
-            part.sequence = stream.next_sequence;
-            let sequence = part.sequence;
-            let durations = self.durations;
-            let before = stream.stamper.clone();
-            let stamper = stream.stamper.get_or_insert_with(|| {
-                StreamStamper::new(durations.audio_part_us, durations.audio_segment_us)
-            });
-            part.hls = Some(stamper.stamp(
-                part.duration_us,
-                true,
-                u64::try_from(part.published_at_unix_ns / 1_000).unwrap_or(0),
-            ));
             if self.publishes_inline(stream, PublicationClass::Audio) {
                 stream.class.get_or_insert(PublicationClass::Audio);
                 journal_enqueued(
@@ -5556,13 +5672,11 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
                     part.packaged_at_unix_ns,
                     hop_journal::now_unix_us(),
                 );
-                let publication = QueuedPublication::Opaque {
+                break 'inline QueuedPublication::Opaque {
                     in_flight: InFlight::new(&stream.in_flight),
                     enqueued_at: Instant::now(),
                     part,
                 };
-                stream.next_sequence = stream.next_sequence.saturating_add(1);
-                break 'inline publication;
             }
             let shard = self.shard_of(stream, stream_id, PublicationClass::Audio);
             let source_times = part.source_times;
@@ -5581,9 +5695,6 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
                     packaged_at_unix_ns,
                     enqueued_us,
                 );
-                stream.next_sequence = stream.next_sequence.saturating_add(1);
-            } else {
-                stream.stamper = before;
             }
             drop(guard);
             return enqueue_publication_result(
@@ -12169,24 +12280,49 @@ mod tests {
         }
     }
 
+    /// Part 0 of a session of 5 ms parts that began now.
     fn test_opaque_part(stream_id: u64) -> PublishedOpaquePart {
+        let session_id_ns = u64::try_from(now_unix_ns()).unwrap();
+        test_opaque_part_at(stream_id, test_anchor(session_id_ns, 0, 240))
+    }
+
+    /// The one-epoch part at `anchor`, as the AEP1 packaging hands it to
+    /// its publisher.
+    fn test_opaque_part_at(stream_id: u64, anchor: SourceAnchor) -> PublishedOpaquePart {
+        let duration_us =
+            av_contrib::part_timing::samples_to_us(anchor.part_samples, anchor.sample_rate);
         PublishedOpaquePart {
             stream_id,
             stream_idx: 0,
-            source_epoch: None,
-            sequence: 0,
-            duration_ms: 5,
-            duration_us: 5_000,
-            duration_samples: Some(240),
-            sample_rate: Some(48_000),
+            sequence: anchor.part_number(),
+            duration_ms: av_contrib::part_timing::legacy_ms(duration_us).max(1),
+            duration_us,
+            duration_samples: Some(anchor.part_samples),
+            sample_rate: Some(anchor.sample_rate),
             packaged_at_unix_ns: now_unix_ns(),
             published_at_unix_ns: now_unix_ns(),
             bytes: Bytes::from_static(b"pcm"),
             audio_units: 1,
             hls: None,
             source_times: Default::default(),
+            anchor,
         }
     }
+
+    /// The anchor of part `number` of the session `session_id_ns` of
+    /// one-epoch parts of `samples` at 48 kHz.
+    fn test_anchor(session_id_ns: u64, number: u64, samples: u64) -> SourceAnchor {
+        SourceAnchor {
+            session_id_ns,
+            first_pts_samples: number * samples,
+            last_pts_samples: number * samples,
+            part_samples: samples,
+            sample_rate: 48_000,
+        }
+    }
+
+    /// A session id in the past: 14 July 2024.
+    const TEST_SESSION_NS: u64 = 1_721_000_000_000_000_000;
 
     /// A publisher whose shard queues the test reads directly.
     fn test_sharded_publisher(
@@ -12346,25 +12482,58 @@ mod tests {
     async fn epoch_parts_of_two_and_a_half_ms_are_stamped_in_microseconds() {
         let args = Args::try_parse_from(["av-contrib"]).unwrap();
         let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
-        let start_ns = 1_721_000_000_000_000_000_i64;
-        for index in 0..801_i64 {
-            let mut part = test_opaque_part(3_001);
-            part.duration_ms = 3;
-            part.duration_us = 2_500;
-            part.duration_samples = Some(120);
-            part.published_at_unix_ns = start_ns + index * 2_500_000;
+        for index in 0..801_u64 {
+            let part = test_opaque_part_at(3_001, test_anchor(TEST_SESSION_NS, index, 120));
             publisher.publish_opaque_part(part).await.unwrap();
         }
         let stamps = drained_stamps(&mut receivers);
         assert_eq!(stamps.len(), 801);
         assert_eq!(stamps[0].msn, 1_721_000_000);
         // 400 parts of 2.5 ms are one second: the segment number keeps pace
-        // with the wall clock.
+        // with the source's clock.
         assert_eq!((stamps[399].msn, stamps[399].part), (1_721_000_000, 399));
         assert_eq!((stamps[400].msn, stamps[400].part), (1_721_000_001, 0));
         assert_eq!((stamps[800].msn, stamps[800].part), (1_721_000_002, 0));
         assert!(stamps.iter().all(|stamp| stamp.part_target_us == 2_500));
         assert!(stamps.iter().all(|stamp| stamp.part_target_ms() == 3));
+    }
+
+    /// An opaque part's sequence and stamp are its source's: a publisher
+    /// that starts at part 500, never gets part 502 and gets part 501 late
+    /// hands on the numbers and places of the source, with no count of its
+    /// own.
+    #[tokio::test]
+    async fn an_opaque_part_is_numbered_and_stamped_from_its_anchor() {
+        let args = Args::try_parse_from(["av-contrib"]).unwrap();
+        let (publisher, mut receivers) = stamping_publisher(args.stamp_durations());
+        for index in [500_u64, 503, 501, 1_000, 1_500] {
+            let mut part = test_opaque_part_at(3_001, test_anchor(TEST_SESSION_NS, index, 48));
+            // Whatever the part says of its sequence, the anchor decides.
+            part.sequence = 0;
+            publisher.publish_opaque_part(part).await.unwrap();
+        }
+        let mut parts = Vec::new();
+        for receiver in receivers.iter_mut() {
+            while let Ok(QueuedPublication::Opaque { part, .. }) = receiver.try_recv() {
+                parts.push((part.sequence, part.hls.unwrap()));
+            }
+        }
+        let stamp = |msn, part| HlsStamp {
+            msn,
+            part,
+            part_target_us: 1_000,
+            target_duration_us: 1_000_000,
+        };
+        assert_eq!(
+            parts,
+            vec![
+                (500, stamp(1_721_000_000, 500)),
+                (503, stamp(1_721_000_000, 503)),
+                (501, stamp(1_721_000_000, 501)),
+                (1_000, stamp(1_721_000_001, 0)),
+                (1_500, stamp(1_721_000_001, 500)),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -12638,7 +12807,7 @@ mod tests {
         let (publisher, mut receivers) = test_sharded_publisher(true);
         // A stream id of this test only: other tests share the process journal.
         let stream_id = 4_000_000_041;
-        let mut part = test_opaque_part(stream_id);
+        let mut part = test_opaque_part_at(stream_id, test_anchor(TEST_SESSION_NS, 0, 240));
         part.packaged_at_unix_ns = i64::try_from((before_us + 70) * 1_000).unwrap();
         // A part of two AEP1 epochs, 1,234 and 1,235.
         part.source_times = hop_journal::PartSourceTimes {
@@ -12649,6 +12818,8 @@ mod tests {
             recovered_us: Some(before_us + 25),
         };
         publisher.publish_opaque_part(part.clone()).await.unwrap();
+        // Its successor, part 1, with the same times.
+        part.anchor = test_anchor(TEST_SESSION_NS, 1, 240);
         publisher.publish_opaque_part(part).await.unwrap();
 
         // The worker side: take both parts as a publication worker would.
@@ -13136,31 +13307,55 @@ mod tests {
 
     #[test]
     fn canonical_opaque_object_preserves_arbitrary_bytes_without_format_metadata() {
-        const PACKAGED_NS: i64 = 1_721_000_000_298_000_000;
-        const PUBLISHED_NS: i64 = 1_721_000_000_300_000_000;
         let payload = Bytes::from_static(b"not-soundkit-not-pcm-not-a-codec");
-        let part = PublishedOpaquePart {
-            stream_id: 91,
-            stream_idx: 91,
-            source_epoch: None,
-            sequence: 17,
-            duration_ms: 3,
-            duration_us: 2_500,
-            duration_samples: Some(120),
-            sample_rate: Some(48_000),
-            packaged_at_unix_ns: PACKAGED_NS,
-            published_at_unix_ns: PUBLISHED_NS,
-            bytes: payload.clone(),
-            audio_units: 1,
-            hls: Some(HlsStamp {
-                msn: 41,
-                part: 7,
-                part_target_us: 2_500,
-                target_duration_us: 1_000_000,
-            }),
-            source_times: Default::default(),
-        };
-        let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
+        let mut part = test_opaque_part_at(91, test_anchor(TEST_SESSION_NS, 17, 120));
+        part.bytes = payload.clone();
+        part.hls = Some(HlsStamp {
+            msn: 41,
+            part: 7,
+            part_target_us: 2_500,
+            target_duration_us: 1_000_000,
+        });
+        // What this host's clock said, and when the part was recovered here,
+        // is not in the object: its name and times are its source's.
+        part.source_times.recovered_us = Some(1_795_000_000_000_000);
+        let object =
+            build_opaque_media_object(&part, OPAQUE_AUDIO_OBJECT_VERSION, 1_000, 250_000).unwrap();
+        assert_eq!(object.key().epoch(), TEST_SESSION_NS / 1_000);
+        assert_eq!(object.key().object(), 17);
+        assert_eq!(object.key().version(), 2 << 16);
+        // Part 17 of 2.5 ms parts: its last (only) epoch leaves the source
+        // 42.5 ms into the session. Packaged, Published and the deadline are
+        // on that clock.
+        let source_time_ns = i64::try_from(TEST_SESSION_NS).unwrap() + 42_500_000;
+        let stages = object.stage_timestamps();
+        assert_eq!(stages.len(), 2);
+        for (stage, expected) in stages.iter().zip([Stage::Packaged, Stage::Published]) {
+            assert_eq!(stage.stage(), expected);
+            assert_eq!(stage.timestamp().unix_time_ns(), source_time_ns);
+            assert_eq!(stage.timestamp().clock_id(), "source:aep1");
+            assert_eq!(
+                stage.timestamp().confidence(),
+                ClockConfidence::estimated(250_000)
+            );
+        }
+        let deadline = object.deadline().unwrap();
+        assert_eq!(deadline.unix_time_ns(), source_time_ns + 1_000_000_000);
+        assert_eq!(deadline.clock_id(), "source:aep1");
+        // The same part built a second later on another host is the same
+        // object, byte for byte.
+        let mut elsewhere = part.clone();
+        elsewhere.packaged_at_unix_ns += 1_000_000_000;
+        elsewhere.published_at_unix_ns += 1_000_000_700;
+        elsewhere.source_times.recovered_us = Some(1_795_000_001_000_000);
+        assert_eq!(
+            media_object::encode(
+                &build_opaque_media_object(&elsewhere, OPAQUE_AUDIO_OBJECT_VERSION, 1_000, 250_000)
+                    .unwrap()
+            )
+            .unwrap(),
+            media_object::encode(&object).unwrap()
+        );
         // The place of the part in the playlist travels with the object.
         assert_eq!(object.metadata().get("hls-msn").unwrap(), b"41");
         assert_eq!(object.metadata().get("hls-part").unwrap(), b"7");
@@ -13199,6 +13394,1032 @@ mod tests {
         );
         assert_eq!(object.metadata().get("file-extension").unwrap(), b"bin");
         assert!(!object.metadata().contains_key("audio-codec"));
+    }
+
+    /// An AEP1 source of one rendition for the identity tests: one SoundKit
+    /// v2 packet an epoch, as the probe and daw-nexus send it, protected by
+    /// one FEC encoder. Every contributor under test is fed its datagrams,
+    /// as two contributors are fed by one source.
+    struct IdentitySource {
+        peer: SocketAddr,
+        session_id: u64,
+        group_id: u16,
+        encoding: frame_header::EncodingFlag,
+        frame_count: u32,
+        payload_bytes: usize,
+        /// `pts_samples` of epoch 0.
+        phase: u64,
+        transport: MultichannelAudioTransportAdapter,
+        sender: MultichannelAudioSender,
+    }
+
+    /// The session of the identity tests' sources: 14 November 2023.
+    const IDENTITY_SESSION_NS: u64 = 1_700_000_000_000_000_000;
+    const IDENTITY_BASE_STREAM_ID: u64 = 2_001;
+    const IDENTITY_BUDGET_MS: u64 = 1_000;
+    const IDENTITY_CLOCK_ERROR_NS: u64 = 5_000_000;
+    const IDENTITY_SEGMENT_US: u64 = 1_000_000;
+
+    impl IdentitySource {
+        fn new(
+            port: u16,
+            group_id: u16,
+            encoding: frame_header::EncodingFlag,
+            frame_count: u32,
+            payload_bytes: usize,
+        ) -> Self {
+            let transport = MultichannelAudioTransportAdapter::udp(1_200);
+            let mut fec = transport.prepare_fec_config(MultichannelAudioFecConfig::default());
+            fec.repair_symbols = 2;
+            Self {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                session_id: IDENTITY_SESSION_NS,
+                group_id,
+                encoding,
+                frame_count,
+                payload_bytes,
+                phase: 0,
+                transport,
+                sender: MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+                    fec,
+                    ..MultichannelAudioSessionConfig::default()
+                }),
+            }
+        }
+
+        /// 1 ms 24-bit stereo PCM, 1 ms Opus Custom, 2.5 ms Opus and 5 ms
+        /// FLAC (whose part is three RelaySession symbols), each on its own
+        /// stream.
+        fn lanes() -> Vec<Self> {
+            use frame_header::EncodingFlag;
+            vec![
+                Self::new(41_001, 0, EncodingFlag::PCMSigned, 48, 288),
+                Self::new(41_002, 0, EncodingFlag::Opus, 48, 40),
+                Self::new(41_003, 1, EncodingFlag::Opus, 120, 100),
+                Self::new(41_004, 0, EncodingFlag::FLAC, 240, 2_900),
+            ]
+        }
+
+        fn stream_id(&self) -> u64 {
+            let format = match self.encoding {
+                frame_header::EncodingFlag::Opus => 1_000,
+                frame_header::EncodingFlag::PCMSigned => 2_000,
+                _ => 0,
+            };
+            IDENTITY_BASE_STREAM_ID + format + u64::from(self.group_id)
+        }
+
+        /// The AEP1 datagrams of epoch `index`, source datagrams first.
+        fn datagrams(&mut self, index: u64) -> Vec<Bytes> {
+            let codec = (0..self.payload_bytes as u64)
+                .map(|byte| (index * 31 + byte * 7 + u64::from(self.frame_count)) as u8)
+                .collect::<Vec<_>>();
+            let bits_per_sample = match self.encoding {
+                frame_header::EncodingFlag::Opus => 0,
+                _ => 24,
+            };
+            let framed = av_contrib::soundkit_v2::frame_soundkit_v2_packet(
+                av_contrib::soundkit_v2::SoundKitV2PacketMetadata {
+                    encoding: self.encoding,
+                    frame_count: self.frame_count,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bits_per_sample,
+                    endianness: frame_header::Endianness::LittleEndian,
+                    id: Some(index),
+                    pts: None,
+                },
+                &codec,
+            )
+            .unwrap();
+            let groups = [MultichannelAudioGroup {
+                group_id: self.group_id,
+                channel_start: 0,
+                channel_count: 2,
+                payload_kind: AudioPayloadKind::SoundKitV2,
+                sample_format: AudioSampleFormat::Unspecified,
+                flags: 0,
+                payload: framed.as_ref(),
+            }];
+            let encoded = self
+                .sender
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: self.session_id,
+                    config_generation: 1,
+                    epoch_id: index,
+                    pts_samples: self.phase + index * u64::from(self.frame_count),
+                    sample_rate: 48_000,
+                    frame_count: self.frame_count,
+                    groups: &groups,
+                })
+                .unwrap();
+            self.transport
+                .wrap_epoch(encoded)
+                .unwrap()
+                .datagrams
+                .into_iter()
+                .map(|datagram| datagram.payload)
+                .collect()
+        }
+    }
+
+    /// The canonical envelope of every opaque part by (stream, part number),
+    /// built as the mesh forwarder builds it.
+    #[derive(Default)]
+    struct EnvelopeCapture {
+        envelopes: StdMutex<std::collections::BTreeMap<(u64, u64), Vec<u8>>>,
+    }
+
+    /// One part's datagrams as its lane received them, sources first, and
+    /// whether it went compact.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct EncodedPart {
+        compact: bool,
+        sources: usize,
+        wires: Vec<Bytes>,
+    }
+
+    /// A contributor's publication of opaque audio as `main` builds it, from
+    /// the packager's hand-off to the wire: `MeshForwarder::new` of the
+    /// contributor's arguments (its relay publisher, source-first encoder,
+    /// compact audio and configured copies), its primary lane sending to a
+    /// loopback socket of this test, which a thread of its own empties so
+    /// that no datagram is lost to a full receive buffer.
+    struct LaneCapture {
+        args: Args,
+        forwarder: Arc<MeshForwarder>,
+        stop: Arc<AtomicBool>,
+        receiver: std::thread::JoinHandle<Vec<Bytes>>,
+    }
+
+    impl LaneCapture {
+        /// A contributor whose lanes ask for `copies` copies of a one-symbol
+        /// part (`--relay-audio-copies configured`, a clean path and
+        /// `--relay-min-repair-symbols`), which is also the repair count of
+        /// a part of several symbols; `budget_ms` is `--relay-deadline-ms`.
+        async fn start(budget_ms: u64, copies: u32) -> Self {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            SockRef::from(&socket)
+                .set_recv_buffer_size(4 << 20)
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(socket.local_addr().unwrap());
+            args.relay_exclusive = true;
+            args.relay_compact_audio = true;
+            args.relay_audio_copies = RelayAudioCopies::Configured;
+            args.relay_min_repair_symbols = copies;
+            args.relay_deadline_ms = budget_ms;
+            args.wall_clock_estimated_error_ms = IDENTITY_CLOCK_ERROR_NS / 1_000_000;
+            args.fmp4_segment_ms = u32::try_from(IDENTITY_SEGMENT_US / 1_000).unwrap();
+            assert!(args.relay_send_batch && args.relay_source_first && args.relay_audio_inline);
+            let forwarder = Arc::new(
+                MeshForwarder::new(&args, Arc::new(IngestTelemetry::default()))
+                    .await
+                    .unwrap(),
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let receiver = std::thread::spawn(move || {
+                let mut wire = vec![0_u8; 65_536];
+                let mut received = Vec::new();
+                loop {
+                    match socket.recv(&mut wire) {
+                        Ok(len) => received.push(Bytes::copy_from_slice(&wire[..len])),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            // Empty: done once every datagram was sent.
+                            if stopped.load(Ordering::Acquire) {
+                                return received;
+                            }
+                        }
+                        Err(error) => panic!("lane receive: {error}"),
+                    }
+                }
+            });
+            Self {
+                args,
+                forwarder,
+                stop,
+                receiver,
+            }
+        }
+
+        /// Every datagram the lane sent, by (stream, part number), once its
+        /// backlog is empty.
+        async fn finish(self) -> std::collections::BTreeMap<(u64, u64), EncodedPart> {
+            let relay = self.forwarder.relay.as_ref().unwrap();
+            for _ in 0..400 {
+                if !relay.primary.backlog.busy() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(!relay.primary.backlog.busy(), "the lane's backlog drains");
+            let sent = relay.primary.backlog.sent.load(Ordering::Acquire);
+            self.stop.store(true, Ordering::Release);
+            let receiver = self.receiver;
+            let received = tokio::task::spawn_blocking(move || receiver.join().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(received.len() as u64, sent, "every datagram the lane sent");
+            let mut parts = std::collections::BTreeMap::<(u64, u64), EncodedPart>::new();
+            for wire in received {
+                let (stream, number, source, compact) = if wire.starts_with(b"RLC1") {
+                    let (header, _) = playlists::compact_object::parse_datagram(&wire).unwrap();
+                    (
+                        header.stream.parse::<u64>().unwrap(),
+                        header.object,
+                        header.role == 0,
+                        true,
+                    )
+                } else {
+                    let datagram =
+                        relay_session::decode_datagram(&wire, RelayLimits::default()).unwrap();
+                    (
+                        datagram.object_key.stream().parse::<u64>().unwrap(),
+                        datagram.object_key.object(),
+                        datagram.role == MediaDatagramRole::Source,
+                        false,
+                    )
+                };
+                let part = parts.entry((stream, number)).or_insert(EncodedPart {
+                    compact,
+                    sources: 0,
+                    wires: Vec::new(),
+                });
+                assert_eq!(
+                    part.compact, compact,
+                    "part {number} of {stream} in one form"
+                );
+                if source {
+                    assert_eq!(part.sources, part.wires.len(), "the sources lead");
+                    part.sources += 1;
+                }
+                part.wires.push(wire);
+            }
+            parts
+        }
+    }
+
+    /// The ids of part `number`'s datagrams are its number's (A 2.2): block
+    /// id `N`, and datagram `i` of the part (sources, then repair or
+    /// copies) packet sequence `N + i`; a compact copy `j` has ESI `1 + j`.
+    fn assert_named_by_number(stream: u64, number: u64, part: &EncodedPart) {
+        let first = number as u32;
+        for (index, wire) in part.wires.iter().enumerate() {
+            let sequence = first.wrapping_add(index as u32);
+            if part.compact {
+                let (header, _) = playlists::compact_object::parse_datagram(wire).unwrap();
+                assert_eq!(
+                    (header.packet_sequence, header.esi),
+                    (sequence, index as u32),
+                    "stream {stream} part {number} datagram {index}"
+                );
+            } else {
+                let datagram =
+                    relay_session::decode_datagram(wire, RelayLimits::default()).unwrap();
+                let fec = raptorq_datagram_fec::decode_header(&datagram.fec_datagram).unwrap();
+                assert_eq!(
+                    (fec.block_id, fec.packet_sequence),
+                    (first, sequence),
+                    "stream {stream} part {number} datagram {index}"
+                );
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Fmp4PartPublisher for EnvelopeCapture {
+        async fn publish_fmp4_part(
+            &self,
+            _part: PublishedFmp4Part,
+        ) -> std::result::Result<(), String> {
+            Err("the identity tests publish opaque parts only".to_owned())
+        }
+
+        async fn publish_opaque_part(
+            &self,
+            part: PublishedOpaquePart,
+        ) -> std::result::Result<(), String> {
+            let object = build_opaque_media_object(
+                &part,
+                OPAQUE_AUDIO_OBJECT_VERSION,
+                IDENTITY_BUDGET_MS,
+                IDENTITY_CLOCK_ERROR_NS,
+            )
+            .map_err(|error| error.to_string())?;
+            let envelope = media_object::encode(&object).map_err(|error| error.to_string())?;
+            let earlier = self
+                .envelopes
+                .lock()
+                .unwrap()
+                .insert((part.stream_id, part.sequence), envelope);
+            assert!(earlier.is_none(), "part {} twice", part.sequence);
+            Ok(())
+        }
+    }
+
+    /// One contributor in this process, from AEP1 datagrams to canonical
+    /// envelopes or to the datagrams of its relay lane: the AEP1 recovery
+    /// and packaging worker and the bounded publisher of the binary (audio
+    /// published on the packager's task), with nothing shared between two
+    /// of them.
+    struct IdentityContributor {
+        input: mpsc::Sender<AudioEpochHlsDatagram>,
+        worker: tokio::task::JoinHandle<()>,
+        output: IdentityOutput,
+        _shutdown: watch::Sender<()>,
+    }
+
+    /// Where an [`IdentityContributor`]'s parts go.
+    enum IdentityOutput {
+        /// Each part's canonical envelope, built as the mesh forwarder
+        /// builds it.
+        Envelopes(Arc<EnvelopeCapture>),
+        /// The contributor's own mesh forwarder and relay lane.
+        Lane(LaneCapture),
+    }
+
+    impl IdentityContributor {
+        fn start(part: AudioPartSize) -> Self {
+            let captured = Arc::new(EnvelopeCapture::default());
+            Self::start_on(
+                part,
+                captured.clone(),
+                StampDurations {
+                    video_part_us: 0,
+                    video_segment_us: 2_000_000,
+                    audio_part_us: 0,
+                    audio_segment_us: IDENTITY_SEGMENT_US,
+                },
+                (true, true),
+                IdentityOutput::Envelopes(captured),
+            )
+        }
+
+        /// A contributor publishing on a relay lane as `main` wires it
+        /// ([`LaneCapture::start`]).
+        async fn start_on_lane(part: AudioPartSize, budget_ms: u64, copies: u32) -> Self {
+            let lane = LaneCapture::start(budget_ms, copies).await;
+            Self::start_on(
+                part,
+                lane.forwarder.clone(),
+                lane.args.stamp_durations(),
+                (
+                    lane.args.publication_shard_mix,
+                    lane.args.relay_audio_inline,
+                ),
+                IdentityOutput::Lane(lane),
+            )
+        }
+
+        fn start_on(
+            part: AudioPartSize,
+            inner: Arc<dyn Fmp4PartPublisher>,
+            durations: StampDurations,
+            (shard_mix, audio_inline): (bool, bool),
+            output: IdentityOutput,
+        ) -> Self {
+            let (shutdown, shutdown_rx) = watch::channel(());
+            let (publisher, _workers) = start_bounded_publication_pipeline(
+                inner,
+                Arc::new(IngestTelemetry::default()),
+                durations,
+                shard_mix,
+                audio_inline,
+                shutdown_rx.clone(),
+            );
+            let (playlists, _, _) = playlists::Playlists::new(playlists::Options::default());
+            let config = AudioEpochHlsConfig::new(
+                IDENTITY_BASE_STREAM_ID,
+                part,
+                AudioEpochHlsPackaging::Opaque,
+                vec![
+                    AudioPayloadKind::Flac,
+                    AudioPayloadKind::Pcm,
+                    AudioPayloadKind::Opus,
+                ],
+                playlists,
+                publisher,
+            );
+            let (input, datagrams) = audio_epoch_hls_channel(1_024);
+            let worker = tokio::spawn(run_audio_epoch_hls_worker(config, datagrams, shutdown_rx));
+            Self {
+                input,
+                worker,
+                output,
+                _shutdown: shutdown,
+            }
+        }
+
+        async fn feed(&self, peer: SocketAddr, datagrams: &[Bytes]) {
+            for bytes in datagrams {
+                self.input
+                    .send(AudioEpochHlsDatagram {
+                        peer,
+                        bytes: bytes.clone(),
+                        received_unix_us: hop_journal::now_unix_us(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+
+        /// Where the parts went, once the worker has packaged and published
+        /// all that was fed.
+        async fn stop(self) -> IdentityOutput {
+            drop(self.input);
+            self.worker.await.unwrap();
+            self.output
+        }
+
+        /// The envelopes of every part of what was fed.
+        async fn finish(self) -> std::collections::BTreeMap<(u64, u64), Vec<u8>> {
+            let IdentityOutput::Envelopes(captured) = self.stop().await else {
+                panic!("a contributor on a lane: finish_lane");
+            };
+            let envelopes = std::mem::take(&mut *captured.envelopes.lock().unwrap());
+            envelopes
+        }
+
+        /// The datagrams of every part of what was fed, as its lane sent
+        /// them (a contributor started on a lane).
+        async fn finish_lane(self) -> std::collections::BTreeMap<(u64, u64), EncodedPart> {
+            let IdentityOutput::Lane(lane) = self.stop().await else {
+                panic!("a contributor of envelopes: finish");
+            };
+            lane.finish().await
+        }
+    }
+
+    /// The heart of the two-contributor design: contributors fed the same
+    /// AEP1 datagrams build the same canonical envelope for every part that
+    /// each of them has, whatever its history. One is there from the
+    /// session's first epoch; one starts (or starts again) at epoch 123 of
+    /// the running session; one loses two epochs outright and recovers a
+    /// third from its repair datagrams.
+    #[tokio::test]
+    async fn two_contributors_emit_identical_envelopes() {
+        const EPOCHS: u64 = 300;
+        const JOINS_AT: u64 = 123;
+        const LOST: [u64; 2] = [41, 200];
+        const REPAIRED: u64 = 77;
+        for part in [AudioPartSize::Epoch, AudioPartSize::Samples(240)] {
+            let mut sources = IdentitySource::lanes();
+            let whole = IdentityContributor::start(part);
+            let late = IdentityContributor::start(part);
+            let lossy = IdentityContributor::start(part);
+            for index in 0..EPOCHS {
+                for source in &mut sources {
+                    let datagrams = source.datagrams(index);
+                    assert!(datagrams.len() >= 3, "a source datagram and two of repair");
+                    whole.feed(source.peer, &datagrams).await;
+                    if index >= JOINS_AT {
+                        late.feed(source.peer, &datagrams).await;
+                    }
+                    if index == REPAIRED {
+                        // Its first source datagram never arrives.
+                        lossy.feed(source.peer, &datagrams[1..]).await;
+                    } else if !LOST.contains(&index) {
+                        lossy.feed(source.peer, &datagrams).await;
+                    }
+                }
+            }
+            let whole = whole.finish().await;
+            let late = late.finish().await;
+            let lossy = lossy.finish().await;
+
+            for source in &sources {
+                let stream = source.stream_id();
+                let epochs_per_part = av_contrib::part_timing::part_samples(
+                    part,
+                    48_000,
+                    source.frame_count,
+                    source.encoding == frame_header::EncodingFlag::FLAC,
+                ) / u64::from(source.frame_count);
+                let numbers = |envelopes: &std::collections::BTreeMap<(u64, u64), Vec<u8>>| {
+                    envelopes
+                        .keys()
+                        .filter(|(of, _)| *of == stream)
+                        .map(|(_, number)| *number)
+                        .collect::<Vec<_>>()
+                };
+                // Part N is the source's part N on every contributor: the
+                // late one starts at the first part it has whole, the lossy
+                // one has a hole where an epoch was lost and no other part
+                // moved.
+                let parts = EPOCHS / epochs_per_part;
+                assert_eq!(numbers(&whole), (0..parts).collect::<Vec<_>>());
+                assert_eq!(
+                    numbers(&late),
+                    (JOINS_AT.div_ceil(epochs_per_part)..parts).collect::<Vec<_>>(),
+                    "{part} stream {stream}"
+                );
+                let holes = LOST.map(|epoch| epoch / epochs_per_part);
+                assert_eq!(
+                    numbers(&lossy),
+                    (0..parts)
+                        .filter(|number| !holes.contains(number))
+                        .collect::<Vec<_>>(),
+                    "{part} stream {stream}"
+                );
+            }
+            // Every part that two contributors both have is the same bytes.
+            for (name, other) in [("late", &late), ("lossy", &lossy)] {
+                for (key, envelope) in other {
+                    assert!(
+                        whole.get(key) == Some(envelope),
+                        "{part}: the {name} contributor's part {key:?} differs"
+                    );
+                }
+            }
+            let mut shared = 0;
+            for (key, envelope) in &late {
+                if let Some(other) = lossy.get(key) {
+                    assert!(other == envelope, "{part}: part {key:?} differs");
+                    shared += 1;
+                }
+            }
+            assert!(shared > 100, "{shared} parts shared");
+            // And they are not equal for want of content: no two parts
+            // share an envelope.
+            let distinct = whole
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            assert_eq!(distinct, whole.len());
+        }
+    }
+
+    /// The heart of the two-contributor design on the wire: contributors
+    /// fed the same AEP1 datagrams send the same datagrams for every part,
+    /// RLC1 and RLS1, sources, repair and copies, whatever each one's
+    /// history and however many copies and repair symbols its lanes ask
+    /// for. Each contributor is the binary's own publication (bounded
+    /// publisher, mesh forwarder, relay publisher, source-first encoder)
+    /// and what is compared is what its relay lane put on the wire. One is
+    /// there from the session's first epoch (three copies, three repair
+    /// symbols); one starts at epoch 123 of the running session (none); one
+    /// loses two epochs outright and recovers a third from repair (two).
+    /// The only difference allowed is the form of the late joiner's first
+    /// part: its first part goes whole where the others are inside a cell
+    /// they opened whole. The FLAC lane's parts are three RLS1 symbols and
+    /// their repair, whose symbol `j` is the same bytes whatever the count.
+    #[tokio::test]
+    async fn two_encoders_emit_identical_datagrams() {
+        const EPOCHS: u64 = 300;
+        const JOINS_AT: u64 = 123;
+        const LOST: [u64; 2] = [41, 200];
+        const REPAIRED: u64 = 77;
+        // The same budget on all three (a loaded test host never expires a
+        // part here); the golden files pin the default one.
+        const BUDGET_MS: u64 = 60_000;
+        let mut sources = IdentitySource::lanes();
+        let whole = IdentityContributor::start_on_lane(AudioPartSize::Epoch, BUDGET_MS, 3).await;
+        let late = IdentityContributor::start_on_lane(AudioPartSize::Epoch, BUDGET_MS, 0).await;
+        let lossy = IdentityContributor::start_on_lane(AudioPartSize::Epoch, BUDGET_MS, 2).await;
+        for index in 0..EPOCHS {
+            for source in &mut sources {
+                let datagrams = source.datagrams(index);
+                whole.feed(source.peer, &datagrams).await;
+                if index >= JOINS_AT {
+                    late.feed(source.peer, &datagrams).await;
+                }
+                if index == REPAIRED {
+                    lossy.feed(source.peer, &datagrams[1..]).await;
+                } else if !LOST.contains(&index) {
+                    lossy.feed(source.peer, &datagrams).await;
+                }
+            }
+        }
+        let whole = whole.finish_lane().await;
+        let late = late.finish_lane().await;
+        let lossy = lossy.finish_lane().await;
+        // Every datagram of every part on every lane is named by its part's
+        // number, not by what that contributor sent before it.
+        for encoded in [&whole, &late, &lossy] {
+            for ((stream, number), part) in encoded {
+                assert_named_by_number(*stream, *number, part);
+            }
+        }
+
+        for source in &sources {
+            let stream = source.stream_id();
+            let flac = source.encoding == frame_header::EncodingFlag::FLAC;
+            let parts_of = |encoded: &std::collections::BTreeMap<(u64, u64), EncodedPart>| {
+                encoded
+                    .iter()
+                    .filter(|((of, _), _)| *of == stream)
+                    .map(|((_, number), part)| (*number, part.clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let reference = parts_of(&whole);
+            assert_eq!(reference.len() as u64, EPOCHS, "stream {stream}");
+            // The parts of `numbers` (sent in this order) that open a cell
+            // of 100 ms of the source's media time on their encoder.
+            let cell = |number: u64| number * u64::from(source.frame_count) * 1_000 / 48 / 100_000;
+            let opens_a_cell = |numbers: Vec<u64>| {
+                let mut last = None;
+                numbers
+                    .into_iter()
+                    .filter(|number| {
+                        let opens = last.is_none_or(|last| cell(*number) > last);
+                        if opens {
+                            last = Some(cell(*number));
+                        }
+                        opens
+                    })
+                    .collect::<std::collections::BTreeSet<u64>>()
+            };
+            let reference_whole = opens_a_cell(reference.keys().copied().collect());
+            let lanes = [
+                ("late", parts_of(&late), 0_usize, JOINS_AT),
+                ("lossy", parts_of(&lossy), 2, LOST[1] + 1),
+            ];
+            for (name, other, copies, first_after_a_gap) in lanes {
+                let other_whole = opens_a_cell(other.keys().copied().collect());
+                let mut forms_differ = Vec::new();
+                for (number, part) in &other {
+                    let expected = &reference[number];
+                    if flac {
+                        // Three source symbols and as many repair symbols
+                        // as each contributor's lanes ask for (3, 0 and 2):
+                        // never compact, and the shorter set of datagrams
+                        // is the start of the longer, byte for byte.
+                        assert_eq!(part.sources, 3, "{name} part {number}");
+                        assert_eq!(expected.sources, 3);
+                        assert!(!part.compact && !expected.compact);
+                        assert_eq!(part.wires.len(), 3 + copies, "{name} part {number}");
+                        assert_eq!(expected.wires.len(), 3 + 3);
+                        assert_eq!(
+                            part.wires[..],
+                            expected.wires[..part.wires.len()],
+                            "{name} FLAC part {number}"
+                        );
+                        continue;
+                    }
+                    assert_eq!(part.sources, 1, "{name} stream {stream} part {number}");
+                    assert_eq!(part.wires.len(), 1 + copies, "{name} part {number}");
+                    assert_eq!(expected.wires.len(), 1 + 3);
+                    assert_eq!(part.compact, !other_whole.contains(number));
+                    assert_eq!(expected.compact, !reference_whole.contains(number));
+                    if part.compact != expected.compact {
+                        forms_differ.push(*number);
+                        continue;
+                    }
+                    // Copy j is the same bytes on both; each sends as many
+                    // as its own lanes ask for.
+                    assert_eq!(
+                        part.wires[..],
+                        expected.wires[..part.wires.len()],
+                        "{name} stream {stream} part {number}"
+                    );
+                }
+                // The forms differ in one part: the first the late joiner
+                // has, and the part after one that opened a cell and was
+                // lost (200: 200 ms at 1 ms, 500 ms at 2.5 ms).
+                let expected_differ = if flac {
+                    Vec::new()
+                } else {
+                    vec![first_after_a_gap]
+                };
+                assert_eq!(forms_differ, expected_differ, "{name} stream {stream}");
+            }
+            // The compact and whole forms are both in use on every
+            // one-symbol lane.
+            if !flac {
+                assert!(reference.values().any(|part| part.compact));
+                assert!(reference.values().any(|part| !part.compact));
+                assert!(reference.values().all(
+                    |part| part.wires[0].starts_with(if part.compact { b"RLC1" } else { b"RLS1" })
+                ));
+            }
+        }
+    }
+
+    /// The datagrams of fixed parts are the bytes of
+    /// `tests/golden/wire-*.hex`: parts 0, 1, 123456789 and 123456790 of
+    /// each lane through recovery, packaging and the binary's publication
+    /// to its relay lane, with two copies: whole (the first of a cell) then
+    /// compact for the one-symbol lanes, three symbols and two repair for
+    /// FLAC.
+    #[tokio::test]
+    async fn opaque_datagrams_match_the_golden_bytes() {
+        const EPOCHS: [u64; 4] = [0, 1, 123_456_789, 123_456_790];
+        for (name, title, mut source) in golden_sources() {
+            let contributor =
+                IdentityContributor::start_on_lane(AudioPartSize::Epoch, IDENTITY_BUDGET_MS, 2)
+                    .await;
+            for index in EPOCHS {
+                let datagrams = source.datagrams(index);
+                contributor.feed(source.peer, &datagrams).await;
+            }
+            let encoded = contributor.finish_lane().await;
+            let stream = source.stream_id();
+            assert_eq!(
+                encoded.keys().copied().collect::<Vec<_>>(),
+                EPOCHS.map(|index| (stream, index)),
+                "{name}"
+            );
+            let mut records = Vec::new();
+            for ((_, number), part) in &encoded {
+                for (index, wire) in part.wires.iter().enumerate() {
+                    let what = match (part.compact, index < part.sources) {
+                        (true, true) => "RLC1 source".to_owned(),
+                        (true, false) => format!("RLC1 copy {}", index - 1),
+                        (false, true) => format!("RLS1 source {index}"),
+                        (false, false) => format!("RLS1 repair {}", index - part.sources),
+                    };
+                    records.push((format!("part {number} {what}"), wire.to_vec()));
+                }
+            }
+            assert_golden(
+                &format!("wire-{name}"),
+                &format!(
+                    "Datagrams of an opaque audio part: {title}.\n\
+                     # Session 1700000000000000000, epochs 0, 1, 123456789 and 123456790, object version\n\
+                     # 2 << 16, budget 1000 ms, clock error 5 ms, 1 s segments, generation 1, subscription 1,\n\
+                     # 100 ms compact cells, two copies, the policy's two repair symbols."
+                ),
+                &records,
+            );
+        }
+    }
+
+    fn hex_lines(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2 + bytes.len() / 32 + 1);
+        for line in bytes.chunks(32) {
+            for byte in line {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Compare `records` (a label and bytes each) with the golden file
+    /// `tests/golden/<name>.hex`, or write the file when the environment
+    /// has `AV_CONTRIB_BLESS_GOLDEN=1`.
+    ///
+    /// The files pin what a contributor emits for fixed input. A change to
+    /// them means that this build and the one before it do not emit the same
+    /// bytes for the same part, so their contributors cannot run side by
+    /// side as one (see the fingerprint and the roll classes in the design):
+    /// rewrite a file only for a change that is meant, and say so.
+    fn assert_golden(name: &str, title: &str, records: &[(String, Vec<u8>)]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(format!("{name}.hex"));
+        let mut expected = format!(
+            "# {title}\n# Hex, 32 bytes a line. Written by the tests of av-contrib with\n\
+             # AV_CONTRIB_BLESS_GOLDEN=1; a change here changes what a contributor emits.\n"
+        );
+        for (label, bytes) in records {
+            expected.push_str(&format!("== {label} ({} bytes)\n", bytes.len()));
+            expected.push_str(&hex_lines(bytes));
+        }
+        if std::env::var("AV_CONTRIB_BLESS_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &expected).unwrap();
+            return;
+        }
+        let golden = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("golden file {}: {error}", path.display()));
+        for (line, (ours, theirs)) in expected.lines().zip(golden.lines()).enumerate() {
+            assert_eq!(ours, theirs, "{} line {}", path.display(), line + 1);
+        }
+        assert_eq!(
+            expected.lines().count(),
+            golden.lines().count(),
+            "{}",
+            path.display()
+        );
+    }
+
+    /// The sources of the golden files: the four lanes of the identity
+    /// tests, 1.5 ms Opus Custom (72 samples, 667 parts a segment) and 1 ms
+    /// PCM whose sample count began at 7, not at a multiple of the frame.
+    fn golden_sources() -> Vec<(&'static str, &'static str, IdentitySource)> {
+        use frame_header::EncodingFlag;
+        let mut lanes = IdentitySource::lanes().into_iter();
+        let mut phased = IdentitySource::new(41_006, 1, EncodingFlag::PCMSigned, 48, 288);
+        phased.phase = 7;
+        vec![
+            (
+                "pcm-48",
+                "1 ms PCM S24LE stereo, stream 4001",
+                lanes.next().unwrap(),
+            ),
+            (
+                "opus-48",
+                "1 ms Opus Custom, stream 3001",
+                lanes.next().unwrap(),
+            ),
+            (
+                "opus-120",
+                "2.5 ms Opus, stream 3002",
+                lanes.next().unwrap(),
+            ),
+            (
+                "flac-240",
+                "5 ms FLAC of three RelaySession symbols, stream 2001",
+                lanes.next().unwrap(),
+            ),
+            (
+                "opus-72",
+                "1.5 ms Opus Custom, stream 3003",
+                IdentitySource::new(41_005, 2, EncodingFlag::Opus, 72, 60),
+            ),
+            (
+                "pcm-48-phase-7",
+                "1 ms PCM S24LE stereo whose sample count began at 7, stream 4002",
+                phased,
+            ),
+        ]
+    }
+
+    /// The epochs of the golden files: the session's first, and one 34 hours
+    /// in (at 1 ms), whose sample count times 10^9 is past 64 bits.
+    const GOLDEN_EPOCHS: [u64; 2] = [0, 123_456_789];
+
+    /// The canonical envelope of fixed parts is the bytes of
+    /// `tests/golden/envelope-*.hex`: from the AEP1 datagrams of one epoch,
+    /// through the recovery, the packaging and the publisher, for each lane.
+    #[tokio::test]
+    async fn opaque_envelopes_match_the_golden_bytes() {
+        for (name, title, mut source) in golden_sources() {
+            let contributor = IdentityContributor::start(AudioPartSize::Epoch);
+            for index in GOLDEN_EPOCHS {
+                let datagrams = source.datagrams(index);
+                contributor.feed(source.peer, &datagrams).await;
+            }
+            let envelopes = contributor.finish().await;
+            let stream = source.stream_id();
+            assert_eq!(
+                envelopes.keys().copied().collect::<Vec<_>>(),
+                GOLDEN_EPOCHS.map(|index| (stream, index)),
+                "{name}"
+            );
+            let records = envelopes
+                .iter()
+                .map(|((_, number), envelope)| (format!("part {number}"), envelope.clone()))
+                .collect::<Vec<_>>();
+            assert_golden(
+                &format!("envelope-{name}"),
+                &format!(
+                    "Canonical envelope (media_object::encode) of an opaque audio part: {title}.\n\
+                     # Session 1700000000000000000, epochs 0 and 123456789, object version 2 << 16,\n\
+                     # budget 1000 ms, clock error 5 ms, 1 s segments."
+                ),
+                &records,
+            );
+        }
+    }
+
+    /// No clock of this host is compared with a part's deadline, which is a
+    /// point on its source's timeline: a source whose clock is ten minutes
+    /// slow or fast (or a DAW that paused) has every part sent, and a part
+    /// expires here only by this host's own clock, a budget after it was
+    /// recovered. Every place the lanes look at a part's expiry is run: the
+    /// audio hot path's hand-offs (`--relay-audio-inline`), the joined
+    /// batches without it, and the lanes' backlogs (a lane with a part
+    /// already waiting for room in its socket's buffer queues the next one
+    /// behind it), each for the source and the repair of a part on a primary
+    /// and a secondary lane.
+    #[tokio::test]
+    async fn a_drifting_source_clock_expires_nothing_locally() {
+        for mode in ["inline", "batch", "backlog"] {
+            let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let secondary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary.local_addr().unwrap());
+            args.relay_secondary_target = Some(secondary.local_addr().unwrap());
+            args.relay_exclusive = true;
+            args.relay_audio_inline = mode != "batch";
+            // One copy: the primary carries the source and the copy, the
+            // secondary the copy.
+            args.relay_audio_copies = RelayAudioCopies::Configured;
+            args.relay_min_repair_symbols = 1;
+            let telemetry = Arc::new(IngestTelemetry::default());
+            let forwarder = MeshForwarder::new(&args, Arc::clone(&telemetry))
+                .await
+                .unwrap();
+            let relay = forwarder.relay.as_ref().unwrap();
+            if mode == "backlog" {
+                for lane in [&relay.primary, relay.secondary.as_ref().unwrap()] {
+                    lane.backlog.pending.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            let budget_us = args.relay_deadline_ms * 1_000;
+            let receive = |object: u64, session_id_ns: u64| {
+                let (primary, secondary) = (&primary, &secondary);
+                async move {
+                    let mut received = receive_relay_datagrams(primary, 2).await;
+                    received.extend(receive_relay_datagrams(secondary, 1).await);
+                    for (datagram, _) in &received {
+                        // What the datagram carries is the source's: a
+                        // budget after the instant the source sent the
+                        // part's last epoch (`object` epochs of 1 ms in).
+                        assert_eq!(
+                            datagram.deadline.expires_at_us,
+                            (session_id_ns + object * 1_000_000).div_ceil(1_000) + budget_us,
+                            "{mode}"
+                        );
+                        assert_eq!(datagram.object_key.epoch(), session_id_ns / 1_000);
+                        assert_eq!(datagram.object_key.object(), object);
+                    }
+                }
+            };
+            let now_ns = u64::try_from(now_unix_ns()).unwrap();
+            let ten_minutes_ns = 600_000_000_000_u64;
+            for session_id_ns in [now_ns - ten_minutes_ns, now_ns, now_ns + ten_minutes_ns] {
+                let mut part = test_opaque_part_at(4_001, test_anchor(session_id_ns, 5, 48));
+                part.source_times.recovered_us = Some(hop_journal::now_unix_us());
+                forwarder.publish_opaque_part(part).await.unwrap();
+                receive(5, session_id_ns).await;
+            }
+            assert_eq!(
+                telemetry.relay_expired_objects.load(Ordering::Relaxed),
+                0,
+                "{mode}"
+            );
+            assert_eq!(telemetry.relay_objects_sent.load(Ordering::Relaxed), 3);
+            assert_eq!(
+                telemetry.relay_lane_backlog_parts.load(Ordering::Relaxed) > 0,
+                mode == "backlog",
+                "{mode}"
+            );
+
+            // A part recovered here two budgets ago has expired on this
+            // host, whatever its source's clock says of it.
+            let mut stale = test_opaque_part_at(4_001, test_anchor(now_ns + ten_minutes_ns, 6, 48));
+            stale.source_times.recovered_us = Some(hop_journal::now_unix_us() - 2 * budget_us);
+            let error = forwarder.publish_opaque_part(stale).await.unwrap_err();
+            assert!(error.contains("expired"), "{error}");
+            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 1);
+            // A part with no recovery time is timed from when it was
+            // gathered.
+            let session_id_ns = now_ns - ten_minutes_ns;
+            let mut gathered = test_opaque_part_at(4_001, test_anchor(session_id_ns, 7, 48));
+            gathered.packaged_at_unix_ns = now_unix_ns();
+            forwarder
+                .publish_opaque_part(gathered.clone())
+                .await
+                .unwrap();
+            receive(7, session_id_ns).await;
+            gathered.anchor = test_anchor(session_id_ns, 8, 48);
+            gathered.packaged_at_unix_ns -= 2 * i64::try_from(budget_us).unwrap() * 1_000;
+            assert!(forwarder.publish_opaque_part(gathered).await.is_err());
+            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 2);
+            // No lane and no backlog let a live part expire.
+            assert_eq!(
+                telemetry.relay_expired_symbols.load(Ordering::Relaxed),
+                0,
+                "{mode}"
+            );
+        }
+    }
+
+    /// Opaque audio parts have one encoder path. A contributor that takes
+    /// AEP1 audio as opaque parts and has relay lanes does not start with
+    /// relay-session's own encoder, whose block ids and packet sequences
+    /// count what this process sent.
+    #[tokio::test]
+    async fn opaque_audio_starts_only_with_the_source_first_encoder() {
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(reserved_loopback_addr());
+        args.daw_media_bind = Some(reserved_loopback_addr());
+        assert!(refuse_opaque_audio_without_source_first(&args).is_ok());
+        for (send_batch, source_first) in [(false, true), (true, false), (false, false)] {
+            args.relay_send_batch = send_batch;
+            args.relay_source_first = source_first;
+            let error = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(error.contains("--relay-source-first true"), "{error}");
+            assert!(error.contains("--relay-send-batch true"), "{error}");
+            // fMP4 audio is not source-anchored, and a contributor without
+            // the AEP1 ingest publishes no opaque audio: neither is refused.
+            let mut fmp4 = contrib_status_args();
+            fmp4.daw_media_bind = args.daw_media_bind;
+            fmp4.daw_hls_packaging = DawHlsPackaging::Fmp4;
+            fmp4.relay_send_batch = send_batch;
+            fmp4.relay_source_first = source_first;
+            assert!(refuse_opaque_audio_without_source_first(&fmp4).is_ok());
+            let mut video_only = contrib_status_args();
+            video_only.relay_send_batch = send_batch;
+            video_only.relay_source_first = source_first;
+            assert!(refuse_opaque_audio_without_source_first(&video_only).is_ok());
+        }
     }
 
     #[test]
@@ -13377,17 +14598,21 @@ mod tests {
                 let mut encode_ns = 0;
                 let mut relay_ns = 0;
                 let mut symbols = 0;
+                let session_id_ns = u64::try_from(now_unix_ns()).unwrap();
                 for sequence in 0..PARTS {
-                    let mut part = test_opaque_part(91_000 + samples);
-                    part.sequence = sequence;
-                    part.duration_samples = Some(samples);
-                    part.duration_us = samples * 1_000_000 / 48_000;
-                    part.duration_ms = (part.duration_us / 1_000).max(1) as u32;
+                    let mut part = test_opaque_part_at(
+                        91_000 + samples,
+                        test_anchor(session_id_ns, sequence, samples),
+                    );
                     part.bytes = payload.clone();
                     let begin = thread_cpu_ns();
-                    let object =
-                        build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 5_000, 1_000_000)
-                            .unwrap();
+                    let object = build_opaque_media_object(
+                        &part,
+                        OPAQUE_AUDIO_OBJECT_VERSION,
+                        5_000,
+                        1_000_000,
+                    )
+                    .unwrap();
                     let built = thread_cpu_ns();
                     let encoded = encode_canonical_media_object(&object).unwrap();
                     let encoded_at = thread_cpu_ns();
@@ -13643,9 +14868,13 @@ mod tests {
             );
 
             let part = test_opaque_part(4_000_000_090 + u64::from(send_batch));
-            let object =
-                build_opaque_media_object(&part, TEST_SOURCE_EPOCH, args.relay_deadline_ms, 1_000)
-                    .unwrap();
+            let object = build_opaque_media_object(
+                &part,
+                OPAQUE_AUDIO_OBJECT_VERSION,
+                args.relay_deadline_ms,
+                1_000,
+            )
+            .unwrap();
             let journal = test_hop_journal();
             let before_us = hop_journal::now_unix_us();
             let journal_stream =
@@ -13744,9 +14973,13 @@ mod tests {
             relay.direct.as_mut().unwrap().targets.insert(0, refused);
 
             let part = test_opaque_part(4_000_000_190 + u64::from(send_batch));
-            let object =
-                build_opaque_media_object(&part, TEST_SOURCE_EPOCH, args.relay_deadline_ms, 1_000)
-                    .unwrap();
+            let object = build_opaque_media_object(
+                &part,
+                OPAQUE_AUDIO_OBJECT_VERSION,
+                args.relay_deadline_ms,
+                1_000,
+            )
+            .unwrap();
             let journal = test_hop_journal();
             let before_us = hop_journal::now_unix_us();
             let journal_stream = 88_100_000_000 + u64::from(send_batch);
@@ -14362,9 +15595,13 @@ mod tests {
     #[tokio::test]
     async fn audio_part_encode_does_not_wait_for_a_video_encode_in_flight() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let object =
-            build_opaque_media_object(&test_opaque_part(4001), TEST_SOURCE_EPOCH, 5_000, 1_000_000)
-                .unwrap();
+        let object = build_opaque_media_object(
+            &test_opaque_part(4001),
+            OPAQUE_AUDIO_OBJECT_VERSION,
+            5_000,
+            1_000_000,
+        )
+        .unwrap();
         for shard_mix in [true, false] {
             let mut args = contrib_status_args();
             args.relay_primary_target = Some(receiver.local_addr().unwrap());
@@ -14582,13 +15819,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(relay.source_encoders.is_some(), "the source-first path");
-        let mut part = test_opaque_part(4001);
-        part.sequence = 7;
-        part.duration_ms = 1;
-        part.duration_us = 1_000;
-        part.duration_samples = Some(48);
+        let session_id_ns = u64::try_from(now_unix_ns()).unwrap();
+        let mut part = test_opaque_part_at(4001, test_anchor(session_id_ns, 7, 48));
         part.bytes = Bytes::from(vec![0x11; 288]);
-        let object = build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 1_000, 250_000).unwrap();
+        let object =
+            build_opaque_media_object(&part, OPAQUE_AUDIO_OBJECT_VERSION, 1_000, 250_000).unwrap();
         let outcome = relay
             .publish_object(&object, 4001, PublicationClass::Audio)
             .await
@@ -16449,7 +17684,7 @@ mod tests {
                 .map(|index| (index * 7 + 3) as u8)
                 .collect::<Vec<_>>(),
         );
-        build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 5_000, 1_000).unwrap()
+        build_opaque_media_object(&part, OPAQUE_AUDIO_OBJECT_VERSION, 5_000, 1_000).unwrap()
     }
 
     #[tokio::test]
@@ -17042,13 +18277,17 @@ mod tests {
                 let mut to_sent = Vec::with_capacity(PARTS as usize);
                 let mut to_return = Vec::with_capacity(PARTS as usize);
                 let mut symbols = 0;
+                let session_id_ns = u64::try_from(now_unix_ns()).unwrap();
                 for sequence in 0..PARTS {
-                    let mut part = test_opaque_part(stream);
-                    part.sequence = u64::from(sequence);
+                    let mut part = test_opaque_part_at(
+                        stream,
+                        test_anchor(session_id_ns, u64::from(sequence), 240),
+                    );
                     part.bytes = Bytes::from(vec![(sequence % 251) as u8; bytes]);
                     let t0 = std::time::Instant::now();
                     let object =
-                        build_opaque_media_object(&part, TEST_SOURCE_EPOCH, 5_000, 1_000).unwrap();
+                        build_opaque_media_object(&part, OPAQUE_AUDIO_OBJECT_VERSION, 5_000, 1_000)
+                            .unwrap();
                     let t1 = std::time::Instant::now();
                     object.validate().unwrap();
                     let t2 = std::time::Instant::now();
@@ -17777,9 +19016,12 @@ mod tests {
         let journal = test_hop_journal();
         let before_us = hop_journal::now_unix_us() - 1;
         let audio_stream = 91_000_000_040;
-        for _ in 0..3 {
+        for number in 0..3 {
             publisher
-                .publish_opaque_part(test_opaque_part(audio_stream))
+                .publish_opaque_part(test_opaque_part_at(
+                    audio_stream,
+                    test_anchor(TEST_SESSION_NS, number, 240),
+                ))
                 .await
                 .unwrap();
         }
@@ -17838,19 +19080,14 @@ mod tests {
         let inner: Arc<dyn Fmp4PartPublisher> = sink.clone();
         let (publisher, mut receivers) = test_sharded_publisher(true);
         let stream = 91_000_000_050;
+        let part = |number| test_opaque_part_at(stream, test_anchor(TEST_SESSION_NS, number, 240));
         // The first part queues (inline off), the second must follow it.
-        publisher
-            .publish_opaque_part(test_opaque_part(stream))
-            .await
-            .unwrap();
+        publisher.publish_opaque_part(part(0)).await.unwrap();
         let publisher = BoundedFmp4Publisher {
             inline_audio: Some(inner),
             ..publisher
         };
-        publisher
-            .publish_opaque_part(test_opaque_part(stream))
-            .await
-            .unwrap();
+        publisher.publish_opaque_part(part(1)).await.unwrap();
         assert!(sink.published.lock().unwrap().is_empty());
         let queued = receivers
             .iter_mut()
@@ -17860,10 +19097,7 @@ mod tests {
         assert_eq!(queued, [0, 1]);
         // Both are published: the next part is inline.
         drop(queued);
-        publisher
-            .publish_opaque_part(test_opaque_part(stream))
-            .await
-            .unwrap();
+        publisher.publish_opaque_part(part(2)).await.unwrap();
         assert_eq!(*sink.published.lock().unwrap(), [(stream, 2)]);
     }
 

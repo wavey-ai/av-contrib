@@ -13,6 +13,11 @@
 //! The first segment number of a stream is taken from the wall clock. A
 //! contributor that starts again therefore continues above the numbers of
 //! its earlier run, and a playlist never goes back.
+//!
+//! An opaque audio part has no stamper: its place is arithmetic on the part
+//! number and the source's session id ([`anchored_stamp`]), so every
+//! contributor of a stream gives a part the same place, and one that starts
+//! again resumes at the place the source has reached.
 
 /// Metadata keys of a media object. The `-ms` keys are whole milliseconds
 /// for caches that do not read the exact `-us` keys.
@@ -23,7 +28,7 @@ pub const META_PART_TARGET_US: &str = "hls-part-target-us";
 pub const META_TARGET_DURATION_MS: &str = "hls-target-duration-ms";
 pub const META_TARGET_DURATION_US: &str = "hls-target-duration-us";
 
-use crate::part_timing::ceil_ms;
+use crate::part_timing::{ceil_ms, samples_to_us, SourceAnchor};
 
 /// The place of one part in the Media Playlist of its stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +76,31 @@ impl HlsStamp {
                 self.target_duration_us.to_string().into_bytes(),
             ),
         ]
+    }
+}
+
+/// The place of a source-anchored audio part, from its anchor and the
+/// configured segment duration alone.
+///
+/// A segment holds a whole number of parts, the number nearest to the
+/// configured segment: 1,000 parts of 48 samples in 1 s at 48 kHz, 400 of
+/// 120, and 667 of 72 (1.0005 s). Part `N` of a session is part
+/// `N % parts` of segment `N / parts` of the session, and the session's first
+/// segment is numbered from its session id (its start in Unix time), so a
+/// later session continues above an earlier one. The part target is the part
+/// and the target duration the configured segment: constants of a session.
+pub fn anchored_stamp(anchor: &SourceAnchor, segment_us: u64) -> HlsStamp {
+    let segment_us = segment_us.max(1);
+    let part_samples = u128::from(anchor.part_samples.max(1));
+    let segment_samples = u128::from(segment_us) * u128::from(anchor.sample_rate) / 1_000_000;
+    let parts_per_segment = ((segment_samples + part_samples / 2) / part_samples).max(1);
+    let number = u128::from(anchor.part_number());
+    let msn = u128::from(anchor.key_epoch() / segment_us) + number / parts_per_segment;
+    HlsStamp {
+        msn: u64::try_from(msn).unwrap_or(u64::MAX),
+        part: u32::try_from(number % parts_per_segment).unwrap_or(u32::MAX),
+        part_target_us: samples_to_us(anchor.part_samples, anchor.sample_rate),
+        target_duration_us: segment_us,
     }
 }
 
@@ -675,6 +705,139 @@ mod tests {
         // And a frame of 70 ms is jitter of the new unit.
         last = stamper.stamp(70_000, false, 0);
         assert_eq!(last.part_target_us, 70_000);
+    }
+
+    fn anchor(session_id_ns: u64, index: u64, part_samples: u64) -> SourceAnchor {
+        SourceAnchor {
+            session_id_ns,
+            first_pts_samples: index * part_samples,
+            last_pts_samples: index * part_samples,
+            part_samples,
+            sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn anchored_parts_fill_one_second_segments_from_the_part_number_alone() {
+        let session = 1_700_000_000_250_000_000_u64;
+        // (part samples, parts a segment, part target in µs).
+        for (samples, per_segment, target_us) in [
+            (12_u64, 4_000_u64, 250_u64),
+            (48, 1_000, 1_000),
+            // 72 samples are 1.5 ms: 666.7 parts a second, so 667 a segment.
+            (72, 667, 1_500),
+            (120, 400, 2_500),
+            (240, 200, 5_000),
+        ] {
+            for (index, segment, part) in [
+                (0_u64, 0_u64, 0_u64),
+                (1, 0, 1),
+                (per_segment - 1, 0, per_segment - 1),
+                (per_segment, 1, 0),
+                (5 * per_segment + 3, 5, 3),
+                (
+                    123_456_789,
+                    123_456_789 / per_segment,
+                    123_456_789 % per_segment,
+                ),
+            ] {
+                let stamp = anchored_stamp(&anchor(session, index, samples), 1_000_000);
+                assert_eq!(stamp.msn, 1_700_000_000 + segment, "{samples} {index}");
+                assert_eq!(u64::from(stamp.part), part, "{samples} {index}");
+                assert_eq!(stamp.part_target_us, target_us);
+                assert_eq!(stamp.target_duration_us, 1_000_000);
+            }
+        }
+        // The stamp does not depend on what was stamped before it: a
+        // contributor that joins at part 500 gives it the place that one
+        // which started at 0 does.
+        let from_zero = (0..=500)
+            .map(|index| anchored_stamp(&anchor(session, index, 48), 1_000_000))
+            .last()
+            .unwrap();
+        assert_eq!(
+            anchored_stamp(&anchor(session, 500, 48), 1_000_000),
+            from_zero
+        );
+        // Old caches read whole milliseconds, rounded up to fit every part.
+        let stamp = anchored_stamp(&anchor(session, 401, 120), 1_000_000);
+        assert_eq!((stamp.msn, stamp.part), (1_700_000_001, 1));
+        assert_eq!(stamp.part_target_ms(), 3);
+        assert_eq!(stamp.target_duration_ms(), 1_000);
+    }
+
+    #[test]
+    fn an_anchored_part_of_several_epochs_is_placed_by_its_first() {
+        let session = 1_700_000_000_000_000_000_u64;
+        // Parts of five 48-sample epochs: 200 a segment.
+        let part = SourceAnchor {
+            session_id_ns: session,
+            first_pts_samples: 201 * 240,
+            last_pts_samples: 201 * 240 + 4 * 48,
+            part_samples: 240,
+            sample_rate: 48_000,
+        };
+        let stamp = anchored_stamp(&part, 1_000_000);
+        assert_eq!((stamp.msn, stamp.part), (1_700_000_001, 1));
+        assert_eq!(stamp.part_target_us, 5_000);
+    }
+
+    #[test]
+    fn an_anchored_pts_phase_and_a_long_session_keep_their_place() {
+        let session = 1_700_000_000_000_000_000_u64;
+        // A pts that began at 7: part 5 of the session all the same.
+        let phased = SourceAnchor {
+            session_id_ns: session,
+            first_pts_samples: 7 + 5 * 48,
+            last_pts_samples: 7 + 5 * 48,
+            part_samples: 48,
+            sample_rate: 48_000,
+        };
+        let stamp = anchored_stamp(&phased, 1_000_000);
+        assert_eq!((stamp.msn, stamp.part), (1_700_000_000, 5));
+        // pts = 2^40: 265 days of 1 ms parts.
+        let pts = 1_u64 << 40;
+        let long = SourceAnchor {
+            session_id_ns: session,
+            first_pts_samples: pts,
+            last_pts_samples: pts,
+            part_samples: 48,
+            sample_rate: 48_000,
+        };
+        let stamp = anchored_stamp(&long, 1_000_000);
+        let number = pts / 48;
+        assert_eq!(stamp.msn, 1_700_000_000 + number / 1_000);
+        assert_eq!(u64::from(stamp.part), number % 1_000);
+        // A segment shorter than a part still holds one part.
+        let stamp = anchored_stamp(&anchor(session, 9, 240), 1_000);
+        assert_eq!((stamp.msn, stamp.part), (1_700_000_000_000 + 9, 0));
+        assert_eq!(stamp.target_duration_us, 1_000);
+    }
+
+    #[test]
+    fn msn_rises_across_two_sessions_that_start_at_zero() {
+        // A session of ten seconds of 1 ms parts, then a new session of the
+        // same source: its pts starts at 0 again and its session id is the
+        // later start.
+        let first = 1_700_000_000_000_000_000_u64;
+        let last_of_first = anchored_stamp(&anchor(first, 9_999, 48), 1_000_000);
+        assert_eq!(
+            (last_of_first.msn, last_of_first.part),
+            (1_700_000_009, 999)
+        );
+        let second = first + 10_000_000_000;
+        let first_of_second = anchored_stamp(&anchor(second, 0, 48), 1_000_000);
+        assert_eq!(
+            (first_of_second.msn, first_of_second.part),
+            (1_700_000_010, 0)
+        );
+        assert!(first_of_second.msn > last_of_first.msn);
+        // Two contributors agree on it, whichever of them saw the first
+        // session.
+        assert_eq!(
+            anchored_stamp(&anchor(second, 0, 48), 1_000_000),
+            first_of_second
+        );
     }
 
     #[test]

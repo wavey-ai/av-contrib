@@ -15,9 +15,17 @@
 //! once, and computes the repair symbols afterwards ([`SourcePart::repair`])
 //! with the encoding plan from `raptorq`'s process-wide plan cache. The
 //! datagrams are byte for byte those of `RaptorQObjectEncoder::encode_object`
-//! for the same block id and packet sequence (checked in the tests below);
-//! the encoder's counters are atomics, so publishing threads share it
-//! without a lock.
+//! for the same block id and packet sequence (checked in the tests below).
+//!
+//! Part ids. A source-anchored audio part (A 2.2) names its datagrams from
+//! its part number alone ([`PartIds`]): block id `N`, packet sequences
+//! `N + i` for source symbol `i` and `N + K + j` for repair symbol or copy
+//! `j`, and the compact sender's clock is the part's cell on a grid of the
+//! source's media time. Two contributors fed the same source therefore emit
+//! the same datagram for every part they both send in the same form, however
+//! long each has run and whatever each lost. Other objects (video,
+//! initialization) take a block id and packet sequences from the encoder's
+//! counters, atomics that publishing threads share without a lock.
 //!
 //! Encoding plans. `raptorq`'s own plan cache is one FIFO of 64 plans keyed
 //! by the source-symbol count K, shared by the whole process: 4K parts vary
@@ -37,6 +45,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use media_object::{MediaObject, ObjectKey, ObjectKind};
+
+use crate::part_timing::SourceAnchor;
 use playlists::compact_object::{self, CompactDecision, CompactHeader, CompactSender};
 use raptorq::{
     EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder,
@@ -68,13 +78,32 @@ pub struct SourceFirstEncoder {
     /// `--relay-video-plan-grid`: video objects' K on [`grid_symbol_count`].
     video_plan_grid: bool,
     plans: Arc<PlanCache>,
+    /// Counters of objects encoded without [`PartIds`].
     block_id: AtomicU32,
     packet_sequence: AtomicU32,
-    /// `--relay-compact-audio`: one-datagram audio parts go as RLC1
-    /// datagrams of a slim object (wave 7 item 3), whole every so often.
+    /// `--relay-compact-audio`: one-datagram source-anchored audio parts go
+    /// as RLC1 datagrams of a slim object (wave 7 item 3), whole the first
+    /// time in each cell of `compact_cell_us`.
     compact: Option<Mutex<CompactSender>>,
-    /// The clock of the compact sender's interval.
-    started: std::time::Instant,
+    /// The compact sender's cell on the source's timeline, in microseconds.
+    compact_cell_us: u64,
+}
+
+/// The ids of a source-anchored part's datagrams (A 2.2): functions of its
+/// part number and its place on the source's timeline, so that every
+/// contributor fed the same source gives the part the same ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartIds {
+    /// The RQD2 block id: the part number, truncated to 32 bits.
+    pub block_id: u32,
+    /// The packet sequence of source symbol 0; source symbol `i` takes
+    /// `first_sequence + i`, repair symbol or copy `j` `first_sequence + K
+    /// + j` (wrapping). Unique within the object, which is all a receiver's
+    /// dedup reads.
+    pub first_sequence: u32,
+    /// The compact sender's clock for the part: the start of its cell on
+    /// the source's timeline ([`SourceAnchor::grid_us`]).
+    pub grid_us: u64,
 }
 
 /// The largest compact datagram the contributor sends: under 1,280 bytes
@@ -101,19 +130,36 @@ impl SourceFirstEncoder {
             block_id: AtomicU32::new(0),
             packet_sequence: AtomicU32::new(0),
             compact: None,
-            started: std::time::Instant::now(),
+            compact_cell_us: 1,
         })
     }
 
-    /// One-datagram audio parts go as compact RLC1 datagrams (wave 7 item
-    /// 3): a slim object of about 30 bytes and the part against the
-    /// stream's descriptor, which the part sent whole when the stream's
-    /// shape is new or changed, and every `whole_every_us` after, carries.
-    /// `None` sends every part whole (RLS1).
+    /// One-datagram source-anchored audio parts go as compact RLC1
+    /// datagrams (wave 7 item 3): a slim object of about 30 bytes and the
+    /// part against the stream's descriptor, which the part sent whole
+    /// carries. A stream's part goes whole when its shape is new or changed,
+    /// and when it is the first part this encoder sends in a cell of
+    /// `whole_every_us` of the source's media time: two encoders fed the
+    /// same parts send the same ones whole. `None` sends every part whole
+    /// (RLS1).
     #[must_use]
     pub fn with_compact_audio(mut self, whole_every_us: Option<u64>) -> Self {
         self.compact = whole_every_us.map(|every| Mutex::new(CompactSender::new(every)));
+        self.compact_cell_us = whole_every_us.unwrap_or(1).max(1);
         self
+    }
+
+    /// The ids of the datagrams of the part at `anchor`.
+    #[must_use]
+    pub fn part_ids(&self, anchor: &SourceAnchor) -> PartIds {
+        // Truncated on purpose: a 32-bit id wraps after 49 days of 1 ms
+        // parts, and a receiver keys an object by its full key.
+        let number = anchor.part_number() as u32;
+        PartIds {
+            block_id: number,
+            first_sequence: number,
+            grid_us: anchor.grid_us(self.compact_cell_us),
+        }
     }
 
     /// The compact sender's counts (`None` without compact audio).
@@ -163,7 +209,7 @@ impl SourceFirstEncoder {
 
     /// The source symbols of `object`, ready to send, and what its repair
     /// symbols need. The object's block id and its packet sequences (source
-    /// and repair) are taken here.
+    /// and repair) are taken from the encoder's counters here.
     ///
     /// # Errors
     ///
@@ -177,7 +223,7 @@ impl SourceFirstEncoder {
         subscription_id: SubscriptionId,
         deadline: MediaDeadline,
     ) -> Result<SourcePart> {
-        self.encode_sources_with(object, generation, subscription_id, deadline, None)
+        self.encode_sources_with(object, generation, subscription_id, deadline, None, None)
     }
 
     /// [`Self::encode_sources`], with the repair count of a one-symbol
@@ -185,6 +231,9 @@ impl SourceFirstEncoder {
     /// its repair symbols are full copies, sized by the caller to the
     /// loss of its lanes instead of the controller's policy. Other objects
     /// keep the policy's count.
+    ///
+    /// `ids`: a source-anchored part's datagram ids ([`Self::part_ids`]),
+    /// in place of the encoder's counters. Only such a part can go compact.
     ///
     /// # Errors
     ///
@@ -196,6 +245,7 @@ impl SourceFirstEncoder {
         subscription_id: SubscriptionId,
         deadline: MediaDeadline,
         single_symbol_audio_repair: Option<u32>,
+        ids: Option<PartIds>,
     ) -> Result<SourcePart> {
         let priority = priority_for_object(object);
         // `encode` validates the object (its payload hash among the rest).
@@ -242,7 +292,7 @@ impl SourceFirstEncoder {
             actual: envelope.len(),
             maximum: u32::MAX as usize,
         })?;
-        if priority == MediaPriority::Audio && source_symbols == 1 {
+        if let (Some(ids), MediaPriority::Audio, 1) = (ids, priority, source_symbols) {
             if let Some(part) = self.encode_compact(
                 object,
                 &envelope,
@@ -252,15 +302,21 @@ impl SourceFirstEncoder {
                 transfer_length,
                 symbol_size,
                 repair_symbols,
+                ids,
             )? {
                 return Ok(part);
             }
         }
-        let block_id = self.block_id.fetch_add(1, Ordering::Relaxed);
-        let first_sequence = self.packet_sequence.fetch_add(
-            u32::from(source_symbols) + repair_symbols,
-            Ordering::Relaxed,
-        );
+        let (block_id, first_sequence) = match ids {
+            Some(ids) => (ids.block_id, ids.first_sequence),
+            None => (
+                self.block_id.fetch_add(1, Ordering::Relaxed),
+                self.packet_sequence.fetch_add(
+                    u32::from(source_symbols) + repair_symbols,
+                    Ordering::Relaxed,
+                ),
+            ),
+        };
         let kind = scheduler_kind(object, priority);
         let header = SymbolHeader {
             generation,
@@ -327,10 +383,11 @@ impl SourceFirstEncoder {
         })
     }
 
-    /// The compact form of a one-symbol audio object, when the compact
-    /// sender gives it a slim object and its datagram fits; `None` sends
-    /// it whole. It takes a block id and its packet sequences as the whole
-    /// object would.
+    /// The compact form of a one-symbol source-anchored audio object, when
+    /// the compact sender, on the part's cell of the source's timeline,
+    /// gives it a slim object and its datagram fits; `None` sends it whole.
+    /// Its block id and packet sequences are those of `ids`, as the whole
+    /// object's would be.
     #[allow(clippy::too_many_arguments)]
     fn encode_compact(
         &self,
@@ -342,6 +399,7 @@ impl SourceFirstEncoder {
         transfer_length: u32,
         symbol_size: u16,
         repair_symbols: u32,
+        ids: PartIds,
     ) -> Result<Option<SourcePart>> {
         let Some(sender) = self.compact.as_ref() else {
             return Ok(None);
@@ -354,12 +412,13 @@ impl SourceFirstEncoder {
         {
             return Ok(None);
         }
-        let now_us = self.started.elapsed().as_micros() as u64;
-        let slim = match sender
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .decide(object, envelope, now_us)
-        {
+        // The compact sender's clock is the source's: a late fill has an
+        // earlier cell than the part sent before it and goes compact.
+        let slim = match sender.lock().unwrap_or_else(|e| e.into_inner()).decide(
+            object,
+            envelope,
+            ids.grid_us,
+        ) {
             CompactDecision::Whole => return Ok(None),
             CompactDecision::Slim(slim) => slim,
         };
@@ -371,10 +430,11 @@ impl SourceFirstEncoder {
             return Ok(None);
         };
         let kind = scheduler_kind(object, MediaPriority::Audio);
-        let block_id = self.block_id.fetch_add(1, Ordering::Relaxed);
-        let first_sequence = self
-            .packet_sequence
-            .fetch_add(1 + repair_symbols, Ordering::Relaxed);
+        let PartIds {
+            block_id,
+            first_sequence,
+            ..
+        } = ids;
         let header = CompactHeader {
             generation: generation.get(),
             subscription_id: subscription_id.get(),
@@ -1006,7 +1066,14 @@ mod tests {
         assert!(policy.repair_count() >= 1);
         for given in [0_u32, 1, 3] {
             let part = encoder
-                .encode_sources_with(&audio, generation, subscription, deadline, Some(given))
+                .encode_sources_with(
+                    &audio,
+                    generation,
+                    subscription,
+                    deadline,
+                    Some(given),
+                    None,
+                )
                 .unwrap();
             assert_eq!(part.source_wires().len(), 1);
             assert_eq!(part.repair_count(), given);
@@ -1018,57 +1085,99 @@ mod tests {
             .encode_sources(&large, generation, subscription, deadline)
             .unwrap();
         let given = encoder
-            .encode_sources_with(&large, generation, subscription, deadline, Some(0))
+            .encode_sources_with(&large, generation, subscription, deadline, Some(0), None)
             .unwrap();
         assert!(given.source_wires().len() > 1);
         assert_eq!(given.repair_count(), policy.repair_count());
     }
 
-    /// An opaque 1 ms audio part as the contributor publishes it.
-    fn opaque_part(sequence: u64, published_ns: i64) -> MediaObject {
+    /// The session of the anchored test parts: 14 November 2023.
+    const SESSION_NS: u64 = 1_700_000_000_000_000_000;
+
+    /// Part `number` of a session of one-epoch opaque audio parts of
+    /// `samples` at 48 kHz, as the contributor builds it: named and timed
+    /// from its anchor alone.
+    fn anchored_part(number: u64, samples: u64) -> (MediaObject, SourceAnchor) {
         use media_object::{ClockConfidence, ClockTimestamp, Stage, StageTimestamp};
+        let anchor = SourceAnchor {
+            session_id_ns: SESSION_NS,
+            first_pts_samples: number * samples,
+            last_pts_samples: number * samples,
+            part_samples: samples,
+            sample_rate: 48_000,
+        };
         let payload = (0..56)
-            .map(|index| (index * 13 + sequence as usize) as u8)
+            .map(|index| (index * 13 + number as usize) as u8)
             .collect::<Vec<_>>();
         let key = ObjectKey::for_payload(
             "default",
             "3001",
             "opaque-audio",
-            1_784_151_600_000_001,
+            anchor.key_epoch(),
             0,
-            sequence,
-            1,
+            anchor.part_number(),
+            2 << 16,
             &payload,
         )
         .unwrap();
         let stamp = |ns| {
-            ClockTimestamp::new(
-                ns,
-                "system:realtime:av-contrib",
-                ClockConfidence::estimated(5_000_000),
-            )
-            .unwrap()
+            ClockTimestamp::new(ns, "source:aep1", ClockConfidence::estimated(5_000_000)).unwrap()
         };
-        MediaObject::builder(key, ObjectKind::Media, payload)
-            .with_deadline(stamp(published_ns + 2_000_000_000))
-            .with_stage_timestamp(StageTimestamp::new(
-                Stage::Packaged,
-                stamp(published_ns - 20_000),
-            ))
-            .with_stage_timestamp(StageTimestamp::new(Stage::Published, stamp(published_ns)))
+        let source_time = stamp(anchor.source_time_ns());
+        let object = MediaObject::builder(key, ObjectKind::Media, payload)
+            .with_deadline(stamp(anchor.deadline_ns(1_000)))
+            .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, source_time.clone()))
+            .with_stage_timestamp(StageTimestamp::new(Stage::Published, source_time))
             .with_metadata("scheduler-class", b"audio".to_vec())
-            .with_metadata("duration-us", b"1000".to_vec())
-            .with_metadata("hls-msn", (sequence / 1_000).to_string().into_bytes())
-            .with_metadata("hls-part", (sequence % 1_000).to_string().into_bytes())
+            .with_metadata(
+                "duration-us",
+                (samples * 1_000 / 48).to_string().into_bytes(),
+            )
+            .with_metadata("hls-msn", (number / 1_000).to_string().into_bytes())
+            .with_metadata("hls-part", (number % 1_000).to_string().into_bytes())
             .build()
+            .unwrap();
+        (object, anchor)
+    }
+
+    /// Every datagram of one part as an encoder sends it, sources first,
+    /// and whether it went compact.
+    fn datagrams(
+        encoder: &SourceFirstEncoder,
+        object: &MediaObject,
+        anchor: &SourceAnchor,
+        copies: u32,
+    ) -> (bool, Vec<Bytes>) {
+        let (generation, subscription, deadline) = ids();
+        let part = encoder
+            .encode_sources_with(
+                object,
+                generation,
+                subscription,
+                deadline,
+                Some(copies),
+                Some(encoder.part_ids(anchor)),
+            )
+            .unwrap();
+        let mut wires = part.source_wires().to_vec();
+        wires.extend(part.repair_wires().unwrap());
+        (part.is_compact(), wires)
+    }
+
+    /// An encoder as the contributor's: compact audio, whole once in each
+    /// 100 ms cell of the source's timeline.
+    fn compact_encoder() -> SourceFirstEncoder {
+        SourceFirstEncoder::new(controller(0), RelayLimits::default())
             .unwrap()
+            .with_compact_audio(Some(100_000))
     }
 
     /// `--relay-compact-audio`: the first part of a stream goes whole (the
     /// descriptor), the next ones as RLC1 datagrams of a few dozen bytes
     /// and the part, whose copies are repair headers over the same slim
     /// object; a receiver that learnt the descriptor rebuilds each part's
-    /// envelope byte for byte. Without it, every part goes whole.
+    /// envelope byte for byte. Its ids are the part number's. Without
+    /// compact audio, or without part ids, every part goes whole.
     #[test]
     fn compact_audio_parts_rebuild_the_whole_envelope() {
         use playlists::compact_object::{parse_datagram, CompactTemplates};
@@ -1078,68 +1187,212 @@ mod tests {
             .unwrap()
             .with_compact_audio(Some(60_000_000));
         let mut templates = CompactTemplates::new();
-        let mut sequences = Vec::new();
-        for sequence in 998..1_003_u64 {
-            let object = opaque_part(sequence, 1_000_000_000 + 1_000_000 * sequence as i64);
+        for number in 998..1_003_u64 {
+            let (object, anchor) = anchored_part(number, 48);
             let envelope = media_object::encode(&object).unwrap();
-            let part = encoder
-                .encode_sources_with(&object, generation, subscription, deadline, Some(2))
-                .unwrap();
-            assert_eq!(part.source_wires().len(), 1);
-            let wires = part
-                .source_wires()
-                .iter()
-                .cloned()
-                .chain(part.repair_wires().unwrap())
-                .collect::<Vec<_>>();
+            let (compact, wires) = datagrams(&encoder, &object, &anchor, 2);
             assert_eq!(wires.len(), 3);
-            if sequence == 998 {
-                assert!(!part.is_compact());
+            if number == 998 {
+                assert!(!compact);
                 assert!(wires.iter().all(|wire| wire.starts_with(b"RLS1")));
                 templates.learn(&object).unwrap();
                 continue;
             }
-            assert!(part.is_compact());
+            assert!(compact);
             for (index, wire) in wires.iter().enumerate() {
                 assert!(wire.len() <= 56 + 80, "{} B", wire.len());
                 let (header, slim) = parse_datagram(wire).unwrap();
                 assert_eq!(header.stream, "3001");
-                assert_eq!(header.object, sequence);
+                assert_eq!(header.object, number);
+                assert_eq!(header.version, 2 << 16);
                 assert_eq!(header.generation, 7);
                 assert_eq!(header.subscription_id, 9);
                 assert_eq!(header.kind, 3);
                 assert_eq!(header.esi, index as u32);
                 assert_eq!(header.role, u8::from(index > 0));
                 assert_eq!(header.path, u8::from(index > 0));
-                sequences.push(header.packet_sequence);
+                assert_eq!(header.packet_sequence, number as u32 + index as u32);
                 let rebuilt = templates.expand("3001", slim).unwrap();
                 assert_eq!(media_object::encode(&rebuilt).unwrap(), envelope);
             }
-            assert_eq!(part.announcement.key, *object.key());
-            assert_eq!(
-                part.announcement.coding.block().transfer_length() as usize,
-                envelope.len()
-            );
         }
-        let mut distinct = sequences.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(distinct.len(), sequences.len());
         let counts = encoder.compact_counts().unwrap();
         assert_eq!((counts.whole, counts.slim), (1, 4));
 
+        // Without part ids (an object not anchored on its source) the part
+        // goes whole and takes the encoder's counters.
+        let (object, _) = anchored_part(1_003, 48);
+        let unanchored = encoder
+            .encode_sources_with(&object, generation, subscription, deadline, Some(0), None)
+            .unwrap();
+        assert!(!unanchored.is_compact());
+
         let whole = SourceFirstEncoder::new(controller(0), limits).unwrap();
         assert!(whole.compact_counts().is_none());
-        let part = whole
+        let (object, anchor) = anchored_part(5, 48);
+        assert!(!datagrams(&whole, &object, &anchor, 0).0);
+    }
+
+    /// A source-anchored part's block id and packet sequences are its part
+    /// number's, whatever the encoder encoded before: RLS1 sources and
+    /// repair of a part of several symbols, and the whole form of a part
+    /// of one.
+    #[test]
+    fn part_ids_name_the_datagrams_of_whole_parts() {
+        let limits = RelayLimits::default();
+        let (generation, subscription, deadline) = ids();
+        let encoder = SourceFirstEncoder::new(controller(2), limits).unwrap();
+        // Counters moved by objects encoded without ids change nothing.
+        for sequence in 0..3 {
+            encoder
+                .encode_sources(
+                    &object(1, sequence, 9_000, b"video-delta", false),
+                    generation,
+                    subscription,
+                    deadline,
+                )
+                .unwrap();
+        }
+        let (object, anchor) = anchored_part(70_000, 48);
+        let large = MediaObject::builder(
+            ObjectKey::for_payload(
+                "default",
+                "2001",
+                "opaque-audio",
+                anchor.key_epoch(),
+                0,
+                anchor.part_number(),
+                2 << 16,
+                &[7_u8; 3_000],
+            )
+            .unwrap(),
+            ObjectKind::Media,
+            vec![7_u8; 3_000],
+        )
+        .with_deadline(object.deadline().unwrap().clone())
+        .with_metadata("scheduler-class", b"audio".to_vec())
+        .build()
+        .unwrap();
+        let ids = encoder.part_ids(&anchor);
+        assert_eq!((ids.block_id, ids.first_sequence), (70_000, 70_000));
+        let part = encoder
+            .encode_sources_with(&large, generation, subscription, deadline, None, Some(ids))
+            .unwrap();
+        let k = part.source_wires().len() as u32;
+        assert_eq!(k, 3);
+        assert!(part.repair_count() >= 2);
+        for (index, symbol) in part
+            .source()
+            .unwrap()
+            .iter()
+            .chain(&part.repair().unwrap())
+            .enumerate()
+        {
+            let fec = raptorq_datagram_fec::decode_header(&symbol.fec_datagram).unwrap();
+            assert_eq!(fec.block_id, 70_000);
+            assert_eq!(fec.packet_sequence, 70_000 + index as u32);
+        }
+        assert_eq!(
+            part.announcement.next_packet_sequence,
+            70_000 + k + part.repair_count()
+        );
+        let whole = encoder
             .encode_sources_with(
-                &opaque_part(5, 5),
+                &object,
                 generation,
                 subscription,
                 deadline,
-                Some(0),
+                Some(1),
+                Some(ids),
             )
             .unwrap();
-        assert!(!part.is_compact());
+        assert!(!whole.is_compact());
+        for (index, symbol) in whole
+            .source()
+            .unwrap()
+            .iter()
+            .chain(&whole.repair().unwrap())
+            .enumerate()
+        {
+            let fec = raptorq_datagram_fec::decode_header(&symbol.fec_datagram).unwrap();
+            assert_eq!(fec.block_id, 70_000);
+            assert_eq!(fec.packet_sequence, 70_000 + index as u32);
+        }
+    }
+
+    /// The compact sender's clock is the source's timeline: of 1 ms parts,
+    /// those that open a 100 ms cell go whole (and the first of the
+    /// stream), every other part compact.
+    #[test]
+    fn the_first_part_of_each_grid_cell_goes_whole() {
+        let encoder = compact_encoder();
+        let whole = (0..350_u64)
+            .filter(|number| {
+                let (object, anchor) = anchored_part(*number, 48);
+                !datagrams(&encoder, &object, &anchor, 1).0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(whole, [0, 100, 200, 300]);
+        // 2.5 ms parts: a cell is 40 parts.
+        let encoder = compact_encoder();
+        let whole = (0..130_u64)
+            .filter(|number| {
+                let (object, anchor) = anchored_part(*number, 120);
+                !datagrams(&encoder, &object, &anchor, 1).0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(whole, [0, 40, 80, 120]);
+    }
+
+    /// An encoder that starts while the source runs (a restarted
+    /// contributor) sends its first part whole where one that ran all along
+    /// sends it compact; from its next part on, every datagram of every part
+    /// is the same bytes, copy for copy, whatever the two sent before.
+    #[test]
+    fn a_restarted_encoder_differs_only_in_its_first_part() {
+        let running = compact_encoder();
+        let restarted = compact_encoder();
+        for number in 0..450_u64 {
+            let (object, anchor) = anchored_part(number, 48);
+            let (running_compact, running_wires) = datagrams(&running, &object, &anchor, 3);
+            if number < 150 {
+                continue;
+            }
+            let (restarted_compact, restarted_wires) = datagrams(&restarted, &object, &anchor, 3);
+            if number == 150 {
+                assert!(running_compact);
+                assert!(!restarted_compact, "the restarted encoder's first part");
+                assert!(restarted_wires.iter().all(|wire| wire.starts_with(b"RLS1")));
+                continue;
+            }
+            assert_eq!(running_compact, restarted_compact, "part {number}");
+            assert_eq!(running_wires, restarted_wires, "part {number}");
+        }
+    }
+
+    /// A part that completes late, after a later part was sent, belongs to
+    /// an earlier cell: it goes compact, the same datagrams as an encoder
+    /// that had it in order sends, and it does not move the cell of the
+    /// parts after it.
+    #[test]
+    fn a_late_fill_goes_compact() {
+        let in_order = compact_encoder();
+        let late = compact_encoder();
+        let mut sent_late = std::collections::BTreeMap::new();
+        // Part 99 closes cell 0 and part 100 opens cell 1: the late encoder
+        // has part 99 only after 100 and 101.
+        for number in (0..99_u64).chain([100, 101, 99, 102, 103]) {
+            let (object, anchor) = anchored_part(number, 48);
+            sent_late.insert(number, datagrams(&late, &object, &anchor, 2));
+        }
+        for number in 0..104_u64 {
+            let (object, anchor) = anchored_part(number, 48);
+            let expected = datagrams(&in_order, &object, &anchor, 2);
+            assert_eq!(sent_late[&number], expected, "part {number}");
+        }
+        assert!(sent_late[&99].0, "the late fill goes compact");
+        assert!(!sent_late[&100].0, "the cell after it opened whole");
+        assert!(sent_late[&102].0);
     }
 
     #[test]
