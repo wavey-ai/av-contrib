@@ -661,6 +661,12 @@ pub struct SourcePart {
 }
 
 impl SourcePart {
+    /// The object's canonical envelope (`media_object::encode`), the bytes
+    /// its symbols carry.
+    pub fn envelope(&self) -> &[u8] {
+        &self.envelope
+    }
+
     /// Whether the part goes as compact RLC1 datagrams.
     pub const fn is_compact(&self) -> bool {
         self.compact.is_some()

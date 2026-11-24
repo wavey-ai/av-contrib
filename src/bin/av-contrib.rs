@@ -31,6 +31,7 @@ use av_contrib::quadra_renditions::{
 };
 use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
 use av_contrib::source_first::{SourceFirstEncoder, SourcePart};
+use xxhash_rust::xxh3::xxh3_64;
 use av_contrib::source_timing::{self, ReceiveTiming};
 use av_contrib::stall_journal::{
     self, StallJournal, StallKind, StallSnapshot, StallThread, TickConfig,
@@ -3540,8 +3541,18 @@ impl RelaySessionPublisher {
             RELAY_COMPACT_AUDIO_PARTS[usize::from(!encoded.is_compact())]
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if let (PublicationClass::Audio, Some((stream_id, _))) = (class, part) {
-            node_status::counters().part_form(stream_id, encoded.is_compact());
+        if let (PublicationClass::Audio, Some((stream_id, number))) = (class, part) {
+            let counters = node_status::counters();
+            counters.part_form(stream_id, encoded.is_compact());
+            if anchored.is_some() {
+                // The window digests that two contributors compare (A 2.6).
+                counters.part_window(
+                    stream_id,
+                    object.key().epoch(),
+                    number,
+                    xxh3_64(encoded.envelope()),
+                );
+            }
         }
         let encoded = Arc::new(encoded);
         let hot = self.audio_inline && class == PublicationClass::Audio;
@@ -11750,7 +11761,7 @@ async fn main() -> Result<()> {
 
     // Taken before anything binds: from here a signal is a graceful stop.
     let mut stop_signals = StopSignals::new()?;
-    let node = contributor_node(&args);
+    let node = contributor_node(&args, identity);
     av_contrib::fmp4_bridge::set_default_flush_on_complete(args.fmp4_flush_on_complete);
     if let Some(warning) = args.legacy_audio_part_warning() {
         warn!("{warning}");
@@ -12292,7 +12303,7 @@ impl StopSignals {
 
 /// This process's status for `GET /api/node`, `starting` until its lanes
 /// are bound.
-fn contributor_node(args: &Args) -> Arc<NodeStatus> {
+fn contributor_node(args: &Args, identity: Identity) -> Arc<NodeStatus> {
     NodeStatus::new(
         node_status::Node {
             node_id: args.node_id(),
@@ -12302,6 +12313,7 @@ fn contributor_node(args: &Args) -> Arc<NodeStatus> {
             boot_unix_us: now_unix_us(),
             args_sha256: node_status::args_sha256(std::env::args_os()),
             cpus: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            identity,
         },
         Arc::clone(node_status::counters()),
     )
@@ -18224,7 +18236,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
-            contributor_node(&args),
+            contributor_node(&args, identity_selftest(&args).unwrap()),
             None,
             None,
             None,
@@ -18300,7 +18312,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
-            contributor_node(&args),
+            contributor_node(&args, identity_selftest(&args).unwrap()),
             None,
             None,
             None,
@@ -18325,6 +18337,11 @@ mod tests {
         assert_eq!(node["build"]["id"], av_contrib::build::GIT);
         assert_eq!(node["build"]["unix"], av_contrib::build::UNIX);
         assert_eq!(node["build"]["git"], av_contrib::build::GIT_FULL);
+        // What names its opaque audio parts, as --print-fingerprint prints it.
+        assert_eq!(
+            node["identity"],
+            serde_json::to_value(identity_selftest(&args).unwrap()).unwrap()
+        );
         assert_eq!(node["process"]["pid"], std::process::id());
         // Nothing has bound the lanes of this router's status.
         assert_eq!(node["state"], "starting");
@@ -18344,7 +18361,7 @@ mod tests {
             forwarder,
             args.stream_id,
             Arc::new(ContribStatusConfig::from_args(&args, telemetry)),
-            contributor_node(&args),
+            contributor_node(&args, identity_selftest(&args).unwrap()),
             None,
             None,
             None,

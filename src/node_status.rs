@@ -15,6 +15,7 @@
 //!   last second's figures, steps the state machine and keeps the report
 //!   that the handler serves.
 
+use crate::identity::{Identity, WindowRow, WindowTable};
 use arc_swap::ArcSwap;
 use music_audio_session::DecodedMultichannelAudioEpoch;
 use serde::Serialize;
@@ -74,6 +75,8 @@ struct StreamCounters {
     last_published_unix_us: AtomicU64,
     whole_parts: AtomicU64,
     compact_parts: AtomicU64,
+    /// The windows of its published parts' envelopes (A 2.6).
+    windows: WindowTable,
 }
 
 /// One part that went out on the lanes.
@@ -275,6 +278,15 @@ impl Counters {
         });
     }
 
+    /// Part `number` of key epoch `epoch` of `stream_id` went out;
+    /// `envelope_digest` is `xxh3_64` of its canonical object. No lock, no
+    /// allocation once the stream is known.
+    pub fn part_window(&self, stream_id: u64, epoch: u64, number: u64, envelope_digest: u64) {
+        self.with_stream(stream_id, |stream| {
+            stream.windows.published(epoch, number, envelope_digest);
+        });
+    }
+
     /// An AEP1 datagram of `peer` arrived at `received_unix_us`, and
     /// completed `epoch` if it completed one.
     pub fn source_datagram(
@@ -382,6 +394,8 @@ pub struct StreamSample {
     pub numbers_reused: u64,
     pub geometry_changed: u64,
     pub time_ahead: u64,
+    /// Its last closed windows of part numbers, oldest first.
+    pub windows: Vec<WindowRow>,
 }
 
 impl StreamSample {
@@ -645,6 +659,7 @@ pub struct StreamRow {
     pub numbers_reused: u64,
     pub geometry_changed: u64,
     pub time_ahead: u64,
+    pub windows: Vec<WindowRow>,
 }
 
 impl From<&StreamSample> for StreamRow {
@@ -666,6 +681,7 @@ impl From<&StreamSample> for StreamRow {
             numbers_reused: stream.numbers_reused,
             geometry_changed: stream.geometry_changed,
             time_ahead: stream.time_ahead,
+            windows: stream.windows.clone(),
         }
     }
 }
@@ -689,6 +705,8 @@ pub struct NodeReport {
     pub ready_forced: bool,
     pub not_ready: Vec<String>,
     pub degraded: Vec<String>,
+    /// What names its opaque audio parts (A 2.4).
+    pub identity: Identity,
     pub sources: Vec<SourceSample>,
     pub streams: Vec<StreamRow>,
     pub lanes: Vec<LaneSample>,
@@ -715,6 +733,7 @@ impl NodeReport {
             ready_forced: false,
             not_ready: verdict.not_ready,
             degraded: verdict.degraded,
+            identity: node.identity.clone(),
             streams: snapshot.streams.iter().map(StreamRow::from).collect(),
             sources: snapshot.sources,
             lanes: snapshot.lanes,
@@ -765,6 +784,8 @@ pub struct Node {
     pub boot_unix_us: u64,
     pub args_sha256: String,
     pub cpus: usize,
+    /// The identity self-test's result, taken at start.
+    pub identity: Identity,
 }
 
 /// Cumulative counters read over time: what they grew by in the last
@@ -914,6 +935,7 @@ impl Sampler {
                 numbers_reused: contract.numbers_reused,
                 geometry_changed: contract.geometry_changed,
                 time_ahead: contract.time_ahead,
+                windows: stream.windows.closed(),
             });
         }
         streams.sort_by_key(|stream| stream.stream_id);
@@ -1045,10 +1067,14 @@ impl NodeStatus {
              av_contrib_build_info{{id=\"{}\",unix=\"{}\"}} 1\n\
              # HELP av_contrib_ready Whether publishing is proven (the state of GET /api/node is ready).\n\
              # TYPE av_contrib_ready gauge\n\
-             av_contrib_ready {}\n",
+             av_contrib_ready {}\n\
+             # HELP av_contrib_identity_info The fingerprint of what names this process's opaque audio parts.\n\
+             # TYPE av_contrib_identity_info gauge\n\
+             av_contrib_identity_info{{fingerprint=\"{}\"}} 1\n",
             report.build.id,
             report.build.unix,
             u8::from(report.ready),
+            report.identity.fingerprint,
         )
     }
 }
@@ -1437,8 +1463,43 @@ mod tests {
             boot_unix_us: 1_763_924_000_123_456,
             args_sha256: "9a1f".to_owned(),
             cpus: 4,
+            identity: identity(),
         }
     }
+
+    /// A's example identity.
+    fn identity() -> Identity {
+        Identity {
+            fingerprint: "9f2c41aa7d10e6b3".to_owned(),
+            object_version: 190_131,
+            numbering: "51c0000000000001".to_owned(),
+            envelope: "0be2000000000002".to_owned(),
+            wire: "77aa000000000003".to_owned(),
+            fields: crate::identity::IdentityFields {
+                fmt: 2,
+                base_stream_id: 2001,
+                audio_part: "epoch".to_owned(),
+                segment_us: 1_000_000,
+                deadline_ms: 1_000,
+                clock: "source:aep1",
+                clock_error_ns: 5_000_000,
+                generation: 1,
+                subscription: 1,
+                symbol_size: 1_200,
+                max_datagram_bytes: 1_400,
+                compact: true,
+            },
+        }
+    }
+
+    /// The `identity` block of [`identity`], as JSON.
+    const IDENTITY_JSON: &str = concat!(
+        r#""identity":{"fingerprint":"9f2c41aa7d10e6b3","object_version":190131,"#,
+        r#""numbering":"51c0000000000001","envelope":"0be2000000000002","wire":"77aa000000000003","#,
+        r#""fields":{"fmt":2,"base_stream_id":2001,"audio_part":"epoch","segment_us":1000000,"#,
+        r#""deadline_ms":1000,"clock":"source:aep1","clock_error_ns":5000000,"generation":1,"#,
+        r#""subscription":1,"symbol_size":1200,"max_datagram_bytes":1400,"compact":true}},"#,
+    );
 
     fn process() -> Process {
         Process {
@@ -1456,6 +1517,12 @@ mod tests {
     fn node_json_is_stable() {
         let mut snapshot = publishing();
         snapshot.lanes.truncate(1);
+        snapshot.streams[0].windows = vec![WindowRow {
+            first_part: 5_122_816,
+            parts: 256,
+            present: 256,
+            xor: "5d0c9a11e2b47f03".to_owned(),
+        }];
         let verdict = after(5_000, &snapshot);
         let report = NodeReport::new(
             &node(),
@@ -1464,7 +1531,7 @@ mod tests {
             verdict,
             Some(1_763_924_003_400),
         );
-        let golden = concat!(
+        let golden = [
             r#"{"schema":"needletail.node.v1","node_id":"contrib-lon-b","region":"london","role":"contributor","#,
             r#""build":{"id":"3f2a9c1d77e0","git":"3f2a9c1d77e0b4c1d2e3f4a5b6c7d8e9f0a1b2c3","dirty":false,"#,
             r#""unix":1763900000,"crate":"0.1.0"},"#,
@@ -1472,15 +1539,18 @@ mod tests {
             r#""args_sha256":"9a1f","cpus":4,"cpu_permille":60},"#,
             r#""state":"ready","ready":true,"ready_unix_ms":1763924003400,"ready_forced":false,"#,
             r#""not_ready":[],"degraded":[],"#,
+            IDENTITY_JSON,
             r#""sources":[{"peer":"10.77.1.4:51234","session_id":1763924000001000000,"datagram_age_ms":0,"#,
             r#""epochs_last_second":1000,"late_p50_us":40,"late_max_us_1s":310}],"#,
             r#""streams":[{"stream_id":3001,"class":"audio","publishing":true,"epoch":1763924000001000,"#,
             r#""head_part":5123456,"source_age_ms":0,"last_part_age_ms":1,"parts_last_second":1000,"#,
             r#""held_last_second":0,"parts_skipped":0,"whole_parts":10,"compact_parts":990,"late_fills":0,"#,
-            r#""numbers_reused":0,"geometry_changed":0,"time_ahead":0}],"#,
+            r#""numbers_reused":0,"geometry_changed":0,"time_ahead":0,"#,
+            r#""windows":[{"first_part":5122816,"parts":256,"present":256,"xor":"5d0c9a11e2b47f03"}]}],"#,
             r#""lanes":[{"path":"primary","id":"lon-dist-a","target":"10.77.1.11:22001","state":"healthy","#,
             r#""sent":0,"loss_ppm":0,"report_age_ms":400,"backlog_parts":0}]}"#,
-        );
+        ]
+        .concat();
         assert_eq!(serde_json::to_string(&report).unwrap(), golden);
     }
 
@@ -1512,19 +1582,21 @@ mod tests {
         let verdict = after(5_000, &snapshot);
         let report = NodeReport::new(&node(), process(), snapshot, verdict, None);
         let json = serde_json::to_string(&report).unwrap();
-        let tail = concat!(
+        let tail = [
             r#""state":"standing_by","ready":false,"ready_unix_ms":null,"ready_forced":false,"#,
             r#""not_ready":["no source heard"],"degraded":[],"#,
+            IDENTITY_JSON,
             r#""sources":[{"peer":"10.77.1.4:51234","session_id":1763924000001000000,"datagram_age_ms":2400,"#,
             r#""epochs_last_second":0,"late_p50_us":null,"late_max_us_1s":null}],"#,
             r#""streams":[{"stream_id":2001,"class":"audio","publishing":false,"epoch":null,"#,
             r#""head_part":null,"source_age_ms":2400,"last_part_age_ms":2400,"parts_last_second":0,"#,
             r#""held_last_second":0,"parts_skipped":0,"whole_parts":0,"compact_parts":0,"late_fills":0,"#,
-            r#""numbers_reused":0,"geometry_changed":0,"time_ahead":0}],"#,
+            r#""numbers_reused":0,"geometry_changed":0,"time_ahead":0,"windows":[]}],"#,
             r#""lanes":[{"path":"primary","id":"lon-dist-a","target":"10.77.1.11:22001","state":"unknown","#,
             r#""sent":0,"loss_ppm":null,"report_age_ms":null,"backlog_parts":0}]}"#,
-        );
-        assert!(json.ends_with(tail), "{json}");
+        ]
+        .concat();
+        assert!(json.ends_with(&tail), "{json}");
     }
 
     #[test]
@@ -1661,6 +1733,36 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_shows_its_closed_windows_and_the_metrics_its_fingerprint() {
+        let counters = Arc::new(Counters::default());
+        let status = NodeStatus::new(node(), Arc::clone(&counters));
+        let start_us = SESSION_NS / 1_000;
+        publish_a_second(&counters, 3_001, start_us, 0);
+        let digest = |number: u64| xxhash_rust::xxh3::xxh3_64(&number.to_le_bytes());
+        // Parts 0 to 767 but 100: window 0 is closed by window 2.
+        for number in (0..768).filter(|&number| number != 100) {
+            counters.part_window(3_001, SESSION_NS / 1_000, number, digest(number));
+        }
+        status.sample(start_us + 1_000_000, 0);
+        let windows = row(&status.report(), 3_001).windows;
+        let xor = (0..256)
+            .filter(|&number| number != 100)
+            .fold(0, |xor, number| xor ^ digest(number));
+        assert_eq!(
+            windows,
+            [WindowRow {
+                first_part: 0,
+                parts: 256,
+                present: 255,
+                xor: crate::identity::hex16(xor),
+            }]
+        );
+        assert!(status
+            .prometheus_metrics()
+            .contains("av_contrib_identity_info{fingerprint=\"9f2c41aa7d10e6b3\"} 1\n"));
+    }
+
+    #[test]
     fn a_stream_shows_what_it_published_in_the_last_second() {
         let counters = Arc::new(Counters::default());
         let status = NodeStatus::new(node(), Arc::clone(&counters));
@@ -1708,6 +1810,7 @@ mod tests {
                 numbers_reused: 0,
                 geometry_changed: 0,
                 time_ahead: 0,
+                windows: Vec::new(),
             }
         );
         let held = row(&report, 2_001);
