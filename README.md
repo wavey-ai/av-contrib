@@ -219,6 +219,11 @@ the canonical delivery budget added to that immutable `Published` timestamp,
 and RelaySession carries the same expiry rounded up to Unix microseconds.
 `--wall-clock-estimated-error-ms` records the host's explicit estimated clock
 error in every timestamp. `/api/status` and `/metrics` expose that provenance.
+An opaque AEP1 audio part is the exception: it is named and timed from its
+source alone (number `pts / P`, `Packaged` and `Published` the source's
+instant on clock `source:aep1`, the deadline a budget on the stream's own
+timeline), so two contributors fed the same source publish the same bytes;
+see "Two contributors" below.
 Capture-capable ingest adapters populate the separate capture timestamp from
 source-provided timing.
 
@@ -227,6 +232,25 @@ Needletail verifies host synchronization and measures the maximum error. It
 configures the declared bound. It promotes synchronized or traceable provenance
 after it verifies the clock source. Deadline-hit and glass-to-glass comparisons
 use only hosts that pass that gate.
+
+Two contributors (the resilient mesh). Each flag is described in `--help`;
+this is where they belong:
+
+- Identity: no flag chooses how an opaque part is named. At start a
+  self-test digests what this build makes for fixed parts (`numbering`,
+  `envelope`, `wire`); the fingerprint's low 16 bits are in every opaque
+  part's object version. `--print-fingerprint` prints that identity as JSON
+  and exits without binding or reading anything; the deploy compares the two
+  contributors' with it.
+- Node: `--node-id` and `--region` name it in `GET /api/node`, and
+  `--version` prints `av-contrib 0.1.0 (<commit> <unix>)`.
+- Stop: SIGTERM or SIGINT stops ingest, drains the lanes for at most
+  `--shutdown-grace-ms` (500), sends each lane a last ledger and exits 0; a
+  second signal exits at once.
+- Stall instruments: `--stall-journal-capacity`, `--stall-tick-us`,
+  `--mlock off|rings`, `--prefault`, `--malloc-tune`.
+- Source: `aep1-48k-probe send --target A --target B` feeds both
+  contributors from one encoder.
 
 Useful endpoints:
 
@@ -242,6 +266,12 @@ Useful endpoints:
   LL-HLS timing, FEC settings, contributor listeners, and browser-safe stream
   ID strings. It also includes runtime counters, protocol sessions, publish
   errors, and current alerts.
+- `GET /api/node`: the node's build, process, readiness state (`starting`,
+  `standing_by`, `proving`, `ready`, `stopping`), identity, sources, streams
+  (with their window digests) and lanes, schema `needletail.node.v1`.
+- `GET /api/stalls?since_us=T`: the stall journal (NDJSON, the same lines as
+  av-mesh's). `GET /api/pacing?since_s=S`: each second of the DAW socket's
+  reads and of each AEP1 source session, kept 300 s.
 - `GET /api/status/events`: streams the same status snapshot once per second as
   Server-Sent Events using the named event `contrib`.
 - `GET /metrics`: exposes Prometheus text metrics for ingest, protocol sessions,
