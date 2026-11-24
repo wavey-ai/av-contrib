@@ -517,18 +517,22 @@ fn aep1_source_timestamp(
 }
 
 /// Until when this host keeps trying to send a source-anchored part: the
-/// delivery budget after the part was recovered here, on this host's clock.
+/// delivery budget after the part was complete here, on this host's clock
+/// (A 2.5): the kernel's receive stamp of the datagram that completed its
+/// last epoch (`src_last`, AC11), else the time it was recovered, else the
+/// time it was gathered. A reader that stalled has spent the part's budget.
 ///
 /// The part's own deadline is a point on its source's timeline and is not
 /// compared with any clock here: a source whose clock runs slow, or a DAW
 /// that paused, would otherwise have every part expire in this process.
 fn local_part_expiry(part: &PublishedOpaquePart, delivery_budget_ms: u64) -> MediaDeadline {
-    let recovered_us = part
+    let arrived_us = part
         .source_times
-        .recovered_us
+        .src_last_us
+        .or(part.source_times.recovered_us)
         .unwrap_or_else(|| u64::try_from(part.packaged_at_unix_ns / 1_000).unwrap_or(0));
     MediaDeadline::from_micros(
-        recovered_us.saturating_add(delivery_budget_ms.saturating_mul(1_000)),
+        arrived_us.saturating_add(delivery_budget_ms.saturating_mul(1_000)),
     )
 }
 
@@ -11570,8 +11574,10 @@ async fn main() -> Result<()> {
     memory::configure(args.prefault, args.mlock);
     // The stall journal runs from the first second, its tick threads
     // started before any thread is pinned or made real-time.
+    // Named as /api/node names the node (`contrib-lon`), as av-mesh's
+    // journal is: a collector keys every node's lines by that name.
     let stalls = stall_journal::install(Arc::new(StallJournal::new(
-        args.relay_local_id.clone(),
+        args.node_id(),
         args.stall_journal_capacity,
     )));
     let stall_ticks = stall_journal::spawn_ticks(stalls, TickConfig::every(args.stall_tick_us));
@@ -11828,6 +11834,23 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .and_then(AudioHotRuntime::rendition_runtimes),
         );
+        // /api/node reads the packaging's contract counters (A 2.3) where
+        // the packaging keeps them, in the sampler only.
+        let opaque_streams = Arc::clone(&audio_epoch_hls_config.opaque_streams);
+        node.contract_counted(move || {
+            opaque_streams
+                .snapshot()
+                .into_iter()
+                .map(|counts| node_status::ContractCounts {
+                    stream_id: counts.stream_id,
+                    parts_skipped: counts.parts_skipped,
+                    late_fills: counts.late_fills,
+                    numbers_reused: counts.numbers_reused,
+                    geometry_changed: counts.geometry_changed,
+                    time_ahead: counts.time_ahead,
+                })
+                .collect()
+        });
         let audio_epoch_hls_task = spawn_audio_hot_task(
             audio_hot.as_ref(),
             run_audio_epoch_hls_worker(
@@ -15444,9 +15467,18 @@ mod tests {
             // host, whatever its source's clock says of it.
             let mut stale = test_opaque_part_at(4_001, test_anchor(now_ns + ten_minutes_ns, 6, 48));
             stale.source_times.recovered_us = Some(hop_journal::now_unix_us() - 2 * budget_us);
-            let error = forwarder.publish_opaque_part(stale).await.unwrap_err();
+            let error = forwarder.publish_opaque_part(stale.clone()).await.unwrap_err();
             assert!(error.contains("expired"), "{error}");
             assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 1);
+            // The kernel's stamp of its last datagram times it first: a part
+            // recovered just now, after a reader stalled two budgets, has
+            // spent its budget.
+            stale.anchor = test_anchor(now_ns + ten_minutes_ns, 9, 48);
+            stale.source_times.recovered_us = Some(hop_journal::now_unix_us());
+            stale.source_times.src_last_us = Some(hop_journal::now_unix_us() - 2 * budget_us);
+            let error = forwarder.publish_opaque_part(stale).await.unwrap_err();
+            assert!(error.contains("expired"), "{error}");
+            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 2);
             // A part with no recovery time is timed from when it was
             // gathered.
             let session_id_ns = now_ns - ten_minutes_ns;
@@ -15460,7 +15492,7 @@ mod tests {
             gathered.anchor = test_anchor(session_id_ns, 8, 48);
             gathered.packaged_at_unix_ns -= 2 * i64::try_from(budget_us).unwrap() * 1_000;
             assert!(forwarder.publish_opaque_part(gathered).await.is_err());
-            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 2);
+            assert_eq!(telemetry.relay_expired_objects.load(Ordering::Relaxed), 3);
             // No lane and no backlog let a live part expire.
             assert_eq!(
                 telemetry.relay_expired_symbols.load(Ordering::Relaxed),
@@ -18005,8 +18037,10 @@ mod tests {
         assert_eq!(node["node_id"], "contrib-lon-b");
         assert_eq!(node["region"], "london");
         assert_eq!(node["role"], "contributor");
-        assert_eq!(node["build"]["git"], av_contrib::build::GIT);
-        assert_eq!(node["build"]["built_unix"], av_contrib::build::UNIX);
+        // The names the tools read for a contributor (A 2.6).
+        assert_eq!(node["build"]["id"], av_contrib::build::GIT);
+        assert_eq!(node["build"]["unix"], av_contrib::build::UNIX);
+        assert_eq!(node["build"]["git"], av_contrib::build::GIT_FULL);
         assert_eq!(node["process"]["pid"], std::process::id());
         // Nothing has bound the lanes of this router's status.
         assert_eq!(node["state"], "starting");

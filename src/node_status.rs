@@ -579,27 +579,32 @@ pub fn evaluate(snapshot: &Snapshot, proof: Proof) -> (Proof, Verdict) {
     (proof, verdict)
 }
 
-/// The `build` block: the fields of `crate::build`, named as av-mesh names
-/// them.
+/// The `build` block: the fields of `crate::build` in a contributor's names
+/// (A 2.6), which the tools read for a node of role `contributor`
+/// (`mesh_ops.status_of`: `build.id`, `build.unix`, `build.dirty`). The
+/// pair (`id`, `unix`) is what `--version` prints, and names the build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Build {
     /// The short id: 12 hex of the commit, `-dirty` when so.
+    pub id: String,
+    /// The whole commit (40 hex).
     pub git: String,
-    pub git_full: String,
     pub dirty: bool,
-    pub built_unix: u64,
+    /// When the build was made, in Unix seconds.
+    pub unix: u64,
     /// The crate's version.
-    pub version: String,
+    #[serde(rename = "crate")]
+    pub crate_version: String,
 }
 
 impl Build {
     pub fn of_this_binary() -> Self {
         Self {
-            git: crate::build::GIT.to_owned(),
-            git_full: crate::build::GIT_FULL.to_owned(),
+            id: crate::build::GIT.to_owned(),
+            git: crate::build::GIT_FULL.to_owned(),
             dirty: crate::build::DIRTY,
-            built_unix: crate::build::UNIX,
-            version: crate::build::CRATE_VERSION.to_owned(),
+            unix: crate::build::UNIX,
+            crate_version: crate::build::CRATE_VERSION.to_owned(),
         }
     }
 }
@@ -1041,8 +1046,8 @@ impl NodeStatus {
              # HELP av_contrib_ready Whether publishing is proven (the state of GET /api/node is ready).\n\
              # TYPE av_contrib_ready gauge\n\
              av_contrib_ready {}\n",
-            report.build.git,
-            report.build.built_unix,
+            report.build.id,
+            report.build.unix,
             u8::from(report.ready),
         )
     }
@@ -1422,11 +1427,11 @@ mod tests {
             node_id: "contrib-lon-b".to_owned(),
             region: "london".to_owned(),
             build: Build {
-                git: "3f2a9c1d77e0".to_owned(),
-                git_full: "3f2a9c1d77e0b4c1d2e3f4a5b6c7d8e9f0a1b2c3".to_owned(),
+                id: "3f2a9c1d77e0".to_owned(),
+                git: "3f2a9c1d77e0b4c1d2e3f4a5b6c7d8e9f0a1b2c3".to_owned(),
                 dirty: false,
-                built_unix: 1_763_900_000,
-                version: "0.1.0".to_owned(),
+                unix: 1_763_900_000,
+                crate_version: "0.1.0".to_owned(),
             },
             pid: 812,
             boot_unix_us: 1_763_924_000_123_456,
@@ -1461,8 +1466,8 @@ mod tests {
         );
         let golden = concat!(
             r#"{"schema":"needletail.node.v1","node_id":"contrib-lon-b","region":"london","role":"contributor","#,
-            r#""build":{"git":"3f2a9c1d77e0","git_full":"3f2a9c1d77e0b4c1d2e3f4a5b6c7d8e9f0a1b2c3","dirty":false,"#,
-            r#""built_unix":1763900000,"version":"0.1.0"},"#,
+            r#""build":{"id":"3f2a9c1d77e0","git":"3f2a9c1d77e0b4c1d2e3f4a5b6c7d8e9f0a1b2c3","dirty":false,"#,
+            r#""unix":1763900000,"crate":"0.1.0"},"#,
             r#""process":{"pid":812,"boot_id":1763924000123456,"started_unix_ms":1763924000123,"uptime_ms":86400,"#,
             r#""args_sha256":"9a1f","cpus":4,"cpu_permille":60},"#,
             r#""state":"ready","ready":true,"ready_unix_ms":1763924003400,"ready_forced":false,"#,
