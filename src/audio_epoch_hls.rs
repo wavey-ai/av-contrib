@@ -16,7 +16,8 @@
 //! published is not published and is counted ([`OpaqueStreamCounts`]).
 
 use crate::fmp4_bridge::{
-    Fmp4PartPublisher, Fmp4Segmenter, PublishedOpaquePart, TimestampInput, DEFAULT_MIN_PART_MS,
+    Fmp4PartPublisher, Fmp4Segmenter, PublishedFmp4Part, PublishedOpaquePart, TimestampInput,
+    DEFAULT_MIN_PART_MS,
 };
 use crate::hop_journal::{now_unix_us, PartSourceTimes};
 pub use crate::part_timing::AudioPartSize;
@@ -987,6 +988,17 @@ impl OpaquePartSegmenter {
     /// Publish a whole part, gathered at `packaged_at_unix_ns` by this
     /// host's clock, under the number, epoch and anchor of its source.
     async fn publish(&self, part: GatheredPart, packaged_at_unix_ns: i64) -> Result<(), String> {
+        let part = self.published_part(part, packaged_at_unix_ns, now_unix_ns());
+        self.publisher.publish_opaque_part(part).await
+    }
+
+    /// The part that [`Self::publish`] hands its publisher.
+    fn published_part(
+        &self,
+        part: GatheredPart,
+        packaged_at_unix_ns: i64,
+        published_at_unix_ns: i64,
+    ) -> PublishedOpaquePart {
         let GatheredPart {
             anchor,
             bytes,
@@ -994,7 +1006,7 @@ impl OpaquePartSegmenter {
             source_times,
         } = part;
         let duration_us = samples_to_us(anchor.part_samples, anchor.sample_rate);
-        let part = PublishedOpaquePart {
+        PublishedOpaquePart {
             stream_id: self.output_stream_id,
             stream_idx: self.output_stream_idx,
             sequence: anchor.part_number(),
@@ -1003,15 +1015,81 @@ impl OpaquePartSegmenter {
             duration_samples: Some(anchor.part_samples),
             sample_rate: Some(anchor.sample_rate),
             packaged_at_unix_ns,
-            published_at_unix_ns: now_unix_ns(),
+            published_at_unix_ns,
             bytes,
             audio_units,
             hls: None,
             source_times,
             anchor,
-        };
-        self.publisher.publish_opaque_part(part).await
+        }
     }
+}
+
+/// A publisher that is never called: the identity self-test takes the
+/// segmenter's parts as they are made.
+struct Unpublished;
+
+#[async_trait::async_trait]
+impl Fmp4PartPublisher for Unpublished {
+    async fn publish_fmp4_part(&self, _part: PublishedFmp4Part) -> Result<(), String> {
+        Err("the identity self-test publishes nothing".to_string())
+    }
+}
+
+/// The opaque parts that the packaging cuts for the rendition of group 0
+/// of `kind` (stream `rendition_stream_id(base_stream_id, 0, kind)`) from
+/// a session `session_id_ns` of epochs of `frame_count` samples at
+/// `sample_rate`: parts `numbers`, each from all of its epochs, the epoch
+/// at `pts` carrying `payload(pts)`. The identity self-test (A 2.4) names
+/// its parts through this, the segmenter of the running packaging.
+/// Nothing is published, counted or logged.
+#[allow(clippy::too_many_arguments)]
+pub fn identity_parts(
+    base_stream_id: u64,
+    part: AudioPartSize,
+    kind: AudioPayloadKind,
+    session_id_ns: u64,
+    sample_rate: u32,
+    frame_count: u32,
+    numbers: &[u64],
+    payload: impl Fn(u64) -> Bytes,
+) -> Result<Vec<PublishedOpaquePart>, String> {
+    let stream_id = rendition_stream_id(base_stream_id, 0, kind)?;
+    let stream_idx = usize::try_from(stream_id)
+        .map_err(|_| "AEP1 LL-HLS stream id exceeds this platform".to_string())?;
+    let mut segmenter = OpaquePartSegmenter::new(
+        stream_id,
+        stream_idx,
+        session_id_ns,
+        part,
+        kind == AudioPayloadKind::Flac,
+        Arc::new(Unpublished),
+        Arc::default(),
+    );
+    let geometry = segmenter
+        .geometry_of(frame_count, sample_rate)
+        .ok_or_else(|| "a new segmenter takes its first geometry".to_string())?;
+    let frame = u64::from(frame_count.max(1));
+    let mut parts = Vec::with_capacity(numbers.len());
+    for &number in numbers {
+        let first_pts = number
+            .checked_mul(geometry.part_samples)
+            .ok_or_else(|| "identity part number overflows the sample count".to_string())?;
+        for epoch in 0..geometry.epochs_per_part() as u64 {
+            let pts = first_pts + epoch * frame;
+            let place = part_place(pts, geometry.part_samples, frame_count);
+            if let Some(gathered) = segmenter.push(
+                geometry,
+                place,
+                payload(pts),
+                pts,
+                PartSourceTimes::default(),
+            ) {
+                parts.push(segmenter.published_part(gathered, 0, 0));
+            }
+        }
+    }
+    Ok(parts)
 }
 
 fn now_unix_ns() -> i64 {
@@ -1878,7 +1956,7 @@ fn samples_to_millis(samples: u64, sample_rate: u32) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fmp4_bridge::{PublishedFmp4Part, PublishedOpaquePart};
+    use crate::fmp4_bridge::PublishedOpaquePart;
     use music_audio_session::MultichannelAudioSender;
     use playlists::Options;
     use raptorq_datagram_fec::{

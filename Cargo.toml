@@ -71,6 +71,9 @@ talkback-media = "0.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
+# xxh3 for the identity digests and window digests (A 2.4, 2.6): the
+# version playlists already locks.
+xxhash-rust = { version = "0.8.17", features = ["xxh3"] }
 av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "066bf4b3296ea8403e1c310b86f189dde20e990e", default-features = false, features = ["rist-pure"] }
 av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "066bf4b3296ea8403e1c310b86f189dde20e990e" }
 

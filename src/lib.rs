@@ -5,6 +5,7 @@ pub mod fixture_replay;
 pub mod fmp4_bridge;
 pub mod hls_stamp;
 pub mod hop_journal;
+pub mod identity;
 pub mod ingress_authorization;
 pub mod memory;
 pub mod node_status;

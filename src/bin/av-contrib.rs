@@ -21,6 +21,7 @@ use av_contrib::ingress_authorization::{
     PublishIngressRequest, PublishLease, PublishRejectionCode, MEDIA_FRAME_ENVELOPE_HEADER,
 };
 use av_contrib::memory::{self, LockMode};
+use av_contrib::identity::{self, Digests, Identity, IdentityFields, PartNumbering};
 use av_contrib::node_status::{self, LaneSample, NodeStatus, PublishedPart};
 use av_contrib::part_timing::{AudioPartSize, SourceAnchor, VideoPartSize};
 #[cfg(all(feature = "quadra-renditions", target_os = "linux"))]
@@ -29,7 +30,7 @@ use av_contrib::quadra_renditions::{
     QuadraRenditionTarget,
 };
 use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
-use av_contrib::source_first::SourceFirstEncoder;
+use av_contrib::source_first::{SourceFirstEncoder, SourcePart};
 use av_contrib::source_timing::{self, ReceiveTiming};
 use av_contrib::stall_journal::{
     self, StallJournal, StallKind, StallSnapshot, StallThread, TickConfig,
@@ -114,11 +115,13 @@ const FMP4_MEDIA_TRACK: &str = "muxed-fmp4";
 const FMP4_INITIALIZATION_TRACK: &str = "muxed-fmp4-init";
 const OPAQUE_AUDIO_TRACK: &str = "opaque-audio";
 const MEDIA_OBJECT_VERSION: u32 = 1;
-/// Key version of a source-anchored opaque audio part. The high half says
-/// that the part is named from its source; the low 16 bits are for the
-/// fingerprint of what produced its bytes, so that two contributors whose
-/// bytes could differ never share a key.
-const OPAQUE_AUDIO_OBJECT_VERSION: u32 = 2 << 16;
+/// Key version of a source-anchored opaque audio part before its
+/// fingerprint: the high half says that the part is named from its source.
+/// A contributor publishes under `identity::object_version(fingerprint)`,
+/// whose low 16 bits are its fingerprint's, so that two contributors whose
+/// bytes could differ never share a key. The identity self-test builds its
+/// parts under this version.
+const OPAQUE_AUDIO_OBJECT_VERSION: u32 = identity::OPAQUE_AUDIO_FORMAT << 16;
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 const AV_CONTRIB_CLOCK_ID: &str = "system:realtime:av-contrib";
@@ -516,6 +519,150 @@ fn aep1_source_timestamp(
     .context("invalid AEP1 source timestamp")
 }
 
+/// `--wall-clock-estimated-error-ms` in nanoseconds.
+fn estimated_clock_error_ns(args: &Args) -> Result<u64> {
+    args.wall_clock_estimated_error_ms
+        .checked_mul(1_000_000)
+        .context("--wall-clock-estimated-error-ms exceeds nanosecond range")
+}
+
+/// The identity self-test's source session: 14 November 2023.
+const IDENTITY_SESSION_NS: u64 = 1_700_000_000_000_000_000;
+/// A part number far into a session (P x 123,456,789 samples).
+const IDENTITY_FAR_PART: u64 = 123_456_789;
+/// Parts of each lane: the first two of a session and two far into it, so
+/// that the whole form and the compact form both occur.
+const IDENTITY_PARTS: [u64; 4] = [0, 1, IDENTITY_FAR_PART, IDENTITY_FAR_PART + 1];
+/// The lanes of the self-test, (payload, epoch samples at 48 kHz, payload
+/// bytes an epoch): PCM and Opus at 1 ms and 2.5 ms, and FLAC at 5 ms in
+/// a part of three symbols. Every lane is tested whatever --daw-hls-formats
+/// says: the formats change which datagrams are sent, not their bytes.
+const IDENTITY_LANES: [(AudioPayloadKind, u32, usize); 5] = [
+    (AudioPayloadKind::Pcm, 48, 48 * 2 * 3),
+    (AudioPayloadKind::Pcm, 120, 120 * 2 * 3),
+    (AudioPayloadKind::Opus, 48, 160),
+    (AudioPayloadKind::Opus, 120, 200),
+    (AudioPayloadKind::Flac, 240, 3_000),
+];
+/// Copies of a one-symbol part, and repair symbols of a larger one: fixed,
+/// since copy and repair symbol j are the same bytes whatever the count
+/// (`--relay-min-repair-symbols`, the path observations and the lanes'
+/// loss size the count, not the bytes).
+const IDENTITY_REPAIR_SYMBOLS: u32 = 2;
+/// The compact cell of the self-test: --relay-compact-whole-ms changes
+/// which parts go whole, not the bytes of either form.
+const IDENTITY_COMPACT_CELL_US: u64 = 100_000;
+
+/// The bytes of the epoch at `pts` of self-test lane `lane`.
+fn identity_payload(lane: usize, pts: u64, len: usize) -> Bytes {
+    (0..len)
+        .map(|index| {
+            (pts.wrapping_mul(0x9e37_79b9)
+                ^ (index as u64).wrapping_mul(31)
+                ^ (lane as u64).wrapping_mul(0x51))
+                .to_le_bytes()[0]
+        })
+        .collect::<Vec<u8>>()
+        .into()
+}
+
+/// The identity self-test (A 2.4): fixed synthetic parts of every lane
+/// through the functions that name, build and encode a published part
+/// (the packaging's segmenter, [`name_opaque_part`],
+/// [`build_opaque_media_object`] under [`OPAQUE_AUDIO_OBJECT_VERSION`],
+/// [`encode_source_first`] with the part's ids, two copies, both forms),
+/// digested as `numbering`, `envelope` and `wire`. It binds nothing, reads
+/// no file and logs nothing.
+fn identity_selftest(args: &Args) -> Result<Identity> {
+    if args.relay_deadline_ms == 0 {
+        bail!("--relay-deadline-ms must be positive");
+    }
+    let budget_ms = args.relay_deadline_ms;
+    let clock_error_ns = estimated_clock_error_ns(args)?;
+    let segment_us = args.stamp_durations().audio_segment_us;
+    let session = (
+        TopologyGeneration::new(args.relay_topology_generation)?,
+        SubscriptionId::new(args.relay_subscription_id)?,
+    );
+    let limits = RelayLimits::default();
+    let policy = AdaptiveFecPolicy {
+        min_repair_symbols: IDENTITY_REPAIR_SYMBOLS,
+        ..AdaptiveFecPolicy::default()
+    };
+    let mut digests = Digests::new();
+    for (lane, &(kind, frame_count, payload_len)) in IDENTITY_LANES.iter().enumerate() {
+        let encoder = SourceFirstEncoder::new(
+            AdaptiveFecController::new(policy, CongestionConfig::default()),
+            limits,
+        )
+        .context("identity self-test encoder")?
+        .with_compact_audio(args.relay_compact_audio.then_some(IDENTITY_COMPACT_CELL_US));
+        let parts = av_contrib::audio_epoch_hls::identity_parts(
+            args.daw_hls_base_stream_id,
+            args.audio_part(),
+            kind,
+            IDENTITY_SESSION_NS,
+            48_000,
+            frame_count,
+            &IDENTITY_PARTS,
+            |pts| identity_payload(lane, pts, payload_len),
+        )
+        .map_err(|error| anyhow::anyhow!("identity self-test: {error}"))?;
+        for mut part in parts {
+            name_opaque_part(&mut part, segment_us);
+            let Some(stamp) = part.hls else {
+                bail!("identity self-test: a named part has its playlist place");
+            };
+            let anchor = part.anchor;
+            digests.numbering(&PartNumbering {
+                stream_id: part.stream_id,
+                key_epoch: anchor.key_epoch(),
+                number: part.sequence,
+                hls_msn: stamp.msn,
+                hls_part: stamp.part,
+                source_time_ns: anchor.source_time_ns(),
+                deadline_ns: anchor.deadline_ns(budget_ms),
+                part_samples: anchor.part_samples,
+            });
+            let object = build_opaque_media_object(
+                &part,
+                OPAQUE_AUDIO_OBJECT_VERSION,
+                budget_ms,
+                clock_error_ns,
+            )?;
+            digests.envelope(&media_object::encode(&object)?);
+            let encoded = encode_source_first(
+                &encoder,
+                &object,
+                session,
+                relay_deadline_for_object(&object)?,
+                Some(IDENTITY_REPAIR_SYMBOLS),
+                Some(&anchor),
+            )?;
+            for wire in encoded.source_wires() {
+                digests.wire(wire);
+            }
+            for wire in encoded.repair_wires()? {
+                digests.wire(&wire);
+            }
+        }
+    }
+    Ok(digests.finish(IdentityFields {
+        fmt: identity::OPAQUE_AUDIO_FORMAT,
+        base_stream_id: args.daw_hls_base_stream_id,
+        audio_part: args.audio_part().to_string(),
+        segment_us,
+        deadline_ms: budget_ms,
+        clock: AEP1_SOURCE_CLOCK_ID,
+        clock_error_ns,
+        generation: args.relay_topology_generation,
+        subscription: args.relay_subscription_id,
+        symbol_size: policy.symbol_size,
+        max_datagram_bytes: limits.max_datagram_bytes,
+        compact: args.relay_compact_audio,
+    }))
+}
+
 /// Until when this host keeps trying to send a source-anchored part: the
 /// delivery budget after the part was complete here, on this host's clock
 /// (A 2.5): the kernel's receive stamp of the datagram that completed its
@@ -672,6 +819,14 @@ struct Args {
         default_value_t = DEFAULT_SHUTDOWN_GRACE_MS
     )]
     shutdown_grace_ms: u64,
+
+    /// Print the identity of this contributor's opaque audio parts (A 2.4:
+    /// the fingerprint, its three digests and the settings they cover) as
+    /// one JSON object and exit 0. Nothing is bound and no file is read:
+    /// the deploy runs it with a node's rendered arguments to compare two
+    /// contributors before it changes either.
+    #[arg(long)]
+    print_fingerprint: bool,
 
     #[arg(
         long,
@@ -3362,13 +3517,13 @@ impl RelaySessionPublisher {
     ) -> Result<RelayPublishOutcome> {
         let expires = anchored.map_or(deadline, |anchored| anchored.expires);
         let encode_started = Instant::now();
-        let encoded = encoder.encode_sources_with(
+        let encoded = encode_source_first(
+            encoder,
             object,
-            self.generation,
-            self.subscription_id,
+            (self.generation, self.subscription_id),
             deadline,
             self.single_symbol_audio_repair(),
-            anchored.map(|anchored| encoder.part_ids(&anchored.anchor)),
+            anchored.map(|anchored| anchored.anchor).as_ref(),
         );
         let mut encode_time = encode_started.elapsed();
         let encoded = match encoded {
@@ -4383,6 +4538,9 @@ struct MeshForwarder {
     fmp4_initialization_payloads: Arc<arc_swap::ArcSwap<Fmp4InitializationPayloadIndex>>,
     delivery_budget_ms: u64,
     estimated_clock_error_ns: u64,
+    /// The key version of opaque audio parts: the format above the low
+    /// bits of this contributor's fingerprint (A 2.4).
+    opaque_object_version: u32,
     relay: Option<Arc<RelaySessionPublisher>>,
     relay_exclusive: bool,
     telemetry: Arc<IngestTelemetry>,
@@ -4431,10 +4589,8 @@ impl MeshForwarder {
         if args.wall_clock_estimated_error_ms == 0 {
             bail!("--wall-clock-estimated-error-ms must be positive");
         }
-        let estimated_clock_error_ns = args
-            .wall_clock_estimated_error_ms
-            .checked_mul(1_000_000)
-            .context("--wall-clock-estimated-error-ms exceeds nanosecond range")?;
+        let estimated_clock_error_ns = estimated_clock_error_ns(args)?;
+        let opaque_object_version = identity_selftest(args)?.object_version;
         let relay = RelaySessionPublisher::new(args, Arc::clone(&telemetry))
             .await?
             .map(Arc::new);
@@ -4484,6 +4640,7 @@ impl MeshForwarder {
             fmp4_initialization_payloads: Arc::default(),
             delivery_budget_ms: args.relay_deadline_ms,
             estimated_clock_error_ns,
+            opaque_object_version,
             relay,
             relay_exclusive: args.relay_exclusive,
             telemetry,
@@ -5379,7 +5536,7 @@ impl Fmp4PartPublisher for MeshForwarder {
             .fetch_max(part.anchor.key_epoch(), Ordering::AcqRel);
         let object = build_opaque_media_object(
             &part,
-            OPAQUE_AUDIO_OBJECT_VERSION,
+            self.opaque_object_version,
             self.delivery_budget_ms,
             self.estimated_clock_error_ns,
         )
@@ -5948,11 +6105,7 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         // The part's number and its place in the playlist are its source's:
         // neither counts what this process has published, so a part refused
         // below leaves a hole and moves no other part.
-        part.sequence = part.anchor.part_number();
-        part.hls = Some(anchored_stamp(
-            &part.anchor,
-            self.durations.audio_segment_us,
-        ));
+        name_opaque_part(&mut part, self.durations.audio_segment_us);
         let sequence = part.sequence;
         let entry = self.streams.entry(stream_id);
         // The stream's lock is held only here, never across an await.
@@ -6004,6 +6157,37 @@ impl Fmp4PartPublisher for BoundedFmp4Publisher {
         self.publish_inline(&entry, publication).await;
         Ok(())
     }
+}
+
+/// Encode `object` source first for the RelaySession of `session`
+/// (generation, subscription), carrying `deadline`; a one-symbol audio part
+/// with `copies` copies. A source-anchored part (`anchor`) names its
+/// datagrams from its part number. The publisher and the identity self-test
+/// both encode here.
+fn encode_source_first(
+    encoder: &SourceFirstEncoder,
+    object: &MediaObject,
+    session: (TopologyGeneration, SubscriptionId),
+    deadline: MediaDeadline,
+    copies: Option<u32>,
+    anchor: Option<&SourceAnchor>,
+) -> relay_session::Result<SourcePart> {
+    encoder.encode_sources_with(
+        object,
+        session.0,
+        session.1,
+        deadline,
+        copies,
+        anchor.map(|anchor| encoder.part_ids(anchor)),
+    )
+}
+
+/// Name an opaque audio part from its anchor: its number, and its place in
+/// the playlist of segments of `audio_segment_us`. The publisher and the
+/// identity self-test both name parts here.
+fn name_opaque_part(part: &mut PublishedOpaquePart, audio_segment_us: u64) {
+    part.sequence = part.anchor.part_number();
+    part.hls = Some(anchored_stamp(&part.anchor, audio_segment_us));
 }
 
 /// Journal a part handed to its publication worker, with the source and
@@ -11540,14 +11724,30 @@ impl Router for ContribRouter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    // What names this contributor's opaque audio parts, from the self-test
+    // (A 2.4). `--print-fingerprint` prints it and exits before anything is
+    // bound, read or logged: stdout holds the JSON alone.
+    let identity = identity_selftest(&args)?;
+    if args.print_fingerprint {
+        println!("{}", serde_json::to_string(&identity)?);
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "av_contrib=info,web_service=info".into()),
         )
         .init();
+    info!(
+        fingerprint = %identity.fingerprint,
+        object_version = identity.object_version,
+        numbering = %identity.numbering,
+        envelope = %identity.envelope,
+        wire = %identity.wire,
+        "identity of the opaque audio parts (--print-fingerprint)"
+    );
 
-    let args = Args::parse();
     // Taken before anything binds: from here a signal is a graceful stop.
     let mut stop_signals = StopSignals::new()?;
     let node = contributor_node(&args);
@@ -15251,12 +15451,94 @@ mod tests {
                 &format!(
                     "Datagrams of an opaque audio part: {title}.\n\
                      # Session 1700000000000000000, epochs 0, 1, 123456789 and 123456790, object version\n\
-                     # 2 << 16, budget 1000 ms, clock error 5 ms, 1 s segments, generation 1, subscription 1,\n\
-                     # 100 ms compact cells, two copies, the policy's two repair symbols."
+                     # 2 << 16 with the fingerprint's low 16 bits, budget 1000 ms, clock error 5 ms,\n\
+                     # 1 s segments, generation 1, subscription 1, 100 ms compact cells, two copies,\n\
+                     # the policy's two repair symbols."
                 ),
                 &records,
             );
         }
+    }
+
+    /// The identity self-test (A 2.4): each setting of the table moves the
+    /// digest it names and those after it, and no other; a setting that
+    /// changes which datagrams go and not their bytes moves none.
+    #[test]
+    fn each_identity_setting_moves_its_digest_and_no_other() {
+        let identity = |extra: &[&str]| {
+            let args = Args::try_parse_from(["av-contrib"].iter().chain(extra)).unwrap();
+            identity_selftest(&args).unwrap()
+        };
+        let base = identity(&[]);
+        assert_eq!(base, identity(&[]), "the self-test is a pure function");
+        // (settings, numbering, envelope, wire) moved.
+        let table: [(&[&str], bool, bool, bool); 14] = [
+            (&["--audio-part", "5ms"], true, true, true),
+            (&["--fmp4-segment-ms", "2000"], true, true, true),
+            (&["--daw-hls-base-stream-id", "2101"], true, true, true),
+            (&["--relay-deadline-ms", "1500"], true, true, true),
+            (&["--wall-clock-estimated-error-ms", "6"], false, true, true),
+            (&["--relay-topology-generation", "2"], false, false, true),
+            (&["--relay-subscription-id", "2"], false, false, true),
+            (&["--relay-compact-audio", "false"], false, false, true),
+            (&["--relay-compact-whole-ms", "50"], false, false, false),
+            (&["--relay-min-repair-symbols", "3"], false, false, false),
+            (&["--relay-path-loss-fraction", "0.02"], false, false, false),
+            (&["--relay-audio-copies", "policy"], false, false, false),
+            (&["--daw-hls-formats", "pcm"], false, false, false),
+            (
+                &["--node-id", "contrib-lon-b", "--relay-local-id", "contrib-b"],
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (settings, numbering, envelope, wire) in table {
+            let changed = identity(settings);
+            assert_eq!(
+                (
+                    changed.numbering != base.numbering,
+                    changed.envelope != base.envelope,
+                    changed.wire != base.wire,
+                ),
+                (numbering, envelope, wire),
+                "{settings:?}"
+            );
+            assert_eq!(
+                changed.fingerprint != base.fingerprint,
+                numbering || envelope || wire,
+                "{settings:?}"
+            );
+        }
+        // The fields say the inputs in words.
+        let fields = &identity(&["--audio-part", "5ms", "--relay-topology-generation", "7"]).fields;
+        assert_eq!(
+            (fields.audio_part.as_str(), fields.generation, fields.clock),
+            ("5000us", 7, "source:aep1")
+        );
+        assert_eq!(base.fields.fmt, 2);
+        assert_eq!(
+            base.object_version,
+            identity::object_version(u64::from_str_radix(&base.fingerprint, 16).unwrap())
+        );
+    }
+
+    /// The parts a contributor publishes carry its fingerprint in their
+    /// version; the self-test's own parts the format alone.
+    #[tokio::test]
+    async fn published_parts_carry_the_fingerprint_in_their_version() {
+        let args = contrib_status_args();
+        let identity = identity_selftest(&args).unwrap();
+        let forwarder = MeshForwarder::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap();
+        assert_eq!(forwarder.opaque_object_version, identity.object_version);
+        assert_eq!(
+            forwarder.opaque_object_version >> 16,
+            OPAQUE_AUDIO_OBJECT_VERSION >> 16
+        );
+        let args = Args::try_parse_from(["av-contrib", "--print-fingerprint"]).unwrap();
+        assert!(args.print_fingerprint);
     }
 
     fn hex_lines(bytes: &[u8]) -> String {
@@ -17210,6 +17492,7 @@ mod tests {
             node_id: None,
             region: String::new(),
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
+            print_fingerprint: false,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -17328,6 +17611,7 @@ mod tests {
             node_id: None,
             region: String::new(),
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
+            print_fingerprint: false,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -18362,6 +18646,7 @@ mod tests {
             node_id: None,
             region: String::new(),
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
+            print_fingerprint: false,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -18620,6 +18905,7 @@ mod tests {
             node_id: None,
             region: String::new(),
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
+            print_fingerprint: false,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,
@@ -18778,6 +19064,7 @@ mod tests {
             node_id: None,
             region: String::new(),
             shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
+            print_fingerprint: false,
             relay_primary_id: "primary-test".to_owned(),
             relay_secondary_id: "secondary-test".to_owned(),
             relay_topology_generation: DEFAULT_RELAY_TOPOLOGY_GENERATION,

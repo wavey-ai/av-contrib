@@ -254,6 +254,7 @@ dependencies = [
  "wavey-mpeg2ts-reader",
  "webpki-roots 1.0.9",
  "xcoder-quadra",
+ "xxhash-rust",
 ]
 
 [[package]]
