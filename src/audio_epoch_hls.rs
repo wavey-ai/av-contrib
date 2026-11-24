@@ -22,6 +22,7 @@ use crate::hop_journal::{now_unix_us, PartSourceTimes};
 pub use crate::part_timing::AudioPartSize;
 use crate::part_timing::{legacy_ms, part_place, part_samples, samples_to_us, SourceAnchor};
 use crate::soundkit_v2::{terminalize_soundkit_group, SoundKitV2StreamRef};
+use crate::source_timing::SourceTiming;
 use access_unit::{AccessUnit, PSI_STREAM_AUDIO_OPUS, PSI_STREAM_PRIVATE_DATA};
 use boxer::fmp4::{
     opus_packet_info, AudioTrackConfig, OpusAudioConfig, PcmAudioConfig, PcmSampleKind,
@@ -157,7 +158,9 @@ pub struct RecoveredAudioEpoch {
 pub struct AudioEpochHlsDatagram {
     pub peer: SocketAddr,
     pub bytes: Bytes,
-    /// Unix microseconds at which the ingest socket returned the datagram.
+    /// Unix microseconds at which the datagram arrived: the kernel's
+    /// receive stamp on the DAW media socket (`SO_TIMESTAMPNS`), the read
+    /// where there is none.
     pub received_unix_us: u64,
 }
 
@@ -740,6 +743,8 @@ struct ReceiverState {
     /// First arrival of each recent AEP1 block, at `block_id %
     /// FIRST_ARRIVAL_BLOCKS`. A block carries one epoch.
     block_first_us: Box<[Option<(u32, u64)>]>,
+    /// `src_gap` and `src_late` of the source's epochs.
+    timing: SourceTiming,
 }
 
 /// The FEC receiver of one source, with its windows set in time.
@@ -756,16 +761,20 @@ impl ReceiverState {
             receiver: MultichannelAudioReceiver::new(aep1_session_config()),
             last_seen: now,
             block_first_us: vec![None; FIRST_ARRIVAL_BLOCKS].into_boxed_slice(),
+            timing: SourceTiming::new(),
         }
     }
 
     /// Note a datagram of `block_id` and return the block's first arrival.
+    /// The first datagram of a block is the epoch's arrival for
+    /// `src_gap`.
     fn observe_block(&mut self, block_id: u32, received_us: u64) -> u64 {
         let slot = &mut self.block_first_us[block_id as usize % FIRST_ARRIVAL_BLOCKS];
         match slot {
             Some((block, first)) if *block == block_id => *first,
             _ => {
                 *slot = Some((block_id, received_us));
+                self.timing.block_opened(block_id, received_us);
                 received_us
             }
         }
@@ -785,6 +794,15 @@ impl ReceiverState {
             .receiver
             .push_datagram(payload)
             .map_err(|error| error.to_string())?;
+        if let Some(epoch) = outcome.completed_epoch.as_ref() {
+            self.timing.epoch_completed(
+                first_us,
+                epoch.session_id,
+                epoch.pts_samples,
+                epoch.sample_rate,
+                epoch.frame_count,
+            );
+        }
         if outcome.completed_groups.is_empty() {
             return Ok((Vec::new(), outcome.completed_epoch));
         }
@@ -2573,6 +2591,105 @@ mod tests {
         assert_eq!(times.src_first_us, Some(5_100));
         assert_eq!(times.src_last_us, Some(completed_at));
         assert!(completed_at > 5_100);
+    }
+
+    /// A receive thread that stops for 80 ms while the source keeps time:
+    /// the kernel's stamps show every epoch on its turn (no `src_gap`), and
+    /// the stop is the reader's (`rx_wait`), in the stall journal too.
+    #[test]
+    fn a_stalled_reader_shows_rx_wait_and_not_a_late_source() {
+        use crate::source_timing::{enable_kernel_stamps, recv_stamped, ReceiveTiming};
+        use crate::stall_journal::{self, StallJournal, StallKind};
+
+        let _turn = stall_journal::PROCESS_JOURNAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let journal = stall_journal::install(Arc::new(StallJournal::new("process", 64)));
+        let since_us = stall_journal::realtime_us();
+
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig {
+            fec: transport.prepare_fec_config(MultichannelAudioFecConfig::default()),
+            ..MultichannelAudioSessionConfig::default()
+        });
+        // 20 epochs of 240 samples: 5 ms each.
+        let epochs = (0..20)
+            .map(|epoch_id| epoch_datagrams(&mut sender, &transport, epoch_id))
+            .collect::<Vec<_>>();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        enable_kernel_stamps(&socket).unwrap();
+        // Room for every datagram sent while the reader is stopped, as the
+        // DAW socket has.
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(4 << 20)
+            .unwrap();
+        let target = socket.local_addr().unwrap();
+        // The source keeps a 5 ms pace and measures how late it sent each
+        // epoch: on a loaded machine its own lateness is a real gap.
+        let source = std::thread::spawn(move || {
+            let out = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let start = Instant::now();
+            let mut late_max = Duration::ZERO;
+            for (index, datagrams) in epochs.iter().enumerate() {
+                let due = start + Duration::from_millis(5 * index as u64);
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                late_max = late_max.max(Instant::now().saturating_duration_since(due));
+                for datagram in datagrams {
+                    out.send_to(datagram, target).unwrap();
+                }
+            }
+            late_max
+        });
+
+        let mut reads = ReceiveTiming::new(target);
+        let mut receiver = ReceiverState::new(Instant::now());
+        let mut buf = vec![0_u8; 65_536];
+        let (mut completed, mut stalled, mut rx_wait_max_us) = (0, false, 0);
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while completed < 20 && Instant::now() < give_up {
+            if completed == 5 && !stalled {
+                std::thread::sleep(Duration::from_millis(80));
+                stalled = true;
+            }
+            match recv_stamped(&socket, &mut buf) {
+                Ok((len, _, stamp)) => {
+                    let read_us = now_unix_us();
+                    let arrival_us = reads.datagram(stamp, read_us);
+                    assert!(stamp.is_some());
+                    rx_wait_max_us = rx_wait_max_us.max(read_us - arrival_us);
+                    let payload = transport.payload(&buf[..len]).unwrap();
+                    if receiver.push(payload, arrival_us).unwrap().1.is_some() {
+                        completed += 1;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let source_late_max_us = source.join().unwrap().as_micros() as u64;
+        assert_eq!(completed, 20);
+        assert!(rx_wait_max_us >= 60_000, "rx_wait {rx_wait_max_us} us");
+        let report = journal.query(Some(since_us));
+        let longest = |kind: StallKind| {
+            report
+                .events
+                .iter()
+                .filter(|line| line.event.kind == kind)
+                .map(|line| line.event.dur_us)
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(longest(StallKind::RxWait) >= 60_000, "{report:?}");
+        // No epoch came later after its turn than the source itself sent
+        // it: nothing of the reader's 80 ms stop is booked to the source.
+        assert!(
+            longest(StallKind::SrcGap) <= source_late_max_us + 2_000,
+            "source late at most {source_late_max_us} us: {report:?}"
+        );
     }
 
     #[tokio::test]

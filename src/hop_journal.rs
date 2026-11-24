@@ -32,8 +32,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// of one epoch (PCM 1 ms and Opus 2.5 ms, 1,400 parts a second) they were
 /// 19 s, less than one latency-bench run, and the run's first contributor
 /// hops were gone before hops.py asked for them. 2^20 events hold 75 s of
-/// the default parts, at about 88 bytes an event (92 MB when full; the
-/// pages are touched as the ring fills). The 0.25 ms PCM sweep point (4,400
+/// the default parts, at about 88 bytes an event (92 MB, faulted in at
+/// start with `--prefault` and locked with `--mlock rings`). The 0.25 ms PCM sweep point (4,400
 /// parts a second with Opus) fills it in 24 s: pass a larger
 /// `--hop-journal-capacity` for long runs of it.
 pub const DEFAULT_HOP_JOURNAL_CAPACITY: usize = 1 << 20;
@@ -50,6 +50,15 @@ pub fn covered_seconds(capacity: usize, parts_per_second: u64) -> f64 {
         return f64::INFINITY;
     }
     capacity as f64 / (parts_per_second * EVENTS_PER_PART) as f64
+}
+
+impl Drop for HopJournal {
+    fn drop(&mut self) {
+        if let Some((address, bytes)) = self.locked {
+            // SAFETY: the range `new` locked; the ring still holds it.
+            unsafe { crate::memory::unpin_region(address as *mut u8, bytes) };
+        }
+    }
 }
 
 /// Content type of `GET /api/hops`.
@@ -214,6 +223,9 @@ pub struct HopJournal {
     node: String,
     capacity: usize,
     ring: Mutex<Ring>,
+    /// The ring's buffer (address, bytes) when `memory::pin_region` locked
+    /// it: unlocked before it is freed.
+    locked: Option<(usize, usize)>,
 }
 
 struct Ring {
@@ -230,14 +242,25 @@ impl Ring {
 }
 
 impl HopJournal {
+    /// A ring of `capacity` events, allocated now, its pages faulted in
+    /// (`--prefault`) and locked (`--mlock rings`) as `memory` is set: the
+    /// first session does not take a fault for each new page it fills.
     pub fn new(node: impl Into<String>, capacity: usize) -> Self {
+        let mut events = Vec::<HopEvent>::with_capacity(capacity);
+        let address = events.as_mut_ptr().cast::<u8>();
+        let bytes = events.capacity() * std::mem::size_of::<HopEvent>();
+        // SAFETY: the empty vector's whole buffer: writable, nothing in it.
+        let locked = unsafe { crate::memory::pin_region("hop journal", address, bytes) };
         Self {
             node: node.into(),
             capacity,
             ring: Mutex::new(Ring {
-                events: VecDeque::with_capacity(capacity),
+                // The deque takes the vector's buffer as it is, and never
+                // grows past it.
+                events: VecDeque::from(events),
                 recorded: 0,
             }),
+            locked: locked.then_some((address as usize, bytes)),
         }
     }
 
@@ -444,6 +467,44 @@ mod tests {
         disabled.record(HopEvent::new(HopStage::Sent, 1, 1, 1));
         assert!(disabled.query(None, None).is_empty());
         assert!(!disabled.enabled());
+    }
+
+    #[test]
+    fn the_ring_is_faulted_in_and_locked_at_start() {
+        use crate::memory::{self, LockMode};
+        let _mode = memory::MODE.lock().unwrap_or_else(PoisonError::into_inner);
+        memory::configure(true, LockMode::Rings);
+        let before = memory::report();
+        let capacity = 1 << 12;
+        let journal = HopJournal::new("contrib-lon", capacity);
+        let bytes = (capacity * std::mem::size_of::<HopEvent>()) as u64;
+        let after = memory::report();
+        assert!(after.prefaulted_bytes >= before.prefaulted_bytes + bytes);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the struct it is given.
+        unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) };
+        if limit.rlim_cur >= 4 << 20 {
+            let (_, locked) = journal.locked.expect("a 360 KB ring is locked");
+            assert_eq!(locked as u64, bytes);
+            assert!(after.locked_bytes >= before.locked_bytes + bytes);
+        }
+        // The ring is the deque's buffer: filling it does not move it.
+        for seq in 0..capacity as u64 + 5 {
+            journal.record(HopEvent::new(HopStage::Enqueued, 4001, seq, seq));
+        }
+        let ring = journal.ring.lock().unwrap();
+        assert_eq!(ring.events.capacity(), capacity);
+        if let Some((address, _)) = journal.locked {
+            let (front, _) = ring.events.as_slices();
+            let at = front.as_ptr() as usize;
+            assert!(at >= address && at < address + bytes as usize);
+        }
+        drop(ring);
+        drop(journal);
+        memory::configure(true, LockMode::Off);
     }
 
     #[test]
