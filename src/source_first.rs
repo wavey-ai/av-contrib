@@ -856,6 +856,30 @@ impl SourcePart {
                 })
                 .collect();
         }
+        self.planned_repair_wires(0, self.repair_symbols)
+    }
+
+    /// `count` repair symbols from repair ordinal `first_ordinal` on (4k-repair:
+    /// the answers to a forwarder's ask take ordinals of their own, disjoint
+    /// from the part's repair), with the part's own packet sequences (its
+    /// first source's plus the ESI). None for a compact part.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a datagram does not validate.
+    pub fn extra_repair_wires(&self, first_ordinal: u32, count: u32) -> Result<Vec<Bytes>> {
+        if self.compact.is_some() || count == 0 {
+            return Ok(Vec::new());
+        }
+        self.planned_repair_wires(first_ordinal, count)
+    }
+
+    /// The source symbols of the object (none for a compact part).
+    pub fn source_symbol_count(&self) -> u32 {
+        u32::from(self.header.source_symbols)
+    }
+
+    fn planned_repair_wires(&self, first_ordinal: u32, count: u32) -> Result<Vec<Bytes>> {
         let size = usize::from(self.header.symbol_size);
         let padded_len = usize::from(self.header.source_symbols) * size;
         let padded;
@@ -878,14 +902,17 @@ impl SourcePart {
         let plan = self.plans.plan(self.header.source_symbols);
         let encoder = SourceBlockEncoder::with_encoding_plan(0, &oti, block, &plan);
         let mut template: Option<Vec<u8>> = None;
-        let mut wires = Vec::with_capacity(self.repair_symbols as usize);
+        let mut wires = Vec::with_capacity(count as usize);
         for (index, packet) in encoder
-            .repair_packets(0, self.repair_symbols)
+            .repair_packets(first_ordinal, count)
             .into_iter()
             .enumerate()
         {
             let esi = packet.payload_id().encoding_symbol_id();
-            let sequence = self.first_repair_sequence.wrapping_add(index as u32);
+            let sequence = self
+                .first_repair_sequence
+                .wrapping_add(first_ordinal)
+                .wrapping_add(index as u32);
             let wire = match template.as_ref() {
                 Some(prefix) => self.header.wire(prefix, esi, sequence, packet.data())?,
                 None => {

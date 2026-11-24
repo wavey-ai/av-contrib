@@ -1876,6 +1876,7 @@ const LANE_LOSS_POLL_US: u64 = 50_000;
 /// Take the loss reports waiting on a lane's audio socket (connected to the
 /// lane's forwarder, so nothing else arrives there) without blocking: a
 /// `recv` with MSG_DONTWAIT until the socket is empty.
+#[allow(dead_code)]
 fn drain_lane_loss_reports(
     socket: &UdpSocket,
     report: &LaneLossReport,
@@ -1907,6 +1908,182 @@ fn drain_lane_loss_reports(
                 demand
                     .0
                     .store(Some(Arc::new((hop_journal::now_unix_us(), streams))));
+            }
+        }
+    }
+}
+
+/// The thread that reads what each lane's forwarder sends to the lane's
+/// sockets (4k-repair): loss reports (RLR1), demand (RLD1) and asks (RLQ1),
+/// answered here from the parts published lately with fresh repair symbols
+/// of them. It reads on the sockets' readiness, so an ask is answered in
+/// the time of its encode, not at the next publication's poll; and none of
+/// it runs on the publishing path any more. It stops when the publisher is
+/// dropped.
+struct LaneResponder {
+    stop: Arc<AtomicBool>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for LaneResponder {
+    /// Stop the thread and wait for it (at most its 10 ms poll): it holds
+    /// the lane sockets, which close with it.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct ResponderSocket {
+    socket: Arc<UdpSocket>,
+    report: Arc<LaneLossReport>,
+    demand: Option<Arc<LaneDemand>>,
+    path: RelayCarrierPath,
+    audio: bool,
+}
+
+/// Asks answered and the repair symbols sent in answers (4k-repair).
+static RELAY_ASKS_ANSWERED: AtomicU64 = AtomicU64::new(0);
+static RELAY_ANSWER_SYMBOLS: AtomicU64 = AtomicU64::new(0);
+
+impl LaneResponder {
+    fn start(
+        primary: &RelayLane,
+        secondary: Option<&RelayLane>,
+        demand: bool,
+        store: Arc<av_contrib::part_answers::PartStore>,
+    ) -> Arc<Self> {
+        let mut sockets = Vec::new();
+        for (lane, path) in [
+            (Some(primary), RelayCarrierPath::Primary),
+            (secondary, RelayCarrierPath::Secondary),
+        ] {
+            let Some(lane) = lane else { continue };
+            sockets.push(ResponderSocket {
+                socket: Arc::clone(&lane.socket),
+                report: Arc::clone(&lane.reported_loss),
+                demand: demand.then(|| Arc::clone(&lane.demand)),
+                path,
+                audio: true,
+            });
+            if let Some(video) = &lane.video {
+                sockets.push(ResponderSocket {
+                    socket: Arc::clone(video),
+                    report: Arc::clone(&lane.video_reported_loss),
+                    demand: None,
+                    path,
+                    audio: false,
+                });
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = match std::thread::Builder::new()
+            .name("lane-responder".into())
+            .spawn(move || run_lane_responder(&sockets, &store, &thread_stop))
+        {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                warn!(error = %error, "failed to start the lane responder: no reports or asks read");
+                None
+            }
+        };
+        Arc::new(Self {
+            stop,
+            thread: std::sync::Mutex::new(thread),
+        })
+    }
+}
+
+fn send_connected(fd: i32, datagram: &[u8]) -> bool {
+    for _ in 0..50 {
+        // SAFETY: `datagram` is valid for its length and `fd` is an open,
+        // connected UDP socket.
+        let sent = unsafe { libc::send(fd, datagram.as_ptr().cast(), datagram.len(), libc::MSG_DONTWAIT) };
+        if sent >= 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            return false;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    false
+}
+
+fn run_lane_responder(
+    sockets: &[ResponderSocket],
+    store: &av_contrib::part_answers::PartStore,
+    stop: &AtomicBool,
+) {
+    let mut polls: Vec<libc::pollfd> = sockets
+        .iter()
+        .map(|socket| libc::pollfd {
+            fd: socket.socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let mut buf = [0_u8; 2_048];
+    while !stop.load(Ordering::Relaxed) {
+        // SAFETY: `polls` is a valid array of `polls.len()` pollfd.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 10) };
+        if ready <= 0 {
+            continue;
+        }
+        for (index, poll) in polls.iter_mut().enumerate() {
+            if poll.revents == 0 {
+                continue;
+            }
+            poll.revents = 0;
+            let socket = &sockets[index];
+            let fd = socket.socket.as_raw_fd();
+            for _ in 0..256 {
+                // SAFETY: `buf` is valid for `buf.len()` bytes; `fd` is open.
+                let len =
+                    unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+                if len < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    continue;
+                }
+                let datagram = &buf[..len as usize];
+                if let Some(ppm) = decode_lane_loss_report(datagram) {
+                    socket.report.record(ppm, hop_journal::now_unix_us());
+                    if socket.audio {
+                        RELAY_LANE_REPORTED_LOSS_PPM[socket.path as usize]
+                            .store(u64::from(ppm), Ordering::Relaxed);
+                    }
+                } else if let Some(request) = av_contrib::part_answers::Request::decode(datagram) {
+                    let (answer, wires) = store.answer(&request);
+                    if let Some(answer) = answer {
+                        send_connected(fd, &answer);
+                    }
+                    let mut sent = 0;
+                    for wire in &wires {
+                        if send_connected(fd, wire) {
+                            sent += 1;
+                        }
+                    }
+                    if !request.probe {
+                        RELAY_ASKS_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                        RELAY_ANSWER_SYMBOLS.fetch_add(sent, Ordering::Relaxed);
+                    }
+                } else if let Some(demand) = &socket.demand {
+                    if let Some(streams) = decode_lane_demand(datagram) {
+                        demand
+                            .0
+                            .store(Some(Arc::new((hop_journal::now_unix_us(), streams))));
+                    }
+                }
             }
         }
     }
@@ -2114,14 +2291,14 @@ struct RelayLane {
     backlog: LaneBacklog,
     /// The loss that the lane's forwarder reports (`--relay-audio-copies
     /// measured`).
-    reported_loss: LaneLossReport,
+    reported_loss: Arc<LaneLossReport>,
     /// The demand that the lane's forwarder reports (RLD1).
-    demand: LaneDemand,
+    demand: Arc<LaneDemand>,
     /// 4k-repair (a): datagrams handed to the kernel on the video socket
     /// (the count of its own ledger, RLL1), and the loss its forwarder's
     /// video thread reports against it (RLR1).
     video_sent: AtomicU64,
-    video_reported_loss: LaneLossReport,
+    video_reported_loss: Arc<LaneLossReport>,
 }
 
 /// The class lane settings: `--relay-class-lanes` and its socket options.
@@ -2218,10 +2395,10 @@ impl RelayLane {
             limits: config.limits,
             path_metrics: std::sync::RwLock::new(PathMetrics::default()),
             backlog: LaneBacklog::default(),
-            reported_loss: LaneLossReport::default(),
-            demand: LaneDemand::default(),
+            reported_loss: Arc::default(),
+            demand: Arc::default(),
             video_sent: AtomicU64::new(0),
-            video_reported_loss: LaneLossReport::default(),
+            video_reported_loss: Arc::default(),
         })
     }
 
@@ -2798,6 +2975,11 @@ struct RelaySessionPublisher {
     /// 4k-repair (a): parts' repair sized to the measured loss
     /// (`--relay-repair-sizing measured`).
     measured_repair: bool,
+    /// 4k-repair (c): the parts published lately, for the forwarders' asks,
+    /// and the thread that reads the lanes (reports, demand, asks) and
+    /// answers (it stops when this is dropped).
+    part_store: Arc<av_contrib::part_answers::PartStore>,
+    _responder: Arc<LaneResponder>,
     /// `--relay-class-lanes`: the class of a part's stream picks its
     /// socket and port. Without class lanes a part's own class is used, as
     /// before.
@@ -2995,6 +3177,13 @@ impl RelaySessionPublisher {
         } else {
             None
         };
+        let part_store = Arc::new(av_contrib::part_answers::PartStore::default());
+        let responder = LaneResponder::start(
+            &primary,
+            secondary.as_ref(),
+            !parse_rendition_groups(&args.relay_demand_renditions)?.is_empty(),
+            Arc::clone(&part_store),
+        );
         Ok(Some(Self {
             encoders,
             source_encoders,
@@ -3026,6 +3215,8 @@ impl RelaySessionPublisher {
             ),
             min_repair_symbols: args.relay_min_repair_symbols,
             measured_repair,
+            _responder: responder,
+            part_store,
             class_lanes: classes.enabled(),
             video_streams: VideoStreamClasses::default(),
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
@@ -3064,15 +3255,9 @@ impl RelaySessionPublisher {
             if ledger_due {
                 lane.send_ledger();
             }
-            drain_lane_loss_reports(
-                &lane.socket,
-                &lane.reported_loss,
-                demand.then_some(&lane.demand),
-                path,
-            );
-            if let Some(video) = &lane.video {
-                drain_lane_loss_reports(video, &lane.video_reported_loss, None, path);
-            }
+            // What the lane's forwarder sends (reports, demand, asks) is
+            // read by the lane responder thread (4k-repair), off this path.
+            let _ = (demand, path);
         }
     }
 
@@ -3657,6 +3842,8 @@ impl RelaySessionPublisher {
             }
         }
         let encoded = Arc::new(encoded);
+        // Kept for the first forwarders' asks (4k-repair).
+        self.part_store.keep(Arc::clone(&encoded));
         let hot = self.audio_inline && class == PublicationClass::Audio;
         // `--relay-repair-alongside-sources`: a large part's repair is
         // computed on a blocking thread while its sources are sent.
@@ -9457,6 +9644,16 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_single_symbol_audio_repair_symbols",
             "Repair symbols (copies) of the last one-symbol audio part (--relay-audio-copies).",
             RELAY_SINGLE_SYMBOL_AUDIO_REPAIR.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_asks_answered",
+            "Asks (RLQ1) of the first forwarders answered with repair (4k-repair).",
+            RELAY_ASKS_ANSWERED.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_answer_symbols",
+            "Repair symbols sent in answers to the first forwarders' asks.",
+            RELAY_ANSWER_SYMBOLS.load(Ordering::Relaxed) as f64,
         ),
         (
             "av_contrib_relay_repair_loss_ppm",
@@ -19754,6 +19951,93 @@ mod tests {
         assert_eq!(receive_wires(&primary_video, all).await.len(), all);
         assert_eq!(receive_wires(&secondary_video, all).await.len(), all);
         drop((primary_audio, secondary_audio));
+    }
+
+    /// 4k-repair (c): a first forwarder's ask (RLQ1) for a part the
+    /// contributor published is answered on the lane, at once, with RLA1
+    /// and fresh repair symbols of the part (ordinals from 32,768) that
+    /// complete it for a forwarder that lost ten of its sources; a probe is
+    /// answered with its time.
+    #[tokio::test]
+    async fn a_forwarders_ask_is_answered_with_fresh_repair_of_the_part() {
+        let video = test_video_object_of(91_000_000_094, 0, 2, 200_000);
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_deadline_ms = 5_000;
+        args.relay_source_first = true;
+        args.relay_repair_sizing = "policy".into();
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let out = relay
+            .publish_part_object(&video, Some((91_000_000_094, 0)), PublicationClass::Video)
+            .await
+            .unwrap();
+        let limits = RelayLimits::default();
+        let mut wires = Vec::new();
+        let mut from = None;
+        let mut buf = vec![0_u8; 65_536];
+        for _ in 0..out.source_symbols + out.repair_symbols {
+            let (len, peer) = timeout(Duration::from_secs(3), primary_video.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            from = Some(peer);
+            if let Ok(symbol) = relay_session::decode_datagram(&buf[..len], limits) {
+                wires.push(symbol);
+            }
+        }
+        let from = from.unwrap();
+        let part = av_contrib::part_answers::PartKey::of(video.key());
+        let ask = |wanted: u16, probe: bool| {
+            let mut out = [0_u8; 48];
+            out[..4].copy_from_slice(b"RLQ1");
+            out[4] = 1;
+            out[5] = u8::from(probe);
+            out[6..8].copy_from_slice(&wanted.to_be_bytes());
+            out[8..16].copy_from_slice(&777_u64.to_be_bytes());
+            out[16..24].copy_from_slice(&part.stream.to_be_bytes());
+            out[24..32].copy_from_slice(&part.epoch.to_be_bytes());
+            out[32..40].copy_from_slice(&part.object.to_be_bytes());
+            out
+        };
+        primary_video.send_to(&ask(0, true), from).await.unwrap();
+        let (len, _) = timeout(Duration::from_secs(2), primary_video.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&buf[..4], buf[5], len), (&b"RLA1"[..], 2, 48), "the probe's answer");
+        assert_eq!(u64::from_be_bytes(buf[8..16].try_into().unwrap()), 777);
+        primary_video.send_to(&ask(12, false), from).await.unwrap();
+        let (len, _) = timeout(Duration::from_secs(2), primary_video.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&buf[..4], buf[5], len), (&b"RLA1"[..], 0, 48), "sending");
+        assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), 12);
+        let mut answer = Vec::new();
+        for _ in 0..12 {
+            let (len, _) = timeout(Duration::from_secs(2), primary_video.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            answer.push(relay_session::decode_datagram(&buf[..len], limits).unwrap());
+        }
+        // A forwarder that lost ten sources (and the part's own repair)
+        // decodes from the answer.
+        let mut assembler =
+            relay_session::ObjectAssembler::new(out.announcement.clone(), limits).unwrap();
+        let mut recovered = None;
+        for symbol in wires[10..out.source_symbols].iter().chain(&answer) {
+            if recovered.is_none() {
+                recovered = assembler.push_symbol(symbol).unwrap();
+            }
+        }
+        assert_eq!(recovered.unwrap(), video);
+        drop(primary_audio);
     }
 
     /// `--relay-source-first`: each lane receives byte for byte what
