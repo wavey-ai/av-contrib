@@ -30,7 +30,7 @@ use av_contrib::quadra_renditions::{
     QuadraRenditionTarget,
 };
 use av_contrib::soundkit_v2::SoundKitV2EpochNormalizer;
-use av_contrib::source_first::{SourceFirstEncoder, SourcePart};
+use av_contrib::source_first::{MeasuredRepair, SourceFirstEncoder, SourcePart};
 use xxhash_rust::xxh3::xxh3_64;
 use av_contrib::source_timing::{self, ReceiveTiming};
 use av_contrib::stall_journal::{
@@ -639,6 +639,7 @@ fn identity_selftest(args: &Args) -> Result<Identity> {
                 relay_deadline_for_object(&object)?,
                 Some(IDENTITY_REPAIR_SYMBOLS),
                 Some(&anchor),
+                None,
             )?;
             for wire in encoded.source_wires() {
                 digests.wire(wire);
@@ -1382,6 +1383,34 @@ struct Args {
     )]
     relay_repair_both_lanes: bool,
 
+    /// 4k-repair (a): how a part's repair is sized. `measured`: a part of
+    /// at least --relay-repair-measured-min-symbols source symbols, of any
+    /// stream, takes repair sized to the worse lane's measured loss on its
+    /// class lane (the forwarder's RLR1 against that lane's ledger; the
+    /// other class lane's report, then --relay-path-loss-fraction, while
+    /// there is none), so that at most one part in 10,000 is undecodable
+    /// from one lane's symbols at 1.5 times that loss and 0.1 %; between
+    /// --relay-repair-floor-permille and --relay-repair-cap-percent of K.
+    /// Smaller parts keep the policy and the copies rule. `policy`: the
+    /// controller's for every part (at most 16 symbols). Needs
+    /// --relay-source-first.
+    #[arg(long, env = "AV_RELAY_REPAIR_SIZING", default_value = "measured")]
+    relay_repair_sizing: String,
+
+    /// 4k-repair (a): the least measured repair, in thousandths of K (and
+    /// two symbols): a clean lane's repair, the re-request covering the rest.
+    #[arg(long, env = "AV_RELAY_REPAIR_FLOOR_PERMILLE", default_value_t = 5)]
+    relay_repair_floor_permille: u32,
+
+    /// 4k-repair (a): the most measured repair, in percent of K.
+    #[arg(long, env = "AV_RELAY_REPAIR_CAP_PERCENT", default_value_t = 30)]
+    relay_repair_cap_percent: u32,
+
+    /// 4k-repair (a): the smallest part (source symbols) whose repair is
+    /// measured; smaller parts keep the policy.
+    #[arg(long, env = "AV_RELAY_REPAIR_MEASURED_MIN_SYMBOLS", default_value_t = 32)]
+    relay_repair_measured_min_symbols: u16,
+
     /// Source first: a part's source symbols are built straight from its
     /// envelope (RaptorQ is systematic) and handed to the lanes before its
     /// repair symbols are computed, which then use a cached RaptorQ
@@ -1887,6 +1916,8 @@ fn drain_lane_loss_reports(
 /// last one-symbol audio part, for /metrics.
 static RELAY_LANE_REPORTED_LOSS_PPM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static RELAY_SINGLE_SYMBOL_AUDIO_REPAIR: AtomicU64 = AtomicU64::new(0);
+/// The loss (ppm) the last measured repair was sized to (4k-repair).
+static RELAY_REPAIR_LOSS_PPM: AtomicU64 = AtomicU64::new(0);
 
 /// `--audio-epoch-mesh-lane`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2086,6 +2117,11 @@ struct RelayLane {
     reported_loss: LaneLossReport,
     /// The demand that the lane's forwarder reports (RLD1).
     demand: LaneDemand,
+    /// 4k-repair (a): datagrams handed to the kernel on the video socket
+    /// (the count of its own ledger, RLL1), and the loss its forwarder's
+    /// video thread reports against it (RLR1).
+    video_sent: AtomicU64,
+    video_reported_loss: LaneLossReport,
 }
 
 /// The class lane settings: `--relay-class-lanes` and its socket options.
@@ -2184,6 +2220,8 @@ impl RelayLane {
             backlog: LaneBacklog::default(),
             reported_loss: LaneLossReport::default(),
             demand: LaneDemand::default(),
+            video_sent: AtomicU64::new(0),
+            video_reported_loss: LaneLossReport::default(),
         })
     }
 
@@ -2199,6 +2237,8 @@ impl RelayLane {
     fn count_sent(&self, socket: &Arc<UdpSocket>, count: usize) {
         if count > 0 && Arc::ptr_eq(socket, &self.socket) {
             self.backlog.sent.fetch_add(count as u64, Ordering::Release);
+        } else if count > 0 && self.video.as_ref().is_some_and(|video| Arc::ptr_eq(socket, video)) {
+            self.video_sent.fetch_add(count as u64, Ordering::Release);
         }
     }
 
@@ -2209,6 +2249,12 @@ impl RelayLane {
         // Without waiting (and without the runtime's readiness): a full
         // socket skips this ledger, and the next one covers the window.
         let _ = udp_batch::try_send_all(&self.socket, &[udp_batch::Outbound::connected(&ledger)]);
+        // And the video socket's, which the forwarder's video thread
+        // measures the video lane against (4k-repair).
+        if let Some(video) = &self.video {
+            let ledger = encode_lane_ledger(self.video_sent.load(Ordering::Acquire));
+            let _ = udp_batch::try_send_all(video, &[udp_batch::Outbound::connected(&ledger)]);
+        }
     }
 
     fn class_socket(&self, class: PublicationClass) -> (&Arc<UdpSocket>, SocketAddr) {
@@ -2749,6 +2795,9 @@ struct RelaySessionPublisher {
     demand_groups: Vec<Vec<u64>>,
     configured_loss: f64,
     min_repair_symbols: u32,
+    /// 4k-repair (a): parts' repair sized to the measured loss
+    /// (`--relay-repair-sizing measured`).
+    measured_repair: bool,
     /// `--relay-class-lanes`: the class of a part's stream picks its
     /// socket and port. Without class lanes a part's own class is used, as
     /// before.
@@ -2909,11 +2958,31 @@ impl RelaySessionPublisher {
         } else {
             vec![Mutex::new(encoder.clone())]
         };
+        let measured_repair = match args.relay_repair_sizing.as_str() {
+            "measured" => true,
+            "policy" => false,
+            other => bail!("--relay-repair-sizing must be measured or policy, not {other:?}"),
+        };
+        if args.relay_repair_cap_percent == 0 || args.relay_repair_cap_percent > 100 {
+            bail!("--relay-repair-cap-percent must be 1 to 100");
+        }
+        // Loss-sized repair of a large part can pass relay-session's default
+        // bound of 256 extra symbols (a 6 MB part at 5 % takes about 400):
+        // the source encoders take raptor-fec's own bound.
+        let source_limits = RelayLimits {
+            max_extra_repair_symbols: RelayLimits::HARD.max_extra_repair_symbols,
+            ..limits
+        };
         let source_encoders = if args.relay_send_batch && args.relay_source_first {
             let encoders = (0..encoders.len())
                 .map(|_| {
-                    SourceFirstEncoder::new(encoder.controller().clone(), limits).map(|fast| {
-                        fast.with_video_symbol_size(args.relay_video_symbol_size)
+                    SourceFirstEncoder::new(encoder.controller().clone(), source_limits).map(|fast| {
+                        fast.with_measured_repair(measured_repair.then_some(MeasuredRepair {
+                            floor_permille: args.relay_repair_floor_permille,
+                            cap_percent: args.relay_repair_cap_percent,
+                            min_symbols: args.relay_repair_measured_min_symbols,
+                        }))
+                        .with_video_symbol_size(args.relay_video_symbol_size)
                             .with_video_plan_grid(args.relay_video_plan_grid)
                             .with_compact_audio(args.relay_compact_audio.then_some(
                                 args.relay_compact_whole_ms.saturating_mul(1_000).max(1_000),
@@ -2956,6 +3025,7 @@ impl RelaySessionPublisher {
                     .loss_fraction,
             ),
             min_repair_symbols: args.relay_min_repair_symbols,
+            measured_repair,
             class_lanes: classes.enabled(),
             video_streams: VideoStreamClasses::default(),
             generation: TopologyGeneration::new(args.relay_topology_generation)?,
@@ -3000,7 +3070,37 @@ impl RelaySessionPublisher {
                 demand.then_some(&lane.demand),
                 path,
             );
+            if let Some(video) = &lane.video {
+                drain_lane_loss_reports(video, &lane.video_reported_loss, None, path);
+            }
         }
+    }
+
+    /// The loss a part's measured repair is sized to now (4k-repair, a):
+    /// the worse lane's on the part's class lane; a lane's from the report
+    /// on that class's socket, else on its other class's, else the
+    /// configured loss.
+    fn lane_loss_ppm(&self, class: PublicationClass) -> u32 {
+        let now = hop_journal::now_unix_us();
+        self.poll_lane_reports(now);
+        let lane_loss = |lane: &RelayLane| {
+            let (own, other) = if lane.video.is_some() && class != PublicationClass::Audio {
+                (&lane.video_reported_loss, &lane.reported_loss)
+            } else {
+                (&lane.reported_loss, &lane.video_reported_loss)
+            };
+            own.loss(now)
+                .or_else(|| other.loss(now))
+                .unwrap_or(self.configured_loss)
+        };
+        let loss = self
+            .secondary
+            .as_ref()
+            .map_or(0.0, lane_loss)
+            .max(lane_loss(&self.primary));
+        let ppm = (loss * 1e6).round().clamp(0.0, 1e6) as u32;
+        RELAY_REPAIR_LOSS_PPM.store(u64::from(ppm), Ordering::Relaxed);
+        ppm
     }
 
     /// The end of a stop: wait until no lane has a part in its backlog, or
@@ -3309,7 +3409,7 @@ impl RelaySessionPublisher {
         // repair from the secondary): its repair on the primary would add
         // R/K of 4K load at every hop.
         let repair_uses_primary = self.secondary.is_none()
-            || (self.repair_both_lanes && class == PublicationClass::Audio);
+            || self.repair_both_lanes;
         if self.secondary.is_none() && repair_count > 0 {
             self.telemetry
                 .relay_repair_primary_fallback_objects
@@ -3517,6 +3617,7 @@ impl RelaySessionPublisher {
         journal_hop: &impl Fn(HopStage, Option<SocketAddr>),
     ) -> Result<RelayPublishOutcome> {
         let expires = anchored.map_or(deadline, |anchored| anchored.expires);
+        let measured_loss_ppm = self.measured_repair.then(|| self.lane_loss_ppm(class));
         let encode_started = Instant::now();
         let encoded = encode_source_first(
             encoder,
@@ -3525,6 +3626,7 @@ impl RelaySessionPublisher {
             deadline,
             self.single_symbol_audio_repair(),
             anchored.map(|anchored| anchored.anchor).as_ref(),
+            measured_loss_ppm,
         );
         let mut encode_time = encode_started.elapsed();
         let encoded = match encoded {
@@ -3578,9 +3680,11 @@ impl RelaySessionPublisher {
             .collect::<Vec<_>>();
         let source_count = sources.len();
         let repair_count = encoded.repair_count() as usize;
-        // The lanes of today's rule (see publish_object_inner).
-        let repair_uses_primary = self.secondary.is_none()
-            || (self.repair_both_lanes && class == PublicationClass::Audio);
+        // The lanes of today's rule (see publish_object_inner), with every
+        // class's repair on both lanes under --relay-repair-both-lanes
+        // (4k-repair: each first forwarder then decodes from its own lane;
+        // the one fed sources only decoded nothing its lane damaged).
+        let repair_uses_primary = self.secondary.is_none() || self.repair_both_lanes;
         if self.secondary.is_none() && repair_count > 0 {
             self.telemetry
                 .relay_repair_primary_fallback_objects
@@ -6182,14 +6286,16 @@ fn encode_source_first(
     deadline: MediaDeadline,
     copies: Option<u32>,
     anchor: Option<&SourceAnchor>,
+    measured_loss_ppm: Option<u32>,
 ) -> relay_session::Result<SourcePart> {
-    encoder.encode_sources_with(
+    encoder.encode_sources_measured(
         object,
         session.0,
         session.1,
         deadline,
         copies,
         anchor.map(|anchor| encoder.part_ids(anchor)),
+        measured_loss_ppm,
     )
 }
 
@@ -9351,6 +9457,11 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_single_symbol_audio_repair_symbols",
             "Repair symbols (copies) of the last one-symbol audio part (--relay-audio-copies).",
             RELAY_SINGLE_SYMBOL_AUDIO_REPAIR.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "av_contrib_relay_repair_loss_ppm",
+            "Loss (ppm) the last part's measured repair was sized to (--relay-repair-sizing measured).",
+            RELAY_REPAIR_LOSS_PPM.load(Ordering::Relaxed) as f64,
         ),
         (
             "av_contrib_relay_session_path_loss_fraction",
@@ -17570,6 +17681,10 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_repair_sizing: "measured".into(),
+            relay_repair_floor_permille: 5,
+            relay_repair_cap_percent: 30,
+            relay_repair_measured_min_symbols: 32,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -17689,6 +17804,10 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_repair_sizing: "measured".into(),
+            relay_repair_floor_permille: 5,
+            relay_repair_cap_percent: 30,
+            relay_repair_measured_min_symbols: 32,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -18729,6 +18848,10 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_repair_sizing: "measured".into(),
+            relay_repair_floor_permille: 5,
+            relay_repair_cap_percent: 30,
+            relay_repair_measured_min_symbols: 32,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -18988,6 +19111,10 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_repair_sizing: "measured".into(),
+            relay_repair_floor_permille: 5,
+            relay_repair_cap_percent: 30,
+            relay_repair_measured_min_symbols: 32,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -19147,6 +19274,10 @@ mod tests {
             relay_video_pacing_mbps: 0,
             relay_audio_inline: true,
             relay_repair_both_lanes: true,
+            relay_repair_sizing: "measured".into(),
+            relay_repair_floor_permille: 5,
+            relay_repair_cap_percent: 30,
+            relay_repair_measured_min_symbols: 32,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -19401,7 +19532,7 @@ mod tests {
                 .all(|(symbol, from)| *from == bind && symbol.object_key == *audio.key()));
         }
 
-        // A video part: the video ports; its repair stays off the primary.
+        // A video part: the video ports, repair on both (4k-repair).
         let video_stream = 91_000_000_002;
         let video = test_video_object(video_stream, 0, 3);
         let outcome = relay
@@ -19410,7 +19541,7 @@ mod tests {
             .unwrap();
         let all = outcome.source_symbols + outcome.repair_symbols;
         for (receiver, bind, count) in [
-            (&primary_video, primary_bind, outcome.source_symbols),
+            (&primary_video, primary_bind, all),
             (&secondary_video, secondary_bind, all),
         ] {
             let symbols = receive_relay_datagrams(receiver, count).await;
@@ -19427,10 +19558,7 @@ mod tests {
             .await
             .unwrap();
         let all = outcome.source_symbols + outcome.repair_symbols;
-        for (receiver, count) in [
-            (&primary_video, outcome.source_symbols),
-            (&secondary_video, all),
-        ] {
+        for (receiver, count) in [(&primary_video, all), (&secondary_video, all)] {
             let symbols = receive_relay_datagrams(receiver, count).await;
             assert!(symbols
                 .iter()
@@ -19566,6 +19694,68 @@ mod tests {
         out
     }
 
+    /// 4k-repair (a): each lane's video socket sends its own ledger, the
+    /// forwarder's report (RLR1) on it sizes the repair of a large part on
+    /// that class lane, and that repair goes on both lanes: 5 % reported on
+    /// the primary's video lane gives the part the repair of 5 %.
+    #[tokio::test]
+    async fn a_lanes_reported_loss_sizes_a_large_parts_repair_on_both_lanes() {
+        let video = test_video_object_of(91_000_000_093, 0, 2, 400_000);
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let (secondary_audio, secondary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_target = Some(secondary_audio.local_addr().unwrap());
+        args.relay_secondary_bind = Some(reserved_loopback_addr());
+        args.relay_secondary_seed_source = true;
+        args.relay_deadline_ms = 5_000;
+        args.relay_source_first = true;
+        args.relay_lane_ledger = true;
+        args.relay_repair_both_lanes = true;
+        args.relay_path_loss_fraction = 0.0;
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        // The video lane's ledger reaches its forwarder's video port.
+        relay.primary.send_ledger();
+        let mut wire = [0_u8; 2_048];
+        let (len, from) = timeout(Duration::from_secs(2), primary_video.recv_from(&mut wire))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&wire[..5], len), (&b"RLL1\x01"[..], 16));
+        // The forwarder's video thread reports 5 % to the socket it came from.
+        let mut report = [0_u8; 16];
+        report[..4].copy_from_slice(b"RLR1");
+        report[4] = 2;
+        report[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
+        primary_video.send_to(&report, from).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while relay.lane_loss_ppm(PublicationClass::Video) < 50_000 {
+            assert!(std::time::Instant::now() < deadline, "the report was not heard");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        let out = relay
+            .publish_part_object(&video, Some((91_000_000_093, 0)), PublicationClass::Video)
+            .await
+            .unwrap();
+        let expected = av_contrib::source_first::measured_repair_symbols(
+            out.source_symbols as u32,
+            50_000,
+            args.relay_repair_floor_permille,
+            args.relay_repair_cap_percent,
+        );
+        assert_eq!(out.repair_symbols as u32, expected);
+        assert!(out.repair_symbols > 16, "{} repair", out.repair_symbols);
+        // Both lanes carry the sources and the repair.
+        let all = out.source_symbols + out.repair_symbols;
+        assert_eq!(receive_wires(&primary_video, all).await.len(), all);
+        assert_eq!(receive_wires(&secondary_video, all).await.len(), all);
+        drop((primary_audio, secondary_audio));
+    }
+
     /// `--relay-source-first`: each lane receives byte for byte what
     /// relay-session's encoder gives it (same objects in the same order),
     /// on the audio hot path (repair on both lanes) and on the joined video
@@ -19594,6 +19784,9 @@ mod tests {
             args.relay_source_first = source_first;
             args.relay_video_plan_grid = false;
             args.relay_repair_alongside_sources = alongside;
+            // The same repair in every mode: the policy's, on the secondary
+            // (relay-session's encoder has no measured video repair).
+            args.relay_repair_sizing = "policy".into();
             let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
                 .await
                 .unwrap()
@@ -19612,7 +19805,11 @@ mod tests {
             lanes.push((
                 receive_wires(&primary_audio, audio_all).await,
                 receive_wires(&secondary_audio, audio_all).await,
-                receive_wires(&primary_video, video_out.source_symbols).await,
+                receive_wires(
+                    &primary_video,
+                    video_out.source_symbols + video_out.repair_symbols,
+                )
+                .await,
                 receive_wires(
                     &secondary_video,
                     video_out.source_symbols + video_out.repair_symbols,
@@ -19662,6 +19859,8 @@ mod tests {
         args.relay_secondary_seed_source = true;
         args.relay_deadline_ms = 5_000;
         args.relay_min_repair_symbols = 4;
+        // The policy's repair (at least 4): the test loses four sources.
+        args.relay_repair_sizing = "policy".into();
         assert!(args.relay_video_plan_grid && args.relay_repair_alongside_sources);
         let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
             .await
@@ -19686,7 +19885,7 @@ mod tests {
             );
             assert!(symbols > av_contrib::source_first::GRID_EXACT_SYMBOLS);
             assert!(out.announcement.coding.symbol_size() <= 1_316);
-            receive_wires(&primary_video, out.source_symbols).await;
+            receive_wires(&primary_video, out.source_symbols + out.repair_symbols).await;
             let wires = receive_wires(&secondary_video, out.source_symbols + out.repair_symbols)
                 .await
                 .iter()
@@ -20850,10 +21049,11 @@ mod tests {
         );
     }
 
-    /// --relay-repair-both-lanes adds repair to the primary for audio parts
-    /// only: a 4K part's primary lane carries its source set alone.
+    /// --relay-repair-both-lanes puts every part's repair on both lanes,
+    /// whatever its class (4k-repair: it was audio's only, and the primary
+    /// lane's first forwarder could decode no 4K part its lane damaged).
     #[tokio::test]
-    async fn repair_on_both_lanes_leaves_video_repair_to_the_secondary() {
+    async fn repair_on_both_lanes_covers_every_class() {
         let (primary_audio, primary_video) = class_port_receivers().await;
         let (secondary_audio, secondary_video) = class_port_receivers().await;
         let mut args = contrib_status_args();
@@ -20877,10 +21077,18 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.repair_symbols > 0);
-        let primary = receive_relay_datagrams(&primary_video, outcome.source_symbols).await;
-        assert!(primary
-            .iter()
-            .all(|(symbol, _)| symbol.role == MediaDatagramRole::Source));
+        let primary = receive_relay_datagrams(
+            &primary_video,
+            outcome.source_symbols + outcome.repair_symbols,
+        )
+        .await;
+        assert_eq!(
+            primary
+                .iter()
+                .filter(|(symbol, _)| symbol.role == MediaDatagramRole::Repair)
+                .count(),
+            outcome.repair_symbols
+        );
         assert_silent(&primary_video).await;
         let secondary = receive_relay_datagrams(
             &secondary_video,
