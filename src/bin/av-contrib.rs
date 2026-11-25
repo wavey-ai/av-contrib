@@ -2025,6 +2025,7 @@ fn relay_answers() -> node_status::RelayAnswers {
         answer_symbols: RELAY_ANSWER_SYMBOLS.load(Ordering::Relaxed),
         answer_refused_not_admitted: store.map_or(0, |store| store.refused_not_admitted()),
         answer_refused_limited: store.map_or(0, |store| store.refused_limited()),
+        answer_refused_window_spent: store.map_or(0, |store| store.refused_window_spent()),
         part_store_parts: store.map_or(0, |store| store.held_parts() as u64),
         part_store_bytes: store.map_or(0, |store| store.held_bytes() as u64),
         part_store_budget_bytes: store.map_or(0, |store| store.budget_bytes() as u64),
@@ -9701,6 +9702,11 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_answer_refused_limited",
             "Asks answered Busy: the asker had its share of the part (2 K + 16) or of the second (8 MiB/s).",
             RELAY_PART_STORE.get().map_or(0, |store| store.refused_limited()) as f64,
+        ),
+        (
+            "av_contrib_relay_answer_refused_window_spent",
+            "Asks answered Missing: the part's answer window (32,768 ordinals from 32,768) is spent.",
+            RELAY_PART_STORE.get().map_or(0, |store| store.refused_window_spent()) as f64,
         ),
         (
             "av_contrib_relay_part_store_bytes",

@@ -30,6 +30,11 @@ pub const REQUEST_LEN: usize = 48;
 pub const ANSWER_LEN: usize = 48;
 /// The contributor's first answer ordinal.
 pub const WINDOW: u32 = 1 << 15;
+/// The answer ordinals of a part, at most: the contributor's window is
+/// [32,768, 65,536), below the forwarders' (from 65,536), so an ESI
+/// (K + ordinal) stays far below raptorq's 2^24. A part whose window is
+/// spent is answered `Missing`.
+pub const WINDOW_LEN: u32 = 1 << 15;
 /// The most parts kept: the byte budget is the bound that counts; this
 /// one keeps the store small when the parts are (a part costs ~200 bytes
 /// beside its envelope).
@@ -124,7 +129,7 @@ struct Stored {
     part: Arc<RepairSource>,
     /// What `part` holds ([`RepairSource::held_bytes`]).
     held: usize,
-    /// The next answer ordinal, past [`WINDOW`].
+    /// The next answer ordinal, past [`WINDOW`]: at most [`WINDOW_LEN`].
     next: u32,
     /// Symbols answered to each asker.
     sent: Vec<(SocketAddr, u32)>,
@@ -153,6 +158,7 @@ pub struct PartStore {
     held_parts: AtomicUsize,
     refused_not_admitted: AtomicU64,
     refused_limited: AtomicU64,
+    refused_window_spent: AtomicU64,
 }
 
 impl Default for PartStore {
@@ -179,6 +185,7 @@ impl PartStore {
             held_parts: AtomicUsize::new(0),
             refused_not_admitted: AtomicU64::new(0),
             refused_limited: AtomicU64::new(0),
+            refused_window_spent: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +210,12 @@ impl PartStore {
     /// Asks answered `Busy`: the asker had its part's or its second's share.
     pub fn refused_limited(&self) -> u64 {
         self.refused_limited.load(Ordering::Relaxed)
+    }
+
+    /// Asks answered `Missing` because the part's answer window
+    /// ([`WINDOW_LEN`] ordinals) is spent.
+    pub fn refused_window_spent(&self) -> u64 {
+        self.refused_window_spent.load(Ordering::Relaxed)
     }
 
     /// Keep a part of two source symbols or more (not a compact one): its
@@ -266,6 +279,11 @@ impl PartStore {
             else {
                 return (Some(encode_answer(request, MISSING, 0)), Vec::new());
             };
+            let window_left = WINDOW_LEN.saturating_sub(stored.next);
+            if window_left == 0 {
+                self.refused_window_spent.fetch_add(1, Ordering::Relaxed);
+                return (Some(encode_answer(request, MISSING, 0)), Vec::new());
+            }
             let k = stored.part.source_symbol_count();
             let lacks = if request.wanted == 0 {
                 whole(k)
@@ -297,7 +315,7 @@ impl PartStore {
             bucket.at_us = bucket.at_us.max(now_us);
             let wire_len = stored.part.wire_len().max(1) as u64;
             let bucket_left = u32::try_from(bucket.bytes / wire_len).unwrap_or(u32::MAX);
-            let count = lacks.min(part_left).min(bucket_left);
+            let count = lacks.min(part_left).min(bucket_left).min(window_left);
             if count == 0 {
                 self.refused_limited.fetch_add(1, Ordering::Relaxed);
                 return (Some(encode_answer(request, BUSY, 0)), Vec::new());
@@ -504,6 +522,44 @@ mod tests {
         let other: SocketAddr = "10.0.0.3:4000".parse().unwrap();
         let (answer, wires) = store.answer(&ask(&part, 0, false), other, other, 0);
         assert_eq!((status(answer), wires.len() as u32), (SENDING, whole(k)));
+    }
+
+    /// A part's answers take ordinals from 32,768 up to 65,536 at most (the
+    /// forwarders' windows start there), whoever asks: then `Missing`,
+    /// counted, never a wrap or an ordinal past the window.
+    #[test]
+    fn a_parts_answers_stay_in_the_contributors_window() {
+        use raptorq_datagram_fec::HEADER_LEN;
+        let encoder = encoder();
+        let part = part(&encoder, 4, 30_000);
+        let k = part.source_symbol_count();
+        let store = PartStore::default();
+        store.keep(&part);
+        let limits = RelayLimits::default();
+        let mut total = 0_u32;
+        let mut spent = false;
+        for asker in 0..2_000_u32 {
+            let from = SocketAddr::from(([10, 1, (asker >> 8) as u8, asker as u8], 4000));
+            let (answer, wires) = store.answer(&ask(&part, 0, false), from, from, 0);
+            if wires.is_empty() {
+                assert_eq!(status(answer), MISSING);
+                spent = true;
+                break;
+            }
+            for wire in &wires {
+                let symbol = relay_session::decode_datagram(wire, limits).unwrap();
+                let id = &symbol.fec_datagram[HEADER_LEN..HEADER_LEN + 4];
+                let esi = u32::from_be_bytes([0, id[1], id[2], id[3]]);
+                assert!(
+                    (k + WINDOW..k + WINDOW + WINDOW_LEN).contains(&esi),
+                    "ESI {esi} outside the window"
+                );
+            }
+            total += wires.len() as u32;
+        }
+        assert!(spent, "the window is spent");
+        assert_eq!(total, WINDOW_LEN);
+        assert_eq!(store.refused_window_spent(), 1);
     }
 
     /// One asker's answers are held to 8 MiB at once and 8 MiB a second.

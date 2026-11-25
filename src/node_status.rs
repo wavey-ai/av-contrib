@@ -696,6 +696,8 @@ pub struct RelayAnswers {
     pub answer_refused_not_admitted: u64,
     /// Asks answered `Busy`: the asker had its share.
     pub answer_refused_limited: u64,
+    /// Asks answered `Missing`: the part's answer window is spent.
+    pub answer_refused_window_spent: u64,
     pub part_store_parts: u64,
     /// What the kept parts hold, within `part_store_budget_bytes`
     /// (`--relay-part-store-mb`).
