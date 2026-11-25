@@ -10,6 +10,7 @@ pub mod ingress_authorization;
 pub mod memory;
 pub mod node_status;
 pub mod opus_custom;
+pub mod part_answers;
 pub mod pacing_journal;
 pub mod part_timing;
 pub mod quadra_renditions;

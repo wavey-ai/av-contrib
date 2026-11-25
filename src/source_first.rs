@@ -87,6 +87,74 @@ pub struct SourceFirstEncoder {
     compact: Option<Mutex<CompactSender>>,
     /// The compact sender's cell on the source's timeline, in microseconds.
     compact_cell_us: u64,
+    /// `--relay-repair-sizing measured` (4k-repair): a part of at least
+    /// `min_symbols` source symbols takes repair sized to the loss its
+    /// caller measured on the part's lane, not the controller's policy.
+    measured_repair: Option<MeasuredRepair>,
+}
+
+/// How a part's repair is sized to the measured loss (4k-repair), from its
+/// size in symbols and that loss alone (no media kind, no key frames): the
+/// fewest symbols that leave at most [`TARGET_PART_FAILURE`] of parts
+/// undecodable from one lane's symbols at [`planned_loss`], at least
+/// `floor_permille` of K (and 2), at most `cap_percent` of K. Parts under
+/// `min_symbols` (an audio part's one to three) keep the controller's
+/// policy and the one-symbol copies rule.
+#[derive(Debug, Clone, Copy)]
+pub struct MeasuredRepair {
+    pub floor_permille: u32,
+    pub cap_percent: u32,
+    pub min_symbols: u16,
+}
+
+/// At most this share of parts undecodable from one lane's symbols.
+pub const TARGET_PART_FAILURE: f64 = 1e-4;
+
+/// The loss a plan takes for a measured `loss_ppm`: half as much again,
+/// and 0.1 % (av-mesh's link repair takes the same).
+#[must_use]
+pub fn planned_loss(loss_ppm: u32) -> f64 {
+    (f64::from(loss_ppm) / 1e6 * 1.5 + 0.001).min(0.5)
+}
+
+/// Smallest `r` such that a block of `k` source symbols sent with `r`
+/// repair symbols is undecodable with probability at most `target` when
+/// each datagram is lost with probability `p` (a block of more than one
+/// symbol counted as needing one more than `k`), at most `limit`.
+#[must_use]
+pub fn repair_for_loss(k: u32, p: f64, target: f64, limit: u32) -> u32 {
+    if !(p > 0.0) || k == 0 {
+        return 0;
+    }
+    let p = p.min(0.5);
+    let margin = u32::from(k > 1);
+    let (ln_p, ln_q) = (p.ln(), (1.0 - p).ln());
+    let mean = (f64::from(k) * p / (1.0 - p)).floor() as u32;
+    let mut r = margin.max(mean.saturating_sub(1));
+    while r < limit {
+        let n = k + r;
+        let allowed = r - margin;
+        let mut ln_term = f64::from(n) * ln_q;
+        let mut delivered = ln_term.exp();
+        for j in 0..allowed {
+            ln_term += (f64::from(n - j) / f64::from(j + 1)).ln() + ln_p - ln_q;
+            delivered += ln_term.exp();
+        }
+        if 1.0 - delivered <= target {
+            return r;
+        }
+        r += 1;
+    }
+    limit
+}
+
+/// The repair of a part of `k` symbols at `loss_ppm` (see
+/// [`MeasuredRepair`]).
+#[must_use]
+pub fn measured_repair_symbols(k: u32, loss_ppm: u32, floor_permille: u32, cap_percent: u32) -> u32 {
+    let cap = (k * cap_percent / 100).max(16);
+    let floor = (k * floor_permille).div_ceil(1_000).max(2).min(cap);
+    repair_for_loss(k, planned_loss(loss_ppm), TARGET_PART_FAILURE, cap).max(floor)
 }
 
 /// The ids of a source-anchored part's datagrams (A 2.2): functions of its
@@ -131,7 +199,16 @@ impl SourceFirstEncoder {
             packet_sequence: AtomicU32::new(0),
             compact: None,
             compact_cell_us: 1,
+            measured_repair: None,
         })
+    }
+
+    /// Parts of `min_symbols` or more take repair sized to the loss their
+    /// caller measured (4k-repair; [`Self::encode_sources_measured`]).
+    #[must_use]
+    pub const fn with_measured_repair(mut self, repair: Option<MeasuredRepair>) -> Self {
+        self.measured_repair = repair;
+        self
     }
 
     /// One-datagram source-anchored audio parts go as compact RLC1
@@ -247,6 +324,31 @@ impl SourceFirstEncoder {
         single_symbol_audio_repair: Option<u32>,
         ids: Option<PartIds>,
     ) -> Result<SourcePart> {
+        self.encode_sources_measured(
+            object,
+            generation,
+            subscription_id,
+            deadline,
+            single_symbol_audio_repair,
+            ids,
+            None,
+        )
+    }
+
+    /// [`Self::encode_sources_with`], with the loss (ppm) measured on the
+    /// lane the part goes on: with [`Self::with_measured_repair`], a part
+    /// of at least its `min_symbols` takes [`measured_repair_symbols`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_sources_measured(
+        &self,
+        object: &MediaObject,
+        generation: TopologyGeneration,
+        subscription_id: SubscriptionId,
+        deadline: MediaDeadline,
+        single_symbol_audio_repair: Option<u32>,
+        ids: Option<PartIds>,
+        measured_loss_ppm: Option<u32>,
+    ) -> Result<SourcePart> {
         let priority = priority_for_object(object);
         // `encode` validates the object (its payload hash among the rest).
         let envelope = media_object::encode(object)?;
@@ -276,8 +378,19 @@ impl SourceFirstEncoder {
                 maximum: raptorq_datagram_fec::MAX_SOURCE_SYMBOLS_PER_BLOCK as usize,
             });
         }
-        let repair_symbols = match single_symbol_audio_repair {
-            Some(repair) if priority == MediaPriority::Audio && source_symbols == 1 => repair,
+        let repair_symbols = match (single_symbol_audio_repair, self.measured_repair, measured_loss_ppm) {
+            (Some(repair), _, _) if priority == MediaPriority::Audio && source_symbols == 1 => {
+                repair
+            }
+            (_, Some(measured), Some(loss_ppm)) if source_symbols >= measured.min_symbols => {
+                measured_repair_symbols(
+                    u32::from(source_symbols),
+                    loss_ppm,
+                    measured.floor_permille,
+                    measured.cap_percent,
+                )
+                .min(self.limits.max_extra_repair_symbols)
+            }
             _ => self.controller.repair_symbols_for(source_symbols, priority),
         };
         if repair_symbols > self.limits.max_extra_repair_symbols {
@@ -743,6 +856,30 @@ impl SourcePart {
                 })
                 .collect();
         }
+        self.planned_repair_wires(0, self.repair_symbols)
+    }
+
+    /// `count` repair symbols from repair ordinal `first_ordinal` on (4k-repair:
+    /// the answers to a forwarder's ask take ordinals of their own, disjoint
+    /// from the part's repair), with the part's own packet sequences (its
+    /// first source's plus the ESI). None for a compact part.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a datagram does not validate.
+    pub fn extra_repair_wires(&self, first_ordinal: u32, count: u32) -> Result<Vec<Bytes>> {
+        if self.compact.is_some() || count == 0 {
+            return Ok(Vec::new());
+        }
+        self.planned_repair_wires(first_ordinal, count)
+    }
+
+    /// The source symbols of the object (none for a compact part).
+    pub fn source_symbol_count(&self) -> u32 {
+        u32::from(self.header.source_symbols)
+    }
+
+    fn planned_repair_wires(&self, first_ordinal: u32, count: u32) -> Result<Vec<Bytes>> {
         let size = usize::from(self.header.symbol_size);
         let padded_len = usize::from(self.header.source_symbols) * size;
         let padded;
@@ -765,14 +902,17 @@ impl SourcePart {
         let plan = self.plans.plan(self.header.source_symbols);
         let encoder = SourceBlockEncoder::with_encoding_plan(0, &oti, block, &plan);
         let mut template: Option<Vec<u8>> = None;
-        let mut wires = Vec::with_capacity(self.repair_symbols as usize);
+        let mut wires = Vec::with_capacity(count as usize);
         for (index, packet) in encoder
-            .repair_packets(0, self.repair_symbols)
+            .repair_packets(first_ordinal, count)
             .into_iter()
             .enumerate()
         {
             let esi = packet.payload_id().encoding_symbol_id();
-            let sequence = self.first_repair_sequence.wrapping_add(index as u32);
+            let sequence = self
+                .first_repair_sequence
+                .wrapping_add(first_ordinal)
+                .wrapping_add(index as u32);
             let wire = match template.as_ref() {
                 Some(prefix) => self.header.wire(prefix, esi, sequence, packet.data())?,
                 None => {
@@ -1764,5 +1904,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 4k-repair (a): a part's repair follows the measured loss at one part
+    /// in ten thousand, between its floor and its cap, where the policy
+    /// gave a large part at most 16 symbols whatever the loss.
+    #[test]
+    fn repair_is_sized_to_the_measured_loss() {
+        // An average 247 Mbit/s part (K 1,088): clean, 1 %, 5 %.
+        // Clean: the 0.1 % planned loss at 1e-4 (8 symbols), over the
+        // floor of 0.5 % (6).
+        assert_eq!(measured_repair_symbols(1_088, 0, 5, 30), 8);
+        assert_eq!(measured_repair_symbols(1_088, 0, 10, 30), 11, "a floor of 1 %");
+        let one = measured_repair_symbols(1_088, 10_000, 5, 30);
+        assert!((30..=50).contains(&one), "{one}");
+        let five = measured_repair_symbols(1_088, 50_000, 5, 30);
+        assert!((110..=150).contains(&five), "{five}");
+        // A 6 MB loop-point frame (K 4,736) at 1 %: more symbols, a smaller
+        // share; the policy's 16 were 0.3 %.
+        let big = measured_repair_symbols(4_736, 10_000, 5, 30);
+        assert!(big > 90 && big * 1_000 / 4_736 < one * 1_000 / 1_088, "{big}");
+        // Capped.
+        assert_eq!(measured_repair_symbols(1_000, 400_000, 5, 30), 300);
+        // The residual: at the planned loss, r leaves at most 1e-4.
+        let p = planned_loss(10_000);
+        assert!(repair_for_loss(1_088, p, 1e-3, 10_000) < one);
+    }
+
+    /// By size alone: a part of at least `min_symbols` takes the measured
+    /// repair whatever its kind; a smaller one (an audio part's one to
+    /// three symbols) keeps the policy.
+    #[test]
+    fn a_large_part_takes_the_measured_repair_and_a_small_one_keeps_the_policy() {
+        let limits = RelayLimits {
+            max_extra_repair_symbols: 4_096,
+            ..RelayLimits::default()
+        };
+        let measured = MeasuredRepair {
+            floor_permille: 5,
+            cap_percent: 30,
+            min_symbols: 32,
+        };
+        let encoder = SourceFirstEncoder::new(controller(0), limits)
+            .unwrap()
+            .with_measured_repair(Some(measured));
+        let reference = SourceFirstEncoder::new(controller(0), limits).unwrap();
+        let (generation, subscription, deadline) = ids();
+        for (sequence, class) in [(1, &b"video-delta"[..]), (2, &b"audio"[..])] {
+            let large = object(4_001, sequence, 600_000, class, false);
+            let part = encoder
+                .encode_sources_measured(&large, generation, subscription, deadline, None, None, Some(10_000))
+                .unwrap();
+            let k = part.source_wires().len() as u32;
+            assert_eq!(part.repair_count(), measured_repair_symbols(k, 10_000, 5, 30));
+            assert!(part.repair_count() > 16);
+            assert_eq!(part.repair().unwrap().len() as u32, part.repair_count());
+        }
+        let small = object(4_001, 3, 3_000, b"video-delta", false);
+        assert_eq!(
+            encoder
+                .encode_sources_measured(&small, generation, subscription, deadline, None, None, Some(10_000))
+                .unwrap()
+                .repair_count(),
+            reference
+                .encode_sources(&small, generation, subscription, deadline)
+                .unwrap()
+                .repair_count()
+        );
     }
 }
