@@ -1965,6 +1965,9 @@ struct ResponderSocket {
     socket: Arc<UdpSocket>,
     /// The lane's forwarder: the one address whose asks are answered.
     peer: SocketAddr,
+    /// The socket's ledger count (RLL1): answers are counted in it, as
+    /// the forwarder counts them against it (M4).
+    ledger: Arc<AtomicU64>,
     report: Arc<LaneLossReport>,
     demand: Option<Arc<LaneDemand>>,
     path: RelayCarrierPath,
@@ -1996,6 +1999,7 @@ impl LaneResponder {
             sockets.push(ResponderSocket {
                 socket: Arc::clone(&lane.socket),
                 peer: lane.peer_addr,
+                ledger: Arc::clone(&lane.backlog.sent),
                 report: Arc::clone(&lane.reported_loss),
                 demand: demand.then(|| Arc::clone(&lane.demand)),
                 path,
@@ -2005,6 +2009,7 @@ impl LaneResponder {
                 sockets.push(ResponderSocket {
                     socket: Arc::clone(video),
                     peer: lane.video_peer_addr,
+                    ledger: Arc::clone(&lane.video_sent),
                     report: Arc::clone(&lane.video_reported_loss),
                     demand: None,
                     path,
@@ -2088,10 +2093,18 @@ fn answer_ask(
     if let Some(answer) = answer {
         send_connected(fd, &answer);
     }
+    // The answer's symbols are in the socket's ledger before they go (and
+    // taken out if they do not), so a ledger that leaves mid-answer never
+    // counts fewer than were sent: the forwarder counts every one it
+    // receives against it (M4). RLA1 is not a relay datagram and is not
+    // counted at either end.
+    socket.ledger.fetch_add(wires.len() as u64, Ordering::Release);
     let mut sent = 0;
     for wire in &wires {
         if send_connected(fd, wire) {
             sent += 1;
+        } else {
+            socket.ledger.fetch_sub(1, Ordering::Release);
         }
     }
     if !request.probe && !wires.is_empty() {
@@ -2410,7 +2423,7 @@ struct RelayLane {
     /// 4k-repair (a): datagrams handed to the kernel on the video socket
     /// (the count of its own ledger, RLL1), and the loss its forwarder's
     /// video thread reports against it (RLR1).
-    video_sent: AtomicU64,
+    video_sent: Arc<AtomicU64>,
     video_reported_loss: Arc<LaneLossReport>,
 }
 
@@ -2510,7 +2523,7 @@ impl RelayLane {
             backlog: LaneBacklog::default(),
             reported_loss: Arc::default(),
             demand: Arc::default(),
-            video_sent: AtomicU64::new(0),
+            video_sent: Arc::default(),
             video_reported_loss: Arc::default(),
         })
     }
@@ -20192,6 +20205,154 @@ mod tests {
         assert_eq!((&buf[..4], buf[5], len), (&b"RLA1"[..], 0, 48), "sending");
         assert_eq!(u64::from_be_bytes(buf[8..16].try_into().unwrap()), 778);
         drop(primary_audio);
+    }
+
+    /// av-mesh's loss meter (src/fast_plane/loss_report.rs,
+    /// `LossMeter::ledger`): at each ledger of 32 datagrams or more since
+    /// the last, the window lost what was sent less what arrived, a
+    /// surplus carried (at most 64) into the next. Totals of the windows.
+    #[derive(Default)]
+    struct FirstHopMeter {
+        base: Option<(u64, u64)>,
+        received: u64,
+        carry: i64,
+        lost: u64,
+        sent: u64,
+    }
+
+    impl FirstHopMeter {
+        fn ledger(&mut self, sent: u64) {
+            let Some((base_sent, base_received)) = self.base else {
+                self.base = Some((sent, self.received));
+                return;
+            };
+            let window = sent - base_sent;
+            if window < 32 {
+                return;
+            }
+            let lost = window as i64 - (self.received - base_received) as i64 + self.carry;
+            let lost = if lost < 0 {
+                self.carry = lost.max(-64);
+                0
+            } else {
+                self.carry = 0;
+                (lost as u64).min(window)
+            };
+            self.lost += lost;
+            self.sent += window;
+            self.base = Some((sent, self.received));
+        }
+
+        fn ppm(&self) -> u32 {
+            (self.lost * 1_000_000 / self.sent.max(1)) as u32
+        }
+    }
+
+    /// M4: with the forwarder asking for what it lost and the answers
+    /// flowing, the first hop's measured loss is the path's: 1 % and 5 %
+    /// random loss between the contributor's video lane and a forwarder
+    /// that measures against the lane's ledgers (RLL1) as av-mesh does and
+    /// reports it (RLR1), which the contributor reads.
+    #[tokio::test]
+    async fn the_first_hops_measured_loss_holds_with_answers_flowing() {
+        for (case, loss) in [0.01_f64, 0.05].into_iter().enumerate() {
+            let (primary_audio, primary_video) = class_port_receivers().await;
+            let mut args = contrib_status_args();
+            args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+            args.relay_primary_bind = Some(reserved_loopback_addr());
+            args.relay_deadline_ms = 5_000;
+            args.relay_source_first = true;
+            args.relay_repair_sizing = "policy".into();
+            args.relay_lane_ledger = false;
+            let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut rng = 0x9e37_79b9_7f4a_7c15_u64 ^ case as u64;
+            let mut lost_on_path = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 11) as f64 / (1_u64 << 53) as f64 <= loss
+            };
+            let mut meter = FirstHopMeter::default();
+            let mut buf = vec![0_u8; 65_536];
+            let mut from = None;
+            let mut answered = 0;
+            let stream = 91_000_000_200 + case as u64;
+            for sequence in 0..100 {
+                let video = test_video_object_of(stream, sequence, 2, 100_000);
+                let out = relay
+                    .publish_part_object(&video, Some((stream, sequence)), PublicationClass::Video)
+                    .await
+                    .unwrap();
+                // Read the part's datagrams (and any ledger among them);
+                // the forwarder asks for as many as the path lost.
+                let mut relay_datagrams = out.source_symbols + out.repair_symbols;
+                let mut lacks = 0;
+                let mut answer_header = false;
+                let mut ledger_sent = false;
+                loop {
+                    if relay_datagrams == 0 {
+                        if lacks > 0 && !answer_header {
+                            let part = av_contrib::part_answers::PartKey::of(video.key());
+                            primary_video
+                                .send_to(&rlq1(part, lacks, sequence), from.unwrap())
+                                .await
+                                .unwrap();
+                            answer_header = true;
+                        } else if !ledger_sent {
+                            relay.primary.send_ledger();
+                            ledger_sent = true;
+                        }
+                    }
+                    let (len, peer) =
+                        timeout(Duration::from_secs(3), primary_video.recv_from(&mut buf))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    from = Some(peer);
+                    let datagram = &buf[..len];
+                    if datagram.starts_with(b"RLL1") {
+                        meter.ledger(u64::from_be_bytes(datagram[8..16].try_into().unwrap()));
+                        if ledger_sent {
+                            break;
+                        }
+                    } else if datagram.starts_with(b"RLA1") {
+                        let count = u16::from_be_bytes([datagram[6], datagram[7]]);
+                        relay_datagrams += usize::from(count);
+                        answered += usize::from(count);
+                        lacks = 0;
+                    } else {
+                        assert!(datagram.starts_with(b"RLS1"));
+                        relay_datagrams -= 1;
+                        if lost_on_path() {
+                            lacks += 1;
+                        } else {
+                            meter.received += 1;
+                        }
+                    }
+                }
+            }
+            assert!(answered > 0, "answers flowed");
+            let measured = meter.ppm();
+            let injected = (loss * 1e6) as u32;
+            primary_video.send_to(&rlr1(measured), from.unwrap()).await.unwrap();
+            let read = timeout(Duration::from_secs(2), async {
+                while relay.primary.video_reported_loss.ppm.load(Ordering::Relaxed)
+                    != u64::from(measured)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(read.is_ok(), "the contributor reads the report");
+            assert!(
+                measured.abs_diff(injected) <= injected * 3 / 10,
+                "measured {measured} ppm, injected {injected} ppm ({answered} answer symbols)"
+            );
+            drop(primary_audio);
+        }
     }
 
     /// 4k-repair (c): a first forwarder's ask (RLQ1) for a part the
