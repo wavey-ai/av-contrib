@@ -41,7 +41,7 @@ mpeg2ts-reader = { package = "wavey-mpeg2ts-reader", version = "0.1.0" }
 media-object = "0.1.1"
 media-capability = "0.1.1"
 music-audio-session = "0.1.2"
-playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "4023d2e0761e876c6b92c6580550e3e2daa9b962", features = ["compact-object"] }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "68f235be997e34b06d4cf1b97a33e1742022cb9c", features = ["compact-object"] }
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 raptorq = "2.0.1"
