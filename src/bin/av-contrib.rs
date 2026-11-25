@@ -1930,24 +1930,36 @@ fn drain_lane_loss_reports(
 /// dropped.
 struct LaneResponder {
     stop: Arc<AtomicBool>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The reader (reports, demand, asks) and the answerer.
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Drop for LaneResponder {
-    /// Stop the thread and wait for it (at most its 10 ms poll): it holds
-    /// the lane sockets, which close with it.
+    /// Stop the threads and wait for them (at most their 10 ms polls): they
+    /// hold the lane sockets, which close with them.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self
-            .thread
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+        let threads = std::mem::take(
+            &mut *self
+                .threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for thread in threads {
             let _ = thread.join();
         }
     }
 }
+
+/// Asks waiting for the answer thread; a full queue answers `Busy`.
+const ANSWER_QUEUE: usize = 64;
+
+/// An ask for the answer thread: the socket it came on, the ask, the asker.
+type AnswerJob = (usize, av_contrib::part_answers::Request, SocketAddr);
+
+/// Test builds: an ask with this time panics its answer (M1/S10 test).
+#[cfg(test)]
+const PANIC_ASK_SENT_US: u64 = 0x00de_adbe_ef00;
 
 struct ResponderSocket {
     socket: Arc<UdpSocket>,
@@ -1962,6 +1974,8 @@ struct ResponderSocket {
 /// Asks answered and the repair symbols sent in answers (4k-repair).
 static RELAY_ASKS_ANSWERED: AtomicU64 = AtomicU64::new(0);
 static RELAY_ANSWER_SYMBOLS: AtomicU64 = AtomicU64::new(0);
+/// Answers that panicked (the answer thread goes on with the next).
+static RELAY_ANSWER_PANICS: AtomicU64 = AtomicU64::new(0);
 /// The relay's part store, for /metrics (the first relay's).
 static RELAY_PART_STORE: std::sync::OnceLock<Arc<av_contrib::part_answers::PartStore>> =
     std::sync::OnceLock::new();
@@ -1998,22 +2012,91 @@ impl LaneResponder {
                 });
             }
         }
+        let sockets = Arc::new(sockets);
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let thread = match std::thread::Builder::new()
+        let mut threads = Vec::new();
+        // Answers are encoded on a thread of their own, so that loss reports
+        // and demand never wait behind them, and a panicking answer is
+        // caught there (M1, S10).
+        let (asks, queue) = std::sync::mpsc::sync_channel::<AnswerJob>(ANSWER_QUEUE);
+        let answerer = {
+            let (sockets, store, stop) = (Arc::clone(&sockets), Arc::clone(&store), Arc::clone(&stop));
+            std::thread::Builder::new()
+                .name("lane-answers".into())
+                .spawn(move || run_lane_answers(&sockets, &store, &queue, &stop))
+        };
+        match answerer {
+            Ok(thread) => threads.push(thread),
+            Err(error) => warn!(error = %error, "failed to start the lane answers: asks answered Busy"),
+        }
+        let reader_stop = Arc::clone(&stop);
+        match std::thread::Builder::new()
             .name("lane-responder".into())
-            .spawn(move || run_lane_responder(&sockets, &store, &thread_stop))
+            .spawn(move || run_lane_responder(&sockets, &store, &asks, &reader_stop))
         {
-            Ok(thread) => Some(thread),
+            Ok(thread) => threads.push(thread),
             Err(error) => {
                 warn!(error = %error, "failed to start the lane responder: no reports or asks read");
-                None
             }
-        };
+        }
         Arc::new(Self {
             stop,
-            thread: std::sync::Mutex::new(thread),
+            threads: std::sync::Mutex::new(threads),
         })
+    }
+}
+
+/// The answer thread: each ask in turn, a panic caught and counted.
+fn run_lane_answers(
+    sockets: &[ResponderSocket],
+    store: &av_contrib::part_answers::PartStore,
+    queue: &std::sync::mpsc::Receiver<AnswerJob>,
+    stop: &AtomicBool,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let (index, request, from) = match queue.recv_timeout(Duration::from_millis(10)) {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let Some(socket) = sockets.get(index) else {
+            continue;
+        };
+        let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            answer_ask(socket, store, &request, from);
+        }));
+        if answered.is_err() {
+            RELAY_ANSWER_PANICS.fetch_add(1, Ordering::Relaxed);
+            warn!(path = ?socket.path, "an answer to a forwarder's ask panicked; the next is answered");
+        }
+    }
+}
+
+/// Answer one ask: RLA1, then the repair symbols.
+fn answer_ask(
+    socket: &ResponderSocket,
+    store: &av_contrib::part_answers::PartStore,
+    request: &av_contrib::part_answers::Request,
+    from: SocketAddr,
+) {
+    #[cfg(test)]
+    if request.sent_us == PANIC_ASK_SENT_US {
+        panic!("an injected answer panic (test)");
+    }
+    let fd = socket.socket.as_raw_fd();
+    let (answer, wires) = store.answer(request, from, socket.peer, hop_journal::now_unix_us());
+    if let Some(answer) = answer {
+        send_connected(fd, &answer);
+    }
+    let mut sent = 0;
+    for wire in &wires {
+        if send_connected(fd, wire) {
+            sent += 1;
+        }
+    }
+    if !request.probe && !wires.is_empty() {
+        RELAY_ASKS_ANSWERED.fetch_add(1, Ordering::Relaxed);
+        RELAY_ANSWER_SYMBOLS.fetch_add(sent, Ordering::Relaxed);
     }
 }
 
@@ -2026,6 +2109,7 @@ fn relay_answers() -> node_status::RelayAnswers {
         answer_refused_not_admitted: store.map_or(0, |store| store.refused_not_admitted()),
         answer_refused_limited: store.map_or(0, |store| store.refused_limited()),
         answer_refused_window_spent: store.map_or(0, |store| store.refused_window_spent()),
+        answer_panics: RELAY_ANSWER_PANICS.load(Ordering::Relaxed),
         part_store_parts: store.map_or(0, |store| store.held_parts() as u64),
         part_store_bytes: store.map_or(0, |store| store.held_bytes() as u64),
         part_store_budget_bytes: store.map_or(0, |store| store.budget_bytes() as u64),
@@ -2048,9 +2132,12 @@ fn send_connected(fd: i32, datagram: &[u8]) -> bool {
     false
 }
 
+/// The reader: loss reports (RLR1) and demand (RLD1) at once, probes
+/// answered at once, asks queued for the answer thread.
 fn run_lane_responder(
     sockets: &[ResponderSocket],
     store: &av_contrib::part_answers::PartStore,
+    asks: &std::sync::mpsc::SyncSender<AnswerJob>,
     stop: &AtomicBool,
 ) {
     let mut polls: Vec<libc::pollfd> = sockets
@@ -2095,20 +2182,13 @@ fn run_lane_responder(
                     }
                 } else if let Some(request) = av_contrib::part_answers::Request::decode(datagram) {
                     let Some(from) = from else { continue };
-                    let (answer, wires) =
-                        store.answer(&request, from, socket.peer, hop_journal::now_unix_us());
-                    if let Some(answer) = answer {
-                        send_connected(fd, &answer);
+                    if !store.admits(from, socket.peer) {
+                        continue;
                     }
-                    let mut sent = 0;
-                    for wire in &wires {
-                        if send_connected(fd, wire) {
-                            sent += 1;
-                        }
-                    }
-                    if !request.probe && !wires.is_empty() {
-                        RELAY_ASKS_ANSWERED.fetch_add(1, Ordering::Relaxed);
-                        RELAY_ANSWER_SYMBOLS.fetch_add(sent, Ordering::Relaxed);
+                    if request.probe {
+                        answer_ask(socket, store, &request, from);
+                    } else if asks.try_send((index, request, from)).is_err() {
+                        send_connected(fd, &store.busy(&request));
                     }
                 } else if let Some(demand) = &socket.demand {
                     if let Some(streams) = decode_lane_demand(datagram) {
@@ -9702,6 +9782,11 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             "av_contrib_relay_answer_refused_limited",
             "Asks answered Busy: the asker had its share of the part (2 K + 16) or of the second (8 MiB/s).",
             RELAY_PART_STORE.get().map_or(0, |store| store.refused_limited()) as f64,
+        ),
+        (
+            "av_contrib_relay_answer_panics",
+            "Answers to the forwarders' asks that panicked (caught on the answer thread).",
+            RELAY_ANSWER_PANICS.load(Ordering::Relaxed) as f64,
         ),
         (
             "av_contrib_relay_answer_refused_window_spent",
@@ -20027,6 +20112,86 @@ mod tests {
         assert_eq!(receive_wires(&primary_video, all).await.len(), all);
         assert_eq!(receive_wires(&secondary_video, all).await.len(), all);
         drop((primary_audio, secondary_audio));
+    }
+
+    /// An RLQ1 ask for `part`, with `sent_us` echoed.
+    fn rlq1(part: av_contrib::part_answers::PartKey, wanted: u16, sent_us: u64) -> [u8; 48] {
+        let mut out = [0_u8; 48];
+        out[..4].copy_from_slice(b"RLQ1");
+        out[4] = 1;
+        out[6..8].copy_from_slice(&wanted.to_be_bytes());
+        out[8..16].copy_from_slice(&sent_us.to_be_bytes());
+        out[16..24].copy_from_slice(&part.stream.to_be_bytes());
+        out[24..32].copy_from_slice(&part.epoch.to_be_bytes());
+        out[32..40].copy_from_slice(&part.object.to_be_bytes());
+        out
+    }
+
+    /// An RLR1 (version 2) loss report of `ppm`.
+    fn rlr1(ppm: u32) -> [u8; 16] {
+        let mut out = [0_u8; 16];
+        out[..4].copy_from_slice(b"RLR1");
+        out[4] = 2;
+        out[8..12].copy_from_slice(&ppm.to_be_bytes());
+        out[12..16].copy_from_slice(&1_000_u32.to_be_bytes());
+        out
+    }
+
+    /// M1/S10: an answer that panics does not stop the lane's loss reports
+    /// (RLR1) being read, and the asks after it are answered.
+    #[tokio::test]
+    async fn a_panicking_answer_leaves_loss_reports_read() {
+        let video = test_video_object_of(91_000_000_095, 0, 2, 60_000);
+        let (primary_audio, primary_video) = class_port_receivers().await;
+        let mut args = contrib_status_args();
+        args.relay_primary_target = Some(primary_audio.local_addr().unwrap());
+        args.relay_primary_bind = Some(reserved_loopback_addr());
+        args.relay_deadline_ms = 5_000;
+        args.relay_source_first = true;
+        args.relay_repair_sizing = "policy".into();
+        let relay = RelaySessionPublisher::new(&args, Arc::new(IngestTelemetry::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let out = relay
+            .publish_part_object(&video, Some((91_000_000_095, 0)), PublicationClass::Video)
+            .await
+            .unwrap();
+        let mut buf = vec![0_u8; 65_536];
+        let mut from = None;
+        for _ in 0..out.source_symbols + out.repair_symbols {
+            let (_, peer) = timeout(Duration::from_secs(3), primary_video.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            from = Some(peer);
+        }
+        let from = from.unwrap();
+        let part = av_contrib::part_answers::PartKey::of(video.key());
+        let panics = RELAY_ANSWER_PANICS.load(Ordering::Relaxed);
+        primary_video
+            .send_to(&rlq1(part, 4, PANIC_ASK_SENT_US), from)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        primary_video.send_to(&rlr1(23_456), from).await.unwrap();
+        let read = timeout(Duration::from_secs(2), async {
+            while relay.primary.video_reported_loss.ppm.load(Ordering::Relaxed) != 23_456 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(read.is_ok(), "the loss report after the panic is read");
+        assert!(RELAY_ANSWER_PANICS.load(Ordering::Relaxed) > panics);
+        // And the next ask is answered.
+        primary_video.send_to(&rlq1(part, 3, 778), from).await.unwrap();
+        let (len, _) = timeout(Duration::from_secs(2), primary_video.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&buf[..4], buf[5], len), (&b"RLA1"[..], 0, 48), "sending");
+        assert_eq!(u64::from_be_bytes(buf[8..16].try_into().unwrap()), 778);
+        drop(primary_audio);
     }
 
     /// 4k-repair (c): a first forwarder's ask (RLQ1) for a part the

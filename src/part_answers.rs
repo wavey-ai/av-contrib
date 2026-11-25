@@ -253,6 +253,23 @@ impl PartStore {
         self.held_parts.store(kept.parts.len(), Ordering::Relaxed);
     }
 
+    /// Whether an ask from `from` on a socket whose forwarder is `peer` is
+    /// answered; a refusal is counted.
+    pub fn admits(&self, from: SocketAddr, peer: SocketAddr) -> bool {
+        let admitted = canonical(from) == canonical(peer);
+        if !admitted {
+            self.refused_not_admitted.fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
+    }
+
+    /// The `Busy` answer to an ask that cannot be taken now (the answer
+    /// queue is full), counted as limited.
+    pub fn busy(&self, request: &Request) -> [u8; ANSWER_LEN] {
+        self.refused_limited.fetch_add(1, Ordering::Relaxed);
+        encode_answer(request, BUSY, 0)
+    }
+
     /// The answer to `request`, which came from `from` on a socket whose
     /// forwarder is `peer`, at `now_us`: the RLA1 datagram and the repair
     /// symbols (none when the part is not kept here, or the asker had its
@@ -264,8 +281,7 @@ impl PartStore {
         peer: SocketAddr,
         now_us: u64,
     ) -> (Option<[u8; ANSWER_LEN]>, Vec<Bytes>) {
-        if canonical(from) != canonical(peer) {
-            self.refused_not_admitted.fetch_add(1, Ordering::Relaxed);
+        if !self.admits(from, peer) {
             return (None, Vec::new());
         }
         if request.probe {

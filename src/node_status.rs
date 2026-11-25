@@ -698,6 +698,8 @@ pub struct RelayAnswers {
     pub answer_refused_limited: u64,
     /// Asks answered `Missing`: the part's answer window is spent.
     pub answer_refused_window_spent: u64,
+    /// Answers that panicked, caught on the answer thread.
+    pub answer_panics: u64,
     pub part_store_parts: u64,
     /// What the kept parts hold, within `part_store_budget_bytes`
     /// (`--relay-part-store-mb`).
