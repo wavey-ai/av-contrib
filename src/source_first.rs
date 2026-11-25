@@ -489,7 +489,8 @@ impl SourceFirstEncoder {
             source,
             repair_symbols,
             first_repair_sequence: first_sequence.wrapping_add(u32::from(source_symbols)),
-            envelope,
+            envelope_alloc: envelope.capacity(),
+            envelope: Bytes::from(envelope),
             header,
             plans: Arc::clone(&self.plans),
             compact: None,
@@ -599,7 +600,8 @@ impl SourceFirstEncoder {
             source: vec![Bytes::from(wire.clone())],
             repair_symbols,
             first_repair_sequence: first_sequence.wrapping_add(1),
-            envelope: envelope.to_vec(),
+            envelope: Bytes::copy_from_slice(envelope),
+            envelope_alloc: envelope.len(),
             header: symbol_header,
             plans: Arc::clone(&self.plans),
             compact: Some(CompactCopies { wire }),
@@ -766,7 +768,10 @@ pub struct SourcePart {
     source: Vec<Bytes>,
     repair_symbols: u32,
     first_repair_sequence: u32,
-    envelope: Vec<u8>,
+    /// Shared (not copied) with the [`RepairSource`] that answers asks.
+    envelope: Bytes,
+    /// The envelope's allocation (its capacity), which `envelope` holds.
+    envelope_alloc: usize,
     header: SymbolHeader,
     plans: Arc<PlanCache>,
     /// A compact part (RLC1): its copies are its datagram's.
@@ -880,60 +885,155 @@ impl SourcePart {
     }
 
     fn planned_repair_wires(&self, first_ordinal: u32, count: u32) -> Result<Vec<Bytes>> {
-        let size = usize::from(self.header.symbol_size);
-        let padded_len = usize::from(self.header.source_symbols) * size;
-        let padded;
-        let block: &[u8] = if self.envelope.len() == padded_len {
-            &self.envelope
-        } else {
-            let mut bytes = Vec::with_capacity(padded_len);
-            bytes.extend_from_slice(&self.envelope);
-            bytes.resize(padded_len, 0);
-            padded = bytes;
-            &padded
-        };
-        let oti = ObjectTransmissionInformation::new(
-            u64::from(self.header.transfer_length),
-            self.header.symbol_size,
-            1,
-            1,
-            1,
-        );
-        let plan = self.plans.plan(self.header.source_symbols);
-        let encoder = SourceBlockEncoder::with_encoding_plan(0, &oti, block, &plan);
-        let mut template: Option<Vec<u8>> = None;
-        let mut wires = Vec::with_capacity(count as usize);
-        for (index, packet) in encoder
-            .repair_packets(first_ordinal, count)
-            .into_iter()
-            .enumerate()
-        {
-            let esi = packet.payload_id().encoding_symbol_id();
-            let sequence = self
-                .first_repair_sequence
-                .wrapping_add(first_ordinal)
-                .wrapping_add(index as u32);
-            let wire = match template.as_ref() {
-                Some(prefix) => self.header.wire(prefix, esi, sequence, packet.data())?,
-                None => {
-                    let (wire, prefix, _) = self.header.validated_wire(
-                        MediaDatagramRole::Repair,
-                        esi,
-                        sequence,
-                        packet.data(),
-                    )?;
-                    template = Some(prefix);
-                    wire
-                }
-            };
-            wires.push(wire);
+        planned_repair_wires(
+            &self.envelope,
+            &self.header,
+            &self.plans,
+            self.first_repair_sequence,
+            first_ordinal,
+            count,
+        )
+    }
+
+    /// What answering a forwarder's asks for the part needs (4k-repair):
+    /// its envelope (shared with the part, not copied), its symbol header
+    /// and the encoder's plans; not its source datagrams, which go when the
+    /// part has been sent. None for a compact part.
+    pub fn repair_source(&self) -> Option<RepairSource> {
+        if self.compact.is_some() {
+            return None;
         }
-        Ok(wires)
+        Some(RepairSource {
+            envelope: self.envelope.clone(),
+            envelope_alloc: self.envelope_alloc,
+            header: self.header.clone(),
+            plans: Arc::clone(&self.plans),
+            first_repair_sequence: self.first_repair_sequence,
+            wire_len: self.source.first().map_or(0, Bytes::len),
+        })
     }
 }
 
+/// A sent part's envelope and what its repair symbols need
+/// ([`SourcePart::repair_source`]), kept to answer asks.
+pub struct RepairSource {
+    envelope: Bytes,
+    envelope_alloc: usize,
+    header: SymbolHeader,
+    plans: Arc<PlanCache>,
+    first_repair_sequence: u32,
+    wire_len: usize,
+}
+
+impl RepairSource {
+    /// The part's object key.
+    pub const fn key(&self) -> &ObjectKey {
+        &self.header.key
+    }
+
+    /// The part's source symbols (K).
+    pub fn source_symbol_count(&self) -> u32 {
+        u32::from(self.header.source_symbols)
+    }
+
+    /// The length of one of its symbol datagrams (a full symbol's).
+    pub const fn wire_len(&self) -> usize {
+        self.wire_len
+    }
+
+    /// The bytes this keeps alive once the part's own datagrams are gone:
+    /// the envelope's allocation, the object key's names and the struct.
+    /// The plans are the encoder's, shared by every part, not counted.
+    pub fn held_bytes(&self) -> usize {
+        let key = &self.header.key;
+        self.envelope_alloc
+            + std::mem::size_of::<Self>()
+            + key.tenant().len()
+            + key.stream().len()
+            + key.track().len()
+    }
+
+    /// `count` repair symbols from repair ordinal `first_ordinal` on, as
+    /// [`SourcePart::extra_repair_wires`] gives them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a datagram does not validate.
+    pub fn repair_wires(&self, first_ordinal: u32, count: u32) -> Result<Vec<Bytes>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        planned_repair_wires(
+            &self.envelope,
+            &self.header,
+            &self.plans,
+            self.first_repair_sequence,
+            first_ordinal,
+            count,
+        )
+    }
+}
+
+fn planned_repair_wires(
+    envelope: &[u8],
+    header: &SymbolHeader,
+    plans: &PlanCache,
+    first_repair_sequence: u32,
+    first_ordinal: u32,
+    count: u32,
+) -> Result<Vec<Bytes>> {
+    let size = usize::from(header.symbol_size);
+    let padded_len = usize::from(header.source_symbols) * size;
+    let padded;
+    let block: &[u8] = if envelope.len() == padded_len {
+        envelope
+    } else {
+        let mut bytes = Vec::with_capacity(padded_len);
+        bytes.extend_from_slice(envelope);
+        bytes.resize(padded_len, 0);
+        padded = bytes;
+        &padded
+    };
+    let oti = ObjectTransmissionInformation::new(
+        u64::from(header.transfer_length),
+        header.symbol_size,
+        1,
+        1,
+        1,
+    );
+    let plan = plans.plan(header.source_symbols);
+    let encoder = SourceBlockEncoder::with_encoding_plan(0, &oti, block, &plan);
+    let mut template: Option<Vec<u8>> = None;
+    let mut wires = Vec::with_capacity(count as usize);
+    for (index, packet) in encoder
+        .repair_packets(first_ordinal, count)
+        .into_iter()
+        .enumerate()
+    {
+        let esi = packet.payload_id().encoding_symbol_id();
+        let sequence = first_repair_sequence
+            .wrapping_add(first_ordinal)
+            .wrapping_add(index as u32);
+        let wire = match template.as_ref() {
+            Some(prefix) => header.wire(prefix, esi, sequence, packet.data())?,
+            None => {
+                let (wire, prefix, _) = header.validated_wire(
+                    MediaDatagramRole::Repair,
+                    esi,
+                    sequence,
+                    packet.data(),
+                )?;
+                template = Some(prefix);
+                wire
+            }
+        };
+        wires.push(wire);
+    }
+    Ok(wires)
+}
+
 /// What every symbol of one object shares.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SymbolHeader {
     generation: TopologyGeneration,
     subscription_id: SubscriptionId,

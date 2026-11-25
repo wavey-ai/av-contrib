@@ -686,6 +686,23 @@ impl From<&StreamSample> for StreamRow {
     }
 }
 
+/// The contributor's answers to its first forwarders' asks (RLQ1,
+/// 4k-repair) and the part store they come from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RelayAnswers {
+    pub asks_answered: u64,
+    pub answer_symbols: u64,
+    /// Asks not from the lane's forwarder, dropped unanswered.
+    pub answer_refused_not_admitted: u64,
+    /// Asks answered `Busy`: the asker had its share.
+    pub answer_refused_limited: u64,
+    pub part_store_parts: u64,
+    /// What the kept parts hold, within `part_store_budget_bytes`
+    /// (`--relay-part-store-mb`).
+    pub part_store_bytes: u64,
+    pub part_store_budget_bytes: u64,
+}
+
 /// The body of `GET /api/node`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeReport {
@@ -710,6 +727,9 @@ pub struct NodeReport {
     pub sources: Vec<SourceSample>,
     pub streams: Vec<StreamRow>,
     pub lanes: Vec<LaneSample>,
+    /// With RelaySession lanes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_answers: Option<RelayAnswers>,
 }
 
 impl NodeReport {
@@ -737,6 +757,7 @@ impl NodeReport {
             streams: snapshot.streams.iter().map(StreamRow::from).collect(),
             sources: snapshot.sources,
             lanes: snapshot.lanes,
+            relay_answers: None,
         }
     }
 }
@@ -971,6 +992,7 @@ impl Sampler {
 
 type LaneReader = Box<dyn Fn(u64) -> Vec<LaneSample> + Send + Sync>;
 type ContractReader = Box<dyn Fn() -> Vec<ContractCounts> + Send + Sync>;
+type AnswersReader = Box<dyn Fn() -> RelayAnswers + Send + Sync>;
 
 /// The node's status: samples the counters and the lanes, steps the state
 /// machine and keeps the report that `GET /api/node` serves.
@@ -982,6 +1004,8 @@ pub struct NodeStatus {
     lanes: OnceLock<LaneReader>,
     /// Reads the packaging's contract counts; set when it starts.
     contract: OnceLock<ContractReader>,
+    /// Reads the relay's answers; set with RelaySession lanes.
+    answers: OnceLock<AnswersReader>,
     stopping: AtomicBool,
     sampler: Mutex<Sampler>,
     report: ArcSwap<NodeReport>,
@@ -1001,6 +1025,7 @@ impl NodeStatus {
             counters,
             lanes: OnceLock::new(),
             contract: OnceLock::new(),
+            answers: OnceLock::new(),
             stopping: AtomicBool::new(false),
             sampler: Mutex::new(sampler),
             report: ArcSwap::from_pointee(report),
@@ -1017,6 +1042,11 @@ impl NodeStatus {
     /// by stream.
     pub fn contract_counted(&self, read: impl Fn() -> Vec<ContractCounts> + Send + Sync + 'static) {
         let _ = self.contract.set(Box::new(read));
+    }
+
+    /// The relay answers its forwarders' asks; `read` gives its counts.
+    pub fn answers_bound(&self, read: impl Fn() -> RelayAnswers + Send + Sync + 'static) {
+        let _ = self.answers.set(Box::new(read));
     }
 
     /// A stop signal has come: the report says `stopping` from now.
@@ -1054,7 +1084,8 @@ impl NodeStatus {
             lanes: self.lanes.get().map(|read| read(now_unix_us)),
             contract: self.contract.get().map(|read| read()).unwrap_or_default(),
         };
-        let report = sampler.report(&self.node, &self.counters, reading);
+        let mut report = sampler.report(&self.node, &self.counters, reading);
+        report.relay_answers = self.answers.get().map(|read| read());
         self.report.store(Arc::new(report));
     }
 
@@ -1988,5 +2019,30 @@ mod tests {
         // and the next figure is of the time since the gap, not across it.
         assert_eq!(window.last_second(20_100, [160]), ([10], 100));
         assert_eq!(window.read.len(), 2);
+    }
+
+    /// With RelaySession lanes the report carries the relay's answers and
+    /// its part store; without, it has no such block.
+    #[test]
+    fn the_report_carries_the_relay_answers_once_bound() {
+        let status = NodeStatus::new(node(), Arc::new(Counters::default()));
+        status.sample(node().boot_unix_us + 1_000_000, 0);
+        let json = serde_json::to_value(&*status.report()).unwrap();
+        assert!(json.get("relay_answers").is_none());
+        status.answers_bound(|| RelayAnswers {
+            asks_answered: 3,
+            answer_symbols: 40,
+            part_store_parts: 12,
+            part_store_bytes: 15_000_000,
+            part_store_budget_bytes: 48 << 20,
+            ..RelayAnswers::default()
+        });
+        status.sample(node().boot_unix_us + 2_000_000, 0);
+        let json = serde_json::to_value(&*status.report()).unwrap();
+        let answers = &json["relay_answers"];
+        assert_eq!(answers["part_store_bytes"], 15_000_000);
+        assert_eq!(answers["part_store_budget_bytes"], 48 << 20);
+        assert_eq!(answers["answer_refused_limited"], 0);
+        assert_eq!(answers["asks_answered"], 3);
     }
 }

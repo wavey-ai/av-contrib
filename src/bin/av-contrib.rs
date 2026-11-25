@@ -1411,6 +1411,14 @@ struct Args {
     #[arg(long, env = "AV_RELAY_REPAIR_MEASURED_MIN_SYMBOLS", default_value_t = 32)]
     relay_repair_measured_min_symbols: u16,
 
+    /// 4k-repair: the envelopes the contributor keeps to answer its first
+    /// forwarders' asks (RLQ1) with fresh repair, in MiB (and at most 1,024
+    /// parts). 48 holds 1.63 s of parts at 247 Mbit/s, 1.26 s at 320,
+    /// past the 1 s media deadline; 0 keeps none (every ask is answered
+    /// `Missing`).
+    #[arg(long, env = "AV_RELAY_PART_STORE_MB", default_value_t = 48)]
+    relay_part_store_mb: u32,
+
     /// Source first: a part's source symbols are built straight from its
     /// envelope (RaptorQ is systematic) and handed to the lanes before its
     /// repair symbols are computed, which then use a cached RaptorQ
@@ -1943,6 +1951,8 @@ impl Drop for LaneResponder {
 
 struct ResponderSocket {
     socket: Arc<UdpSocket>,
+    /// The lane's forwarder: the one address whose asks are answered.
+    peer: SocketAddr,
     report: Arc<LaneLossReport>,
     demand: Option<Arc<LaneDemand>>,
     path: RelayCarrierPath,
@@ -1952,6 +1962,9 @@ struct ResponderSocket {
 /// Asks answered and the repair symbols sent in answers (4k-repair).
 static RELAY_ASKS_ANSWERED: AtomicU64 = AtomicU64::new(0);
 static RELAY_ANSWER_SYMBOLS: AtomicU64 = AtomicU64::new(0);
+/// The relay's part store, for /metrics (the first relay's).
+static RELAY_PART_STORE: std::sync::OnceLock<Arc<av_contrib::part_answers::PartStore>> =
+    std::sync::OnceLock::new();
 
 impl LaneResponder {
     fn start(
@@ -1968,6 +1981,7 @@ impl LaneResponder {
             let Some(lane) = lane else { continue };
             sockets.push(ResponderSocket {
                 socket: Arc::clone(&lane.socket),
+                peer: lane.peer_addr,
                 report: Arc::clone(&lane.reported_loss),
                 demand: demand.then(|| Arc::clone(&lane.demand)),
                 path,
@@ -1976,6 +1990,7 @@ impl LaneResponder {
             if let Some(video) = &lane.video {
                 sockets.push(ResponderSocket {
                     socket: Arc::clone(video),
+                    peer: lane.video_peer_addr,
                     report: Arc::clone(&lane.video_reported_loss),
                     demand: None,
                     path,
@@ -1999,6 +2014,20 @@ impl LaneResponder {
             stop,
             thread: std::sync::Mutex::new(thread),
         })
+    }
+}
+
+/// The relay's answers to its forwarders' asks, for `GET /api/node`.
+fn relay_answers() -> node_status::RelayAnswers {
+    let store = RELAY_PART_STORE.get();
+    node_status::RelayAnswers {
+        asks_answered: RELAY_ASKS_ANSWERED.load(Ordering::Relaxed),
+        answer_symbols: RELAY_ANSWER_SYMBOLS.load(Ordering::Relaxed),
+        answer_refused_not_admitted: store.map_or(0, |store| store.refused_not_admitted()),
+        answer_refused_limited: store.map_or(0, |store| store.refused_limited()),
+        part_store_parts: store.map_or(0, |store| store.held_parts() as u64),
+        part_store_bytes: store.map_or(0, |store| store.held_bytes() as u64),
+        part_store_budget_bytes: store.map_or(0, |store| store.budget_bytes() as u64),
     }
 }
 
@@ -2031,7 +2060,7 @@ fn run_lane_responder(
             revents: 0,
         })
         .collect();
-    let mut buf = [0_u8; 2_048];
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 2_048];
     while !stop.load(Ordering::Relaxed) {
         // SAFETY: `polls` is a valid array of `polls.len()` pollfd.
         let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 10) };
@@ -2045,17 +2074,18 @@ fn run_lane_responder(
             poll.revents = 0;
             let socket = &sockets[index];
             let fd = socket.socket.as_raw_fd();
+            let receiver = SockRef::from(socket.socket.as_ref());
             for _ in 0..256 {
-                // SAFETY: `buf` is valid for `buf.len()` bytes; `fd` is open.
-                let len =
-                    unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-                if len < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                        break;
-                    }
-                    continue;
-                }
-                let datagram = &buf[..len as usize];
+                // With the sender's address: only the lane's forwarder's
+                // asks are answered (the socket is connected to it).
+                let (len, from) = match receiver.recv_from_with_flags(&mut buf, libc::MSG_DONTWAIT) {
+                    Ok((len, from)) => (len, from.as_socket()),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => continue,
+                };
+                // SAFETY: `recv_from_with_flags` initialised the first
+                // `len` bytes of `buf`.
+                let datagram = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) };
                 if let Some(ppm) = decode_lane_loss_report(datagram) {
                     socket.report.record(ppm, hop_journal::now_unix_us());
                     if socket.audio {
@@ -2063,7 +2093,9 @@ fn run_lane_responder(
                             .store(u64::from(ppm), Ordering::Relaxed);
                     }
                 } else if let Some(request) = av_contrib::part_answers::Request::decode(datagram) {
-                    let (answer, wires) = store.answer(&request);
+                    let Some(from) = from else { continue };
+                    let (answer, wires) =
+                        store.answer(&request, from, socket.peer, hop_journal::now_unix_us());
                     if let Some(answer) = answer {
                         send_connected(fd, &answer);
                     }
@@ -2073,7 +2105,7 @@ fn run_lane_responder(
                             sent += 1;
                         }
                     }
-                    if !request.probe {
+                    if !request.probe && !wires.is_empty() {
                         RELAY_ASKS_ANSWERED.fetch_add(1, Ordering::Relaxed);
                         RELAY_ANSWER_SYMBOLS.fetch_add(sent, Ordering::Relaxed);
                     }
@@ -3177,7 +3209,11 @@ impl RelaySessionPublisher {
         } else {
             None
         };
-        let part_store = Arc::new(av_contrib::part_answers::PartStore::default());
+        let part_store = Arc::new(av_contrib::part_answers::PartStore::new(
+            (args.relay_part_store_mb as usize) << 20,
+            av_contrib::part_answers::STORE_PARTS,
+        ));
+        let _ = RELAY_PART_STORE.set(Arc::clone(&part_store));
         let responder = LaneResponder::start(
             &primary,
             secondary.as_ref(),
@@ -3841,9 +3877,10 @@ impl RelaySessionPublisher {
                 );
             }
         }
+        // Kept for the first forwarders' asks (4k-repair): its envelope,
+        // shared with the part, within --relay-part-store-mb.
+        self.part_store.keep(&encoded);
         let encoded = Arc::new(encoded);
-        // Kept for the first forwarders' asks (4k-repair).
-        self.part_store.keep(Arc::clone(&encoded));
         let hot = self.audio_inline && class == PublicationClass::Audio;
         // `--relay-repair-alongside-sources`: a large part's repair is
         // computed on a blocking thread while its sources are sent.
@@ -9656,6 +9693,31 @@ fn render_contrib_prometheus_metrics(snapshot: &ContribStatusSnapshot) -> String
             RELAY_ANSWER_SYMBOLS.load(Ordering::Relaxed) as f64,
         ),
         (
+            "av_contrib_relay_answer_refused_not_admitted",
+            "Asks (RLQ1) dropped unanswered: not from the lane's forwarder.",
+            RELAY_PART_STORE.get().map_or(0, |store| store.refused_not_admitted()) as f64,
+        ),
+        (
+            "av_contrib_relay_answer_refused_limited",
+            "Asks answered Busy: the asker had its share of the part (2 K + 16) or of the second (8 MiB/s).",
+            RELAY_PART_STORE.get().map_or(0, |store| store.refused_limited()) as f64,
+        ),
+        (
+            "av_contrib_relay_part_store_bytes",
+            "Bytes the parts kept for the forwarders' asks hold (--relay-part-store-mb).",
+            RELAY_PART_STORE.get().map_or(0, |store| store.held_bytes()) as f64,
+        ),
+        (
+            "av_contrib_relay_part_store_budget_bytes",
+            "The part store's budget (--relay-part-store-mb).",
+            RELAY_PART_STORE.get().map_or(0, |store| store.budget_bytes()) as f64,
+        ),
+        (
+            "av_contrib_relay_part_store_parts",
+            "Parts kept for the forwarders' asks.",
+            RELAY_PART_STORE.get().map_or(0, |store| store.held_parts()) as f64,
+        ),
+        (
             "av_contrib_relay_repair_loss_ppm",
             "Loss (ppm) the last part's measured repair was sized to (--relay-repair-sizing measured).",
             RELAY_REPAIR_LOSS_PPM.load(Ordering::Relaxed) as f64,
@@ -12146,6 +12208,9 @@ async fn main() -> Result<()> {
             args.relay_secondary_id.clone(),
         ];
         node.lanes_bound(move |now_unix_us| forwarder.lane_samples(&lane_ids, now_unix_us));
+    }
+    if args.relay_primary_target.is_some() {
+        node.answers_bound(relay_answers);
     }
     tokio::spawn(Arc::clone(&node).run());
     let mesh_publisher: Arc<dyn Fmp4PartPublisher> = forwarder.clone();
@@ -17882,6 +17947,7 @@ mod tests {
             relay_repair_floor_permille: 5,
             relay_repair_cap_percent: 30,
             relay_repair_measured_min_symbols: 32,
+            relay_part_store_mb: 48,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -18005,6 +18071,7 @@ mod tests {
             relay_repair_floor_permille: 5,
             relay_repair_cap_percent: 30,
             relay_repair_measured_min_symbols: 32,
+            relay_part_store_mb: 48,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -19049,6 +19116,7 @@ mod tests {
             relay_repair_floor_permille: 5,
             relay_repair_cap_percent: 30,
             relay_repair_measured_min_symbols: 32,
+            relay_part_store_mb: 48,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -19312,6 +19380,7 @@ mod tests {
             relay_repair_floor_permille: 5,
             relay_repair_cap_percent: 30,
             relay_repair_measured_min_symbols: 32,
+            relay_part_store_mb: 48,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
@@ -19475,6 +19544,7 @@ mod tests {
             relay_repair_floor_permille: 5,
             relay_repair_cap_percent: 30,
             relay_repair_measured_min_symbols: 32,
+            relay_part_store_mb: 48,
             relay_source_first: true,
             relay_video_symbol_size: 0,
             relay_video_plan_grid: true,
