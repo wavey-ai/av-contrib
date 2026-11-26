@@ -217,7 +217,7 @@ dependencies = [
  "av-hls",
  "av-traits",
  "av-upload-response",
- "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=c309e95ba93b6b9b833c444cab461533dd7fc839)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=ea4a0a804793e0d3b32bfedfac560b068f02ca21)",
  "base64",
  "bytes",
  "clap 4.6.3",
@@ -299,11 +299,11 @@ source = "git+https://github.com/wavey-ai/av-rs.git?rev=fe1342454a6aad796066fd18
 [[package]]
 name = "av-upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=c309e95ba93b6b9b833c444cab461533dd7fc839#c309e95ba93b6b9b833c444cab461533dd7fc839"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=ea4a0a804793e0d3b32bfedfac560b068f02ca21#ea4a0a804793e0d3b32bfedfac560b068f02ca21"
 dependencies = [
  "anyhow",
  "async-trait",
- "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=c309e95ba93b6b9b833c444cab461533dd7fc839)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=ea4a0a804793e0d3b32bfedfac560b068f02ca21)",
  "bytes",
  "futures-util",
  "http",
@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "av-web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=c309e95ba93b6b9b833c444cab461533dd7fc839#c309e95ba93b6b9b833c444cab461533dd7fc839"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=ea4a0a804793e0d3b32bfedfac560b068f02ca21#ea4a0a804793e0d3b32bfedfac560b068f02ca21"
 dependencies = [
  "anyhow",
  "async-trait",
