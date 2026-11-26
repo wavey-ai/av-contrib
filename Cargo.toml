@@ -64,8 +64,8 @@ talkback-media = "0.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
-av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "a56de57d92b371890d2286b65fd2dda96af09d59", default-features = false, features = ["rist-pure"] }
-av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "a56de57d92b371890d2286b65fd2dda96af09d59" }
+av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "c309e95ba93b6b9b833c444cab461533dd7fc839", default-features = false, features = ["rist-pure"] }
+av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "c309e95ba93b6b9b833c444cab461533dd7fc839" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 av-traits = { git = "https://github.com/wavey-ai/av-rs.git", rev = "fe1342454a6aad796066fd18268b2a06edec2d4d", optional = true }
