@@ -260,9 +260,15 @@ Useful endpoints:
   error, object metadata, and dependency/timing fields feed the same view.
   `/api/status` carries the configured targets/carrier state and latest deadline
   headroom.
-- `rist://<rist-bind>`: accepts RIST MPEG-TS through librist and demuxes
-  H.264/AAC. It boxes fMP4/CMAF parts and serves LL-HLS locally. It publishes
-  fMP4 part bytes to mesh under `--rist-stream-id` (default `0`).
+- `rist://<rist-bind>`: accepts RIST MPEG-TS (Main profile by default, from
+  librist, FFmpeg or OBS) through the pure Rust rist-rs receiver in
+  upload-response and demuxes H.264/AAC. It boxes fMP4/CMAF parts and serves
+  LL-HLS locally. It publishes fMP4 part bytes to mesh under
+  `--rist-stream-id` (default `0`). `--rist-buffer-ms` (default 1000, the
+  rist-rs default) is the receiver buffer: how long a hole is NACKed and, by
+  default, how long the ingest holds later packets before it skips a gap the
+  sender never repaired (`--rist-reorder-deadline-ms` overrides that wait;
+  `--rist-reorder-capacity`, default 65536, bounds the packets held).
 - `srt://<srt-bind>`: accepts SRT MPEG-TS and follows the same fMP4
   path under `--srt-stream-id` (default `6`).
 - `rtmp://<rtmp-bind>`: accepts RTMP/FLV access units and boxes them
