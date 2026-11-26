@@ -268,13 +268,14 @@ async fn main() -> Result<()> {
     );
     eprintln!(
         "rist-send: packets {} retransmitted {} nack_requests {} refused_not_in_history {} \
-         refused_too_old {} echo_responses {} rtt_us {}",
+         refused_too_old {} echo_responses {} repairs_dropped_queue_full {} rtt_us {}",
         stats.sent_packets,
         stats.retransmitted_packets,
         stats.nack_requests,
         stats.retransmit_refused_not_in_history,
         stats.retransmit_refused_too_old,
         stats.echo_responses,
+        stats.repairs_dropped_queue_full,
         stats
             .rtt_micros
             .map_or_else(|| "-".to_owned(), |rtt| rtt.to_string()),

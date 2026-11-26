@@ -217,7 +217,7 @@ dependencies = [
  "av-hls",
  "av-traits",
  "av-upload-response",
- "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=f5115da1a76d88678b1cada482e3060be61d3d2c)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=084436167832b6ad2af996f8b45d59431dbb435d)",
  "base64",
  "bytes",
  "clap 4.6.3",
@@ -299,11 +299,11 @@ source = "git+https://github.com/wavey-ai/av-rs.git?rev=fe1342454a6aad796066fd18
 [[package]]
 name = "av-upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=f5115da1a76d88678b1cada482e3060be61d3d2c#f5115da1a76d88678b1cada482e3060be61d3d2c"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=084436167832b6ad2af996f8b45d59431dbb435d#084436167832b6ad2af996f8b45d59431dbb435d"
 dependencies = [
  "anyhow",
  "async-trait",
- "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=f5115da1a76d88678b1cada482e3060be61d3d2c)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git?rev=084436167832b6ad2af996f8b45d59431dbb435d)",
  "base64",
  "bytes",
  "futures-util",
@@ -378,7 +378,7 @@ dependencies = [
 [[package]]
 name = "av-web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=f5115da1a76d88678b1cada482e3060be61d3d2c#f5115da1a76d88678b1cada482e3060be61d3d2c"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=084436167832b6ad2af996f8b45d59431dbb435d#084436167832b6ad2af996f8b45d59431dbb435d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "av-web-service-core"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=f5115da1a76d88678b1cada482e3060be61d3d2c#f5115da1a76d88678b1cada482e3060be61d3d2c"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=084436167832b6ad2af996f8b45d59431dbb435d#084436167832b6ad2af996f8b45d59431dbb435d"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2980,7 +2980,7 @@ dependencies = [
 [[package]]
 name = "rist-core"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?rev=532dec297069cd2ec9eee14ccfd3a4bfab449297#532dec297069cd2ec9eee14ccfd3a4bfab449297"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=82bfc2b4ab874c6bbca51f608c1b95566ad24cf0#82bfc2b4ab874c6bbca51f608c1b95566ad24cf0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2999,7 +2999,7 @@ dependencies = [
 [[package]]
 name = "rist-mio"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?rev=532dec297069cd2ec9eee14ccfd3a4bfab449297#532dec297069cd2ec9eee14ccfd3a4bfab449297"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=82bfc2b4ab874c6bbca51f608c1b95566ad24cf0#82bfc2b4ab874c6bbca51f608c1b95566ad24cf0"
 dependencies = [
  "libc",
  "mio",
