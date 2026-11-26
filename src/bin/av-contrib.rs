@@ -44,6 +44,9 @@ use relay_session::{
     PathMetrics, PrivateUdpConfig, PrivateUdpTransport, RaptorQObjectEncoder, RelayLimits,
     RelayTransport, SubscriptionId, TopologyGeneration,
 };
+use rist_core_pure::{
+    CongestionControlMode as RistCongestionControl, RecoveryConfig as RistRecoveryConfig,
+};
 use rtmp_ingress::ingress::start_rtmp_listener;
 use rtmp_ingress::{RtmpIngestEvent, RtmpStreamInfo};
 use serde::{Deserialize, Serialize};
@@ -75,6 +78,11 @@ use web_service::{
 };
 
 const MEDIA_ACCESS_UNIT_PATH: &str = "/media/access-unit";
+/// rist-core's default receiver buffer (`RecoveryConfig::default()`), which
+/// the product ingest runs with.
+const DEFAULT_RIST_BUFFER_MS: u64 = 1_000;
+/// upload-response's default reorder bound for one pure-RIST request.
+const DEFAULT_RIST_REORDER_CAPACITY: usize = 65_536;
 const NEEDLETAIL_AEP1_INGEST_PATH: &str = "/v1/ingest/aep1";
 const NEEDLETAIL_AEP1_CONTENT_TYPE: &str = "application/x-needletail-aep1-stream";
 const NEEDLETAIL_AEP1_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
@@ -700,6 +708,30 @@ struct Args {
     #[arg(long, value_enum, default_value = "main")]
     rist_profile: RistProfile,
 
+    /// RIST receiver buffer in ms (librist `buffer=`): how long a hole is
+    /// NACKed and, unless --rist-reorder-deadline-ms says otherwise, how long
+    /// the ingest waits for a repair before it skips the gap.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_RIST_BUFFER_MS,
+        value_parser = clap::value_parser!(u64).range(1..=60_000)
+    )]
+    rist_buffer_ms: u64,
+
+    /// Skip a gap the sender has not repaired once the packet after it has
+    /// waited this long, in ms (default: the RIST buffer).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+    rist_reorder_deadline_ms: Option<u64>,
+
+    /// Packets one RIST stream may hold behind gaps; past it the oldest gap
+    /// is skipped early.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_RIST_REORDER_CAPACITY,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    rist_reorder_capacity: usize,
+
     #[arg(long)]
     srt_bind: Option<SocketAddr>,
 
@@ -823,6 +855,9 @@ impl From<RistProfile> for UploadRistProfile {
 struct RistIngestConfig {
     bind: SocketAddr,
     profile: RistProfile,
+    buffer_ms: u64,
+    reorder_deadline_ms: Option<u64>,
+    reorder_capacity: usize,
     output_stream_id: u64,
     output_stream_idx: usize,
     min_part_ms: u32,
@@ -2561,14 +2596,19 @@ async fn start_rist_ingest(
     telemetry: Arc<IngestTelemetry>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
-    let service = Arc::new(UploadResponseService::new(upload_response_config()));
-    let rist_shutdown = UploadRistIngest::new(service.clone())
+    let service = Arc::new(new_upload_response_service()?);
+    let mut ingest = UploadRistIngest::new(service.clone())
         .with_profile(config.profile.into())
-        .start(config.bind)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!("failed to bind pure Rust RIST contributor frontend: {error}")
-        })?;
+        .with_reorder_capacity_packets(config.reorder_capacity);
+    if let Some(recovery) = config.recovery_config() {
+        ingest = ingest.with_recovery_config(recovery, RistCongestionControl::default());
+    }
+    if let Some(deadline_ms) = config.reorder_deadline_ms {
+        ingest = ingest.with_reorder_deadline(Duration::from_millis(deadline_ms));
+    }
+    let rist_shutdown = ingest.start(config.bind).await.map_err(|error| {
+        anyhow::anyhow!("failed to bind pure Rust RIST contributor frontend: {error}")
+    })?;
     tokio::spawn(run_upload_response_ts_bridge(
         service,
         playlists,
@@ -2586,6 +2626,9 @@ async fn start_rist_ingest(
     info!(
         bind = %config.bind,
         profile = config.profile.as_str(),
+        buffer_ms = config.buffer_ms,
+        reorder_deadline_ms = config.effective_reorder_deadline_ms(),
+        reorder_capacity = config.reorder_capacity,
         backend = "pure-rust",
         output_stream_id = config.output_stream_id,
         output_stream_idx = config.output_stream_idx,
@@ -2681,7 +2724,7 @@ async fn start_srt_ingest(
     telemetry: Arc<IngestTelemetry>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<watch::Sender<()>> {
-    let service = Arc::new(UploadResponseService::new(upload_response_config()));
+    let service = Arc::new(new_upload_response_service()?);
     let srt_shutdown = UploadSrtIngest::new(service.clone())
         .start(config.bind)
         .await
@@ -3137,11 +3180,39 @@ async fn run_rtmp_hls_bridge(
 }
 
 fn upload_response_config() -> UploadResponseConfig {
+    // 16 384 slots x 47 KiB is about 770 MB of ring per request, far above
+    // any ingest backlog. 32 768 put the estimated metadata (8 streams x
+    // 18 cache lanes) above upload-response's 512 MiB limit.
     UploadResponseConfig {
         num_streams: 8,
         slot_size_kb: 47,
-        slots_per_stream: 32768,
+        slots_per_stream: 16_384,
         response_timeout_ms: 60_000,
+    }
+}
+
+/// Builds the ingest's upload-response service; a config it rejects is an
+/// error at start-up instead of a panic.
+fn new_upload_response_service() -> Result<UploadResponseService> {
+    UploadResponseService::try_new(upload_response_config())
+        .map_err(|error| anyhow::anyhow!("invalid upload-response config: {error}"))
+}
+
+impl RistIngestConfig {
+    /// The receiver recovery config for `--rist-buffer-ms`, or `None` when it
+    /// is rist-core's default (the ingest then keeps its own default).
+    fn recovery_config(&self) -> Option<RistRecoveryConfig> {
+        let buffer = Duration::from_millis(self.buffer_ms);
+        let recovery = RistRecoveryConfig {
+            length_min: buffer,
+            length_max: buffer,
+            ..RistRecoveryConfig::default()
+        };
+        (recovery != RistRecoveryConfig::default()).then_some(recovery)
+    }
+
+    fn effective_reorder_deadline_ms(&self) -> u64 {
+        self.reorder_deadline_ms.unwrap_or(self.buffer_ms)
     }
 }
 
@@ -6426,6 +6497,12 @@ struct ListenerStatus {
     enabled: bool,
     bind: Option<String>,
     output_stream_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buffer_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reorder_deadline_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reorder_capacity: Option<usize>,
     output_hls_path: String,
     backend: Option<&'static str>,
     profile: Option<&'static str>,
@@ -6439,6 +6516,11 @@ impl ListenerStatus {
             enabled: args.rist_bind.is_some(),
             bind: args.rist_bind.map(|bind| bind.to_string()),
             output_stream_id: args.rist_stream_id.to_string(),
+            buffer_ms: Some(args.rist_buffer_ms),
+            reorder_deadline_ms: Some(
+                args.rist_reorder_deadline_ms.unwrap_or(args.rist_buffer_ms),
+            ),
+            reorder_capacity: Some(args.rist_reorder_capacity),
             output_hls_path: format!("/{}/stream.m3u8", args.rist_stream_id),
             backend: Some("pure-rust"),
             profile: Some(args.rist_profile.as_str()),
@@ -6452,6 +6534,9 @@ impl ListenerStatus {
             enabled: args.srt_bind.is_some(),
             bind: args.srt_bind.map(|bind| bind.to_string()),
             output_stream_id: args.srt_stream_id.to_string(),
+            buffer_ms: None,
+            reorder_deadline_ms: None,
+            reorder_capacity: None,
             output_hls_path: format!("/{}/stream.m3u8", args.srt_stream_id),
             backend: None,
             profile: None,
@@ -6465,6 +6550,9 @@ impl ListenerStatus {
             enabled: args.rtmp_bind.is_some(),
             bind: args.rtmp_bind.map(|bind| bind.to_string()),
             output_stream_id: args.rtmp_stream_id.to_string(),
+            buffer_ms: None,
+            reorder_deadline_ms: None,
+            reorder_capacity: None,
             output_hls_path: format!("/{}/stream.m3u8", args.rtmp_stream_id),
             backend: None,
             profile: None,
@@ -7301,6 +7389,9 @@ async fn main() -> Result<()> {
                 RistIngestConfig {
                     bind,
                     profile: args.rist_profile,
+                    buffer_ms: args.rist_buffer_ms,
+                    reorder_deadline_ms: args.rist_reorder_deadline_ms,
+                    reorder_capacity: args.rist_reorder_capacity,
                     output_stream_id: args.rist_stream_id,
                     output_stream_idx,
                     min_part_ms: args.fmp4_part_ms,
@@ -9413,6 +9504,9 @@ mod tests {
             daw_hls_formats: vec![DawHlsFormat::Flac],
             daw_hls_base_stream_id: 2001,
             stream_id: 1,
+            rist_buffer_ms: DEFAULT_RIST_BUFFER_MS,
+            rist_reorder_deadline_ms: None,
+            rist_reorder_capacity: DEFAULT_RIST_REORDER_CAPACITY,
             rist_stream_id: 1,
             srt_stream_id: 1,
             rtmp_stream_id: 1,
@@ -9428,6 +9522,78 @@ mod tests {
             playlist_count: 65,
             playlist_buffer_kb: 800,
         }
+    }
+    #[test]
+    fn upload_response_config_passes_service_validation() {
+        upload_response_config()
+            .validate()
+            .expect("the ingest config must pass upload-response's capacity check");
+    }
+
+    #[test]
+    fn rist_ingest_defaults_are_the_product_settings() {
+        let args = Args::try_parse_from(["av-contrib", "--rist-bind", "127.0.0.1:27000"])
+            .expect("parse defaults");
+        assert_eq!(args.rist_buffer_ms, DEFAULT_RIST_BUFFER_MS);
+        assert_eq!(
+            Duration::from_millis(DEFAULT_RIST_BUFFER_MS),
+            RistRecoveryConfig::default().length_max
+        );
+        assert_eq!(args.rist_reorder_deadline_ms, None);
+        assert_eq!(args.rist_reorder_capacity, DEFAULT_RIST_REORDER_CAPACITY);
+
+        let config = RistIngestConfig {
+            bind: args.rist_bind.unwrap(),
+            profile: args.rist_profile,
+            buffer_ms: args.rist_buffer_ms,
+            reorder_deadline_ms: args.rist_reorder_deadline_ms,
+            reorder_capacity: args.rist_reorder_capacity,
+            output_stream_id: args.rist_stream_id,
+            output_stream_idx: 0,
+            min_part_ms: args.fmp4_part_ms,
+        };
+        assert!(config.recovery_config().is_none());
+        assert_eq!(
+            config.effective_reorder_deadline_ms(),
+            DEFAULT_RIST_BUFFER_MS
+        );
+    }
+
+    #[test]
+    fn rist_buffer_flag_sets_the_receiver_buffer_and_the_deadline() {
+        let args = Args::try_parse_from([
+            "av-contrib",
+            "--rist-bind",
+            "127.0.0.1:27000",
+            "--rist-buffer-ms",
+            "250",
+            "--rist-reorder-capacity",
+            "8192",
+        ])
+        .expect("parse RIST flags");
+        let config = RistIngestConfig {
+            bind: args.rist_bind.unwrap(),
+            profile: args.rist_profile,
+            buffer_ms: args.rist_buffer_ms,
+            reorder_deadline_ms: args.rist_reorder_deadline_ms,
+            reorder_capacity: args.rist_reorder_capacity,
+            output_stream_id: args.rist_stream_id,
+            output_stream_idx: 0,
+            min_part_ms: args.fmp4_part_ms,
+        };
+        let recovery = config.recovery_config().expect("non-default buffer");
+        assert_eq!(recovery.length_min, Duration::from_millis(250));
+        assert_eq!(recovery.length_max, Duration::from_millis(250));
+        assert_eq!(config.effective_reorder_deadline_ms(), 250);
+        assert_eq!(config.reorder_capacity, 8192);
+
+        let status = ListenerStatus::rist(&args);
+        assert_eq!(status.buffer_ms, Some(250));
+        assert_eq!(status.reorder_deadline_ms, Some(250));
+        assert_eq!(status.reorder_capacity, Some(8192));
+
+        assert!(Args::try_parse_from(["av-contrib", "--rist-buffer-ms", "0"]).is_err());
+        assert!(Args::try_parse_from(["av-contrib", "--rist-reorder-capacity", "0"]).is_err());
     }
 
     #[cfg(feature = "srt-ingest")]
@@ -9487,6 +9653,9 @@ mod tests {
             daw_hls_formats: vec![DawHlsFormat::Flac],
             daw_hls_base_stream_id: 2001,
             stream_id: 9_007_199_254_741_993,
+            rist_buffer_ms: DEFAULT_RIST_BUFFER_MS,
+            rist_reorder_deadline_ms: None,
+            rist_reorder_capacity: DEFAULT_RIST_REORDER_CAPACITY,
             rist_stream_id: 9_007_199_254_741_994,
             srt_stream_id: 9_007_199_254_741_995,
             rtmp_stream_id: 9_007_199_254_741_996,
@@ -10066,6 +10235,9 @@ mod tests {
             daw_hls_formats: vec![DawHlsFormat::Flac],
             daw_hls_base_stream_id: 2001,
             stream_id: 1,
+            rist_buffer_ms: DEFAULT_RIST_BUFFER_MS,
+            rist_reorder_deadline_ms: None,
+            rist_reorder_capacity: DEFAULT_RIST_REORDER_CAPACITY,
             rist_stream_id: 0,
             srt_stream_id: 6,
             rtmp_stream_id: 7,
@@ -10280,6 +10452,9 @@ mod tests {
             daw_hls_formats: vec![DawHlsFormat::Flac],
             daw_hls_base_stream_id: 2001,
             stream_id: 1,
+            rist_buffer_ms: DEFAULT_RIST_BUFFER_MS,
+            rist_reorder_deadline_ms: None,
+            rist_reorder_capacity: DEFAULT_RIST_REORDER_CAPACITY,
             rist_stream_id: 0,
             srt_stream_id: 6,
             rtmp_stream_id: 7,
@@ -10394,6 +10569,9 @@ mod tests {
             daw_hls_formats: vec![DawHlsFormat::Flac],
             daw_hls_base_stream_id: 2001,
             stream_id: 1,
+            rist_buffer_ms: DEFAULT_RIST_BUFFER_MS,
+            rist_reorder_deadline_ms: None,
+            rist_reorder_capacity: DEFAULT_RIST_REORDER_CAPACITY,
             rist_stream_id: 0,
             srt_stream_id: 6,
             rtmp_stream_id: 7,

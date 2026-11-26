@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use rist_core_pure::packet::gre::{BufferNegotiation, GreKeepalive};
 use rist_core_pure::time::ntp_now;
-use rist_core_pure::{MainOutboundPacket, OutboundPacket};
+use rist_core_pure::{
+    CongestionControlMode, RecoveryConfig, RecoveryTuning, SenderStats, MAX_ADDRESSABLE_HISTORY,
+};
 use rist_mio_pure::{MainMioSender, SimpleMioSender};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -12,6 +14,16 @@ use tokio::io::{self as tokio_io, AsyncReadExt};
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const INITIAL_UDP_RETRY_DELAY: Duration = Duration::from_millis(1);
 const MAX_UDP_RETRY_DELAY: Duration = Duration::from_millis(32);
+/// rist-core's default buffer (`RecoveryConfig::default()`), which the
+/// product ingest runs with.
+const DEFAULT_RIST_BUFFER_MS: u64 = 1_000;
+/// The sender socket is not registered with a reactor, so feedback (NACKs,
+/// echo requests) that arrives while stdin is quiet is read at least this
+/// often. While data flows, the send path also reads it every 32 packets.
+const FEEDBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const KEEPALIVE_MAC: [u8; 6] = [1, 2, 3, 4, 5, 6];
+/// What the sender tells a Main receiver its current buffer is, in ms.
+const NEGOTIATED_RECEIVER_BUFFER_MS: u16 = 250;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RistProfile {
@@ -36,8 +48,20 @@ struct Args {
     #[arg(long, default_value_t = 1316)]
     chunk_bytes: usize,
 
+    /// Initial send-history size in packets. The history keeps every packet
+    /// for at least the buffer plus 2 x rtt_max, growing up to the 16-bit
+    /// NACK horizon (32 768 packets); a larger value is kept as a fixed size.
     #[arg(long, default_value_t = 8192)]
     history_packets: usize,
+
+    /// RIST buffer in ms (librist `buffer=`): how long the sender keeps and
+    /// repairs a packet. Use the receiver's buffer.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_RIST_BUFFER_MS,
+        value_parser = clap::value_parser!(u64).range(1..=60_000)
+    )]
+    rist_buffer_ms: u64,
 
     /// Keep the sender alive after EOF so the receiver can request final repairs.
     #[arg(long, default_value_t = 250)]
@@ -48,12 +72,6 @@ struct Args {
 enum Sender {
     Simple(SimpleMioSender),
     Main(MainMioSender),
-}
-
-#[allow(clippy::large_enum_variant)]
-enum PayloadPacket {
-    Simple(OutboundPacket),
-    Main(MainOutboundPacket),
 }
 
 impl Sender {
@@ -69,78 +87,123 @@ impl Sender {
                     .map(Self::Main)
             }
         }?;
-        sender.prime_session()?;
+        sender.configure_recovery(args.rist_buffer_ms);
+        sender.prime_session(args.rist_buffer_ms)?;
         Ok(sender)
     }
 
-    fn prime_session(&mut self) -> io::Result<()> {
-        let Self::Main(sender) = self else {
-            return Ok(());
-        };
+    /// The buffer the receiver runs with, and a history kept by time, so a
+    /// repair is never refused for want of the packet while it can still
+    /// arrive in time.
+    fn configure_recovery(&mut self, buffer_ms: u64) {
+        let (recovery, tuning) = recovery_settings(buffer_ms);
+        match self {
+            Self::Simple(sender) => {
+                sender.set_recovery_config(recovery, CongestionControlMode::default());
+                sender.set_recovery_tuning(tuning);
+            }
+            Self::Main(sender) => {
+                sender.set_recovery_config(recovery, CongestionControlMode::default());
+                sender.set_recovery_tuning(tuning);
+            }
+        }
+    }
 
-        sender.send_keepalive(GreKeepalive::librist_default([1, 2, 3, 4, 5, 6]))?;
-        sender.send_buffer_negotiation(BufferNegotiation::session(1000, 250))?;
-        let now = Instant::now();
-        sender.poll_rtcp_and_send(now, ntp_now())?;
-        sender.poll_rtcp_and_send(now + Duration::from_secs(1), ntp_now())?;
+    fn prime_session(&mut self, buffer_ms: u64) -> io::Result<()> {
+        if let Self::Main(sender) = self {
+            let keepalive = GreKeepalive::librist_default(KEEPALIVE_MAC);
+            sender.send_keepalive(keepalive)?;
+            // From here send_payload and service() send keepalives when due.
+            sender.set_auto_keepalive(keepalive);
+            let sender_buffer_ms = u16::try_from(buffer_ms).unwrap_or(u16::MAX);
+            sender.send_buffer_negotiation(BufferNegotiation::session(
+                sender_buffer_ms,
+                NEGOTIATED_RECEIVER_BUFFER_MS.min(sender_buffer_ms),
+            ))?;
+        }
+        // The first SR and echo request go out now, not a period later.
+        let mut buf = vec![0u8; 2048];
+        self.service(Instant::now(), &mut buf)?;
         std::thread::sleep(Duration::from_millis(20));
         Ok(())
     }
 
-    fn build_payload(&mut self, payload: &[u8]) -> PayloadPacket {
+    /// Sends one payload, straight from its history slot. `WouldBlock` means
+    /// the send queue was full and nothing was committed, so it is safe to
+    /// retry; the SR/echo request and keepalive go out with the data when due.
+    fn send_payload(&mut self, payload: &[u8], now: Instant) -> io::Result<()> {
         match self {
             Self::Simple(sender) => sender
-                .build_payload(payload, ntp_now(), Instant::now())
-                .into(),
+                .send_payload_meta(payload, ntp_now(), now)
+                .map(|_| ()),
             Self::Main(sender) => sender
-                .build_payload(payload, ntp_now(), Instant::now())
-                .into(),
+                .send_payload_meta(payload, ntp_now(), now)
+                .map(|_| ()),
         }
     }
 
-    fn send_outbound(&mut self, packet: &PayloadPacket) -> io::Result<()> {
-        match (self, packet) {
-            (Self::Simple(sender), PayloadPacket::Simple(packet)) => {
-                sender.send_outbound(packet).map(|_| ())
-            }
-            (Self::Main(sender), PayloadPacket::Main(packet)) => {
-                sender.send_outbound(packet).map(|_| ())
-            }
-            _ => unreachable!("payload packet profile must match sender profile"),
+    /// Flushes queued datagrams, serves feedback (NACKs repaired, echo
+    /// requests answered) and sends the SR/echo request, keepalive and
+    /// scheduled repairs that are due. Returns when it wants to be called
+    /// again.
+    fn service(&mut self, now: Instant, buf: &mut [u8]) -> io::Result<Option<Instant>> {
+        match self {
+            Self::Simple(sender) => sender.service(now, ntp_now(), buf),
+            Self::Main(sender) => sender.service(now, ntp_now(), buf),
         }
     }
 
-    fn drain_feedback(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        for _ in 0..32 {
-            match self {
-                Self::Simple(sender) => match sender.try_recv_feedback_and_retransmit(buf) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(()),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) => return Err(error),
-                },
-                Self::Main(sender) => match sender.try_recv_feedback_and_retransmit(buf) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(()),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) => return Err(error),
-                },
-            }
+    fn next_timeout(&self) -> Option<Instant> {
+        match self {
+            Self::Simple(sender) => sender.next_timeout(),
+            Self::Main(sender) => sender.next_timeout(),
         }
-        Ok(())
+    }
+
+    fn stats(&self) -> SenderStats {
+        match self {
+            Self::Simple(sender) => sender.stats(),
+            Self::Main(sender) => sender.stats(),
+        }
     }
 }
 
-impl From<OutboundPacket> for PayloadPacket {
-    fn from(packet: OutboundPacket) -> Self {
-        Self::Simple(packet)
+fn recovery_settings(buffer_ms: u64) -> (RecoveryConfig, RecoveryTuning) {
+    let buffer = Duration::from_millis(buffer_ms);
+    let recovery = RecoveryConfig {
+        length_min: buffer,
+        length_max: buffer,
+        ..RecoveryConfig::default()
+    };
+    let tuning = RecoveryTuning {
+        history_by_time: true,
+        max_history_packets: MAX_ADDRESSABLE_HISTORY,
+        ..RecoveryTuning::default()
+    };
+    (recovery, tuning)
+}
+
+/// Serves the sender and returns when to serve it next: its own deadline,
+/// but no later than the feedback poll interval.
+fn service_sender(sender: &mut Sender, buf: &mut [u8]) -> io::Result<Instant> {
+    let now = Instant::now();
+    let poll_at = now + FEEDBACK_POLL_INTERVAL;
+    match sender.service(now, buf) {
+        Ok(due) => Ok(due.map_or(poll_at, |due| due.min(poll_at))),
+        Err(error) if is_transient_udp_error(&error) => Ok(now + INITIAL_UDP_RETRY_DELAY),
+        Err(error) => Err(error),
     }
 }
 
-impl From<MainOutboundPacket> for PayloadPacket {
-    fn from(packet: MainOutboundPacket) -> Self {
-        Self::Main(packet)
-    }
+/// Sends one payload, serving the sender while its send queue is full.
+async fn send_payload(sender: &mut Sender, payload: &[u8], buf: &mut [u8]) -> io::Result<()> {
+    retry_would_block(|attempt| {
+        if attempt > 0 {
+            service_sender(sender, buf)?;
+        }
+        sender.send_payload(payload, Instant::now())
+    })
+    .await
 }
 
 #[tokio::main]
@@ -153,50 +216,86 @@ async fn main() -> Result<()> {
     let mut feedback_buf = vec![0u8; 65_536];
     let chunk_bytes = args.chunk_bytes.max(1);
     let mut chunk = vec![0u8; chunk_bytes];
+    let mut filled = 0usize;
     let mut sent_bytes = 0usize;
+    let mut next_service = Instant::now();
 
     loop {
-        let read = read_chunk(&mut input, &mut chunk).await?;
-        if read == 0 {
-            break;
+        if Instant::now() >= next_service {
+            next_service = service_sender(&mut sender, &mut feedback_buf)
+                .context("failed to serve RIST sender")?;
         }
-        let payload = &chunk[..read];
-        let packet = sender.build_payload(payload);
-        retry_transient_udp(|| sender.send_outbound(&packet))
-            .await
-            .context("failed to send RIST payload")?;
-        retry_transient_udp(|| sender.drain_feedback(&mut feedback_buf))
-            .await
-            .context("failed to process RIST feedback")?;
-        sent_bytes += read;
+        tokio::select! {
+            biased;
+            // Cancel safe: no bytes are lost when the timer wins.
+            read = input.read(&mut chunk[filled..]) => {
+                let read = read.context("failed to read stdin")?;
+                filled += read;
+                let eof = read == 0;
+                if filled == chunk_bytes || (eof && filled > 0) {
+                    send_payload(&mut sender, &chunk[..filled], &mut feedback_buf)
+                        .await
+                        .context("failed to send RIST payload")?;
+                    sent_bytes += filled;
+                    filled = 0;
+                    // The send path read feedback it could not finish.
+                    if sender.next_timeout().is_some_and(|at| at < next_service) {
+                        next_service = Instant::now();
+                    }
+                }
+                if eof {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(next_service.into()) => {}
+        }
     }
 
     let repair_deadline = Instant::now() + Duration::from_millis(args.final_repair_ms);
-    while Instant::now() < repair_deadline {
-        retry_transient_udp(|| sender.drain_feedback(&mut feedback_buf))
-            .await
-            .context("failed to process final RIST feedback")?;
-        tokio::time::sleep(Duration::from_millis(1)).await;
+    loop {
+        let next = service_sender(&mut sender, &mut feedback_buf)
+            .context("failed to serve RIST sender after EOF")?;
+        if Instant::now() >= repair_deadline {
+            break;
+        }
+        tokio::time::sleep_until(next.min(repair_deadline).into()).await;
     }
-    retry_transient_udp(|| sender.drain_feedback(&mut feedback_buf))
-        .await
-        .context("failed to process final RIST feedback")?;
 
+    let stats = sender.stats();
     println!(
         "sent {} bytes to {} using RIST chunks of {} bytes",
         sent_bytes, args.target, chunk_bytes
     );
+    eprintln!(
+        "rist-send: packets {} retransmitted {} nack_requests {} refused_not_in_history {} \
+         refused_too_old {} echo_responses {} rtt_us {}",
+        stats.sent_packets,
+        stats.retransmitted_packets,
+        stats.nack_requests,
+        stats.retransmit_refused_not_in_history,
+        stats.retransmit_refused_too_old,
+        stats.echo_responses,
+        stats
+            .rtt_micros
+            .map_or_else(|| "-".to_owned(), |rtt| rtt.to_string()),
+    );
     Ok(())
 }
 
-async fn retry_transient_udp<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+/// Runs `operation` until it does not return `WouldBlock`, backing off
+/// between attempts. `WouldBlock` from a send means nothing was committed (a
+/// full send queue; rist-mio reports `ENOBUFS` the same way), so a retry
+/// cannot duplicate a sequence. The attempt number is passed in.
+async fn retry_would_block<T>(mut operation: impl FnMut(u32) -> io::Result<T>) -> io::Result<T> {
     let mut delay = INITIAL_UDP_RETRY_DELAY;
+    let mut attempt = 0u32;
     loop {
-        match operation() {
+        match operation(attempt) {
             Ok(value) => return Ok(value),
-            Err(error) if is_transient_udp_error(&error) => {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2).min(MAX_UDP_RETRY_DELAY);
+                attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
         }
@@ -245,24 +344,6 @@ fn is_enobufs(_raw_os_error: Option<i32>) -> bool {
     false
 }
 
-async fn read_chunk<R>(input: &mut R, chunk: &mut [u8]) -> Result<usize>
-where
-    R: tokio_io::AsyncRead + Unpin,
-{
-    let mut filled = 0usize;
-    while filled < chunk.len() {
-        let read = input
-            .read(&mut chunk[filled..])
-            .await
-            .context("failed to read stdin")?;
-        if read == 0 {
-            break;
-        }
-        filled += read;
-    }
-    Ok(filled)
-}
-
 fn local_sender_addr(peer: SocketAddr) -> SocketAddr {
     match peer {
         SocketAddr::V4(addr) => {
@@ -302,12 +383,12 @@ mod tests {
     use std::cell::Cell;
 
     #[tokio::test]
-    async fn retries_transient_errors_until_success() {
+    async fn retries_would_block_until_success() {
         let attempts = Cell::new(0);
-        let result = retry_transient_udp(|| {
-            let attempt = attempts.get() + 1;
-            attempts.set(attempt);
-            if attempt < 3 {
+        let result = retry_would_block(|attempt| {
+            attempts.set(attempts.get() + 1);
+            assert_eq!(attempt + 1, attempts.get());
+            if attempt < 2 {
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             } else {
                 Ok(42)
@@ -323,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn returns_fatal_errors_without_retry() {
         let attempts = Cell::new(0);
-        let error = retry_transient_udp(|| {
+        let error = retry_would_block(|_| {
             attempts.set(attempts.get() + 1);
             Err::<(), _>(io::Error::from(io::ErrorKind::NetworkUnreachable))
         })
@@ -332,6 +413,32 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::NetworkUnreachable);
         assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn default_buffer_is_rist_core_default() {
+        assert_eq!(
+            Duration::from_millis(DEFAULT_RIST_BUFFER_MS),
+            RecoveryConfig::default().length_max
+        );
+        let (recovery, tuning) = recovery_settings(DEFAULT_RIST_BUFFER_MS);
+        assert_eq!(recovery, RecoveryConfig::default());
+        assert!(tuning.history_by_time);
+        assert_eq!(tuning.max_history_packets, MAX_ADDRESSABLE_HISTORY);
+    }
+
+    #[test]
+    fn buffer_flag_sets_both_recovery_lengths() {
+        let args =
+            Args::try_parse_from(["rist-send", "127.0.0.1:27000", "--rist-buffer-ms", "250"])
+                .unwrap();
+        let (recovery, _) = recovery_settings(args.rist_buffer_ms);
+        assert_eq!(recovery.length_min, Duration::from_millis(250));
+        assert_eq!(recovery.length_max, Duration::from_millis(250));
+        assert!(
+            Args::try_parse_from(["rist-send", "127.0.0.1:27000", "--rist-buffer-ms", "0"])
+                .is_err()
+        );
     }
 
     #[test]

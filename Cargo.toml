@@ -11,7 +11,7 @@ readme = "README.md"
 default = ["srt-ingest"]
 media_capability_enforce_publish_v1 = []
 quadra-renditions = ["dep:av-traits", "dep:xcoder-quadra"]
-rist-rs-tools = ["dep:rist-core-pure", "dep:rist-mio-pure"]
+rist-rs-tools = ["dep:rist-mio-pure"]
 srt-ingest = ["av-upload-response/srt"]
 
 [[bin]]
@@ -44,8 +44,10 @@ playlists = "0.1.6"
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 relay-session = "0.1.1"
-rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "614c10ab03fb37e25b7d892a2224caaddcbb89a6", optional = true }
-rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", rev = "614c10ab03fb37e25b7d892a2224caaddcbb89a6", optional = true }
+# rist-rs pin (branch perf-librist-parity). Bump both lines together, and keep
+# the rev equal to the one web-services upload-response pins, so one copy links.
+rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "532dec297069cd2ec9eee14ccfd3a4bfab449297" }
+rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", rev = "532dec297069cd2ec9eee14ccfd3a4bfab449297", optional = true }
 rtmp-ingress = "0.1.1"
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std"] }
 rustls-pemfile = "2"
@@ -64,8 +66,9 @@ talkback-media = "0.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
-av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "066bf4b3296ea8403e1c310b86f189dde20e990e", default-features = false, features = ["rist-pure"] }
-av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "066bf4b3296ea8403e1c310b86f189dde20e990e" }
+# web-services pin (branch rist-rs-perf). Both lines must name the same rev.
+av-upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "f5115da1a76d88678b1cada482e3060be61d3d2c", default-features = false, features = ["rist-pure"] }
+av-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "f5115da1a76d88678b1cada482e3060be61d3d2c" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 av-traits = { git = "https://github.com/wavey-ai/av-rs.git", rev = "fe1342454a6aad796066fd18268b2a06edec2d4d", optional = true }
